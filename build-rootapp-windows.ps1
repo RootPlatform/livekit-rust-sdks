@@ -122,14 +122,19 @@ function Get-Arm64CrossEnv {
     $rustflags = @('-C', 'target-feature=+crt-static') +
         ($libPaths | ForEach-Object { '-C'; "link-arg=/LIBPATH:$_" })
 
+    # clang-cl defines __aarch64__, which turns on libyuv's NEON/SVE/SME row functions, but
+    # yuv-sys never compiles their assembly sources for Windows. MSVC (the official arm64
+    # build) leaves them off, so match it.
+    $arm64Flags = '--target=aarch64-pc-windows-msvc -DLIBYUV_DISABLE_NEON -DLIBYUV_DISABLE_SVE -DLIBYUV_DISABLE_SME'
+
     [ordered]@{
         PATH = "$llvmBin;$env:PATH"
         INCLUDE = $include
         CC_aarch64_pc_windows_msvc = $clangCl
         CXX_aarch64_pc_windows_msvc = $clangCl
         AR_aarch64_pc_windows_msvc = $llvmLib
-        CFLAGS_aarch64_pc_windows_msvc = '--target=aarch64-pc-windows-msvc'
-        CXXFLAGS_aarch64_pc_windows_msvc = '--target=aarch64-pc-windows-msvc'
+        CFLAGS_aarch64_pc_windows_msvc = $arm64Flags
+        CXXFLAGS_aarch64_pc_windows_msvc = $arm64Flags
         CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER = $lldLink
         CARGO_ENCODED_RUSTFLAGS = $rustflags -join [char]0x1f
     }
