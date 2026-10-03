@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt::{Debug, Formatter},
     sync::Arc,
 };
@@ -32,8 +32,9 @@ struct TransportInner {
     renegotiate: bool,
     restarting_ice: bool,
     single_pc_mode: bool,
-    // Publish-side target bitrate (bps) for offer munging
-    max_send_bitrate_bps: Option<u64>,
+    // x-google-start-bitrate (kbps) per published video track id, munged into that
+    // track's m-section
+    start_bitrates_kbps: HashMap<String, u32>,
     pending_initial_offer: Option<SessionDescription>,
     stereo_track_ids: HashSet<String>,
 }
@@ -66,7 +67,7 @@ impl PeerTransport {
                 renegotiate: false,
                 restarting_ice: false,
                 single_pc_mode,
-                max_send_bitrate_bps: None,
+                start_bitrates_kbps: HashMap::new(),
                 pending_initial_offer: None,
                 stereo_track_ids: HashSet::new(),
             })),
@@ -192,32 +193,22 @@ impl PeerTransport {
             }
         }
 
-        // Apply x-google-start-bitrate munging for video codecs if we have a target bitrate.
-        // In initial offers (before track is published), max_send_bitrate_bps is None,
-        // so no munging is applied and WebRTC uses its default conservative start bitrate.
-        let has_video = sdp.contains(" VP8/90000")
-            || sdp.contains(" VP9/90000")
-            || sdp.contains(" AV1/90000")
-            || sdp.contains(" H264/90000")
-            || sdp.contains(" H265/90000");
-        if has_video {
-            let start_kbps = {
-                let inner = self.inner.lock().await;
-                Self::compute_start_bitrate_kbps(inner.max_send_bitrate_bps)
-            };
-            if let Some(start_kbps) = start_kbps {
-                log::info!("Initial offer: applying x-google-start-bitrate={} kbps", start_kbps);
-
-                let munged = Self::munge_x_google_start_bitrate(&sdp, start_kbps);
-                if munged != sdp {
-                    if let Ok(parsed) = SessionDescription::parse(&munged, offer.sdp_type()) {
-                        offer = parsed;
-                    }
+        // Before any video track is published there is no start bitrate to apply, and WebRTC
+        // uses its default conservative one.
+        let mut inner = self.inner.lock().await;
+        if !inner.start_bitrates_kbps.is_empty() {
+            let munged = Self::munge_start_bitrate_for_tracks(&sdp, &inner.start_bitrates_kbps);
+            if munged != sdp {
+                log::info!(
+                    "Initial offer: applying x-google-start-bitrate {:?}",
+                    inner.start_bitrates_kbps
+                );
+                if let Ok(parsed) = SessionDescription::parse(&munged, offer.sdp_type()) {
+                    offer = parsed;
                 }
             }
         }
 
-        let mut inner = self.inner.lock().await;
         inner.pending_initial_offer = Some(offer.clone());
         Ok(Some(offer))
     }
@@ -227,30 +218,43 @@ impl PeerTransport {
         inner.pending_initial_offer = None;
     }
 
-    pub async fn set_max_send_bitrate_bps(&self, bps: Option<u64>) {
+    /// Records the start bitrate for the m-section that will carry `track_id`, from the sum of
+    /// its encodings' max bitrates.
+    pub async fn set_max_send_bitrate_bps(&self, track_id: String, bps: Option<u64>, screen: bool) {
         let mut inner = self.inner.lock().await;
-        inner.max_send_bitrate_bps = bps;
+        match Self::compute_start_bitrate_kbps(bps, screen) {
+            Some(start_kbps) => inner.start_bitrates_kbps.insert(track_id, start_kbps),
+            None => inner.start_bitrates_kbps.remove(&track_id),
+        };
     }
 
-    /// Maximum x-google-start-bitrate (kbps).
+    /// Maximum x-google-start-bitrate (kbps) for cameras.
     /// 1 Mbps is a reasonable ceiling that prevents BWE from starting too aggressively.
     const MAX_START_BITRATE_KBPS: u32 = 1000;
 
+    /// Maximum x-google-start-bitrate (kbps) for screen shares. livekit-client leaves screen
+    /// shares uncapped, but Chromium never applies its value to the H.264 payload type the SFU
+    /// answers with, so the browser really starts at libwebrtc's default. 3 Mbps is enough to
+    /// enable a 2K share's top layer next to its 1.2 Mbps low layer at the first allocation
+    /// without starting far above a typical uplink.
+    const MAX_SCREEN_START_BITRATE_KBPS: u32 = 3000;
+
     /// Compute the x-google-start-bitrate value for SDP munging.
     ///
-    /// Returns min(90% of target, 1 Mbps). Returns None if no target bitrate is set
-    /// (initial offer before track publish) or if the target is too low.
-    fn compute_start_bitrate_kbps(target_bps: Option<u64>) -> Option<u32> {
+    /// Returns min(90% of target, 1 Mbps), or 3 Mbps for screen shares. Returns None if no
+    /// target bitrate is set or if the target is too low.
+    fn compute_start_bitrate_kbps(target_bps: Option<u64>, screen: bool) -> Option<u32> {
         let target_bps = target_bps?;
-        let target_kbps = (target_bps / 1000) as u32;
+        let target_kbps = u32::try_from(target_bps / 1000).unwrap_or(u32::MAX);
 
-        if target_kbps == 0 || target_kbps < 300 {
+        if target_kbps < 300 {
             return None;
         }
 
-        // Use 90% of target bitrate as start bitrate, capped at 1 Mbps
+        let cap =
+            if screen { Self::MAX_SCREEN_START_BITRATE_KBPS } else { Self::MAX_START_BITRATE_KBPS };
         let start_kbps = (target_kbps as f64 * 0.9).round() as u32;
-        Some(start_kbps.min(target_kbps).min(Self::MAX_START_BITRATE_KBPS))
+        Some(start_kbps.min(target_kbps).min(cap))
     }
 
     /// Munge SDP to change a=inactive to a=recvonly for RTP media m-lines in single PC mode.
@@ -435,6 +439,28 @@ impl PeerTransport {
             if is_stereo_track {
                 Self::add_opus_stereo(section);
             }
+        }
+        Self::join_sdp_sections(eol, sections)
+    }
+
+    /// Applies each track's start bitrate to the video codecs of the m-section carrying it
+    /// (matched via `a=msid`), so a screen share and a camera start from their own value.
+    fn munge_start_bitrate_for_tracks(sdp: &str, start_kbps: &HashMap<String, u32>) -> String {
+        let (eol, mut sections) = Self::split_sdp_sections(sdp);
+        for section in sections.iter_mut().skip(1) {
+            let kbps = Self::section_attribute(section, "msid")
+                .and_then(|msid| msid.split_whitespace().nth(1))
+                .and_then(|track_id| start_kbps.get(track_id).copied());
+            let Some(kbps) = kbps else {
+                continue;
+            };
+            let munged = Self::munge_x_google_start_bitrate(&section.join(eol), kbps);
+            *section = munged
+                .strip_suffix(eol)
+                .unwrap_or(&munged)
+                .split(eol)
+                .map(str::to_string)
+                .collect();
         }
         Self::join_sdp_sections(eol, sections)
     }
@@ -651,32 +677,17 @@ impl PeerTransport {
             }
         }
 
-        // Apply x-google-start-bitrate for all video codecs to improve initial quality.
-        // Uses min(90% of target, 1 Mbps) to prevent BWE from starting too aggressively.
-        let has_video = sdp.contains(" VP8/90000")
-            || sdp.contains(" VP9/90000")
-            || sdp.contains(" AV1/90000")
-            || sdp.contains(" H264/90000")
-            || sdp.contains(" H265/90000");
-        if has_video {
-            if let Some(start_kbps) = Self::compute_start_bitrate_kbps(inner.max_send_bitrate_bps) {
-                log::info!(
-                    "Applying x-google-start-bitrate={} kbps (target_bps={:?})",
-                    start_kbps,
-                    inner.max_send_bitrate_bps
-                );
-
-                let munged = Self::munge_x_google_start_bitrate(&sdp, start_kbps);
-                if munged != sdp {
-                    log::debug!("SDP munged successfully for video codec");
-                    match SessionDescription::parse(&munged, offer.sdp_type()) {
-                        Ok(parsed) => offer = parsed,
-                        Err(e) => log::warn!(
-                            "Failed to parse munged SDP, falling back to original offer: {e}"
-                        ),
-                    }
-                } else {
-                    log::debug!("SDP munging produced no changes");
+        // Apply x-google-start-bitrate to each published video track's codecs to improve
+        // initial quality.
+        if !inner.start_bitrates_kbps.is_empty() {
+            let munged = Self::munge_start_bitrate_for_tracks(&sdp, &inner.start_bitrates_kbps);
+            if munged != sdp {
+                log::info!("Applying x-google-start-bitrate {:?}", inner.start_bitrates_kbps);
+                match SessionDescription::parse(&munged, offer.sdp_type()) {
+                    Ok(parsed) => offer = parsed,
+                    Err(e) => log::warn!(
+                        "Failed to parse munged SDP, falling back to original offer: {e}"
+                    ),
                 }
             }
         }
@@ -693,6 +704,8 @@ impl PeerTransport {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::PeerTransport;
 
     /// Reproduces the publisher-transport self-deadlock.
@@ -1104,6 +1117,63 @@ a=fmtp:111 minptime=10;useinbandfec=1\r\n";
             "a=msid:- screen-audio\r\na=rtpmap:111 opus/48000/2\r\na=fmtp:111 minptime=10;useinbandfec=1;stereo=1\r\n"
         ));
         assert!(out.ends_with("\r\n") && !out.ends_with("\r\n\r\n"));
+    }
+
+    #[test]
+    fn camera_start_bitrate_is_capped_at_one_mbps() {
+        assert_eq!(PeerTransport::compute_start_bitrate_kbps(Some(15_610_000), false), Some(1000));
+        assert_eq!(PeerTransport::compute_start_bitrate_kbps(Some(800_000), false), Some(720));
+        assert_eq!(PeerTransport::compute_start_bitrate_kbps(Some(299_000), false), None);
+        assert_eq!(PeerTransport::compute_start_bitrate_kbps(None, false), None);
+    }
+
+    #[test]
+    fn screen_share_start_bitrate_is_capped_at_three_mbps() {
+        assert_eq!(PeerTransport::compute_start_bitrate_kbps(Some(16_200_000), true), Some(3000));
+        assert_eq!(PeerTransport::compute_start_bitrate_kbps(Some(2_900_000), true), Some(2610));
+        assert_eq!(PeerTransport::compute_start_bitrate_kbps(Some(299_000), true), None);
+    }
+
+    #[test]
+    fn start_bitrate_is_applied_per_track_section() {
+        let sdp = "v=0\r\n\
+o=- 0 0 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96 98\r\n\
+a=mid:0\r\n\
+a=msid:- camera-track\r\n\
+a=rtpmap:96 VP8/90000\r\n\
+a=rtpmap:98 H264/90000\r\n\
+a=fmtp:98 packetization-mode=1;profile-level-id=42e01f\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96 98\r\n\
+a=mid:1\r\n\
+a=msid:- screen-track\r\n\
+a=rtpmap:96 VP8/90000\r\n\
+a=rtpmap:98 H264/90000\r\n\
+a=fmtp:98 packetization-mode=1;profile-level-id=42e01f\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96 98\r\n\
+a=mid:2\r\n\
+a=recvonly\r\n\
+a=rtpmap:96 VP8/90000\r\n\
+a=rtpmap:98 H264/90000\r\n\
+a=fmtp:98 packetization-mode=1;profile-level-id=42e01f\r\n";
+        let start: HashMap<String, u32> =
+            [("camera-track".to_string(), 1000), ("screen-track".to_string(), 3000)]
+                .into_iter()
+                .collect();
+        let out = PeerTransport::munge_start_bitrate_for_tracks(sdp, &start);
+        assert!(out.contains(
+            "a=msid:- camera-track\r\na=rtpmap:96 VP8/90000\r\na=fmtp:96 x-google-start-bitrate=1000\r\na=rtpmap:98 H264/90000\r\na=fmtp:98 packetization-mode=1;profile-level-id=42e01f;x-google-start-bitrate=1000\r\n"
+        ));
+        assert!(out.contains(
+            "a=msid:- screen-track\r\na=rtpmap:96 VP8/90000\r\na=fmtp:96 x-google-start-bitrate=3000\r\na=rtpmap:98 H264/90000\r\na=fmtp:98 packetization-mode=1;profile-level-id=42e01f;x-google-start-bitrate=3000\r\n"
+        ));
+        assert!(out.ends_with(
+            "a=mid:2\r\na=recvonly\r\na=rtpmap:96 VP8/90000\r\na=rtpmap:98 H264/90000\r\na=fmtp:98 packetization-mode=1;profile-level-id=42e01f\r\n"
+        ));
+        assert_eq!(out.matches("x-google-start-bitrate=").count(), 4);
+        assert_eq!(PeerTransport::munge_start_bitrate_for_tracks(sdp, &HashMap::new()), sdp);
     }
 
     #[test]

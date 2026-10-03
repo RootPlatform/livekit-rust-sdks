@@ -25,11 +25,13 @@ use crate::video_frame::{self as vf, VideoFormatType, VideoRotation};
 /// All the types inside this module are only used internally. For public types, see the top level
 /// video_frame.rs
 
+/// Buffer types without a Rust wrapper (I210, I410, anything newer) are converted to I420;
+/// `None` when that conversion fails.
 pub fn new_video_frame_buffer(
     mut sys_handle: UniquePtr<vfb_sys::ffi::VideoFrameBuffer>,
-) -> Box<dyn vf::VideoBuffer + Send + Sync> {
+) -> Option<Box<dyn vf::VideoBuffer + Send + Sync>> {
     unsafe {
-        match sys_handle.buffer_type() {
+        Some(match sys_handle.buffer_type() {
             vfb_sys::ffi::VideoFrameBufferType::Native => {
                 Box::new(vf::native::NativeBuffer { handle: NativeBuffer { sys_handle } })
             }
@@ -51,8 +53,14 @@ pub fn new_video_frame_buffer(
             vfb_sys::ffi::VideoFrameBufferType::NV12 => Box::new(vf::NV12Buffer {
                 handle: NV12Buffer { sys_handle: sys_handle.pin_mut().get_nv12() },
             }),
-            _ => unreachable!(),
-        }
+            _ => {
+                let i420 = sys_handle.to_i420();
+                if i420.is_null() {
+                    return None;
+                }
+                Box::new(vf::I420Buffer { handle: I420Buffer { sys_handle: i420 } })
+            }
+        })
     }
 }
 
@@ -910,5 +918,33 @@ impl NV12Buffer {
                 sys_handle: self.sys_handle.pin_mut().scale(scaled_width, scaled_height),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use webrtc_sys::video_frame as vf_sys;
+
+    use super::new_video_frame_buffer;
+    use crate::video_frame::{I420Buffer, NV12Buffer, VideoBuffer, VideoBufferType};
+
+    fn through_video_frame(buffer: &dyn VideoBuffer) -> Option<Box<dyn VideoBuffer + Send + Sync>> {
+        let mut builder = vf_sys::ffi::new_video_frame_builder();
+        builder.pin_mut().set_video_frame_buffer(buffer.sys_handle());
+        let frame = builder.pin_mut().build();
+        new_video_frame_buffer(unsafe { frame.video_frame_buffer() })
+    }
+
+    #[test]
+    fn nv12_buffer_reaches_a_sink_as_nv12() {
+        let buffer = through_video_frame(&NV12Buffer::new(64, 32)).expect("NV12 buffer");
+        assert_eq!(buffer.buffer_type(), VideoBufferType::NV12);
+        assert_eq!((buffer.width(), buffer.height()), (64, 32));
+    }
+
+    #[test]
+    fn i420_buffer_reaches_a_sink_as_i420() {
+        let buffer = through_video_frame(&I420Buffer::new(64, 32)).expect("I420 buffer");
+        assert_eq!(buffer.buffer_type(), VideoBufferType::I420);
     }
 }

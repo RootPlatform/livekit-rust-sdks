@@ -24,6 +24,20 @@ VideoFrameBuffer::VideoFrameBuffer(
     webrtc::scoped_refptr<webrtc::VideoFrameBuffer> buffer)
     : buffer_(std::move(buffer)) {}
 
+#define LK_CHECK_BUFFER_TYPE(rust, cpp)                       \
+  static_assert(static_cast<int>(VideoFrameBufferType::rust) == \
+                static_cast<int>(webrtc::VideoFrameBuffer::Type::cpp))
+LK_CHECK_BUFFER_TYPE(Native, kNative);
+LK_CHECK_BUFFER_TYPE(I420, kI420);
+LK_CHECK_BUFFER_TYPE(I420A, kI420A);
+LK_CHECK_BUFFER_TYPE(I422, kI422);
+LK_CHECK_BUFFER_TYPE(I444, kI444);
+LK_CHECK_BUFFER_TYPE(I010, kI010);
+LK_CHECK_BUFFER_TYPE(I210, kI210);
+LK_CHECK_BUFFER_TYPE(I410, kI410);
+LK_CHECK_BUFFER_TYPE(NV12, kNV12);
+#undef LK_CHECK_BUFFER_TYPE
+
 VideoFrameBufferType VideoFrameBuffer::buffer_type() const {
   return static_cast<VideoFrameBufferType>(buffer_->type());
 }
@@ -37,7 +51,11 @@ unsigned int VideoFrameBuffer::height() const {
 }
 
 std::unique_ptr<I420Buffer> VideoFrameBuffer::to_i420() const {
-  return std::make_unique<I420Buffer>(buffer_->ToI420());
+  webrtc::scoped_refptr<webrtc::I420BufferInterface> i420 = buffer_->ToI420();
+  if (!i420) {
+    return nullptr;
+  }
+  return std::make_unique<I420Buffer>(std::move(i420));
 }
 
 // const_cast is valid here because we take the ownership on the rust side

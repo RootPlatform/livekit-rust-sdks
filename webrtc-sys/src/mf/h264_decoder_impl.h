@@ -61,6 +61,9 @@ class MFH264DecoderImpl : public VideoDecoder {
   HRESULT NegotiateOutputType();
   int32_t DrainOutputs(std::optional<int> qp);
   int32_t DeliverSample(IMFSample* sample, std::optional<int> qp);
+  // Map(READ) of the staging copy that leaves the shared device's lock free
+  // while the GPU finishes the copy.
+  HRESULT MapStaging(D3D11_MAPPED_SUBRESOURCE* mapped);
   int32_t DeliverNV12(const uint8_t* data_y,
                       int stride_y,
                       const uint8_t* data_uv,
@@ -69,9 +72,7 @@ class MFH264DecoderImpl : public VideoDecoder {
                       std::optional<int> qp);
 
   livekit_ffi::ComPtr<IMFTransform> transform_;
-  livekit_ffi::ComPtr<ID3D11Device> d3d_device_;
-  livekit_ffi::ComPtr<ID3D11DeviceContext> d3d_context_;
-  livekit_ffi::ComPtr<IMFDXGIDeviceManager> dxgi_manager_;
+  livekit_ffi::SharedD3D11Device d3d_;
   livekit_ffi::ComPtr<ID3D11Texture2D> staging_texture_;
   bool use_d3d_ = false;
   // Whether decoded samples arrive as D3D11 surfaces (DXVA) or system memory;

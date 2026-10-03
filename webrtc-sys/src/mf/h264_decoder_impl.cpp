@@ -17,10 +17,10 @@
 #include "h264_decoder_impl.h"
 
 #include <codecapi.h>
-#include <d3d10_1.h>  // ID3D10Multithread; d3d10.h directly breaks SAL ordering
 #include <wmcodecdsp.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 
 #include <api/video/i420_buffer.h>
@@ -139,43 +139,38 @@ VideoDecoder::DecoderInfo MFH264DecoderImpl::GetDecoderInfo() const {
 }
 
 HRESULT MFH264DecoderImpl::SetupD3D() {
-  UINT flags = D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
-  const D3D_FEATURE_LEVEL feature_levels[] = {
-      D3D_FEATURE_LEVEL_11_1,
-      D3D_FEATURE_LEVEL_11_0,
-      D3D_FEATURE_LEVEL_10_1,
-      D3D_FEATURE_LEVEL_10_0,
-  };
-  HRESULT hr = D3D11CreateDevice(
-      nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, feature_levels,
-      ARRAYSIZE(feature_levels), D3D11_SDK_VERSION, &d3d_device_, nullptr,
-      &d3d_context_);
+  HRESULT hr = livekit_ffi::AcquireD3D11Device(
+      nullptr, livekit_ffi::D3D11DeviceUser::kDecoder, &d3d_);
   if (FAILED(hr)) {
     return hr;
   }
-
-  // The decoder MFT accesses the device from its own threads.
-  ComPtr<ID3D10Multithread> multithread;
-  hr = d3d_device_.As(&multithread);
-  if (FAILED(hr)) {
-    return hr;
-  }
-  multithread->SetMultithreadProtected(TRUE);
-
-  UINT reset_token = 0;
-  hr = MFCreateDXGIDeviceManager(&reset_token, &dxgi_manager_);
-  if (FAILED(hr)) {
-    return hr;
-  }
-  hr = dxgi_manager_->ResetDevice(d3d_device_.Get(), reset_token);
-  if (FAILED(hr)) {
-    return hr;
-  }
-
-  hr = transform_->ProcessMessage(
+  return transform_->ProcessMessage(
       MFT_MESSAGE_SET_D3D_MANAGER,
-      reinterpret_cast<ULONG_PTR>(dxgi_manager_.Get()));
-  return hr;
+      reinterpret_cast<ULONG_PTR>(d3d_->manager.Get()));
+}
+
+HRESULT MFH264DecoderImpl::MapStaging(D3D11_MAPPED_SUBRESOURCE* mapped) {
+  d3d_->context->Flush();
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+  for (int attempt = 0;; attempt++) {
+    HRESULT hr = d3d_->context->Map(staging_texture_.Get(), 0, D3D11_MAP_READ,
+                                    D3D11_MAP_FLAG_DO_NOT_WAIT, mapped);
+    if (hr != DXGI_ERROR_WAS_STILL_DRAWING) {
+      return hr;
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+      return d3d_->context->Map(staging_texture_.Get(), 0, D3D11_MAP_READ, 0,
+                                mapped);
+    }
+    if (attempt < 64) {
+      YieldProcessor();
+    } else if (attempt < 256) {
+      SwitchToThread();
+    } else {
+      Sleep(1);
+    }
+  }
 }
 
 bool MFH264DecoderImpl::Configure(const Settings& settings) {
@@ -229,9 +224,7 @@ bool MFH264DecoderImpl::Configure(const Settings& settings) {
     RTC_LOG(LS_WARNING)
         << "D3D11 unavailable for H264 decode, falling back to software: "
         << HResultToString(hr);
-    d3d_device_.Reset();
-    d3d_context_.Reset();
-    dxgi_manager_.Reset();
+    d3d_.reset();
   }
 
   // Cap internal reordering/buffering so frames come out ~1-in/1-out.
@@ -347,9 +340,7 @@ int32_t MFH264DecoderImpl::Release() {
   }
   staging_texture_.Reset();
   transform_.Reset();
-  dxgi_manager_.Reset();
-  d3d_context_.Reset();
-  d3d_device_.Reset();
+  d3d_.reset();
   use_d3d_ = false;
   frames_decoded_ = 0;
   consecutive_errors_ = 0;
@@ -599,8 +590,8 @@ int32_t MFH264DecoderImpl::DeliverSample(IMFSample* sample,
       staging_desc.SampleDesc.Count = 1;
       staging_desc.Usage = D3D11_USAGE_STAGING;
       staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-      hr = d3d_device_->CreateTexture2D(&staging_desc, nullptr,
-                                        &staging_texture_);
+      hr = d3d_->device->CreateTexture2D(&staging_desc, nullptr,
+                                         &staging_texture_);
       if (FAILED(hr)) {
         RTC_LOG(LS_ERROR) << "Failed to create staging texture: "
                           << HResultToString(hr);
@@ -609,11 +600,10 @@ int32_t MFH264DecoderImpl::DeliverSample(IMFSample* sample,
     }
 
     // GPU -> CPU readback: the known copy-back cost of this design.
-    d3d_context_->CopySubresourceRegion(staging_texture_.Get(), 0, 0, 0, 0,
-                                        texture.Get(), subresource, nullptr);
+    d3d_->context->CopySubresourceRegion(staging_texture_.Get(), 0, 0, 0, 0,
+                                         texture.Get(), subresource, nullptr);
     D3D11_MAPPED_SUBRESOURCE mapped = {};
-    hr = d3d_context_->Map(staging_texture_.Get(), 0, D3D11_MAP_READ, 0,
-                           &mapped);
+    hr = MapStaging(&mapped);
     if (FAILED(hr)) {
       RTC_LOG(LS_ERROR) << "Decoder staging Map failed: "
                         << HResultToString(hr);
@@ -627,7 +617,7 @@ int32_t MFH264DecoderImpl::DeliverSample(IMFSample* sample,
                              (crop_y / 2) * mapped.RowPitch + crop_x;
     int32_t ret = DeliverNV12(data_y, mapped.RowPitch, data_uv,
                               mapped.RowPitch, rtp_timestamp, qp);
-    d3d_context_->Unmap(staging_texture_.Get(), 0);
+    d3d_->context->Unmap(staging_texture_.Get(), 0);
     return ret;
   }
 

@@ -254,6 +254,22 @@ Both targets link the CRT statically (`+crt-static` in `.cargo/config.toml`) and
 therefore loads on Windows N/KN without the Media Feature Pack and falls back to software codecs
 there.
 
+### libyuv SIMD on win-x64
+
+libyuv only compiles its x86 SSSE3/AVX2 row functions for GCC-style compilers, so a
+`cl.exe` build of `yuv-sys` runs every FFI colour conversion (BGRA to I420 for each
+captured camera and screen frame) through the scalar C rows. For the x64 target the
+script sets `LK_YUV_CC` to the LLVM `clang-cl.exe`, and `yuv-sys/build.rs` compiles
+libyuv with it. Only yuv-sys changes compiler: `CC_x86_64_pc_windows_msvc` would also
+move `ring` and `soxr-sys`. Without `LK_YUV_CC` (upstream, or a build outside the
+script) yuv-sys uses `cl.exe` as before. libyuv picks AVX2/SSSE3 at runtime and falls
+back to C on CPUs without them; the output is bit-identical to the C rows. Check a build
+with:
+
+```powershell
+dumpbin /LINKERMEMBER:1 target\x86_64-pc-windows-msvc\release\build\yuv-sys-*\out\yuv.lib | Select-String rs_ARGBToYRow_AVX2
+```
+
 ### win-arm64 on an x64 machine
 
 If an MSVC toolset has `bin\Hostx64\arm64\cl.exe`, cargo/cc-rs use it directly. Otherwise the script
@@ -314,6 +330,7 @@ still apply. Flags accept `1/true/yes/on`. `LK_MF_ALLOW_AMD` also accepts `0/fal
 | `LK_DISABLE_MF_DECODE=1` | The MF decoder factory reports no H.264 decoder, so decoding uses FFmpeg. |
 | `LK_MF_ENCODER_ADAPTER=nvidia\|amd\|intel` | Try that vendor's encoder MFT first. |
 | `LK_MF_ALLOW_AMD=0` | Skip AMD encoder MFTs (browser-parity workaround for AMD CBP black remote video). Allowed by default. |
+| `LK_MF_D3D11_SHARING=off\|user` | `off` gives every MF encoder and decoder its own D3D11 device again; `user` shares one device per adapter among encoders and another among decoders. The default shares one device per adapter between all of them. Read once per process. |
 
 Fault injection, for testing recovery only:
 
@@ -322,8 +339,9 @@ Fault injection, for testing recovery only:
 | `LK_MF_FAULT_INIT=1` | MF H.264 `InitEncode` fails, which must fall back to software. |
 | `LK_MF_FAULT_AFTER_FRAMES=N` | The encoder simulates device removal after N frames. |
 | `LK_MF_MAX_SESSIONS=N` | Refuse to open more than N concurrent MF encoder sessions. |
-| `LK_MF_FAULT_RUNTIME_RC=1` | Runtime VBV/max bitrate updates fail, which forces an encoder re-init. |
+| `LK_MF_FAULT_RUNTIME_RC=1` | Runtime VBV/max bitrate updates fail, as if the VBV were fixed at configuration (what NVIDIA does silently). |
 | `LK_MF_FAULT_STRICT_RC=1` | Enforce strict rate-control ordering, like drivers that reject max < mean or an undersized VBV. |
+| `LK_MF_FAULT_INIT_BPS=N` | Every MF encoder sizes its rate control for N bps at InitEncode, whatever its start bitrate. `30000` reproduces a simulcast top layer started at its placeholder minimum; `300000` a low start that the starvation re-init has to fix. |
 | `LK_MF_FAULT_DECODE_AFTER_FRAMES=N` | Decoder fault after N frames. |
 | `LK_MF_FAULT_DECODE_MODE=unlisted\|renegotiate` | Decoder fault kind. The default is `DXGI_ERROR_DEVICE_REMOVED`, `unlisted` is `E_FAIL`, and `renegotiate` is `MF_E_TRANSFORM_STREAM_CHANGE`. |
 
@@ -487,6 +505,38 @@ Stopping the transceiver instead is not compatible with LiveKit server 1.13.7:
 - A rejected m-section keeps its old ICE credentials, so the next ICE-restart offer has
   conflicting `ice-ufrag` values; the server answers with `LEAVE STATE_MISMATCH` and the resume
   escalates to a full reconnect.
+## MediaFoundation encoder rate control
+
+NVIDIA's H.264 MFT reads `CODECAPI_AVEncCommonBufferSize` (the VBV) once, when the media
+types are set, and returns S_OK for later updates without applying them. Mean bitrate,
+max bitrate and `MF_MT_AVG_BITRATE` do follow at runtime. Its frames stay near one VBV in
+size, so an encoder configured at a low bitrate cannot reach a higher target. A simulcast
+top layer that the first allocation can't fit is initialised at its 30 kbps minimum
+(SimulcastEncoderAdapter), at startup and on every dynacast resume, and used to stay at
+QP 41-50.
+
+- The VBV is 100 ms of the target, at least three frames at the codec's max frame rate
+  (600 ms at 5 fps) and at most 1 s. A 500 ms VBV at the target left 2K simulcast shares
+  0.5-1 s behind in the sender's pacer.
+- An encoder configured below 150 kbps is rebuilt at its target as soon as the target is
+  at least twice that (before its first frame when the layer was paused).
+- Otherwise it is rebuilt when the target has stayed at least twice the configured
+  bitrate for a second, its frames over the last second averaged at least half the VBV,
+  and the last configuration is at least 5 s old. The rebuild releases the old MFT first
+  and costs one keyframe. There is no downward rebuild.
+
+The policy is `webrtc-sys/src/mf/mf_reinit_policy.h`; the encoder logs
+`MF H264 encoder VBV is sized for ... re-initializing` when it fires.
+
+## Start bitrate
+
+`x-google-start-bitrate` is munged per published video track into the m-section carrying
+it (matched by `a=msid`): 0.9 × the sum of its encodings' max bitrates, capped at 1 Mbps
+for cameras and 3 Mbps for screen shares. livekit-client leaves screen shares uncapped,
+but Chromium writes its value only on the first H.264 payload type (42001f) while the SFU
+answers with 42e01f, so the browser really starts at libwebrtc's default. 3 Mbps turns on
+a 2K share's top layer (low layer 1.2 Mbps) at the first allocation without starting far
+above typical uplinks.
 
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
@@ -506,6 +556,7 @@ Stopping the transceiver instead is not compatible with LiveKit server 1.13.7:
 | 1d8b229e | Drop degenerate custom simulcast layers; pair arm64 cross headers with the CRT libs |
 | e2a6b46b | win-arm64 clang-cl build disables libyuv NEON/SVE/SME like the official MSVC build |
 | `rootapp/fx-xos` | macOS build script, Linux script for x64/arm64/cross with glibc and link checks, shared `build-info.json` and zips, Windows `-ToolsDir`/`-LlvmDir`/`-Protoc`/`-Zip`, `rootapp-ffi.yml` release workflow, cross-platform audit |
+| `rootapp/fx-encoder` | MF encoder rebuilt when NVIDIA's latched VBV starves it, 3-frame VBV; one shared D3D11 device per adapter, non-blocking decoder readback; per-track start bitrate (screen shares up to 3 Mbps); NV12/I210/I410 buffer types no longer abort the process; x64 libyuv built with clang-cl |
 
 `rootapp/fx-session` adds: unpublishing a video track releases its encoder (see above);
 received I420 frames whose planes are already packed are handed to the FFI handle without a

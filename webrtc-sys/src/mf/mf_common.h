@@ -28,6 +28,7 @@
 #include <wrl/client.h>
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -43,16 +44,24 @@ struct D3D11DeviceBundle {
   ComPtr<IMFDXGIDeviceManager> manager;
 };
 
-// Creates a multithread-protected, video-capable D3D11 device on the adapter
-// identified by `luid` (the default hardware adapter when null) and wraps it
-// in an IMFDXGIDeviceManager.
-HRESULT CreateD3D11DeviceBundle(const LUID* luid, D3D11DeviceBundle* out);
+using SharedD3D11Device = std::shared_ptr<const D3D11DeviceBundle>;
+
+enum class D3D11DeviceUser { kEncoder, kDecoder };
+
+// A multithread-protected, video-capable D3D11 device and its DXGI device
+// manager on the adapter identified by `luid` (the default adapter when
+// null), shared by every MF encoder and decoder on that adapter: each device
+// costs the NVIDIA driver 37 worker threads. The device is released when the
+// last holder drops it, and a removed device is replaced on the next call.
+HRESULT AcquireD3D11Device(const LUID* luid,
+                           D3D11DeviceUser user,
+                           SharedD3D11Device* out);
 
 // Hardware MFTs on multi-adapter systems are bound to one adapter, recorded
 // on the activate as MFT_ENUM_ADAPTER_LUID; the device manager handed to the
 // MFT must live on that same adapter. No LUID means the default adapter.
-HRESULT CreateD3D11DeviceBundleForActivate(IMFActivate* activate,
-                                           D3D11DeviceBundle* out);
+HRESULT AcquireD3D11DeviceForActivate(IMFActivate* activate,
+                                      SharedD3D11Device* out);
 
 constexpr uint32_t kVendorNvidia = 0x10DE;
 constexpr uint32_t kVendorAmd = 0x1002;
@@ -88,11 +97,11 @@ std::string GetFriendlyName(IMFActivate* activate);
 
 // Unlocks an async MFT (required before any media type can be set) and, when
 // the MFT is D3D11-aware, attaches a device manager on the MFT's own adapter.
-// `bundle` is left empty for MFTs that take system-memory input.
+// `device` is left empty for MFTs that take system-memory input.
 HRESULT PrepareHardwareTransform(IMFActivate* activate,
                                  IMFTransform* transform,
                                  bool* is_async,
-                                 D3D11DeviceBundle* bundle);
+                                 SharedD3D11Device* device);
 
 // Ensures COM is initialized (MTA) on the calling thread. webrtc invokes the
 // encoder/decoder on its own task-queue threads which are not guaranteed to

@@ -117,7 +117,7 @@ ProbeResult ProbeHardwareEncoders() {
     std::optional<H264Level> level;
     {
       bool is_async = false;
-      livekit_ffi::D3D11DeviceBundle d3d;
+      livekit_ffi::SharedD3D11Device d3d;
       hr = livekit_ffi::PrepareHardwareTransform(activate.Get(),
                                                  transform.Get(), &is_async,
                                                  &d3d);
@@ -126,7 +126,7 @@ ProbeResult ProbeHardwareEncoders() {
       }
       RTC_LOG(LS_INFO) << "Probed hardware H264 encoder MFT \"" << name
                        << "\": async=" << is_async
-                       << " d3d11=" << (d3d.manager != nullptr) << " hr="
+                       << " d3d11=" << (d3d != nullptr) << " hr="
                        << HResultToString(hr) << " max_level="
                        << (level ? std::to_string(static_cast<int>(*level))
                                  : std::string("none"));

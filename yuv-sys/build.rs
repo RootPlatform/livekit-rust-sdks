@@ -181,6 +181,15 @@ fn main() {
     let mut common_build = new_build(&libyuv_dir);
     common_build.files(&common_files);
 
+    // libyuv only enables its x86 SIMD row functions for GCC-style compilers; under cl.exe
+    // every conversion runs the scalar C rows.
+    println!("cargo:rerun-if-env-changed=LK_YUV_CC");
+    if is_msvc && target_arch == "x86_64" {
+        if let Some(clang_cl) = env::var("LK_YUV_CC").ok().filter(|cc| !cc.is_empty()) {
+            common_build.compiler(clang_cl);
+        }
+    }
+
     if is_arm32 && !is_msvc {
         common_build.define("LIBYUV_NEON", "1");
     }
