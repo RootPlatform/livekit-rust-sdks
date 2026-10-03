@@ -131,6 +131,24 @@ Fault injection, for testing recovery only:
 | `LK_MF_FAULT_DECODE_AFTER_FRAMES=N` | Decoder fault after N frames. |
 | `LK_MF_FAULT_DECODE_MODE=unlisted\|renegotiate` | Decoder fault kind. The default is `DXGI_ERROR_DEVICE_REMOVED`, `unlisted` is `E_FAIL`, and `renegotiate` is `MF_E_TRANSFORM_STREAM_CHANGE`. |
 
+## Unpublish and the publisher SDP
+
+`unpublish_track` keeps upstream's `remove_track` (the m-section goes inactive and stays in
+the SDP) and then calls `RtpSender::release_video_encoder`, which makes libwebrtc recreate the
+sender's `VideoSendStream` without a source. That destroys the encoder instances (MF sessions,
+their D3D11 devices and NVIDIA driver threads); each unpublished video track keeps only an idle
+stream (one `EncoderQueue` thread, stale outbound-rtp counters) until the PeerConnection closes.
+
+Stopping the transceiver instead is not compatible with LiveKit server 1.13.7:
+
+- libwebrtc recycles a rejected m-section for the next transceiver under a new mid, but the
+  server only treats m-sections after the last answered mid as new. A recycled slot that is not
+  the last video section gets no simulcast rid mapping (`adding up track failed: duplicate
+  layer`) and the track never reaches subscribers.
+- A rejected m-section keeps its old ICE credentials, so the next ICE-restart offer has
+  conflicting `ice-ufrag` values; the server answers with `LEAVE STATE_MISMATCH` and the resume
+  escalates to a full reconnect.
+
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
 | Commit | Change |
@@ -145,4 +163,12 @@ Fault injection, for testing recovery only:
 | be034b9f | Capture timestamps, bounded VBV, tracked input samples |
 | 5db8c807 | Rate-control limits ordered around the mean, re-init on failed runtime VBV/max updates; decoder escalates repeated failures to software |
 | 3e688c64 | FFI `simulcast_layers` (explicit lower layers, browser-style selection) and `force_stereo` (stereo Opus publish); `TF_NO_DTX` when `dtx=false`; subscriber answer keeps `stereo=1` |
-| (this) | win-arm64 LLVM cross build, Linux build script, this document |
+| c640683f | win-arm64 LLVM cross build, Linux build script, this document |
+| 1d8b229e | Degenerate custom simulcast layers dropped; arm64 cross headers paired with the CRT libs |
+| e2a6b46b | win-arm64 clang-cl build disables libyuv NEON/SVE/SME like the official MSVC build |
+
+`rootapp/fx-session` adds: unpublishing a video track releases its encoder (see above);
+received I420 frames whose planes are already packed are handed to the FFI handle without a
+copy (other layouts still get the packed copy); stats deserialize libwebrtc's
+`totalFreezesDuration`, `totalPausesDuration` and `scalabilityMode`; native audio captures of
+one source run on one task, in submission order.
