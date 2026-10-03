@@ -2,20 +2,33 @@ param(
     [string[]]$Targets = @('x86_64-pc-windows-msvc', 'aarch64-pc-windows-msvc'),
     [string]$OutDir = "$PSScriptRoot\rootapp-dist",
     [string]$Arm64CrtLibDir = $env:LK_ARM64_CRT_LIB_DIR,
-    [switch]$CompileOnly
+    [string]$ToolsDir = "$env:USERPROFILE\dev-tools",
+    [string]$LlvmDir,
+    [string]$Protoc,
+    [switch]$CompileOnly,
+    [switch]$Zip
 )
 
 $ErrorActionPreference = 'Stop'
-$tools = "$env:USERPROFILE\dev-tools"
-$env:PATH = "$env:USERPROFILE\.cargo\bin;$tools\protoc\bin;$env:PATH"
-$env:PROTOC = "$tools\protoc\bin\protoc.exe"
-$libclang = Get-ChildItem "$tools\llvm" -Recurse -Filter libclang.dll | Select-Object -First 1
-if (-not $libclang) { throw "libclang.dll not found under $tools\llvm" }
+if (-not $LlvmDir) { $LlvmDir = "$ToolsDir\llvm" }
+if (-not $Protoc) { $Protoc = "$ToolsDir\protoc\bin\protoc.exe" }
+if (-not (Test-Path $Protoc)) { throw "protoc not found at $Protoc; pass -Protoc or put it under $ToolsDir\protoc\bin" }
+$env:PATH = "$env:USERPROFILE\.cargo\bin;$(Split-Path $Protoc -Parent);$env:PATH"
+$env:PROTOC = $Protoc
+$libclang = Get-ChildItem $LlvmDir -Recurse -Filter libclang.dll -ErrorAction SilentlyContinue | Select-Object -First 1
+if (-not $libclang) { throw "libclang.dll not found under $LlvmDir; pass -LlvmDir" }
 $env:LIBCLANG_PATH = $libclang.DirectoryName
 $llvmBin = $libclang.DirectoryName
 
 Set-Location $PSScriptRoot
+$OutDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutDir)
 $rids = @{ 'x86_64-pc-windows-msvc' = 'win-x64'; 'aarch64-pc-windows-msvc' = 'win-arm64' }
+$assets = @{ 'win-x64' = 'ffi-windows-x86_64.zip'; 'win-arm64' = 'ffi-windows-arm64.zip' }
+$utf8 = New-Object Text.UTF8Encoding $false
+$rustChannel = (Select-String -Path "$PSScriptRoot\rust-toolchain.toml" -Pattern '^channel\s*=\s*"(.+)"' |
+    Select-Object -First 1).Matches[0].Groups[1].Value
+rustup toolchain install $rustChannel --profile minimal --no-self-update
+if ($LASTEXITCODE -ne 0) { throw "rustup toolchain install $rustChannel failed" }
 
 function Get-VsInstalls {
     $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -80,7 +93,7 @@ function Get-Arm64CrossEnv {
     $lldLink = Join-Path $llvmBin 'lld-link.exe'
     $llvmLib = Join-Path $llvmBin 'llvm-lib.exe'
     foreach ($tool in @($clangCl, $lldLink, $llvmLib, (Join-Path $llvmBin 'clang.exe'))) {
-        if (-not (Test-Path $tool)) { throw "$tool not found; the arm64 cross build needs LLVM under $tools\llvm" }
+        if (-not (Test-Path $tool)) { throw "$tool not found; the arm64 cross build needs clang-cl, lld-link and llvm-lib next to libclang.dll in $LlvmDir" }
     }
 
     $crt = Resolve-Arm64Crt
@@ -140,8 +153,77 @@ function Get-Arm64CrossEnv {
     }
 }
 
+function Get-GitValue([string[]]$GitArgs) {
+    $ErrorActionPreference = 'Continue'
+    $value = & git -C $PSScriptRoot @GitArgs 2>$null
+    if ($LASTEXITCODE -ne 0) { return $null }
+    return $value
+}
+
+function Write-BuildInfo([string]$Dest, [string]$Rid, [string]$Target) {
+    $commit = Get-GitValue @('rev-parse', 'HEAD')
+    $branch = Get-GitValue @('rev-parse', '--abbrev-ref', 'HEAD')
+    $dirty = [bool]($commit -and (Get-GitValue @('status', '--porcelain', '--untracked-files=no')))
+    $ffiVersion = (Select-String -Path "$PSScriptRoot\livekit-ffi\Cargo.toml" -Pattern '^version\s*=\s*"(.+)"' |
+        Select-Object -First 1).Matches[0].Groups[1].Value
+    $info = [ordered]@{
+        rid = $Rid
+        target = $Target
+        library = 'livekit_ffi.dll'
+        librarySha256 = (Get-FileHash -Algorithm SHA256 (Join-Path $Dest 'livekit_ffi.dll')).Hash.ToLowerInvariant()
+        ffiVersion = $ffiVersion
+        commit = $(if ($commit) { "$commit" } else { 'unknown' })
+        branch = $(if ($branch) { "$branch" } else { 'unknown' })
+        dirty = $dirty
+        rustc = "$(& rustc --version)"
+        builtAt = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'")
+        buildHost = "Windows $([Environment]::OSVersion.Version) $env:PROCESSOR_ARCHITECTURE"
+        minimumOs = 'Windows 10'
+        hardwareVideo = 'MediaFoundation H.264'
+    }
+    $json = ($info | ConvertTo-Json) -replace "`r`n", "`n"
+    [IO.File]::WriteAllText((Join-Path $Dest 'build-info.json'), "$json`n", $utf8)
+    Write-Host "build info -> $Dest\build-info.json"
+}
+
+function New-FfiZip([string]$Rid, [string]$Dll) {
+    $asset = $assets[$Rid]
+    $webrtcLicense = "$PSScriptRoot\livekit-ffi\WEBRTC_LICENSE.md"
+    if (-not (Test-Path $webrtcLicense)) { throw "$webrtcLicense is missing; livekit-ffi/build.rs writes it during the build" }
+    $zipPath = Join-Path $OutDir $asset
+    $work = Join-Path ([IO.Path]::GetTempPath()) ("rootapp-ffi-" + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory $work | Out-Null
+    try {
+        Copy-Item $Dll "$work\livekit_ffi.dll"
+        Copy-Item "$PSScriptRoot\livekit-ffi\include\livekit_ffi.h" "$work\livekit_ffi.h"
+        $fence = '```'
+        $license = "# livekit`n$fence`n" + [IO.File]::ReadAllText("$PSScriptRoot\LICENSE").TrimEnd() + "`n$fence`n" +
+            [IO.File]::ReadAllText($webrtcLicense)
+        [IO.File]::WriteAllText("$work\LICENSE.md", $license, $utf8)
+        if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+        Compress-Archive -Path "$work\livekit_ffi.dll", "$work\livekit_ffi.h", "$work\LICENSE.md" -DestinationPath $zipPath
+    }
+    finally {
+        Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    $sha = (Get-FileHash -Algorithm SHA256 $zipPath).Hash.ToLowerInvariant()
+    $sums = Join-Path $OutDir 'SHA256SUMS'
+    $lines = @()
+    if (Test-Path $sums) {
+        $lines = @([IO.File]::ReadAllLines($sums) | Where-Object { $_ -and (($_ -split '\s+', 2)[1] -ne $asset) })
+    }
+    $lines += "$sha  $asset"
+    [IO.File]::WriteAllText($sums, (($lines -join "`n") + "`n"), $utf8)
+    Write-Host "zip -> $zipPath"
+    Write-Host "sha256: $sha (recorded in $sums)"
+    Write-Host "desktop ffi-checksums.sha256 line: $sha  rootapp/$asset"
+}
+
 foreach ($target in $Targets) {
     Write-Host "=== building livekit-ffi for $target ==="
+    if (-not $rids.ContainsKey($target)) { throw "unknown target $target (expected x86_64-pc-windows-msvc or aarch64-pc-windows-msvc)" }
+    rustup target add --toolchain $rustChannel $target
+    if ($LASTEXITCODE -ne 0) { throw "rustup target add $target failed" }
     $saved = @{}
     if ($target -eq 'aarch64-pc-windows-msvc' -and -not (Test-NativeArm64Msvc)) {
         Write-Host "no MSVC ARM64 cross compiler; using clang-cl + lld-link from $llvmBin"
@@ -172,4 +254,6 @@ foreach ($target in $Targets) {
     New-Item -ItemType Directory -Force $dest | Out-Null
     Copy-Item "target\$target\release\livekit_ffi.dll" $dest -Force
     Write-Host "copied -> $dest\livekit_ffi.dll"
+    Write-BuildInfo -Dest $dest -Rid $rid -Target $target
+    if ($Zip) { New-FfiZip -Rid $rid -Dll (Join-Path $dest 'livekit_ffi.dll') }
 }

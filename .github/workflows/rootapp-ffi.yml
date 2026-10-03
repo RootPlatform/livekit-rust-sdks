@@ -1,0 +1,377 @@
+# RootApp fork: builds livekit-ffi for the six desktop RIDs with the build-rootapp-* scripts, zips each
+# under the upstream asset name (ffi-<os>-<arch>.zip) and attaches the zips, SHA256SUMS and
+# build-info-<rid>.json to a GitHub release. Needs only GITHUB_TOKEN. See ROOTAPP-BUILD.md.
+
+name: RootApp FFI
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create or update, e.g. rootapp-ffi/v0.12.76-hw.1. Empty: build and upload workflow artifacts only."
+        required: false
+        type: string
+        default: ""
+      rids:
+        description: "RIDs to build (space or comma separated)"
+        required: false
+        type: string
+        default: "win-x64 win-arm64 osx-arm64 osx-x64 linux-x64 linux-arm64"
+      publish:
+        description: "Publish the release; otherwise it stays a draft"
+        required: false
+        type: boolean
+        default: false
+  push:
+    tags:
+      - "rootapp-ffi/v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rootapp-ffi-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  PROTOC_VERSION: "25.2"
+
+jobs:
+  plan:
+    name: Plan
+    if: github.repository_owner != 'livekit'
+    runs-on: ubuntu-latest
+    outputs:
+      windows: ${{ steps.plan.outputs.windows }}
+      macos: ${{ steps.plan.outputs.macos }}
+      linux: ${{ steps.plan.outputs.linux }}
+      tag: ${{ steps.plan.outputs.tag }}
+      publish: ${{ steps.plan.outputs.publish }}
+    steps:
+      - name: Resolve RIDs and release tag
+        id: plan
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_RIDS: ${{ inputs.rids }}
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
+        run: |
+          set -euo pipefail
+          all="win-x64 win-arm64 osx-arm64 osx-x64 linux-x64 linux-arm64"
+          rids="$(printf '%s' "${INPUT_RIDS:-$all}" | tr ',' ' ')"
+          win=""
+          mac=""
+          lin=""
+          for rid in $rids; do
+            case "$rid" in
+              win-x64) win="$win,{\"rid\":\"win-x64\",\"target\":\"x86_64-pc-windows-msvc\"}" ;;
+              win-arm64) win="$win,{\"rid\":\"win-arm64\",\"target\":\"aarch64-pc-windows-msvc\"}" ;;
+              osx-arm64 | osx-x64) mac="$mac,{\"rid\":\"$rid\"}" ;;
+              linux-x64) lin="$lin,{\"rid\":\"linux-x64\",\"runner\":\"ubuntu-24.04\"}" ;;
+              linux-arm64) lin="$lin,{\"rid\":\"linux-arm64\",\"runner\":\"ubuntu-24.04-arm\"}" ;;
+              *) echo "::error::unknown RID '$rid' (expected: $all)"; exit 1 ;;
+            esac
+          done
+          if [ "$EVENT" = push ]; then
+            tag="$REF_NAME"
+            publish=true
+          else
+            tag="$INPUT_TAG"
+            publish="${INPUT_PUBLISH:-false}"
+          fi
+          if [ -n "$tag" ] && ! printf '%s' "$tag" | grep -qE '^rootapp-ffi/v[0-9A-Za-z._+-]+$'; then
+            echo "::error::release tag '$tag' must look like rootapp-ffi/v0.12.76-hw.1"
+            exit 1
+          fi
+          matrix() {
+            if [ -n "$1" ]; then printf '{"include":[%s]}' "${1#,}"; fi
+          }
+          {
+            echo "windows=$(matrix "$win")"
+            echo "macos=$(matrix "$mac")"
+            echo "linux=$(matrix "$lin")"
+            echo "tag=$tag"
+            echo "publish=$publish"
+          } >> "$GITHUB_OUTPUT"
+          echo "RIDs: $rids; release tag: ${tag:-none}; publish: $publish"
+
+  build-windows:
+    name: Build ${{ matrix.rid }}
+    needs: plan
+    if: needs.plan.outputs.windows != ''
+    runs-on: windows-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.windows) }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          submodules: recursive
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@a8b67ba40b37d35169e222f3bb352603327985b6 # v2.1.0
+        with:
+          version: ${{ env.PROTOC_VERSION }}
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache cargo registry
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: rootapp-${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            rootapp-${{ runner.os }}-cargo-registry-
+
+      # The runner image ships the VS "MSVC ARM64 build tools", so build-rootapp-windows.ps1 links
+      # win-arm64 with MSVC directly. Only if an image ever drops them, splat the ARM64 CRT with
+      # xwin (pinned) and hand it to the script's clang-cl + lld-link cross path.
+      - name: ARM64 MSVC runtime libraries
+        if: matrix.rid == 'win-arm64'
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $found = & $vswhere -all -products * -property installationPath |
+            ForEach-Object { Get-ChildItem "$_\VC\Tools\MSVC\*\lib\arm64\libcmt.lib" -ErrorAction SilentlyContinue } |
+            Select-Object -First 1
+          if ($found) {
+            Write-Host "MSVC ARM64 runtime libraries: $($found.DirectoryName)"
+            exit 0
+          }
+          $version = '0.10.0'
+          $name = "xwin-$version-x86_64-pc-windows-msvc"
+          $archive = Join-Path $env:RUNNER_TEMP "$name.tar.gz"
+          Invoke-WebRequest "https://github.com/Jake-Shadle/xwin/releases/download/$version/$name.tar.gz" -OutFile $archive
+          $sha = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          if ($sha -ne '96e83665ef5c1406aabd0be603a8d08e67e604f36fda630b6807ee948a614e26') { throw "xwin archive sha256 $sha does not match the pin" }
+          tar -xzf $archive -C $env:RUNNER_TEMP
+          $splat = Join-Path $env:RUNNER_TEMP 'xwin'
+          & (Join-Path $env:RUNNER_TEMP "$name\xwin.exe") --accept-license --arch aarch64 --cache-dir (Join-Path $env:RUNNER_TEMP 'xwin-cache') splat --disable-symlinks --output $splat
+          if ($LASTEXITCODE -ne 0) { throw "xwin splat failed" }
+          "LK_ARM64_CRT_LIB_DIR=$splat\crt\lib\aarch64" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Build
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          $protoc = (Get-Command protoc).Source
+          $llvm = Join-Path $env:ProgramFiles 'LLVM'
+          ./build-rootapp-windows.ps1 -Targets $env:TARGET -LlvmDir $llvm -Protoc $protoc -Zip
+
+      - name: Upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rootapp-ffi-${{ matrix.rid }}
+          path: |
+            rootapp-dist/ffi-*.zip
+            rootapp-dist/*/native/build-info.json
+          if-no-files-found: error
+
+  build-macos:
+    name: Build ${{ matrix.rid }}
+    needs: plan
+    if: needs.plan.outputs.macos != ''
+    runs-on: macos-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.macos) }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          submodules: recursive
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@a8b67ba40b37d35169e222f3bb352603327985b6 # v2.1.0
+        with:
+          version: ${{ env.PROTOC_VERSION }}
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache cargo registry
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: rootapp-${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            rootapp-${{ runner.os }}-cargo-registry-
+
+      - name: Build
+        env:
+          RID: ${{ matrix.rid }}
+        run: bash ./build-rootapp-macos.sh --rid "$RID" --zip
+
+      - name: Upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rootapp-ffi-${{ matrix.rid }}
+          path: |
+            rootapp-dist/ffi-*.zip
+            rootapp-dist/*/native/build-info.json
+          if-no-files-found: error
+
+  # Ubuntu 22.04 (glibc 2.35) is the desktop app's glibc floor; the container pins it no matter
+  # which image the runner label points to.
+  build-linux:
+    name: Build ${{ matrix.rid }}
+    needs: plan
+    if: needs.plan.outputs.linux != ''
+    runs-on: ${{ matrix.runner }}
+    container: ubuntu:22.04
+    timeout-minutes: 150
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.linux) }}
+    steps:
+      - name: Install git
+        run: |
+          apt-get update -y
+          apt-get install -y --no-install-recommends git ca-certificates
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          submodules: recursive
+
+      - name: Trust the workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      # cuda.h for NVENC/NVDEC. nvidia-cuda-dev depends on the virtual libcuda1, which apt will not
+      # pick a provider for on its own, so name the newest libnvidia-compute in the archive.
+      - name: Install CUDA headers
+        if: matrix.rid == 'linux-x64'
+        run: |
+          set -euo pipefail
+          if ! apt-get install -y --no-install-recommends nvidia-cuda-dev; then
+            provider="$(apt-cache showpkg libcuda1 | awk '/^Reverse Provides:/ { f = 1; next } f && NF { print $1 }' | grep -E '^libnvidia-compute-[0-9]+$' | sort -V | tail -n 1)"
+            [ -n "$provider" ] || { echo "::error::no libnvidia-compute package provides libcuda1"; exit 1; }
+            apt-get install -y --no-install-recommends "$provider" nvidia-cuda-dev
+          fi
+          test -f /usr/include/cuda.h
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@a8b67ba40b37d35169e222f3bb352603327985b6 # v2.1.0
+        with:
+          version: ${{ env.PROTOC_VERSION }}
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache cargo registry
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: rootapp-${{ runner.os }}-${{ runner.arch }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            rootapp-${{ runner.os }}-${{ runner.arch }}-cargo-registry-
+
+      - name: Build
+        env:
+          RID: ${{ matrix.rid }}
+        run: bash ./build-rootapp-linux.sh --rid "$RID" --zip
+
+      - name: Upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: rootapp-ffi-${{ matrix.rid }}
+          path: |
+            rootapp-dist/ffi-*.zip
+            rootapp-dist/*/native/build-info.json
+          if-no-files-found: error
+
+  release:
+    name: Release
+    needs: [plan, build-windows, build-macos, build-linux]
+    if: >-
+      always() && needs.plan.result == 'success' && needs.plan.outputs.tag != '' &&
+      !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: rootapp-ffi-*
+          merge-multiple: true
+          path: dist
+
+      - name: Verify assets and write SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          shopt -s nullglob
+          zips=(dist/ffi-*.zip)
+          [ "${#zips[@]}" -gt 0 ] || { echo "::error::no ffi-*.zip artifacts"; exit 1; }
+          for path in "${zips[@]}"; do
+            z="$(basename "$path")"
+            case "$z" in
+              ffi-windows-*) lib=livekit_ffi.dll ;;
+              ffi-macos-*) lib=liblivekit_ffi.dylib ;;
+              ffi-linux-*) lib=liblivekit_ffi.so ;;
+              *) echo "::error::unexpected asset $z"; exit 1 ;;
+            esac
+            case "$z" in
+              *-x86_64.zip) want='x86-64|x86_64' ;;
+              *-arm64.zip) want='aarch64|arm64' ;;
+              *) echo "::error::unexpected architecture in $z"; exit 1 ;;
+            esac
+            for member in "$lib" livekit_ffi.h LICENSE.md; do
+              unzip -Z1 "$path" | grep -qxF "$member" || { echo "::error::$z has no $member at its root"; exit 1; }
+            done
+            unzip -p "$path" "$lib" > "$RUNNER_TEMP/$lib"
+            desc="$(file -b "$RUNNER_TEMP/$lib")"
+            echo "$z: $desc"
+            printf '%s' "$desc" | grep -qiE "$want" || { echo "::error::$z holds '$desc', not $want"; exit 1; }
+            cp "$path" release/
+          done
+          for f in dist/*/native/build-info.json; do
+            rid="${f#dist/}"
+            rid="${rid%%/*}"
+            cp "$f" "release/build-info-$rid.json"
+          done
+          cd release
+          for z in ffi-*.zip; do
+            printf '%s  %s\n' "$(sha256sum "$z" | awk '{ print $1 }')" "$z"
+          done > SHA256SUMS
+          cat SHA256SUMS
+          {
+            echo "### RootApp FFI assets"
+            echo
+            echo "Lines for RootApp.Client.Desktop \`external/LivekitRtc/ffi-checksums.sha256\`:"
+            echo
+            echo '```'
+            awk '{ print $1 "  rootapp/" $2 }' SHA256SUMS
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create or update the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          PUBLISH: ${{ needs.plan.outputs.publish }}
+        run: |
+          set -euo pipefail
+          notes="RootApp livekit-ffi fork build of $GITHUB_SHA. SHA256SUMS lists every zip; the desktop pins each one as rootapp/<asset> in external/LivekitRtc/ffi-checksums.sha256."
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "release $TAG exists; replacing its assets"
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --target "$GITHUB_SHA" --title "$TAG" --notes "$notes"
+          fi
+          gh release upload "$TAG" release/* --repo "$GITHUB_REPOSITORY" --clobber
+          if [ "$PUBLISH" = true ]; then
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+          fi
