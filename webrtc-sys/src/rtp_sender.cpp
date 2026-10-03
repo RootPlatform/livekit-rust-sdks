@@ -245,4 +245,15 @@ void RtpSender::set_video_encoder_backend(VideoEncoderBackend backend) const {
       std::make_unique<FixedVideoEncoderSelector>(backend));
 }
 
+void RtpSender::release_video_encoder() const {
+  if (sender_->media_type() != webrtc::MediaType::VIDEO) {
+    return;
+  }
+  // The m-section of a sender that stopped sending keeps listing its stream,
+  // so the channel keeps the VideoSendStream and its encoders. Re-applying the
+  // frame encryptor makes WebRtcVideoSendStream recreate that stream; the new
+  // one has no source, so it creates no encoder.
+  sender_->SetFrameEncryptor(sender_->GetFrameEncryptor());
+}
+
 }  // namespace livekit_ffi

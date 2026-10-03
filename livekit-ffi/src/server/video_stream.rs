@@ -156,14 +156,18 @@ impl FfiVideoStream {
                     let metadata = frame_metadata_to_proto(frame.frame_metadata);
                     let timestamp_us = frame.timestamp_us;
                     let rotation = proto::VideoRotation::from(frame.rotation).into();
-                    let Ok((buffer, info)) = colorcvt::to_video_buffer_info(frame.buffer, dst_type, normalize_stride) else {
-                        log::error!("video stream failed to convert video frame to {:?}", dst_type);
-                        continue;
-                    };
-
                     let handle_id = server.next_id();
-                    server.store_handle(handle_id, buffer);
-
+                    let info = if let Some(info) = colorcvt::shared_i420_info(frame.buffer.as_ref(), dst_type) {
+                        server.store_handle(handle_id, frame.buffer);
+                        info
+                    } else {
+                        let Ok((buffer, info)) = colorcvt::to_video_buffer_info(frame.buffer, dst_type, normalize_stride) else {
+                            log::error!("video stream failed to convert video frame to {:?}", dst_type);
+                            continue;
+                        };
+                        server.store_handle(handle_id, buffer);
+                        info
+                    };
 
                     if let Err(err) = server.send_event(
                         proto::VideoStreamEvent {

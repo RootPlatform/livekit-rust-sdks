@@ -122,6 +122,44 @@ pub unsafe fn to_libwebrtc_buffer(info: proto::VideoBufferInfo) -> BoxVideoBuffe
     }
 }
 
+/// Clients may read an I420 frame as one block of width*height + 2*chroma bytes from
+/// `data_ptr`, so a decoded buffer can back the handle directly only when it already has the
+/// packed layout the copy below produces.
+pub fn shared_i420_info(
+    rtcbuffer: &dyn VideoBuffer,
+    dst_type: Option<proto::VideoBufferType>,
+) -> Option<proto::VideoBufferInfo> {
+    if !matches!(dst_type, None | Some(proto::VideoBufferType::I420)) {
+        return None;
+    }
+    let i420 = rtcbuffer.as_i420()?;
+    let (width, height) = (i420.width(), i420.height());
+    let (chroma_width, chroma_height) = ((width + 1) / 2, (height + 1) / 2);
+    let (stride_y, stride_u, stride_v) = i420.strides();
+    if stride_y != width || stride_u != chroma_width || stride_v != chroma_width {
+        return None;
+    }
+    let (data_y, data_u, data_v) = i420.data();
+    let luma_size = (width * height) as usize;
+    let chroma_size = (chroma_width * chroma_height) as usize;
+    let packed = data_u.as_ptr() as usize == data_y.as_ptr() as usize + luma_size
+        && data_v.as_ptr() as usize == data_u.as_ptr() as usize + chroma_size;
+    if !packed {
+        return None;
+    }
+    Some(i420_info(
+        data_y.as_ptr(),
+        data_y.as_ptr(),
+        data_u.as_ptr(),
+        data_v.as_ptr(),
+        width,
+        height,
+        stride_y,
+        stride_u,
+        stride_v,
+    ))
+}
+
 pub fn to_video_buffer_info(
     rtcbuffer: BoxVideoBuffer,
     dst_type: Option<proto::VideoBufferType>,
@@ -542,5 +580,68 @@ pub fn rgb_info(
         components: Vec::default(),
         data_ptr: data_ptr as u64,
         stride: Some(width * 3),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn filled(mut buffer: I420Buffer) -> I420Buffer {
+        let (y, u, v) = buffer.data_mut();
+        for (i, b) in y.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        u.fill(64);
+        v.fill(192);
+        buffer
+    }
+
+    fn layout(info: &proto::VideoBufferInfo) -> Vec<(u32, u32)> {
+        info.components.iter().map(|c| (c.stride, c.size)).collect()
+    }
+
+    #[test]
+    fn packed_i420_is_shared_with_the_copy_layout() {
+        for (width, height) in [(1280, 720), (641, 359), (2, 2)] {
+            let buffer = filled(I420Buffer::new(width, height));
+            let (y, u, v) = buffer.data();
+            let pointers = [y.as_ptr() as u64, u.as_ptr() as u64, v.as_ptr() as u64];
+
+            let shared = shared_i420_info(&buffer, Some(proto::VideoBufferType::I420)).unwrap();
+            assert_eq!(shared_i420_info(&buffer, None).unwrap(), shared);
+            assert_eq!(shared.data_ptr, pointers[0]);
+            let shared_pointers: Vec<u64> = shared.components.iter().map(|c| c.data_ptr).collect();
+            assert_eq!(shared_pointers, pointers);
+
+            let (copy, copied) =
+                to_video_buffer_info(Box::new(filled(I420Buffer::new(width, height))), None, true)
+                    .unwrap();
+            assert_eq!(layout(&shared), layout(&copied));
+            assert_eq!(
+                (shared.width, shared.height, shared.r#type),
+                (width, height, copied.r#type)
+            );
+
+            let block = unsafe { slice::from_raw_parts(shared.data_ptr as *const u8, copy.len()) };
+            assert_eq!(block, &copy[..]);
+        }
+    }
+
+    #[test]
+    fn padded_or_converted_i420_is_not_shared() {
+        let padded = I420Buffer::with_strides(640, 360, 704, 352, 352);
+        assert!(shared_i420_info(&padded, None).is_none());
+
+        let packed = I420Buffer::new(640, 360);
+        assert!(shared_i420_info(&packed, Some(proto::VideoBufferType::Rgba)).is_none());
+        assert!(shared_i420_info(&packed, Some(proto::VideoBufferType::Nv12)).is_none());
+    }
+
+    #[test]
+    fn padded_i420_copy_is_packed() {
+        let padded = filled(I420Buffer::with_strides(640, 360, 704, 352, 352));
+        let (_, info) = to_video_buffer_info(Box::new(padded), None, true).unwrap();
+        assert_eq!(layout(&info), vec![(640, 640 * 360), (320, 320 * 180), (320, 320 * 180)]);
     }
 }

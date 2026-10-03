@@ -470,6 +470,24 @@ This applies to `rootapp/fx-encoder`, `rootapp/fx-session` and later branches. B
     is on GitHub. Rust-only changes under `livekit/` and `livekit-ffi/src/` carry little risk, but
     still need one platform build before release.
 
+## Unpublish and the publisher SDP
+
+`unpublish_track` keeps upstream's `remove_track` (the m-section goes inactive and stays in
+the SDP) and then calls `RtpSender::release_video_encoder`, which makes libwebrtc recreate the
+sender's `VideoSendStream` without a source. That destroys the encoder instances (MF sessions,
+their D3D11 devices and NVIDIA driver threads); each unpublished video track keeps only an idle
+stream (one `EncoderQueue` thread, stale outbound-rtp counters) until the PeerConnection closes.
+
+Stopping the transceiver instead is not compatible with LiveKit server 1.13.7:
+
+- libwebrtc recycles a rejected m-section for the next transceiver under a new mid, but the
+  server only treats m-sections after the last answered mid as new. A recycled slot that is not
+  the last video section gets no simulcast rid mapping (`adding up track failed: duplicate
+  layer`) and the track never reaches subscribers.
+- A rejected m-section keeps its old ICE credentials, so the next ICE-restart offer has
+  conflicting `ice-ufrag` values; the server answers with `LEAVE STATE_MISMATCH` and the resume
+  escalates to a full reconnect.
+
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
 | Commit | Change |
@@ -488,3 +506,9 @@ This applies to `rootapp/fx-encoder`, `rootapp/fx-session` and later branches. B
 | 1d8b229e | Drop degenerate custom simulcast layers; pair arm64 cross headers with the CRT libs |
 | e2a6b46b | win-arm64 clang-cl build disables libyuv NEON/SVE/SME like the official MSVC build |
 | `rootapp/fx-xos` | macOS build script, Linux script for x64/arm64/cross with glibc and link checks, shared `build-info.json` and zips, Windows `-ToolsDir`/`-LlvmDir`/`-Protoc`/`-Zip`, `rootapp-ffi.yml` release workflow, cross-platform audit |
+
+`rootapp/fx-session` adds: unpublishing a video track releases its encoder (see above);
+received I420 frames whose planes are already packed are handed to the FFI handle without a
+copy (other layouts still get the packed copy); stats deserialize libwebrtc's
+`totalFreezesDuration`, `totalPausesDuration` and `scalabilityMode`; native audio captures of
+one source run on one task, in submission order.

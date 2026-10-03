@@ -368,9 +368,9 @@ impl From<rtc::dictionaries::InboundRtpStreamStats> for proto::InboundRtpStreamS
             total_inter_frame_delay: value.total_inter_frame_delay,
             total_squared_inter_frame_delay: value.total_squared_inter_frame_delay,
             pause_count: value.pause_count,
-            total_pause_duration: value.total_pause_duration,
+            total_pause_duration: value.total_pauses_duration,
             freeze_count: value.freeze_count,
-            total_freeze_duration: value.total_freeze_duration,
+            total_freeze_duration: value.total_freezes_duration,
             last_packet_received_timestamp: value.last_packet_received_timestamp,
             header_bytes_received: value.header_bytes_received,
             packets_discarded: value.packets_discarded,
@@ -450,7 +450,7 @@ impl From<rtc::dictionaries::OutboundRtpStreamStats> for proto::OutboundRtpStrea
             encoder_implementation: value.encoder_implementation,
             power_efficient_encoder: value.power_efficient_encoder,
             active: value.active,
-            scalability_mode: value.scalibility_mode,
+            scalability_mode: value.scalability_mode,
         }
     }
 }
