@@ -170,6 +170,11 @@ MFVideoEncoderFactory::~MFVideoEncoderFactory() {}
 
 bool MFVideoEncoderFactory::IsSupported() {
   static const bool supported = [] {
+    if (livekit_ffi::EnvFlagSet("LK_DISABLE_MF_ENCODE")) {
+      RTC_LOG(LS_WARNING)
+          << "LK_DISABLE_MF_ENCODE is set; MediaFoundation encoding disabled.";
+      return false;
+    }
     if (!CachedProbe().supported) {
       RTC_LOG(LS_WARNING)
           << "No usable hardware H264 encoder MFT; MF encoding disabled.";

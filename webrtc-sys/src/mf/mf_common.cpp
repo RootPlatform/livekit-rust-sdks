@@ -30,7 +30,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
 #include <initializer_list>
+#include <iterator>
 #include <utility>
 
 #include "rtc_base/logging.h"
@@ -71,8 +73,29 @@ bool EnsureComInitialized() {
   return init.ok;
 }
 
+bool IsMfPlatAvailable() {
+  static const bool available = [] {
+    // Loaded from System32 only, and kept loaded: it is the module the
+    // delay-load helper will bind the MF imports to.
+    HMODULE module =
+        LoadLibraryExW(L"mfplat.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!module) {
+      RTC_LOG(LS_WARNING)
+          << "mfplat.dll is not available (error " << GetLastError()
+          << "; Windows N/KN without the Media Feature Pack?). "
+             "MediaFoundation video codecs are disabled.";
+      return false;
+    }
+    return true;
+  }();
+  return available;
+}
+
 bool EnsureMFStarted() {
   static bool ok = [] {
+    if (!IsMfPlatAvailable()) {
+      return false;
+    }
     HRESULT hr = MFStartup(MF_VERSION, MFSTARTUP_LITE);
     if (FAILED(hr)) {
       RTC_LOG(LS_ERROR) << "MFStartup failed: " << HResultToString(hr);
@@ -270,7 +293,8 @@ using MFTEnum2Fn = HRESULT(WINAPI*)(GUID,
 // loading on older systems.
 MFTEnum2Fn GetMFTEnum2() {
   static const MFTEnum2Fn fn = [] {
-    HMODULE module = GetModuleHandleW(L"mfplat.dll");
+    HMODULE module = IsMfPlatAvailable() ? GetModuleHandleW(L"mfplat.dll")
+                                         : nullptr;
     return module ? reinterpret_cast<MFTEnum2Fn>(
                         GetProcAddress(module, "MFTEnum2"))
                   : nullptr;
@@ -290,9 +314,120 @@ void AppendActivates(IMFActivate** activates,
   }
 }
 
+// Private activate attribute carrying the DXGI adapter's PCI vendor id, set
+// when MFTEnum2 enumerated the MFT for a known adapter.
+constexpr GUID kLkAdapterVendorId = {
+    0x6b1f3c2a,
+    0x52d4,
+    0x4e0b,
+    {0x9a, 0x61, 0x3e, 0x0c, 0x7d, 0x55, 0x8f, 0x21}};
+
+bool IsAmdVendor(uint32_t vendor) {
+  return vendor == kVendorAmd || vendor == kVendorAmdAlt;
+}
+
+const char* VendorName(uint32_t vendor) {
+  switch (vendor) {
+    case kVendorNvidia:
+      return "nvidia";
+    case kVendorAmd:
+    case kVendorAmdAlt:
+      return "amd";
+    case kVendorIntel:
+      return "intel";
+    default:
+      return "unknown";
+  }
+}
+
+bool VendorMatches(uint32_t vendor, const std::string& preferred) {
+  if (_stricmp(preferred.c_str(), "nvidia") == 0) {
+    return vendor == kVendorNvidia;
+  }
+  if (_stricmp(preferred.c_str(), "amd") == 0) {
+    return IsAmdVendor(vendor);
+  }
+  if (_stricmp(preferred.c_str(), "intel") == 0) {
+    return vendor == kVendorIntel;
+  }
+  return false;
+}
+
+std::vector<ComPtr<IMFActivate>> FilterAndOrderEncoders(
+    std::vector<ComPtr<IMFActivate>> activates) {
+  // The browser engine turns hardware H.264 CBP encode off on AMD-primary
+  // machines after AMD MFT output decoded black for remote viewers. Allowed
+  // here by default until that is reproduced; LK_MF_ALLOW_AMD=0 restores
+  // parity (AMD MFTs are skipped, so AMD-only machines encode in software).
+  const bool allow_amd = !EnvFlagCleared("LK_MF_ALLOW_AMD");
+  const std::optional<std::string> preferred =
+      GetEnvVar("LK_MF_ENCODER_ADAPTER");
+  if (preferred && _stricmp(preferred->c_str(), "nvidia") != 0 &&
+      _stricmp(preferred->c_str(), "amd") != 0 &&
+      _stricmp(preferred->c_str(), "intel") != 0) {
+    RTC_LOG(LS_WARNING) << "Ignoring LK_MF_ENCODER_ADAPTER=\"" << *preferred
+                        << "\"; expected nvidia, amd or intel.";
+  }
+
+  std::vector<ComPtr<IMFActivate>> kept;
+  std::vector<ComPtr<IMFActivate>> rest;
+  for (ComPtr<IMFActivate>& activate : activates) {
+    const uint32_t vendor = GetActivateVendorId(activate.Get());
+    if (!allow_amd && IsAmdVendor(vendor)) {
+      RTC_LOG(LS_INFO) << "LK_MF_ALLOW_AMD=0: skipping H264 encoder MFT \""
+                       << GetFriendlyName(activate.Get()) << "\"";
+      continue;
+    }
+    if (preferred && VendorMatches(vendor, *preferred)) {
+      kept.push_back(std::move(activate));
+    } else {
+      rest.push_back(std::move(activate));
+    }
+  }
+  if (preferred && kept.empty()) {
+    RTC_LOG(LS_WARNING) << "LK_MF_ENCODER_ADAPTER=" << *preferred
+                        << ": no matching hardware H264 encoder MFT.";
+  }
+  kept.insert(kept.end(), std::make_move_iterator(rest.begin()),
+              std::make_move_iterator(rest.end()));
+
+  std::string order;
+  for (const ComPtr<IMFActivate>& activate : kept) {
+    order += (order.empty() ? "" : ", ") + GetFriendlyName(activate.Get()) +
+             " [" + VendorName(GetActivateVendorId(activate.Get())) + "]";
+  }
+  RTC_LOG(LS_INFO) << "H264 encoder MFT order: "
+                   << (order.empty() ? "(none)" : order);
+  return kept;
+}
+
 }  // namespace
 
+uint32_t GetActivateVendorId(IMFActivate* activate) {
+  UINT32 vendor = 0;
+  if (SUCCEEDED(activate->GetUINT32(kLkAdapterVendorId, &vendor))) {
+    return vendor;
+  }
+  // Hardware MFT registrations carry "VEN_xxxx".
+  WCHAR* value = nullptr;
+  UINT32 length = 0;
+  if (SUCCEEDED(activate->GetAllocatedString(MFT_ENUM_HARDWARE_VENDOR_ID_Attribute,
+                                             &value, &length))) {
+    if (length > 4 && _wcsnicmp(value, L"VEN_", 4) == 0) {
+      vendor = static_cast<uint32_t>(std::wcstoul(value + 4, nullptr, 16));
+    }
+    CoTaskMemFree(value);
+  }
+  return vendor;
+}
+
+std::vector<ComPtr<IMFActivate>> EnumHardwareH264EncodersUnordered();
+
 std::vector<ComPtr<IMFActivate>> EnumHardwareH264Encoders() {
+  return FilterAndOrderEncoders(EnumHardwareH264EncodersUnordered());
+}
+
+std::vector<ComPtr<IMFActivate>> EnumHardwareH264EncodersUnordered() {
   std::vector<ComPtr<IMFActivate>> result;
   MFT_REGISTER_TYPE_INFO input_info = {MFMediaType_Video, MFVideoFormat_NV12};
   MFT_REGISTER_TYPE_INFO output_info = {MFMediaType_Video, MFVideoFormat_H264};
@@ -344,6 +479,7 @@ std::vector<ComPtr<IMFActivate>> EnumHardwareH264Encoders() {
         result[j]->SetBlob(kMftEnumAdapterLuid,
                            reinterpret_cast<const UINT8*>(&desc.AdapterLuid),
                            sizeof(desc.AdapterLuid));
+        result[j]->SetUINT32(kLkAdapterVendorId, desc.VendorId);
       }
     }
     if (!result.empty()) {

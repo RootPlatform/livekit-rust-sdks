@@ -91,6 +91,11 @@ MFVideoDecoderFactory::~MFVideoDecoderFactory() {}
 
 bool MFVideoDecoderFactory::IsSupported() {
   static const bool supported = [] {
+    if (livekit_ffi::EnvFlagSet("LK_DISABLE_MF_DECODE")) {
+      RTC_LOG(LS_WARNING)
+          << "LK_DISABLE_MF_DECODE is set; MediaFoundation decoding disabled.";
+      return false;
+    }
     if (!ProbeDecodeSupport()) {
       return false;
     }

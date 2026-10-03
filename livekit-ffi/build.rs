@@ -45,7 +45,17 @@ fn copy_webrtc_license() {
 fn configure_linker() {
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
     match target_os.as_str() {
-        "windows" => {}
+        "windows" => {
+            // webrtc-sys's MediaFoundation codecs import mfplat.dll, which Windows
+            // N/KN lacks without the Media Feature Pack. Delay-load it so the DLL
+            // still loads there; webrtc-sys probes for it before any MF call.
+            // This has to be set on the final cdylib link, so it lives here
+            // rather than in webrtc-sys's build script.
+            if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+                println!("cargo:rustc-link-arg=/DELAYLOAD:mfplat.dll");
+                println!("cargo:rustc-link-lib=dylib=delayimp");
+            }
+        }
         "linux" => {
             println!("cargo:rustc-link-lib=static=webrtc");
         }

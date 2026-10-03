@@ -54,9 +54,25 @@ HRESULT CreateD3D11DeviceBundle(const LUID* luid, D3D11DeviceBundle* out);
 HRESULT CreateD3D11DeviceBundleForActivate(IMFActivate* activate,
                                            D3D11DeviceBundle* out);
 
-// Hardware H264 encoder MFTs accepting NV12, best first
-// (MFT_ENUM_FLAG_SORTANDFILTER order).
+constexpr uint32_t kVendorNvidia = 0x10DE;
+constexpr uint32_t kVendorAmd = 0x1002;
+constexpr uint32_t kVendorAmdAlt = 0x1022;
+constexpr uint32_t kVendorIntel = 0x8086;
+
+// Hardware H264 encoder MFTs accepting NV12, best first. Starts from the
+// per-adapter MFT_ENUM_FLAG_SORTANDFILTER order, then drops AMD MFTs when
+// LK_MF_ALLOW_AMD=0 and moves the vendor named by
+// LK_MF_ENCODER_ADAPTER=nvidia|amd|intel to the front. The factory probe and
+// the encoder both use this, so they always pick the same MFT.
 std::vector<ComPtr<IMFActivate>> EnumHardwareH264Encoders();
+
+// PCI vendor id of the adapter a hardware MFT belongs to, 0 when unknown.
+uint32_t GetActivateVendorId(IMFActivate* activate);
+
+// True when Media Foundation (mfplat.dll) is installed. Windows N/KN without
+// the Media Feature Pack lacks it; livekit_ffi.dll delay-loads mfplat.dll, so
+// no MF entry point may be called when this is false.
+bool IsMfPlatAvailable();
 
 // Reads a process environment variable through the Win32 environment, so a
 // value set by the host after this DLL loaded (where the CRT getenv snapshot
@@ -89,7 +105,7 @@ bool EnsureComInitialized();
 // intentionally never balanced with MFShutdown: encoders/decoders are created
 // and destroyed on different webrtc threads throughout the process lifetime,
 // and tearing MF down while another thread is mid-create is racy. The OS
-// reclaims MF state at process exit.
+// reclaims MF state at process exit. False without mfplat.dll.
 bool EnsureMFStarted();
 
 // Formats an HRESULT as "0x8007000E" for log output.
