@@ -22,6 +22,7 @@
 #include <utility>
 
 #include <common_video/h264/h264_common.h>
+#include "api/array_view.h"
 #include "common_video/libyuv/include/webrtc_libyuv.h"
 #include "mf_common.h"
 #include "modules/video_coding/include/video_codec_interface.h"
