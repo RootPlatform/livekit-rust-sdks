@@ -1,4 +1,4 @@
 # Generated from the LiveKit protocol definitions; do not edit by hand.
 livekit-protocol/src/livekit.rs linguist-generated=true
 livekit-protocol/src/livekit.serde.rs linguist-generated=true
-build-rootapp-linux.sh text eol=lf
+*.sh text eol=lf
