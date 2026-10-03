@@ -21,6 +21,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <string>
@@ -28,6 +29,7 @@
 
 #include <common_video/h264/h264_common.h>
 #include "api/array_view.h"
+#include "api/task_queue/task_queue_base.h"
 #include "common_video/libyuv/include/webrtc_libyuv.h"
 #include "mf_common.h"
 #include "modules/video_coding/include/video_codec_interface.h"
@@ -63,7 +65,6 @@ constexpr size_t kMaxPendingFrames = 4;
 // kMaxPendingFrames of them, the rest is headroom for drivers that release
 // input samples late.
 constexpr size_t kMaxInputTextures = 16;
-constexpr int kMaxOutputWaitMisses = 30;
 
 HRESULT SetCodecApiUInt32(ICodecAPI* api, const GUID& guid, UINT32 value) {
   VARIANT v = {};
@@ -161,7 +162,29 @@ class MFAsyncEventPump : public IMFAsyncCallback {
     std::lock_guard<std::mutex> lock(mutex_);
     generator_ = nullptr;
     events_.clear();
+    drain_queue_ = nullptr;
+    drain_task_ = nullptr;
     cv_.notify_all();
+  }
+
+  void SetDrainTask(TaskQueueBase* queue,
+                    scoped_refptr<PendingTaskSafetyFlag> safety,
+                    std::function<void()> drain) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    drain_queue_ = queue;
+    drain_safety_ = std::move(safety);
+    drain_task_ = std::move(drain);
+    drain_posted_ = false;
+    if (!events_.empty()) {
+      PostDrainLocked();
+    }
+  }
+
+  // Called by the drain task before it consumes events, so an event arriving
+  // while it runs schedules another drain.
+  void OnDrainStarted() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    drain_posted_ = false;
   }
 
   WaitResult Wait(std::chrono::steady_clock::duration timeout,
@@ -222,11 +245,19 @@ class MFAsyncEventPump : public IMFAsyncCallback {
       error_ = hr;
     }
     cv_.notify_all();
+    PostDrainLocked();
     return S_OK;
   }
 
  private:
   virtual ~MFAsyncEventPump() = default;
+
+  void PostDrainLocked() {
+    if (drain_queue_ && drain_task_ && !drain_posted_) {
+      drain_posted_ = true;
+      drain_queue_->PostTask(SafeTask(drain_safety_, drain_task_));
+    }
+  }
 
   std::atomic<ULONG> ref_count_{1};
   std::mutex mutex_;
@@ -234,6 +265,10 @@ class MFAsyncEventPump : public IMFAsyncCallback {
   IMFMediaEventGenerator* generator_;
   std::deque<MediaEventType> events_;
   HRESULT error_ = S_OK;
+  TaskQueueBase* drain_queue_ = nullptr;
+  scoped_refptr<PendingTaskSafetyFlag> drain_safety_;
+  std::function<void()> drain_task_;
+  bool drain_posted_ = false;
 };
 
 MFH264EncoderImpl::MFH264EncoderImpl(const Environment& env,
@@ -338,6 +373,7 @@ int32_t MFH264EncoderImpl::InitEncode(const VideoCodec* inst,
       init_allocator.Allocate(VideoBitrateAllocationParameters(
           DataRate::KilobitsPerSec(codec_.startBitrate), codec_.maxFramerate));
   SetRates(RateControlParameters(allocation, codec_.maxFramerate));
+  initialized_ = true;
   ReportInit();
   return WEBRTC_VIDEO_CODEC_OK;
 }
@@ -587,15 +623,13 @@ int32_t MFH264EncoderImpl::ReinitTransform() {
   RTC_LOG(LS_INFO) << "Reinitializing MF H264 encoder (bitrate "
                    << active_bitrate_bps_ << " -> "
                    << configuration_.target_bps << " bps).";
-  EncodedImageCallback* callback = encoded_image_callback_;
-  int32_t ret = Release();
-  if (ret != WEBRTC_VIDEO_CODEC_OK) {
-    return ret;
-  }
-  encoded_image_callback_ = callback;
-  ret = CreateTransform();
-  if (ret != WEBRTC_VIDEO_CODEC_OK) {
-    return ret;
+  ReleaseTransform();
+  pending_frames_.clear();
+  frame_count_ = 0;
+  if (CreateTransform() != WEBRTC_VIDEO_CODEC_OK) {
+    RTC_LOG(LS_ERROR) << "MF H264 encoder re-init failed; requesting an "
+                         "encoder switch.";
+    return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
   }
   configuration_.key_frame_request = true;
   return WEBRTC_VIDEO_CODEC_OK;
@@ -647,6 +681,7 @@ int32_t MFH264EncoderImpl::RegisterEncodeCompleteCallback(
 }
 
 int32_t MFH264EncoderImpl::Release() {
+  initialized_ = false;
   ReleaseTransform();
   pending_frames_.clear();
   frame_count_ = 0;
@@ -654,6 +689,11 @@ int32_t MFH264EncoderImpl::Release() {
 }
 
 void MFH264EncoderImpl::ReleaseTransform() {
+  if (drain_safety_) {
+    drain_safety_->SetNotAlive();
+    drain_safety_ = nullptr;
+  }
+  async_failed_ = false;
   if (event_pump_) {
     event_pump_->Stop();
     event_pump_.Reset();
@@ -677,7 +717,6 @@ void MFH264EncoderImpl::ReleaseTransform() {
   need_input_credits_ = 0;
   sequence_header_.clear();
   is_async_ = false;
-  output_wait_misses_ = 0;
   requested_keyframes_ = 0;
 }
 
@@ -923,9 +962,13 @@ int32_t MFH264EncoderImpl::PumpEvents(int timeout_ms,
 int32_t MFH264EncoderImpl::Encode(
     const VideoFrame& input_frame,
     const std::vector<VideoFrameType>* frame_types) {
-  if (!transform_) {
+  if (!initialized_) {
     ReportError();
     return WEBRTC_VIDEO_CODEC_UNINITIALIZED;
+  }
+  if (!transform_ || async_failed_) {
+    ReportError();
+    return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
   }
   if (!encoded_image_callback_) {
     RTC_LOG(LS_WARNING)
@@ -982,6 +1025,9 @@ int32_t MFH264EncoderImpl::Encode(
   }
 
   if (is_async_) {
+    if (!drain_safety_) {
+      EnableOutputDrainTask();
+    }
     int32_t ret = PumpEvents(kNeedInputTimeoutMs, /*until_need_input=*/true,
                              /*until_pending_at_most=*/SIZE_MAX);
     if (ret != WEBRTC_VIDEO_CODEC_OK) {
@@ -1043,11 +1089,10 @@ int32_t MFH264EncoderImpl::Encode(
 
   if (is_async_) {
     need_input_credits_--;
-    // Give the hardware a short window to return this frame, so latency is
-    // the encode time rather than a whole frame interval. MFTs that hold a
-    // frame until more input arrives would miss this every time; stop
-    // waiting for those.
-    if (output_wait_misses_ < kMaxOutputWaitMisses) {
+    // Without an encoder task queue to post drains to, give the hardware a
+    // short window to return this frame so latency is the encode time rather
+    // than a whole frame interval.
+    if (!drain_safety_) {
       const int soft_wait_ms = std::max(
           2, static_cast<int>(500 / std::max(1.0f, configuration_.max_frame_rate)));
       int32_t ret = PumpEvents(soft_wait_ms, /*until_need_input=*/false,
@@ -1056,11 +1101,6 @@ int32_t MFH264EncoderImpl::Encode(
       if (ret != WEBRTC_VIDEO_CODEC_OK) {
         return ret;
       }
-      output_wait_misses_ = pending_frames_.empty() ? 0 : output_wait_misses_ + 1;
-      if (output_wait_misses_ == kMaxOutputWaitMisses) {
-        RTC_LOG(LS_INFO) << "Encoder MFT pipelines frames; no longer waiting "
-                            "for same-frame output.";
-      }
     }
     // Block only when too many frames are in flight so encoder latency
     // stays bounded.
@@ -1068,6 +1108,32 @@ int32_t MFH264EncoderImpl::Encode(
                       /*until_pending_at_most=*/kMaxPendingFrames);
   }
   return CollectOutputsSync();
+}
+
+void MFH264EncoderImpl::EnableOutputDrainTask() {
+  TaskQueueBase* queue = TaskQueueBase::Current();
+  if (!queue || !event_pump_) {
+    return;
+  }
+  drain_safety_ = PendingTaskSafetyFlag::Create();
+  event_pump_->SetDrainTask(queue, drain_safety_,
+                            [this] { DrainAsyncOutput(); });
+}
+
+void MFH264EncoderImpl::DrainAsyncOutput() {
+  if (!transform_ || !event_pump_ || async_failed_) {
+    return;
+  }
+  event_pump_->OnDrainStarted();
+  if (!encoded_image_callback_) {
+    return;
+  }
+  int32_t ret = PumpEvents(0, /*until_need_input=*/false,
+                           /*until_pending_at_most=*/SIZE_MAX,
+                           /*fail_on_timeout=*/false);
+  if (ret == WEBRTC_VIDEO_CODEC_ENCODER_FAILURE) {
+    async_failed_ = true;
+  }
 }
 
 int32_t MFH264EncoderImpl::CollectOutputsSync() {

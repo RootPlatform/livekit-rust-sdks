@@ -28,6 +28,8 @@
 #include <vector>
 
 #include "api/environment/environment.h"
+#include "api/scoped_refptr.h"
+#include "api/task_queue/pending_task_safety_flag.h"
 #include "api/video/color_space.h"
 #include "api/video/i420_buffer.h"
 #include "api/video/video_rotation.h"
@@ -124,6 +126,11 @@ class MFH264EncoderImpl : public VideoEncoder {
                      bool until_need_input,
                      size_t until_pending_at_most,
                      bool fail_on_timeout = true);
+  // Has the event pump post a drain task to the calling (encoder) task queue
+  // whenever the MFT signals output, so frames are delivered as soon as the
+  // hardware finishes rather than inside the next Encode().
+  void EnableOutputDrainTask();
+  void DrainAsyncOutput();
   // Collects one encoded output from the MFT; WEBRTC_VIDEO_CODEC_NO_OUTPUT
   // means the transform needs more input.
   int32_t CollectOneOutput();
@@ -143,7 +150,13 @@ class MFH264EncoderImpl : public VideoEncoder {
   livekit_ffi::ComPtr<ICodecAPI> codec_api_;
   livekit_ffi::ComPtr<IMFMediaEventGenerator> event_generator_;
   livekit_ffi::ComPtr<MFAsyncEventPump> event_pump_;
-  int output_wait_misses_ = 0;
+  webrtc::scoped_refptr<PendingTaskSafetyFlag> drain_safety_;
+  // Set when the drain task hit an MFT failure outside Encode(); the next
+  // Encode() reports it so webrtc can switch encoders.
+  bool async_failed_ = false;
+  // InitEncode() succeeded and Release() has not been called since. A null
+  // transform_ while this is set means a runtime re-init failed.
+  bool initialized_ = false;
   int requested_keyframes_ = 0;
   livekit_ffi::D3D11DeviceBundle d3d_;
   livekit_ffi::ComPtr<ID3D11Texture2D> staging_texture_;
