@@ -360,9 +360,9 @@ pub mod dictionaries {
         pub total_inter_frame_delay: f64,
         pub total_squared_inter_frame_delay: f64,
         pub pause_count: u32,
-        pub total_pause_duration: f64,
+        pub total_pauses_duration: f64,
         pub freeze_count: u32,
-        pub total_freeze_duration: f64,
+        pub total_freezes_duration: f64,
         pub last_packet_received_timestamp: f64,
         pub header_bytes_received: u64,
         pub packets_discarded: u64,
@@ -441,7 +441,7 @@ pub mod dictionaries {
         pub encoder_implementation: String,
         pub power_efficient_encoder: bool,
         pub active: bool,
-        pub scalibility_mode: String,
+        pub scalability_mode: String,
     }
 
     #[derive(Debug, Default, Clone, Deserialize)]
@@ -620,5 +620,31 @@ pub mod dictionaries {
         pub id: String,
         pub stream_identifier: String,
         // pub timestamp: i64,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn freeze_pause_and_scalability_members_use_libwebrtc_names() {
+        let json = r#"[
+            {"type":"inbound-rtp","id":"IT01V","timestamp":1,"kind":"video","pauseCount":2,
+             "totalPausesDuration":1.5,"freezeCount":3,"totalFreezesDuration":0.75},
+            {"type":"outbound-rtp","id":"OT01V","timestamp":1,"kind":"video","rid":"f",
+             "scalabilityMode":"L1T3"}
+        ]"#;
+        let stats: Vec<RtcStats> = serde_json::from_str(json).unwrap();
+
+        let RtcStats::InboundRtp(inbound) = &stats[0] else { panic!("expected inbound-rtp") };
+        assert_eq!(inbound.inbound.pause_count, 2);
+        assert_eq!(inbound.inbound.total_pauses_duration, 1.5);
+        assert_eq!(inbound.inbound.freeze_count, 3);
+        assert_eq!(inbound.inbound.total_freezes_duration, 0.75);
+
+        let RtcStats::OutboundRtp(outbound) = &stats[1] else { panic!("expected outbound-rtp") };
+        assert_eq!(outbound.outbound.scalability_mode, "L1T3");
+        assert_eq!(outbound.outbound.rid, "f");
     }
 }
