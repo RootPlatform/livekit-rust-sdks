@@ -19,6 +19,7 @@
 
 #include <windows.h>
 
+#include <d3d11.h>
 #include <mfapi.h>
 #include <mferror.h>
 #include <mfidl.h>
@@ -28,10 +29,43 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace livekit_ffi {
 
 using Microsoft::WRL::ComPtr;
+
+// A D3D11 device plus the DXGI device manager that hands it to an MFT.
+struct D3D11DeviceBundle {
+  ComPtr<ID3D11Device> device;
+  ComPtr<ID3D11DeviceContext> context;
+  ComPtr<IMFDXGIDeviceManager> manager;
+};
+
+// Creates a multithread-protected, video-capable D3D11 device on the adapter
+// identified by `luid` (the default hardware adapter when null) and wraps it
+// in an IMFDXGIDeviceManager.
+HRESULT CreateD3D11DeviceBundle(const LUID* luid, D3D11DeviceBundle* out);
+
+// Hardware MFTs on multi-adapter systems are bound to one adapter, recorded
+// on the activate as MFT_ENUM_ADAPTER_LUID; the device manager handed to the
+// MFT must live on that same adapter. No LUID means the default adapter.
+HRESULT CreateD3D11DeviceBundleForActivate(IMFActivate* activate,
+                                           D3D11DeviceBundle* out);
+
+// Hardware H264 encoder MFTs accepting NV12, best first
+// (MFT_ENUM_FLAG_SORTANDFILTER order).
+std::vector<ComPtr<IMFActivate>> EnumHardwareH264Encoders();
+
+std::string GetFriendlyName(IMFActivate* activate);
+
+// Unlocks an async MFT (required before any media type can be set) and, when
+// the MFT is D3D11-aware, attaches a device manager on the MFT's own adapter.
+// `bundle` is left empty for MFTs that take system-memory input.
+HRESULT PrepareHardwareTransform(IMFActivate* activate,
+                                 IMFTransform* transform,
+                                 bool* is_async,
+                                 D3D11DeviceBundle* bundle);
 
 // Ensures COM is initialized (MTA) on the calling thread. webrtc invokes the
 // encoder/decoder on its own task-queue threads which are not guaranteed to

@@ -38,6 +38,8 @@
 
 namespace webrtc {
 
+class MFAsyncEventPump;
+
 // H264 encoder on top of a hardware Media Foundation transform (MFT). The
 // vendor's driver registers the MFT (Intel QuickSync, AMD VCN, NVIDIA NVENC),
 // so a single implementation covers all of them with no third-party
@@ -90,8 +92,13 @@ class MFH264EncoderImpl : public VideoEncoder {
     std::optional<webrtc::ColorSpace> color_space;
   };
 
+  // Tries every hardware encoder MFT in preference order and keeps the first
+  // one that accepts the configuration.
   int32_t CreateTransform();
+  HRESULT ActivateTransform(IMFActivate* activate);
   int32_t ConfigureTransform();
+  int32_t ApplyCodecApiSettings(bool log_failures);
+  void ReleaseTransform();
   int32_t ReinitTransform();
   HRESULT NegotiateOutputType();
   void CacheSequenceHeader();
@@ -99,14 +106,24 @@ class MFH264EncoderImpl : public VideoEncoder {
                             int64_t sample_time_100ns,
                             int64_t duration_100ns,
                             IMFSample** sample_out);
+  // D3D11-aware MFTs: uploads I420 into a pooled NV12 texture on the MFT's
+  // adapter and wraps it in a DXGI surface buffer.
+  HRESULT CreateD3DInputSample(const I420BufferInterface& buffer,
+                               int64_t sample_time_100ns,
+                               int64_t duration_100ns,
+                               IMFSample** sample_out);
+  HRESULT AcquireInputTexture(ID3D11Texture2D** texture_out);
   // Runs the async MFT event loop until the requested goals are met: an input
   // credit is available (when `until_need_input`) and at most
   // `until_pending_at_most` frames are in flight. Encoded output that becomes
   // available meanwhile is delivered to the callback. Returns an error when
   // the timeout expires with goals unmet.
+  // With `fail_on_timeout` false an unmet goal at the deadline is not an
+  // error.
   int32_t PumpEvents(int timeout_ms,
                      bool until_need_input,
-                     size_t until_pending_at_most);
+                     size_t until_pending_at_most,
+                     bool fail_on_timeout = true);
   // Collects one encoded output from the MFT; WEBRTC_VIDEO_CODEC_NO_OUTPUT
   // means the transform needs more input.
   int32_t CollectOneOutput();
@@ -125,6 +142,14 @@ class MFH264EncoderImpl : public VideoEncoder {
   livekit_ffi::ComPtr<IMFTransform> transform_;
   livekit_ffi::ComPtr<ICodecAPI> codec_api_;
   livekit_ffi::ComPtr<IMFMediaEventGenerator> event_generator_;
+  livekit_ffi::ComPtr<MFAsyncEventPump> event_pump_;
+  int output_wait_misses_ = 0;
+  int requested_keyframes_ = 0;
+  livekit_ffi::D3D11DeviceBundle d3d_;
+  livekit_ffi::ComPtr<ID3D11Texture2D> staging_texture_;
+  // Input textures handed to the MFT. A texture is reused only once nothing
+  // but this pool references it (the MFT released the sample wrapping it).
+  std::vector<livekit_ffi::ComPtr<ID3D11Texture2D>> input_textures_;
   bool is_async_ = false;
   DWORD input_stream_id_ = 0;
   DWORD output_stream_id_ = 0;

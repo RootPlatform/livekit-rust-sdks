@@ -17,7 +17,12 @@
 #include "h264_encoder_impl.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <limits>
+#include <mutex>
 #include <string>
 #include <utility>
 
@@ -54,6 +59,11 @@ constexpr int kOutputWaitTimeoutMs = 500;
 // How many frames may be in flight inside the MFT before Encode() blocks
 // waiting for output. Low-latency mode keeps this near 1 in practice.
 constexpr size_t kMaxPendingFrames = 4;
+// Upper bound on pooled D3D11 input textures; the MFT normally holds at most
+// kMaxPendingFrames of them, the rest is headroom for drivers that release
+// input samples late.
+constexpr size_t kMaxInputTextures = 16;
+constexpr int kMaxOutputWaitMisses = 30;
 
 HRESULT SetCodecApiUInt32(ICodecAPI* api, const GUID& guid, UINT32 value) {
   VARIANT v = {};
@@ -128,6 +138,103 @@ UINT32 H264LevelToMFLevel(H264Level level) {
 }
 
 }  // namespace
+
+// Receives an async MFT's events on a Media Foundation work queue thread via
+// BeginGetEvent, so Encode() can block on a condition variable and wake as
+// soon as the hardware signals, instead of polling with Sleep() (whose
+// granularity is the system timer resolution, up to 15.6 ms).
+class MFAsyncEventPump : public IMFAsyncCallback {
+ public:
+  enum class WaitResult { kEvent, kTimeout, kError };
+
+  explicit MFAsyncEventPump(IMFMediaEventGenerator* generator)
+      : generator_(generator) {}
+
+  HRESULT Start() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return generator_->BeginGetEvent(this, nullptr);
+  }
+
+  // After Stop() returns the generator is never touched again; the pending
+  // BeginGetEvent reference is dropped when the MFT shuts down.
+  void Stop() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    generator_ = nullptr;
+    events_.clear();
+    cv_.notify_all();
+  }
+
+  WaitResult Wait(std::chrono::steady_clock::duration timeout,
+                  MediaEventType* type,
+                  HRESULT* status) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    cv_.wait_for(lock, timeout,
+                 [this] { return !events_.empty() || FAILED(error_); });
+    if (!events_.empty()) {
+      *type = events_.front();
+      events_.pop_front();
+      return WaitResult::kEvent;
+    }
+    if (FAILED(error_)) {
+      *status = error_;
+      return WaitResult::kError;
+    }
+    return WaitResult::kTimeout;
+  }
+
+  STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
+    if (!ppv) {
+      return E_POINTER;
+    }
+    if (riid == __uuidof(IUnknown) || riid == __uuidof(IMFAsyncCallback)) {
+      *ppv = static_cast<IMFAsyncCallback*>(this);
+      AddRef();
+      return S_OK;
+    }
+    *ppv = nullptr;
+    return E_NOINTERFACE;
+  }
+  STDMETHODIMP_(ULONG) AddRef() override { return ++ref_count_; }
+  STDMETHODIMP_(ULONG) Release() override {
+    const ULONG count = --ref_count_;
+    if (count == 0) {
+      delete this;
+    }
+    return count;
+  }
+
+  STDMETHODIMP GetParameters(DWORD*, DWORD*) override { return E_NOTIMPL; }
+
+  STDMETHODIMP Invoke(IMFAsyncResult* async_result) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!generator_) {
+      return S_OK;
+    }
+    ComPtr<IMFMediaEvent> event;
+    HRESULT hr = generator_->EndGetEvent(async_result, &event);
+    if (SUCCEEDED(hr)) {
+      MediaEventType type = MEUnknown;
+      event->GetType(&type);
+      events_.push_back(type);
+      hr = generator_->BeginGetEvent(this, nullptr);
+    }
+    if (FAILED(hr)) {
+      error_ = hr;
+    }
+    cv_.notify_all();
+    return S_OK;
+  }
+
+ private:
+  virtual ~MFAsyncEventPump() = default;
+
+  std::atomic<ULONG> ref_count_{1};
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  IMFMediaEventGenerator* generator_;
+  std::deque<MediaEventType> events_;
+  HRESULT error_ = S_OK;
+};
 
 MFH264EncoderImpl::MFH264EncoderImpl(const Environment& env,
                                      const SdpVideoFormat& format)
@@ -217,16 +324,14 @@ int32_t MFH264EncoderImpl::InitEncode(const VideoCodec* inst,
     ReportError();
     return ret;
   }
-  ret = ConfigureTransform();
-  if (ret != WEBRTC_VIDEO_CODEC_OK) {
-    ReportError();
-    return ret;
-  }
 
   RTC_LOG(LS_INFO) << "MediaFoundation H264 encoder initialized ("
                    << friendly_name_ << "): " << codec_.width << "x"
                    << codec_.height << " @ " << codec_.maxFramerate
-                   << "fps, target_bps=" << configuration_.target_bps;
+                   << "fps, target_bps=" << configuration_.target_bps
+                   << ", level=" << static_cast<int>(level_)
+                   << ", input=" << (d3d_.manager ? "d3d11" : "system memory")
+                   << ", async=" << is_async_;
 
   SimulcastRateAllocator init_allocator(env_, codec_);
   VideoBitrateAllocation allocation =
@@ -238,58 +343,51 @@ int32_t MFH264EncoderImpl::InitEncode(const VideoCodec* inst,
 }
 
 int32_t MFH264EncoderImpl::CreateTransform() {
-  MFT_REGISTER_TYPE_INFO input_info = {MFMediaType_Video, MFVideoFormat_NV12};
-  MFT_REGISTER_TYPE_INFO output_info = {MFMediaType_Video, MFVideoFormat_H264};
-
-  IMFActivate** activates = nullptr;
-  UINT32 count = 0;
-  HRESULT hr = MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER,
-                         MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
-                         &input_info, &output_info, &activates, &count);
-  if (FAILED(hr) || count == 0) {
-    RTC_LOG(LS_ERROR) << "No hardware H264 encoder MFT found: "
-                      << HResultToString(hr);
-    if (activates) {
-      CoTaskMemFree(activates);
-    }
+  std::vector<ComPtr<IMFActivate>> activates =
+      livekit_ffi::EnumHardwareH264Encoders();
+  if (activates.empty()) {
+    RTC_LOG(LS_ERROR) << "No hardware H264 encoder MFT found.";
     return WEBRTC_VIDEO_CODEC_ERROR;
   }
 
-  activate_ = activates[0];
-  for (UINT32 i = 0; i < count; i++) {
-    activates[i]->Release();
+  for (const ComPtr<IMFActivate>& activate : activates) {
+    HRESULT hr = ActivateTransform(activate.Get());
+    if (SUCCEEDED(hr)) {
+      if (ConfigureTransform() == WEBRTC_VIDEO_CODEC_OK) {
+        return WEBRTC_VIDEO_CODEC_OK;
+      }
+      hr = E_FAIL;
+    }
+    RTC_LOG(LS_WARNING) << "H264 encoder MFT \"" << friendly_name_
+                        << "\" unusable (" << HResultToString(hr)
+                        << "); trying the next one.";
+    ReleaseTransform();
   }
-  CoTaskMemFree(activates);
 
-  WCHAR* name = nullptr;
-  UINT32 name_len = 0;
-  if (SUCCEEDED(activate_->GetAllocatedString(MFT_FRIENDLY_NAME_Attribute,
-                                              &name, &name_len))) {
-    // Log-only string; lossy narrowing is fine.
-    friendly_name_.assign(name, name + name_len);
-    CoTaskMemFree(name);
-  }
+  RTC_LOG(LS_ERROR) << "No hardware H264 encoder MFT accepted the "
+                    << configuration_.width << "x" << configuration_.height
+                    << " configuration.";
+  return WEBRTC_VIDEO_CODEC_ERROR;
+}
 
-  hr = activate_->ActivateObject(IID_PPV_ARGS(&transform_));
+HRESULT MFH264EncoderImpl::ActivateTransform(IMFActivate* activate) {
+  activate_ = activate;
+  friendly_name_ = livekit_ffi::GetFriendlyName(activate);
+
+  HRESULT hr = activate_->ActivateObject(IID_PPV_ARGS(&transform_));
   if (FAILED(hr)) {
     RTC_LOG(LS_ERROR) << "Failed to activate H264 encoder MFT \""
                       << friendly_name_ << "\": " << HResultToString(hr);
-    return WEBRTC_VIDEO_CODEC_ERROR;
+    return hr;
   }
 
-  ComPtr<IMFAttributes> attributes;
-  if (SUCCEEDED(transform_->GetAttributes(&attributes)) && attributes) {
-    UINT32 is_async = 0;
-    attributes->GetUINT32(MF_TRANSFORM_ASYNC, &is_async);
-    is_async_ = is_async != 0;
-    if (is_async_) {
-      hr = attributes->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE);
-      if (FAILED(hr)) {
-        RTC_LOG(LS_ERROR) << "Failed to unlock async MFT: "
-                          << HResultToString(hr);
-        return WEBRTC_VIDEO_CODEC_ERROR;
-      }
-    }
+  // D3D11-aware vendor MFTs (NVIDIA, AMD) reject media types with
+  // MF_E_UNSUPPORTED_D3D_TYPE until they have a device manager on their own
+  // adapter, so this has to happen before any SetOutputType.
+  hr = livekit_ffi::PrepareHardwareTransform(activate, transform_.Get(),
+                                             &is_async_, &d3d_);
+  if (FAILED(hr)) {
+    return hr;
   }
 
   if (is_async_) {
@@ -297,7 +395,13 @@ int32_t MFH264EncoderImpl::CreateTransform() {
     if (FAILED(hr)) {
       RTC_LOG(LS_ERROR) << "Async MFT without IMFMediaEventGenerator: "
                         << HResultToString(hr);
-      return WEBRTC_VIDEO_CODEC_ERROR;
+      return hr;
+    }
+    event_pump_.Attach(new MFAsyncEventPump(event_generator_.Get()));
+    hr = event_pump_->Start();
+    if (FAILED(hr)) {
+      RTC_LOG(LS_ERROR) << "BeginGetEvent failed: " << HResultToString(hr);
+      return hr;
     }
   }
 
@@ -307,9 +411,64 @@ int32_t MFH264EncoderImpl::CreateTransform() {
   if (FAILED(hr)) {
     RTC_LOG(LS_ERROR) << "H264 encoder MFT does not expose ICodecAPI: "
                       << HResultToString(hr);
-    return WEBRTC_VIDEO_CODEC_ERROR;
+    return hr;
   }
 
+  return S_OK;
+}
+
+int32_t MFH264EncoderImpl::ApplyCodecApiSettings(bool log_failures) {
+  // Rate control: CBR at the target bitrate, low latency, no B-frames (webrtc
+  // cannot tolerate them), and an effectively infinite GOP since webrtc
+  // requests IDR frames itself.
+  HRESULT hr = SetCodecApiUInt32(codec_api_.Get(),
+                                 CODECAPI_AVEncCommonRateControlMode,
+                                 eAVEncCommonRateControlMode_CBR);
+  if (FAILED(hr)) {
+    if (log_failures) {
+      RTC_LOG(LS_ERROR) << "Failed to set CBR rate control: "
+                        << HResultToString(hr);
+    }
+    return WEBRTC_VIDEO_CODEC_ERROR;
+  }
+  hr = SetCodecApiUInt32(codec_api_.Get(), CODECAPI_AVEncCommonMeanBitRate,
+                         configuration_.target_bps);
+  if (FAILED(hr)) {
+    if (log_failures) {
+      RTC_LOG(LS_ERROR) << "Failed to set mean bitrate: "
+                        << HResultToString(hr);
+    }
+    return WEBRTC_VIDEO_CODEC_ERROR;
+  }
+  hr = SetCodecApiUInt32(codec_api_.Get(),
+                         CODECAPI_AVEncMPVDefaultBPictureCount, 0);
+  if (FAILED(hr)) {
+    // Baseline has no B-frames, and some MFTs (NVIDIA) reject the property
+    // for that profile with E_INVALIDARG.
+    if (H264ProfileToMFProfile(profile_) != eAVEncH264VProfile_Base) {
+      if (log_failures) {
+        RTC_LOG(LS_ERROR) << "Failed to disable B-frames: "
+                          << HResultToString(hr);
+      }
+      return WEBRTC_VIDEO_CODEC_ERROR;
+    }
+    if (log_failures) {
+      RTC_LOG(LS_INFO) << "Encoder MFT rejected B-frame count ("
+                       << HResultToString(hr)
+                       << "); Baseline profile has none anyway.";
+    }
+  }
+  // Best effort from here on: support varies by vendor/driver.
+  if (FAILED(SetCodecApiBool(codec_api_.Get(), CODECAPI_AVLowLatencyMode,
+                             true)) &&
+      log_failures) {
+    RTC_LOG(LS_WARNING) << "Encoder MFT rejected AVLowLatencyMode.";
+  }
+  if (FAILED(SetCodecApiUInt32(codec_api_.Get(), CODECAPI_AVEncMPVGOPSize,
+                               0x7FFFFFFF)) &&
+      log_failures) {
+    RTC_LOG(LS_WARNING) << "Encoder MFT rejected infinite GOP size.";
+  }
   return WEBRTC_VIDEO_CODEC_OK;
 }
 
@@ -329,6 +488,11 @@ int32_t MFH264EncoderImpl::ConfigureTransform() {
 
   const UINT32 fps =
       std::max(1u, static_cast<UINT32>(configuration_.max_frame_rate + 0.5f));
+
+  // Rate control, GOP and B-frame settings are latched when the media types
+  // are set (Microsoft documents this for the encoder MFTs, and NVIDIA
+  // ignores a later rate control mode / GOP size), so set them first.
+  ApplyCodecApiSettings(/*log_failures=*/false);
 
   // Output type first: encoder MFTs require it before the input type.
   ComPtr<IMFMediaType> output_type;
@@ -392,36 +556,10 @@ int32_t MFH264EncoderImpl::ConfigureTransform() {
     return WEBRTC_VIDEO_CODEC_ERROR;
   }
 
-  // Rate control: CBR at the target bitrate, low latency, no B-frames (webrtc
-  // cannot tolerate them), and an effectively infinite GOP since webrtc
-  // requests IDR frames itself.
-  hr = SetCodecApiUInt32(codec_api_.Get(), CODECAPI_AVEncCommonRateControlMode,
-                         eAVEncCommonRateControlMode_CBR);
-  if (FAILED(hr)) {
-    RTC_LOG(LS_ERROR) << "Failed to set CBR rate control: "
-                      << HResultToString(hr);
+  // Applied again now that the types are set: some MFTs only accept these
+  // afterwards, and this pass is the one whose failures count.
+  if (ApplyCodecApiSettings(/*log_failures=*/true) != WEBRTC_VIDEO_CODEC_OK) {
     return WEBRTC_VIDEO_CODEC_ERROR;
-  }
-  hr = SetCodecApiUInt32(codec_api_.Get(), CODECAPI_AVEncCommonMeanBitRate,
-                         configuration_.target_bps);
-  if (FAILED(hr)) {
-    RTC_LOG(LS_ERROR) << "Failed to set mean bitrate: " << HResultToString(hr);
-    return WEBRTC_VIDEO_CODEC_ERROR;
-  }
-  hr = SetCodecApiUInt32(codec_api_.Get(),
-                         CODECAPI_AVEncMPVDefaultBPictureCount, 0);
-  if (FAILED(hr)) {
-    RTC_LOG(LS_ERROR) << "Failed to disable B-frames: " << HResultToString(hr);
-    return WEBRTC_VIDEO_CODEC_ERROR;
-  }
-  // Best effort from here on: support varies by vendor/driver.
-  if (FAILED(SetCodecApiBool(codec_api_.Get(), CODECAPI_AVLowLatencyMode,
-                             true))) {
-    RTC_LOG(LS_WARNING) << "Encoder MFT rejected AVLowLatencyMode.";
-  }
-  if (FAILED(SetCodecApiUInt32(codec_api_.Get(), CODECAPI_AVEncMPVGOPSize,
-                               0x7FFFFFFF))) {
-    RTC_LOG(LS_WARNING) << "Encoder MFT rejected infinite GOP size.";
   }
 
   active_bitrate_bps_ = configuration_.target_bps;
@@ -456,10 +594,6 @@ int32_t MFH264EncoderImpl::ReinitTransform() {
   }
   encoded_image_callback_ = callback;
   ret = CreateTransform();
-  if (ret != WEBRTC_VIDEO_CODEC_OK) {
-    return ret;
-  }
-  ret = ConfigureTransform();
   if (ret != WEBRTC_VIDEO_CODEC_OK) {
     return ret;
   }
@@ -513,6 +647,17 @@ int32_t MFH264EncoderImpl::RegisterEncodeCompleteCallback(
 }
 
 int32_t MFH264EncoderImpl::Release() {
+  ReleaseTransform();
+  pending_frames_.clear();
+  frame_count_ = 0;
+  return WEBRTC_VIDEO_CODEC_OK;
+}
+
+void MFH264EncoderImpl::ReleaseTransform() {
+  if (event_pump_) {
+    event_pump_->Stop();
+    event_pump_.Reset();
+  }
   if (transform_) {
     transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM,
                                input_stream_id_);
@@ -526,12 +671,14 @@ int32_t MFH264EncoderImpl::Release() {
     activate_->ShutdownObject();
     activate_.Reset();
   }
-  pending_frames_.clear();
+  input_textures_.clear();
+  staging_texture_.Reset();
+  d3d_ = livekit_ffi::D3D11DeviceBundle();
   need_input_credits_ = 0;
-  frame_count_ = 0;
   sequence_header_.clear();
   is_async_ = false;
-  return WEBRTC_VIDEO_CODEC_OK;
+  output_wait_misses_ = 0;
+  requested_keyframes_ = 0;
 }
 
 HRESULT MFH264EncoderImpl::CreateInputSample(const I420BufferInterface& buffer,
@@ -591,39 +738,176 @@ HRESULT MFH264EncoderImpl::CreateInputSample(const I420BufferInterface& buffer,
   return S_OK;
 }
 
+HRESULT MFH264EncoderImpl::AcquireInputTexture(ID3D11Texture2D** texture_out) {
+  for (const ComPtr<ID3D11Texture2D>& texture : input_textures_) {
+    // Only the pool's reference left means the MFT has released the sample
+    // and DXGI buffer that wrapped this texture.
+    texture->AddRef();
+    if (texture->Release() == 1) {
+      *texture_out = texture.Get();
+      (*texture_out)->AddRef();
+      return S_OK;
+    }
+  }
+  if (input_textures_.size() >= kMaxInputTextures) {
+    RTC_LOG(LS_ERROR) << "All " << input_textures_.size()
+                      << " encoder input textures are still owned by the MFT.";
+    return MF_E_SAMPLEALLOCATOR_EMPTY;
+  }
+
+  D3D11_TEXTURE2D_DESC desc = {};
+  desc.Width = static_cast<UINT>(configuration_.width);
+  desc.Height = static_cast<UINT>(configuration_.height);
+  desc.MipLevels = 1;
+  desc.ArraySize = 1;
+  desc.Format = DXGI_FORMAT_NV12;
+  desc.SampleDesc.Count = 1;
+  desc.Usage = D3D11_USAGE_DEFAULT;
+  ComPtr<ID3D11Texture2D> texture;
+  HRESULT hr = E_FAIL;
+  for (UINT bind_flags :
+       {static_cast<UINT>(D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE),
+        static_cast<UINT>(D3D11_BIND_SHADER_RESOURCE), 0u}) {
+    desc.BindFlags = bind_flags;
+    hr = d3d_.device->CreateTexture2D(&desc, nullptr, &texture);
+    if (SUCCEEDED(hr)) {
+      break;
+    }
+  }
+  if (FAILED(hr)) {
+    RTC_LOG(LS_ERROR) << "Failed to create NV12 encoder input texture: "
+                      << HResultToString(hr);
+    return hr;
+  }
+  input_textures_.push_back(texture);
+  RTC_LOG(LS_INFO) << "Allocated D3D11 encoder input texture "
+                   << input_textures_.size() << " (" << desc.Width << "x"
+                   << desc.Height << ", bind flags " << desc.BindFlags << ")";
+  *texture_out = texture.Detach();
+  return S_OK;
+}
+
+HRESULT MFH264EncoderImpl::CreateD3DInputSample(
+    const I420BufferInterface& buffer,
+    int64_t sample_time_100ns,
+    int64_t duration_100ns,
+    IMFSample** sample_out) {
+  const int width = buffer.width();
+  const int height = buffer.height();
+  if (width != configuration_.width || height != configuration_.height) {
+    RTC_LOG(LS_ERROR) << "Frame size " << width << "x" << height
+                      << " does not match encoder configuration "
+                      << configuration_.width << "x" << configuration_.height;
+    return E_INVALIDARG;
+  }
+
+  if (!staging_texture_) {
+    D3D11_TEXTURE2D_DESC desc = {};
+    desc.Width = static_cast<UINT>(width);
+    desc.Height = static_cast<UINT>(height);
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_NV12;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    HRESULT hr = d3d_.device->CreateTexture2D(&desc, nullptr, &staging_texture_);
+    if (FAILED(hr)) {
+      RTC_LOG(LS_ERROR) << "Failed to create NV12 staging texture: "
+                        << HResultToString(hr);
+      return hr;
+    }
+  }
+
+  D3D11_MAPPED_SUBRESOURCE mapped = {};
+  HRESULT hr = d3d_.context->Map(staging_texture_.Get(), 0, D3D11_MAP_WRITE, 0,
+                                 &mapped);
+  if (FAILED(hr)) {
+    return hr;
+  }
+  // Mapped NV12: Y rows at RowPitch, then the interleaved UV plane starting
+  // Height rows below with the same pitch.
+  uint8_t* dst_y = static_cast<uint8_t*>(mapped.pData);
+  uint8_t* dst_uv = dst_y + static_cast<size_t>(mapped.RowPitch) * height;
+  const int pitch = static_cast<int>(mapped.RowPitch);
+  int ret = libyuv::I420ToNV12(buffer.DataY(), buffer.StrideY(), buffer.DataU(),
+                               buffer.StrideU(), buffer.DataV(),
+                               buffer.StrideV(), dst_y, pitch, dst_uv, pitch,
+                               width, height);
+  d3d_.context->Unmap(staging_texture_.Get(), 0);
+  if (ret != 0) {
+    return E_FAIL;
+  }
+
+  ComPtr<ID3D11Texture2D> texture;
+  hr = AcquireInputTexture(&texture);
+  if (FAILED(hr)) {
+    return hr;
+  }
+  d3d_.context->CopyResource(texture.Get(), staging_texture_.Get());
+
+  ComPtr<IMFMediaBuffer> media_buffer;
+  hr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), texture.Get(), 0,
+                                 FALSE, &media_buffer);
+  if (FAILED(hr)) {
+    return hr;
+  }
+  DWORD length = 0;
+  ComPtr<IMF2DBuffer> buffer_2d;
+  if (SUCCEEDED(media_buffer.As(&buffer_2d)) &&
+      SUCCEEDED(buffer_2d->GetContiguousLength(&length))) {
+    media_buffer->SetCurrentLength(length);
+  } else if (SUCCEEDED(media_buffer->GetMaxLength(&length))) {
+    media_buffer->SetCurrentLength(length);
+  }
+
+  ComPtr<IMFSample> sample;
+  hr = MFCreateSample(&sample);
+  if (FAILED(hr)) {
+    return hr;
+  }
+  sample->AddBuffer(media_buffer.Get());
+  sample->SetSampleTime(sample_time_100ns);
+  sample->SetSampleDuration(duration_100ns);
+
+  *sample_out = sample.Detach();
+  return S_OK;
+}
+
 int32_t MFH264EncoderImpl::PumpEvents(int timeout_ms,
                                       bool until_need_input,
-                                      size_t until_pending_at_most) {
-  const ULONGLONG deadline = GetTickCount64() + timeout_ms;
+                                      size_t until_pending_at_most,
+                                      bool fail_on_timeout) {
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
   for (;;) {
     const bool goals_met = (!until_need_input || need_input_credits_ > 0) &&
                            pending_frames_.size() <= until_pending_at_most;
 
-    ComPtr<IMFMediaEvent> event;
-    HRESULT hr = event_generator_->GetEvent(MF_EVENT_FLAG_NO_WAIT, &event);
-    if (hr == MF_E_NO_EVENTS_AVAILABLE) {
-      if (goals_met) {
+    MediaEventType type = MEUnknown;
+    HRESULT status = S_OK;
+    const auto wait = goals_met
+                          ? std::chrono::steady_clock::duration::zero()
+                          : deadline - std::chrono::steady_clock::now();
+    const MFAsyncEventPump::WaitResult result =
+        event_pump_->Wait(wait, &type, &status);
+    if (result == MFAsyncEventPump::WaitResult::kTimeout) {
+      if (goals_met || !fail_on_timeout) {
         return WEBRTC_VIDEO_CODEC_OK;
       }
-      if (GetTickCount64() >= deadline) {
-        RTC_LOG(LS_ERROR) << "Timed out waiting for encoder MFT ("
-                          << (until_need_input ? "input slot" : "output")
-                          << ", " << pending_frames_.size()
-                          << " frames in flight).";
-        ReportError();
-        return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
-      }
-      Sleep(1);
-      continue;
+      RTC_LOG(LS_ERROR) << "Timed out waiting for encoder MFT ("
+                        << (until_need_input ? "input slot" : "output") << ", "
+                        << pending_frames_.size() << " frames in flight).";
+      ReportError();
+      return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
     }
-    if (FAILED(hr)) {
-      RTC_LOG(LS_ERROR) << "GetEvent failed: " << HResultToString(hr);
+    if (result == MFAsyncEventPump::WaitResult::kError) {
+      RTC_LOG(LS_ERROR) << "Encoder MFT event queue failed: "
+                        << HResultToString(status);
       ReportError();
       return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
     }
 
-    MediaEventType type = MEUnknown;
-    event->GetType(&type);
     if (type == METransformNeedInput) {
       need_input_credits_++;
     } else if (type == METransformHaveOutput) {
@@ -711,6 +995,7 @@ int32_t MFH264EncoderImpl::Encode(
     if (FAILED(hr)) {
       RTC_LOG(LS_WARNING) << "ForceKeyFrame rejected: " << HResultToString(hr);
     }
+    requested_keyframes_++;
   }
 
   const int64_t fps =
@@ -720,8 +1005,11 @@ int32_t MFH264EncoderImpl::Encode(
   frame_count_++;
 
   ComPtr<IMFSample> sample;
-  HRESULT hr = CreateInputSample(*frame_buffer, sample_time_100ns,
-                                 duration_100ns, &sample);
+  HRESULT hr = d3d_.manager
+                   ? CreateD3DInputSample(*frame_buffer, sample_time_100ns,
+                                          duration_100ns, &sample)
+                   : CreateInputSample(*frame_buffer, sample_time_100ns,
+                                       duration_100ns, &sample);
   if (FAILED(hr)) {
     RTC_LOG(LS_ERROR) << "Failed to create input sample: "
                       << HResultToString(hr);
@@ -755,8 +1043,27 @@ int32_t MFH264EncoderImpl::Encode(
 
   if (is_async_) {
     need_input_credits_--;
-    // Collect whatever the MFT already produced; block only when too many
-    // frames are in flight so encoder latency stays bounded.
+    // Give the hardware a short window to return this frame, so latency is
+    // the encode time rather than a whole frame interval. MFTs that hold a
+    // frame until more input arrives would miss this every time; stop
+    // waiting for those.
+    if (output_wait_misses_ < kMaxOutputWaitMisses) {
+      const int soft_wait_ms = std::max(
+          2, static_cast<int>(500 / std::max(1.0f, configuration_.max_frame_rate)));
+      int32_t ret = PumpEvents(soft_wait_ms, /*until_need_input=*/false,
+                               /*until_pending_at_most=*/0,
+                               /*fail_on_timeout=*/false);
+      if (ret != WEBRTC_VIDEO_CODEC_OK) {
+        return ret;
+      }
+      output_wait_misses_ = pending_frames_.empty() ? 0 : output_wait_misses_ + 1;
+      if (output_wait_misses_ == kMaxOutputWaitMisses) {
+        RTC_LOG(LS_INFO) << "Encoder MFT pipelines frames; no longer waiting "
+                            "for same-frame output.";
+      }
+    }
+    // Block only when too many frames are in flight so encoder latency
+    // stays bounded.
     return PumpEvents(kOutputWaitTimeoutMs, /*until_need_input=*/false,
                       /*until_pending_at_most=*/kMaxPendingFrames);
   }
@@ -917,6 +1224,16 @@ int32_t MFH264EncoderImpl::ProcessEncodedFrame(std::vector<uint8_t>& packet) {
     }
   }
 
+  if (is_idr) {
+    if (requested_keyframes_ > 0) {
+      requested_keyframes_--;
+    } else {
+      RTC_LOG(LS_VERBOSE) << "Encoder MFT produced an unrequested IDR ("
+                       << packet.size() << " bytes, bitrate "
+                       << active_bitrate_bps_ << ").";
+    }
+  }
+
   // Some vendor MFTs do not repeat SPS/PPS on every IDR; the RTP packetizer
   // needs them inline, so prepend the cached sequence header.
   if (is_idr && !has_sps) {
@@ -976,6 +1293,8 @@ VideoEncoder::EncoderInfo MFH264EncoderImpl::GetEncoderInfo() const {
   info.scaling_settings = VideoEncoder::ScalingSettings::kOff;
   info.is_hardware_accelerated = true;
   info.supports_simulcast = false;
+  // NV12 surfaces (and most hardware encoders) need even dimensions.
+  info.requested_resolution_alignment = 2;
   info.preferred_pixel_formats = {VideoFrameBuffer::Type::kI420};
   return info;
 }
