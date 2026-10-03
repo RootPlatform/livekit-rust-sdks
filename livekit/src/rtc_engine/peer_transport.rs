@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::{
+    collections::HashSet,
     fmt::{Debug, Formatter},
     sync::Arc,
 };
@@ -34,6 +35,7 @@ struct TransportInner {
     // Publish-side target bitrate (bps) for offer munging
     max_send_bitrate_bps: Option<u64>,
     pending_initial_offer: Option<SessionDescription>,
+    stereo_track_ids: HashSet<String>,
 }
 
 pub struct PeerTransport {
@@ -66,6 +68,7 @@ impl PeerTransport {
                 single_pc_mode,
                 max_send_bitrate_bps: None,
                 pending_initial_offer: None,
+                stereo_track_ids: HashSet::new(),
             })),
         }
     }
@@ -142,11 +145,26 @@ impl PeerTransport {
         offer: SessionDescription,
         options: AnswerOptions,
     ) -> EngineResult<SessionDescription> {
+        let offer_sdp = offer.to_string();
         self.set_remote_description(offer).await?;
-        let answer = self.peer_connection().create_answer(options).await?;
+        let mut answer = self.peer_connection().create_answer(options).await?;
+
+        let answer_sdp = answer.to_string();
+        let stereo_munged = Self::munge_answer_stereo_from_offer(&offer_sdp, &answer_sdp);
+        if stereo_munged != answer_sdp {
+            match SessionDescription::parse(&stereo_munged, answer.sdp_type()) {
+                Ok(parsed) => answer = parsed,
+                Err(e) => log::warn!("Failed to parse stereo-munged answer, using original: {e}"),
+            }
+        }
+
         self.peer_connection().set_local_description(answer.clone()).await?;
 
         Ok(answer)
+    }
+
+    pub async fn add_stereo_track(&self, track_id: String) {
+        self.inner.lock().await.stereo_track_ids.insert(track_id);
     }
 
     /// Create an initial offer without setting it as local description.
@@ -339,6 +357,114 @@ impl PeerTransport {
         munged
     }
 
+    fn split_sdp_sections(sdp: &str) -> (&'static str, Vec<Vec<String>>) {
+        let eol = if sdp.contains("\r\n") { "\r\n" } else { "\n" };
+        let mut sections: Vec<Vec<String>> = vec![Vec::new()];
+        for line in sdp.split(eol) {
+            if line.starts_with("m=") {
+                sections.push(Vec::new());
+            }
+            sections.last_mut().unwrap().push(line.to_string());
+        }
+        (eol, sections)
+    }
+
+    fn join_sdp_sections(eol: &str, sections: Vec<Vec<String>>) -> String {
+        let mut joined = sections.into_iter().flatten().collect::<Vec<_>>().join(eol);
+        if !joined.ends_with(eol) {
+            joined.push_str(eol);
+        }
+        joined
+    }
+
+    fn opus_payload_types(section: &[String]) -> Vec<String> {
+        if !section.first().is_some_and(|m| m.starts_with("m=audio")) {
+            return Vec::new();
+        }
+        section
+            .iter()
+            .filter_map(|line| {
+                let mut it = line.trim().strip_prefix("a=rtpmap:")?.split_whitespace();
+                let pt = it.next()?;
+                it.next()?.to_ascii_lowercase().starts_with("opus/48000").then(|| pt.to_string())
+            })
+            .collect()
+    }
+
+    fn fmtp_param<'a>(fmtp_line: &'a str, key: &str) -> Option<&'a str> {
+        let (_, params) = fmtp_line.trim().split_once(' ')?;
+        params.split(';').find_map(|p| {
+            let (k, v) = p.trim().split_once('=')?;
+            k.trim().eq_ignore_ascii_case(key).then(|| v.trim())
+        })
+    }
+
+    fn section_has_opus_param(section: &[String], key: &str, value: &str) -> bool {
+        Self::opus_payload_types(section).iter().any(|pt| {
+            let prefix = format!("a=fmtp:{pt} ");
+            section
+                .iter()
+                .any(|line| line.starts_with(&prefix) && Self::fmtp_param(line, key) == Some(value))
+        })
+    }
+
+    fn add_opus_stereo(section: &mut [String]) {
+        for pt in Self::opus_payload_types(section) {
+            let prefix = format!("a=fmtp:{pt} ");
+            for line in section.iter_mut() {
+                if line.starts_with(&prefix) && Self::fmtp_param(line, "stereo").is_none() {
+                    line.push_str(";stereo=1");
+                }
+            }
+        }
+    }
+
+    fn section_attribute<'a>(section: &'a [String], attr: &str) -> Option<&'a str> {
+        let prefix = format!("a={attr}:");
+        section.iter().find_map(|line| line.trim().strip_prefix(prefix.as_str()))
+    }
+
+    /// Adds `stereo=1` to the Opus fmtp of publisher m-sections carrying one of `track_ids`
+    /// (matched via `a=msid`), so the answer lets libwebrtc open a 2-channel encoder.
+    fn munge_stereo_for_tracks(sdp: &str, track_ids: &HashSet<String>) -> String {
+        let (eol, mut sections) = Self::split_sdp_sections(sdp);
+        for section in sections.iter_mut().skip(1) {
+            let is_stereo_track = Self::section_attribute(section, "msid")
+                .and_then(|msid| msid.split_whitespace().nth(1))
+                .is_some_and(|track_id| track_ids.contains(track_id));
+            if is_stereo_track {
+                Self::add_opus_stereo(section);
+            }
+        }
+        Self::join_sdp_sections(eol, sections)
+    }
+
+    /// livekit-client parity (`ensureAudioNackAndStereo`): the subscriber answer gets
+    /// `stereo=1` for every mid whose offered Opus fmtp carries `sprop-stereo=1`, otherwise
+    /// libwebrtc opens a mono decoder and downmixes stereo publishers.
+    fn munge_answer_stereo_from_offer(offer_sdp: &str, answer_sdp: &str) -> String {
+        let (_, offer_sections) = Self::split_sdp_sections(offer_sdp);
+        let stereo_mids: HashSet<&str> = offer_sections
+            .iter()
+            .skip(1)
+            .filter(|s| Self::section_has_opus_param(s, "sprop-stereo", "1"))
+            .filter_map(|s| Self::section_attribute(s, "mid"))
+            .collect();
+        if stereo_mids.is_empty() {
+            return answer_sdp.to_string();
+        }
+
+        let (eol, mut sections) = Self::split_sdp_sections(answer_sdp);
+        for section in sections.iter_mut().skip(1) {
+            let is_stereo_mid = Self::section_attribute(section, "mid")
+                .is_some_and(|mid| stereo_mids.contains(mid));
+            if is_stereo_mid {
+                Self::add_opus_stereo(section);
+            }
+        }
+        Self::join_sdp_sections(eol, sections)
+    }
+
     /// Check if a codec string represents a video codec that should get start bitrate hint.
     fn is_video_codec(codec: &str) -> bool {
         codec.starts_with("VP8/90000")
@@ -505,6 +631,21 @@ impl PeerTransport {
                     }
                     Err(e) => {
                         log::warn!("Failed to parse stereo-munged SDP, using original: {e}");
+                    }
+                }
+            }
+        }
+
+        if !inner.stereo_track_ids.is_empty() {
+            let stereo_munged = Self::munge_stereo_for_tracks(&sdp, &inner.stereo_track_ids);
+            if stereo_munged != sdp {
+                match SessionDescription::parse(&stereo_munged, offer.sdp_type()) {
+                    Ok(parsed) => {
+                        offer = parsed;
+                        sdp = stereo_munged;
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to parse stereo-track-munged SDP, using original: {e}");
                     }
                 }
             }
@@ -938,5 +1079,64 @@ a=rtpmap:111 opus/48000/2\n\
 a=fmtp:111 minptime=10;stereo=1\n";
         let out = PeerTransport::munge_stereo_for_audio(sdp);
         assert_eq!(out.matches("stereo=1").count(), 1);
+    }
+
+    #[test]
+    fn stereo_is_added_only_for_registered_tracks() {
+        let sdp = "v=0\r\n\
+o=- 0 0 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+a=mid:0\r\n\
+a=msid:- mic-track\r\n\
+a=rtpmap:111 opus/48000/2\r\n\
+a=fmtp:111 minptime=10;useinbandfec=1\r\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+a=mid:1\r\n\
+a=msid:- screen-audio\r\n\
+a=rtpmap:111 opus/48000/2\r\n\
+a=fmtp:111 minptime=10;useinbandfec=1\r\n";
+        let ids = ["screen-audio".to_string()].into_iter().collect();
+        let out = PeerTransport::munge_stereo_for_tracks(sdp, &ids);
+        assert_eq!(out.matches("stereo=1").count(), 1);
+        assert!(out.contains(
+            "a=msid:- screen-audio\r\na=rtpmap:111 opus/48000/2\r\na=fmtp:111 minptime=10;useinbandfec=1;stereo=1\r\n"
+        ));
+        assert!(out.ends_with("\r\n") && !out.ends_with("\r\n\r\n"));
+    }
+
+    #[test]
+    fn answer_gets_stereo_for_sprop_stereo_mids() {
+        let offer = "v=0\n\
+o=- 0 0 IN IP4 127.0.0.1\n\
+s=-\n\
+t=0 0\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 111\n\
+a=mid:0\n\
+a=rtpmap:111 opus/48000/2\n\
+a=fmtp:111 minptime=10;useinbandfec=1\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 111\n\
+a=mid:1\n\
+a=rtpmap:111 opus/48000/2\n\
+a=fmtp:111 minptime=10;sprop-stereo=1;useinbandfec=1\n";
+        let answer = "v=0\n\
+o=- 0 0 IN IP4 127.0.0.1\n\
+s=-\n\
+t=0 0\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 111\n\
+a=mid:0\n\
+a=rtpmap:111 opus/48000/2\n\
+a=fmtp:111 minptime=10;useinbandfec=1\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 111\n\
+a=mid:1\n\
+a=rtpmap:111 opus/48000/2\n\
+a=fmtp:111 minptime=10;useinbandfec=1\n";
+        let out = PeerTransport::munge_answer_stereo_from_offer(offer, answer);
+        assert_eq!(out.matches(";stereo=1").count(), 1);
+        assert!(out.ends_with(
+            "a=mid:1\na=rtpmap:111 opus/48000/2\na=fmtp:111 minptime=10;useinbandfec=1;stereo=1\n"
+        ));
+        assert_eq!(PeerTransport::munge_answer_stereo_from_offer(answer, answer), answer);
     }
 }

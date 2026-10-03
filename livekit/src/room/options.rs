@@ -122,9 +122,13 @@ pub struct TrackPublishOptions {
     pub dtx: bool,
     pub red: bool,
     pub simulcast: bool,
-    /// Custom simulcast layer presets (low, mid). When set, these override the
-    /// SDK's built-in defaults which reduce fps on lower layers.
+    /// Custom simulcast layer presets (low, mid). When set and non-empty, these
+    /// replace the SDK's built-in lower layers (see `compute_custom_simulcast_encodings`).
     pub simulcast_layers: Option<Vec<VideoPreset>>,
+    /// Publish audio as stereo Opus (AddTrackRequest stereo + TF_STEREO, and
+    /// `stereo=1` on this track's Opus fmtp in the publisher offer). The audio
+    /// source must provide 2 channels for the encoder to carry distinct L/R.
+    pub force_stereo: bool,
     // pub name: String,
     pub source: TrackSource,
     pub stream: String,
@@ -163,6 +167,7 @@ impl Default for TrackPublishOptions {
             red: true,
             simulcast: true,
             simulcast_layers: None,
+            force_stereo: false,
             source: TrackSource::Unknown,
             stream: "".to_string(),
             preconnect_buffer: false,
@@ -249,10 +254,11 @@ pub fn compute_video_encodings(
         return into_rtp_encodings(width, height, &[initial_preset]);
     }
 
-    let mut simulcast_presets = match options.simulcast_layers {
-        Some(ref custom) => custom.clone(),
-        None => compute_default_simulcast_presets(screenshare, &initial_preset),
-    };
+    if let Some(custom) = options.simulcast_layers.as_ref().filter(|layers| !layers.is_empty()) {
+        return compute_custom_simulcast_encodings(width, height, initial_preset, custom);
+    }
+
+    let mut simulcast_presets = compute_default_simulcast_presets(screenshare, &initial_preset);
 
     let mid_preset = simulcast_presets.pop();
     let low_preset = simulcast_presets.pop();
@@ -272,6 +278,38 @@ pub fn compute_video_encodings(
 
     // Other layers not needed
     into_rtp_encodings(width, height, &[initial_preset])
+}
+
+/// Mirrors livekit-client's `computeVideoEncodings` for caller-provided layers:
+/// presets are sorted by (max_bitrate, max_framerate); the lowest is always used
+/// from 480px, the second-lowest is added from 960px. Extra presets are ignored.
+fn compute_custom_simulcast_encodings(
+    width: u32,
+    height: u32,
+    initial_preset: VideoPreset,
+    custom: &[VideoPreset],
+) -> Vec<RtpEncodingParameters> {
+    let mut presets = custom.to_vec();
+    presets.sort_by(|a, b| {
+        a.encoding.max_bitrate.cmp(&b.encoding.max_bitrate).then(
+            a.encoding
+                .max_framerate
+                .partial_cmp(&b.encoding.max_framerate)
+                .unwrap_or(std::cmp::Ordering::Equal),
+        )
+    });
+    let mut presets = presets.into_iter();
+    let low_preset = presets.next();
+    let mid_preset = presets.next();
+
+    let size = u32::max(width, height);
+    match (low_preset, mid_preset) {
+        (Some(low), Some(mid)) if size >= 960 => {
+            into_rtp_encodings(width, height, &[low, mid, initial_preset])
+        }
+        (Some(low), _) if size >= 480 => into_rtp_encodings(width, height, &[low, initial_preset]),
+        _ => into_rtp_encodings(width, height, &[initial_preset]),
+    }
 }
 
 /// Return an appropriate VideoEncdoding for the specified resolution based on our presets
@@ -556,10 +594,82 @@ pub mod screenshare {
 #[cfg(test)]
 mod tests {
     use super::{
-        get_default_degradation_preference, DegradationPreference, TrackPublishOptions,
-        VideoEncoderBackend,
+        compute_video_encodings, get_default_degradation_preference, DegradationPreference,
+        TrackPublishOptions, VideoEncoderBackend, VideoEncoding, VideoPreset,
     };
     use crate::prelude::TrackSource;
+
+    fn layer_summary(
+        width: u32,
+        height: u32,
+        options: &TrackPublishOptions,
+    ) -> Vec<(String, f64, u64, f64)> {
+        compute_video_encodings(width, height, options)
+            .into_iter()
+            .map(|e| {
+                (
+                    e.rid,
+                    e.scale_resolution_down_by.unwrap(),
+                    e.max_bitrate.unwrap(),
+                    e.max_framerate.unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn custom_camera_layers_replace_defaults_and_are_sorted() {
+        let options = TrackPublishOptions {
+            source: TrackSource::Camera,
+            video_encoding: Some(VideoEncoding { max_bitrate: 1_700_000, max_framerate: 30.0 }),
+            simulcast_layers: Some(vec![
+                VideoPreset::new(640, 360, 450_000, 30.0),
+                VideoPreset::new(320, 180, 160_000, 30.0),
+            ]),
+            ..Default::default()
+        };
+        assert_eq!(
+            layer_summary(1280, 720, &options),
+            vec![
+                ("f".to_string(), 1.0, 1_700_000, 30.0),
+                ("h".to_string(), 2.0, 450_000, 30.0),
+                ("q".to_string(), 4.0, 160_000, 30.0),
+            ]
+        );
+        assert_eq!(
+            layer_summary(640, 480, &options),
+            vec![
+                ("h".to_string(), 1.0, 1_700_000, 30.0),
+                ("q".to_string(), 480.0 / 180.0, 160_000, 30.0)
+            ]
+        );
+        assert_eq!(layer_summary(320, 240, &options).len(), 1);
+    }
+
+    #[test]
+    fn custom_single_screenshare_layer() {
+        let options = TrackPublishOptions {
+            source: TrackSource::Screenshare,
+            video_encoding: Some(VideoEncoding { max_bitrate: 2_500_000, max_framerate: 30.0 }),
+            simulcast_layers: Some(vec![VideoPreset::new(1280, 720, 1_200_000, 30.0)]),
+            ..Default::default()
+        };
+        assert_eq!(
+            layer_summary(2560, 1440, &options),
+            vec![("h".to_string(), 1.0, 2_500_000, 30.0), ("q".to_string(), 2.0, 1_200_000, 30.0)]
+        );
+    }
+
+    #[test]
+    fn empty_custom_layers_use_defaults() {
+        let custom = TrackPublishOptions {
+            source: TrackSource::Camera,
+            simulcast_layers: Some(Vec::new()),
+            ..Default::default()
+        };
+        let default = TrackPublishOptions { source: TrackSource::Camera, ..Default::default() };
+        assert_eq!(layer_summary(1280, 720, &custom), layer_summary(1280, 720, &default));
+    }
 
     #[test]
     fn track_publish_options_default_encoder_is_auto() {

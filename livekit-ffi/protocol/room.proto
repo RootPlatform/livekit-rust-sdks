@@ -326,6 +326,20 @@ message TrackPublishOptions {
   // Controls how the encoder trades off between resolution and framerate
   // when bandwidth is constrained. Default is MAINTAIN_RESOLUTION.
   optional DegradationPreference degradation_preference = 13;
+
+  // RootApp fork extensions use field numbers >= 100 so they never collide with upstream.
+  // Explicit lower simulcast layers; when non-empty they replace the SDK's default
+  // lower layers (sorted by max_bitrate, lowest used from 480px, second from 960px).
+  repeated VideoLayerPreset simulcast_layers = 100;
+  // Publish audio as stereo Opus (TF_STEREO + stereo=1 on this track's Opus fmtp).
+  optional bool force_stereo = 101;
+}
+
+message VideoLayerPreset {
+  required uint32 width = 1;
+  required uint32 height = 2;
+  required uint64 max_bitrate = 3;
+  required double max_framerate = 4;
 }
 
 enum VideoEncoderBackend {

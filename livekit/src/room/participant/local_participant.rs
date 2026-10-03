@@ -381,6 +381,8 @@ impl LocalParticipant {
         video_send_encodings: Option<Vec<RtpEncodingParameters>>,
     ) -> RoomResult<LocalTrackPublication> {
         let disable_red = self.local.encryption_type != EncryptionType::None || !options.red;
+        let is_audio = matches!(track, LocalTrack::Audio(_));
+        let stereo = is_audio && options.force_stereo;
 
         let mut req = proto::AddTrackRequest {
             cid: track.rtc_track().id(),
@@ -389,6 +391,7 @@ impl LocalParticipant {
             muted: track.is_muted(),
             source: proto::TrackSource::from(options.source) as i32,
             disable_dtx: !options.dtx,
+            stereo,
             disable_red,
             encryption: proto::encryption::Type::from(self.local.encryption_type) as i32,
             stream: options.stream.clone(),
@@ -397,6 +400,15 @@ impl LocalParticipant {
 
         if options.preconnect_buffer {
             req.audio_features.push(proto::AudioTrackFeature::TfPreconnectBuffer as i32);
+        }
+
+        if is_audio {
+            if stereo {
+                req.audio_features.push(proto::AudioTrackFeature::TfStereo as i32);
+            }
+            if !options.dtx {
+                req.audio_features.push(proto::AudioTrackFeature::TfNoDtx as i32);
+            }
         }
 
         req.packet_trailer_features =

@@ -1911,6 +1911,10 @@ impl SessionInner {
             self.publisher_pc.set_max_send_bitrate_bps(ultimate_bps).await;
         }
 
+        if track.kind() == TrackKind::Audio && options.force_stereo {
+            self.publisher_pc.add_stereo_track(track.rtc_track().id()).await;
+        }
+
         let init = RtpTransceiverInit {
             direction: RtpTransceiverDirection::SendOnly,
             stream_ids: Default::default(),

@@ -20,7 +20,7 @@ use livekit::{
     },
     options::{
         AudioEncoding, DegradationPreference, FrameMetadataFeatures, TrackPublishOptions,
-        VideoEncoderBackend, VideoEncoding,
+        VideoEncoderBackend, VideoEncoding, VideoPreset,
     },
     prelude::*,
     webrtc::{
@@ -356,7 +356,12 @@ impl From<proto::TrackPublishOptions> for TrackPublishOptions {
             red: opts.red.unwrap_or(default_publish_options.red),
             simulcast: opts.simulcast.unwrap_or(default_publish_options.simulcast),
             stream: opts.stream.unwrap_or(default_publish_options.stream),
-            simulcast_layers: default_publish_options.simulcast_layers,
+            simulcast_layers: if opts.simulcast_layers.is_empty() {
+                default_publish_options.simulcast_layers
+            } else {
+                Some(opts.simulcast_layers.into_iter().map(Into::into).collect())
+            },
+            force_stereo: opts.force_stereo.unwrap_or(default_publish_options.force_stereo),
             preconnect_buffer: opts
                 .preconnect_buffer
                 .unwrap_or(default_publish_options.preconnect_buffer),
@@ -374,6 +379,12 @@ impl From<proto::TrackPublishOptions> for TrackPublishOptions {
 impl From<proto::VideoEncoding> for VideoEncoding {
     fn from(opts: proto::VideoEncoding) -> Self {
         Self { max_bitrate: opts.max_bitrate, max_framerate: opts.max_framerate }
+    }
+}
+
+impl From<proto::VideoLayerPreset> for VideoPreset {
+    fn from(preset: proto::VideoLayerPreset) -> Self {
+        VideoPreset::new(preset.width, preset.height, preset.max_bitrate, preset.max_framerate)
     }
 }
 
@@ -453,6 +464,43 @@ mod tests {
         for (proto_backend, expected) in cases {
             assert_eq!(video_encoder_from_proto(Some(proto_backend as i32)), Some(expected));
         }
+    }
+
+    #[test]
+    fn rootapp_extensions_default_to_upstream_behavior() {
+        let options = TrackPublishOptions::from(proto::TrackPublishOptions::default());
+
+        assert!(options.simulcast_layers.is_none());
+        assert!(!options.force_stereo);
+    }
+
+    #[test]
+    fn rootapp_extensions_map_layers_and_stereo() {
+        let options = TrackPublishOptions::from(proto::TrackPublishOptions {
+            simulcast_layers: vec![
+                proto::VideoLayerPreset {
+                    width: 640,
+                    height: 360,
+                    max_bitrate: 450_000,
+                    max_framerate: 30.0,
+                },
+                proto::VideoLayerPreset {
+                    width: 320,
+                    height: 180,
+                    max_bitrate: 160_000,
+                    max_framerate: 30.0,
+                },
+            ],
+            force_stereo: Some(true),
+            ..Default::default()
+        });
+
+        let layers = options.simulcast_layers.unwrap();
+        assert_eq!(layers.len(), 2);
+        assert_eq!((layers[0].width, layers[0].height), (640, 360));
+        assert_eq!(layers[0].encoding.max_bitrate, 450_000);
+        assert_eq!(layers[1].encoding.max_framerate, 30.0);
+        assert!(options.force_stereo);
     }
 }
 
