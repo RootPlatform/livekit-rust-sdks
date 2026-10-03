@@ -21,6 +21,7 @@
 #include <optional>
 #include <vector>
 
+#include "api/task_queue/task_queue_base.h"
 #include "api/video_codecs/video_encoder.h"
 #include "api/video_codecs/video_encoder_factory.h"
 
@@ -32,7 +33,33 @@ struct VideoEncoderBackendFactory {
   std::unique_ptr<webrtc::VideoEncoderFactory> factory;
 };
 
+// A sender's first encoder is created from the format libwebrtc picked from
+// GetImplementations() (the first, i.e. hardware, implementation) before the
+// sender's encoder selector can request its backend, so a Software sender
+// used to open and InitEncode a hardware session and then switch. The
+// selector learns of that encoder (OnCurrentEncoder) on the encoder task
+// queue before SimulcastEncoderAdapter creates the per-layer encoders on the
+// same queue, so it records its backend here and creates on that queue use
+// it in place of the format's tag.
+void SetEncoderBackendForTaskQueue(webrtc::TaskQueueBase* queue,
+                                   const void* owner,
+                                   VideoEncoderBackend backend);
+void ClearEncoderBackendForTaskQueue(webrtc::TaskQueueBase* queue,
+                                     const void* owner);
+
 class VideoEncoderFactory : public webrtc::VideoEncoderFactory {
+  // Hands SimulcastEncoderAdapter a software encoder for each hardware layer;
+  // SEA wraps the pair in VideoEncoderSoftwareFallbackWrapper, so a layer
+  // whose hardware encoder fails InitEncode or returns
+  // WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE keeps encoding in software.
+  class SoftwareFallbackFactory : public webrtc::VideoEncoderFactory {
+   public:
+    std::vector<webrtc::SdpVideoFormat> GetSupportedFormats() const override;
+
+    std::unique_ptr<webrtc::VideoEncoder> Create(
+        const webrtc::Environment& env, const webrtc::SdpVideoFormat& format) override;
+  };
+
   class InternalFactory : public webrtc::VideoEncoderFactory {
    public:
     InternalFactory();
@@ -68,5 +95,6 @@ class VideoEncoderFactory : public webrtc::VideoEncoderFactory {
 
  private:
   std::unique_ptr<InternalFactory> internal_factory_;
+  std::unique_ptr<SoftwareFallbackFactory> software_fallback_factory_;
 };
 }  // namespace livekit_ffi

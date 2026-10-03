@@ -34,6 +34,14 @@ class VideoDecoderFactory : public webrtc::VideoDecoderFactory {
       const webrtc::Environment& env, const webrtc::SdpVideoFormat& format) override;
 
  private:
+  // Platform H.264 decoders run behind VideoDecoderSoftwareFallbackWrapper
+  // with the internal decoder, so a hardware failure (configure, device
+  // loss, unsupported stream size) keeps the stream decoding in software.
+  std::unique_ptr<webrtc::VideoDecoder> WithSoftwareFallback(
+      const webrtc::Environment& env,
+      const webrtc::SdpVideoFormat& format,
+      std::unique_ptr<webrtc::VideoDecoder> decoder) const;
+
   std::vector<std::unique_ptr<webrtc::VideoDecoderFactory>> factories_;
   const bool internal_h264_decoder_works_;
 };

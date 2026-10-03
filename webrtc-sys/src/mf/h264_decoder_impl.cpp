@@ -49,6 +49,39 @@ uint32_t SampleTimeToRtp(int64_t sample_time) {
   return static_cast<uint32_t>((sample_time * 9 + 500) / 1000);
 }
 
+// Lost or failed hardware: VideoDecoderSoftwareFallbackWrapper switches to
+// the internal decoder on WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE. Anything else
+// is a plain error, after which webrtc requests a keyframe.
+int32_t DecodeFailure(HRESULT hr) {
+  switch (hr) {
+    case DXGI_ERROR_DEVICE_REMOVED:
+    case DXGI_ERROR_DEVICE_RESET:
+    case DXGI_ERROR_DEVICE_HUNG:
+    case DXGI_ERROR_DRIVER_INTERNAL_ERROR:
+    case MF_E_HW_MFT_FAILED_START_STREAMING:
+    case E_OUTOFMEMORY:
+      return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
+    default:
+      return WEBRTC_VIDEO_CODEC_ERROR;
+  }
+}
+
+// Test-only: LK_MF_FAULT_DECODE_AFTER_FRAMES=N makes ProcessInput report
+// DXGI_ERROR_DEVICE_REMOVED once N frames have been decoded.
+std::optional<int64_t> DecodeFaultAfterFrames() {
+  static const std::optional<int64_t> frames = [] {
+    std::optional<int64_t> n =
+        livekit_ffi::GetEnvInt("LK_MF_FAULT_DECODE_AFTER_FRAMES");
+    if (n) {
+      RTC_LOG(LS_WARNING) << "MF decoder fault injection active: device "
+                             "removal after "
+                          << *n << " frames";
+    }
+    return n;
+  }();
+  return frames;
+}
+
 }  // namespace
 
 MFH264DecoderImpl::MFH264DecoderImpl() : buffer_pool_(false) {}
@@ -58,11 +91,21 @@ MFH264DecoderImpl::~MFH264DecoderImpl() {
 }
 
 VideoDecoder::DecoderInfo MFH264DecoderImpl::GetDecoderInfo() const {
+  // Without a usable DXVA path the MFT decodes on the CPU even when it was
+  // handed a device manager, so report what the output buffers show.
   VideoDecoder::DecoderInfo info;
-  info.implementation_name = use_d3d_
+  if (!transform_ && !output_is_dxgi_) {
+    // Not configured yet. VideoDecoderSoftwareFallbackWrapper caches its
+    // "fallback from" name from this, so do not claim either mode.
+    info.implementation_name = "MediaFoundation H264 Decoder";
+    info.is_hardware_accelerated = true;
+    return info;
+  }
+  const bool hardware = output_is_dxgi_.value_or(use_d3d_);
+  info.implementation_name = hardware
                                  ? "MediaFoundation H264 Decoder (DXVA)"
                                  : "MediaFoundation H264 Decoder (software)";
-  info.is_hardware_accelerated = use_d3d_;
+  info.is_hardware_accelerated = hardware;
   return info;
 }
 
@@ -119,6 +162,9 @@ bool MFH264DecoderImpl::Configure(const Settings& settings) {
   }
 
   settings_ = settings;
+  // Kept across Release() so the fallback wrapper's "fallback from" name
+  // still says what the hardware decoder was doing.
+  output_is_dxgi_.reset();
 
   if (!livekit_ffi::EnsureComInitialized() || !livekit_ffi::EnsureMFStarted()) {
     return false;
@@ -276,6 +322,7 @@ int32_t MFH264DecoderImpl::Release() {
   d3d_context_.Reset();
   d3d_device_.Reset();
   use_d3d_ = false;
+  frames_decoded_ = 0;
   buffer_pool_.Release();
   return WEBRTC_VIDEO_CODEC_OK;
 }
@@ -328,6 +375,14 @@ int32_t MFH264DecoderImpl::Decode(const EncodedImage& input_image,
   sample->SetSampleTime(RtpToSampleTime(input_image.RtpTimestamp()));
 
   for (int attempt = 0; attempt < 2; attempt++) {
+    if (DecodeFaultAfterFrames() &&
+        frames_decoded_ >= *DecodeFaultAfterFrames()) {
+      RTC_LOG(LS_WARNING) << "LK_MF_FAULT_DECODE_AFTER_FRAMES: simulating "
+                             "device removal after "
+                          << frames_decoded_ << " frames.";
+      hr = DXGI_ERROR_DEVICE_REMOVED;
+      break;
+    }
     hr = transform_->ProcessInput(input_stream_id_, sample.Get(), 0);
     if (hr != MF_E_NOTACCEPTING) {
       break;
@@ -341,7 +396,7 @@ int32_t MFH264DecoderImpl::Decode(const EncodedImage& input_image,
   if (FAILED(hr)) {
     RTC_LOG(LS_ERROR) << "Decoder ProcessInput failed: "
                       << HResultToString(hr);
-    return WEBRTC_VIDEO_CODEC_ERROR;
+    return DecodeFailure(hr);
   }
 
   return DrainOutputs(qp);
@@ -403,7 +458,7 @@ int32_t MFH264DecoderImpl::DrainOutputs(std::optional<int> qp) {
     if (FAILED(hr)) {
       RTC_LOG(LS_ERROR) << "Decoder ProcessOutput failed: "
                         << HResultToString(hr);
-      return WEBRTC_VIDEO_CODEC_ERROR;
+      return DecodeFailure(hr);
     }
 
     ComPtr<IMFSample> sample;
@@ -439,11 +494,19 @@ int32_t MFH264DecoderImpl::DeliverSample(IMFSample* sample,
   const UINT32 crop_y = has_aperture_ ? display_aperture_.OffsetY.value : 0;
 
   ComPtr<IMFDXGIBuffer> dxgi_buffer;
-  if (use_d3d_ && SUCCEEDED(buffer.As(&dxgi_buffer))) {
+  const bool is_dxgi = use_d3d_ && SUCCEEDED(buffer.As(&dxgi_buffer));
+  if (output_is_dxgi_ != is_dxgi) {
+    RTC_LOG(LS_INFO) << "MF H264 decoder output is "
+                     << (is_dxgi ? "DXVA (D3D11 surfaces)"
+                                 : "system memory (software decode)");
+    output_is_dxgi_ = is_dxgi;
+  }
+  frames_decoded_++;
+  if (is_dxgi) {
     ComPtr<ID3D11Texture2D> texture;
     hr = dxgi_buffer->GetResource(IID_PPV_ARGS(&texture));
     if (FAILED(hr)) {
-      return WEBRTC_VIDEO_CODEC_ERROR;
+      return DecodeFailure(hr);
     }
     UINT subresource = 0;
     dxgi_buffer->GetSubresourceIndex(&subresource);
@@ -474,7 +537,7 @@ int32_t MFH264DecoderImpl::DeliverSample(IMFSample* sample,
       if (FAILED(hr)) {
         RTC_LOG(LS_ERROR) << "Failed to create staging texture: "
                           << HResultToString(hr);
-        return WEBRTC_VIDEO_CODEC_ERROR;
+        return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
       }
     }
 
@@ -485,7 +548,9 @@ int32_t MFH264DecoderImpl::DeliverSample(IMFSample* sample,
     hr = d3d_context_->Map(staging_texture_.Get(), 0, D3D11_MAP_READ, 0,
                            &mapped);
     if (FAILED(hr)) {
-      return WEBRTC_VIDEO_CODEC_ERROR;
+      RTC_LOG(LS_ERROR) << "Decoder staging Map failed: "
+                        << HResultToString(hr);
+      return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
     }
     const uint8_t* base = static_cast<const uint8_t*>(mapped.pData);
     const uint8_t* data_y = base + crop_y * mapped.RowPitch + crop_x;

@@ -20,8 +20,10 @@
 #include <memory>
 #include <optional>
 
+#include "api/task_queue/task_queue_base.h"
 #include "api/video_codecs/sdp_video_format.h"
 #include "api/video_codecs/video_encoder_factory.h"
+#include "livekit/video_encoder_factory.h"
 #include "rust/cxx.h"
 #include "rtc_base/logging.h"
 #include "webrtc-sys/src/rtp_sender.rs.h"
@@ -94,9 +96,28 @@ class FixedVideoEncoderSelector final
   explicit FixedVideoEncoderSelector(VideoEncoderBackend backend)
       : backend_(backend) {}
 
+  ~FixedVideoEncoderSelector() override {
+    ClearEncoderBackendForTaskQueue(queue_, this);
+  }
+
   void OnCurrentEncoder(const webrtc::SdpVideoFormat& format) override {
     current_encoder_ = format;
     requested_ = BackendFromFormat(format) == backend_;
+    // The pre-encoded backend keeps the explicit switch: a stale queue
+    // entry must never turn another sender's encoder into a pass-through.
+    if (requested_ || backend_ == VideoEncoderBackend::PreEncoded) {
+      return;
+    }
+    webrtc::TaskQueueBase* queue = webrtc::TaskQueueBase::Current();
+    if (!queue) {
+      return;
+    }
+    if (queue_ != queue) {
+      ClearEncoderBackendForTaskQueue(queue_, this);
+      queue_ = queue;
+    }
+    SetEncoderBackendForTaskQueue(queue_, this, backend_);
+    requested_ = true;
   }
 
   std::optional<webrtc::SdpVideoFormat> OnAvailableBitrate(
@@ -135,6 +156,7 @@ class FixedVideoEncoderSelector final
   VideoEncoderBackend backend_;
   bool requested_ = false;
   std::optional<webrtc::SdpVideoFormat> current_encoder_;
+  webrtc::TaskQueueBase* queue_ = nullptr;
 };
 
 }  // namespace

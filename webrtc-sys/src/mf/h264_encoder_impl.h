@@ -170,6 +170,10 @@ class MFH264EncoderImpl : public VideoEncoder {
   std::deque<PendingFrameInfo> pending_frames_;
   PendingFrameInfo pending_output_info_;
   int64_t frame_count_ = 0;
+  // Frames accepted by ProcessInput since InitEncode.
+  int64_t frames_submitted_ = 0;
+  // This encoder holds a hardware session (counted for LK_MF_MAX_SESSIONS).
+  bool session_open_ = false;
   std::vector<uint8_t> sequence_header_;
   std::vector<uint8_t> packet_;
   std::string friendly_name_;

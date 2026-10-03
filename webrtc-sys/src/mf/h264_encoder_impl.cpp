@@ -66,6 +66,43 @@ constexpr size_t kMaxPendingFrames = 4;
 // input samples late.
 constexpr size_t kMaxInputTextures = 16;
 
+// Every runtime hardware failure asks the VideoEncoderSoftwareFallbackWrapper
+// that SimulcastEncoderAdapter puts around this encoder to continue in
+// software. ENCODER_FAILURE instead would make webrtc request a codec switch,
+// which cannot recover when H.264 is the only negotiated codec.
+constexpr int32_t kHardwareFailure = WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
+
+// Test-only fault injection, read once per process:
+//   LK_MF_FAULT_INIT=1           InitEncode fails.
+//   LK_MF_FAULT_AFTER_FRAMES=N   ProcessInput reports DXGI_ERROR_DEVICE_REMOVED
+//                                from the (N+1)th frame after InitEncode.
+//   LK_MF_MAX_SESSIONS=N         InitEncode fails while N MF encoder sessions
+//                                are open (simulates NVENC session limits).
+struct FaultInjection {
+  bool fail_init = false;
+  std::optional<int64_t> fail_after_frames;
+  std::optional<int64_t> max_sessions;
+};
+
+const FaultInjection& Faults() {
+  static const FaultInjection faults = [] {
+    FaultInjection f;
+    f.fail_init = livekit_ffi::EnvFlagSet("LK_MF_FAULT_INIT");
+    f.fail_after_frames = livekit_ffi::GetEnvInt("LK_MF_FAULT_AFTER_FRAMES");
+    f.max_sessions = livekit_ffi::GetEnvInt("LK_MF_MAX_SESSIONS");
+    if (f.fail_init || f.fail_after_frames || f.max_sessions) {
+      RTC_LOG(LS_WARNING) << "MF encoder fault injection active: init="
+                          << f.fail_init << " after_frames="
+                          << f.fail_after_frames.value_or(-1)
+                          << " max_sessions=" << f.max_sessions.value_or(-1);
+    }
+    return f;
+  }();
+  return faults;
+}
+
+std::atomic<int> g_open_sessions{0};
+
 HRESULT SetCodecApiUInt32(ICodecAPI* api, const GUID& guid, UINT32 value) {
   VARIANT v = {};
   v.vt = VT_UI4;
@@ -354,6 +391,12 @@ int32_t MFH264EncoderImpl::InitEncode(const VideoCodec* inst,
     return WEBRTC_VIDEO_CODEC_ERROR;
   }
 
+  if (Faults().fail_init) {
+    RTC_LOG(LS_WARNING) << "LK_MF_FAULT_INIT: failing MF H264 InitEncode.";
+    ReportError();
+    return WEBRTC_VIDEO_CODEC_ERROR;
+  }
+
   int32_t ret = CreateTransform();
   if (ret != WEBRTC_VIDEO_CODEC_OK) {
     ReportError();
@@ -379,6 +422,12 @@ int32_t MFH264EncoderImpl::InitEncode(const VideoCodec* inst,
 }
 
 int32_t MFH264EncoderImpl::CreateTransform() {
+  if (Faults().max_sessions &&
+      g_open_sessions.load() >= *Faults().max_sessions) {
+    RTC_LOG(LS_WARNING) << "LK_MF_MAX_SESSIONS: " << g_open_sessions.load()
+                        << " MF encoder sessions open, refusing another.";
+    return WEBRTC_VIDEO_CODEC_ERROR;
+  }
   std::vector<ComPtr<IMFActivate>> activates =
       livekit_ffi::EnumHardwareH264Encoders();
   if (activates.empty()) {
@@ -390,6 +439,9 @@ int32_t MFH264EncoderImpl::CreateTransform() {
     HRESULT hr = ActivateTransform(activate.Get());
     if (SUCCEEDED(hr)) {
       if (ConfigureTransform() == WEBRTC_VIDEO_CODEC_OK) {
+        session_open_ = true;
+        RTC_LOG(LS_INFO) << "MF encoder sessions open: "
+                         << ++g_open_sessions;
         return WEBRTC_VIDEO_CODEC_OK;
       }
       hr = E_FAIL;
@@ -627,9 +679,9 @@ int32_t MFH264EncoderImpl::ReinitTransform() {
   pending_frames_.clear();
   frame_count_ = 0;
   if (CreateTransform() != WEBRTC_VIDEO_CODEC_OK) {
-    RTC_LOG(LS_ERROR) << "MF H264 encoder re-init failed; requesting an "
-                         "encoder switch.";
-    return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+    RTC_LOG(LS_ERROR) << "MF H264 encoder re-init failed; falling back to "
+                         "software.";
+    return kHardwareFailure;
   }
   configuration_.key_frame_request = true;
   return WEBRTC_VIDEO_CODEC_OK;
@@ -685,10 +737,15 @@ int32_t MFH264EncoderImpl::Release() {
   ReleaseTransform();
   pending_frames_.clear();
   frame_count_ = 0;
+  frames_submitted_ = 0;
   return WEBRTC_VIDEO_CODEC_OK;
 }
 
 void MFH264EncoderImpl::ReleaseTransform() {
+  if (session_open_) {
+    session_open_ = false;
+    --g_open_sessions;
+  }
   if (drain_safety_) {
     drain_safety_->SetNotAlive();
     drain_safety_ = nullptr;
@@ -938,13 +995,13 @@ int32_t MFH264EncoderImpl::PumpEvents(int timeout_ms,
                         << (until_need_input ? "input slot" : "output") << ", "
                         << pending_frames_.size() << " frames in flight).";
       ReportError();
-      return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+      return kHardwareFailure;
     }
     if (result == MFAsyncEventPump::WaitResult::kError) {
       RTC_LOG(LS_ERROR) << "Encoder MFT event queue failed: "
                         << HResultToString(status);
       ReportError();
-      return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+      return kHardwareFailure;
     }
 
     if (type == METransformNeedInput) {
@@ -968,7 +1025,7 @@ int32_t MFH264EncoderImpl::Encode(
   }
   if (!transform_ || async_failed_) {
     ReportError();
-    return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+    return kHardwareFailure;
   }
   if (!encoded_image_callback_) {
     RTC_LOG(LS_WARNING)
@@ -993,7 +1050,7 @@ int32_t MFH264EncoderImpl::Encode(
                       << VideoFrameBufferTypeToString(
                              input_frame.video_frame_buffer()->type())
                       << " image to I420. Can't encode frame.";
-    return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+    return kHardwareFailure;
   }
   RTC_CHECK(frame_buffer->type() == VideoFrameBuffer::Type::kI420);
 
@@ -1060,7 +1117,7 @@ int32_t MFH264EncoderImpl::Encode(
     RTC_LOG(LS_ERROR) << "Failed to create input sample: "
                       << HResultToString(hr);
     ReportError();
-    return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+    return kHardwareFailure;
   }
 
   PendingFrameInfo info;
@@ -1072,7 +1129,15 @@ int32_t MFH264EncoderImpl::Encode(
   info.color_space = input_frame.color_space();
   pending_frames_.push_back(info);
 
-  hr = transform_->ProcessInput(input_stream_id_, sample.Get(), 0);
+  if (Faults().fail_after_frames &&
+      frames_submitted_ >= *Faults().fail_after_frames) {
+    RTC_LOG(LS_WARNING) << "LK_MF_FAULT_AFTER_FRAMES: simulating device "
+                           "removal after "
+                        << frames_submitted_ << " frames.";
+    hr = DXGI_ERROR_DEVICE_REMOVED;
+  } else {
+    hr = transform_->ProcessInput(input_stream_id_, sample.Get(), 0);
+  }
   if (hr == MF_E_NOTACCEPTING && !is_async_) {
     int32_t ret = CollectOutputsSync();
     if (ret != WEBRTC_VIDEO_CODEC_OK) {
@@ -1084,8 +1149,9 @@ int32_t MFH264EncoderImpl::Encode(
     pending_frames_.pop_back();
     RTC_LOG(LS_ERROR) << "ProcessInput failed: " << HResultToString(hr);
     ReportError();
-    return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+    return kHardwareFailure;
   }
+  frames_submitted_++;
 
   if (is_async_) {
     need_input_credits_--;
@@ -1131,7 +1197,7 @@ void MFH264EncoderImpl::DrainAsyncOutput() {
   int32_t ret = PumpEvents(0, /*until_need_input=*/false,
                            /*until_pending_at_most=*/SIZE_MAX,
                            /*fail_on_timeout=*/false);
-  if (ret == WEBRTC_VIDEO_CODEC_ENCODER_FAILURE) {
+  if (ret == kHardwareFailure) {
     async_failed_ = true;
   }
 }
@@ -1154,7 +1220,7 @@ int32_t MFH264EncoderImpl::CollectOneOutput() {
   if (FAILED(hr)) {
     RTC_LOG(LS_ERROR) << "GetOutputStreamInfo failed: " << HResultToString(hr);
     ReportError();
-    return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+    return kHardwareFailure;
   }
   const bool transform_allocates =
       stream_info.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES |
@@ -1164,7 +1230,7 @@ int32_t MFH264EncoderImpl::CollectOneOutput() {
   if (!transform_allocates) {
     hr = MFCreateSample(&allocated);
     if (FAILED(hr)) {
-      return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+      return kHardwareFailure;
     }
     ComPtr<IMFMediaBuffer> out_buffer;
     const DWORD size = stream_info.cbSize
@@ -1175,7 +1241,7 @@ int32_t MFH264EncoderImpl::CollectOneOutput() {
         size, stream_info.cbAlignment > 1 ? stream_info.cbAlignment - 1 : 0,
         &out_buffer);
     if (FAILED(hr)) {
-      return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+      return kHardwareFailure;
     }
     allocated->AddBuffer(out_buffer.Get());
   }
@@ -1199,7 +1265,7 @@ int32_t MFH264EncoderImpl::CollectOneOutput() {
         RTC_LOG(LS_ERROR) << "Output renegotiation failed: "
                           << HResultToString(nhr);
         ReportError();
-        return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+        return kHardwareFailure;
       }
       // Async MFTs re-signal METransformHaveOutput after a stream change; an
       // immediate ProcessOutput retry returns E_UNEXPECTED (seen on Intel
@@ -1212,7 +1278,7 @@ int32_t MFH264EncoderImpl::CollectOneOutput() {
     if (FAILED(hr)) {
       RTC_LOG(LS_ERROR) << "ProcessOutput failed: " << HResultToString(hr);
       ReportError();
-      return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+      return kHardwareFailure;
     }
 
     ComPtr<IMFSample> sample;
@@ -1231,14 +1297,14 @@ int32_t MFH264EncoderImpl::CollectOneOutput() {
     ComPtr<IMFMediaBuffer> contiguous;
     hr = sample->ConvertToContiguousBuffer(&contiguous);
     if (FAILED(hr)) {
-      return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+      return kHardwareFailure;
     }
     BYTE* data = nullptr;
     DWORD max_length = 0;
     DWORD current_length = 0;
     hr = contiguous->Lock(&data, &max_length, &current_length);
     if (FAILED(hr)) {
-      return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+      return kHardwareFailure;
     }
     packet_.assign(data, data + current_length);
     contiguous->Unlock();
@@ -1249,7 +1315,7 @@ int32_t MFH264EncoderImpl::CollectOneOutput() {
 
   RTC_LOG(LS_ERROR) << "Encoder output stream change did not settle.";
   ReportError();
-  return WEBRTC_VIDEO_CODEC_ENCODER_FAILURE;
+  return kHardwareFailure;
 }
 
 MFH264EncoderImpl::PendingFrameInfo MFH264EncoderImpl::TakePendingInfo(

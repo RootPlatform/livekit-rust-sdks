@@ -73,6 +73,10 @@ class MFH264DecoderImpl : public VideoDecoder {
   livekit_ffi::ComPtr<IMFDXGIDeviceManager> dxgi_manager_;
   livekit_ffi::ComPtr<ID3D11Texture2D> staging_texture_;
   bool use_d3d_ = false;
+  // Whether decoded samples arrive as D3D11 surfaces (DXVA) or system memory;
+  // unset until the first output.
+  std::optional<bool> output_is_dxgi_;
+  int64_t frames_decoded_ = 0;
   DWORD input_stream_id_ = 0;
   DWORD output_stream_id_ = 0;
 

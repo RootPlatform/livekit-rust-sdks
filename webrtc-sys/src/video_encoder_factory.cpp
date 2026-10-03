@@ -19,6 +19,8 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <map>
+#include <mutex>
 #include <optional>
 #include <string_view>
 #include <utility>
@@ -146,6 +148,42 @@ std::optional<VideoEncoderBackend> BackendFromFormat(
   }
 
   return std::nullopt;
+}
+
+struct QueueBackend {
+  const void* owner;
+  VideoEncoderBackend backend;
+};
+
+std::mutex& QueueBackendMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+std::map<webrtc::TaskQueueBase*, QueueBackend>& QueueBackends() {
+  static std::map<webrtc::TaskQueueBase*, QueueBackend> backends;
+  return backends;
+}
+
+std::optional<VideoEncoderBackend> BackendForCurrentTaskQueue() {
+  webrtc::TaskQueueBase* queue = webrtc::TaskQueueBase::Current();
+  if (!queue) {
+    return std::nullopt;
+  }
+  std::lock_guard<std::mutex> lock(QueueBackendMutex());
+  auto it = QueueBackends().find(queue);
+  if (it == QueueBackends().end()) {
+    return std::nullopt;
+  }
+  return it->second.backend;
+}
+
+// The sender's selector is authoritative: its backend wins over the tag
+// libwebrtc picked from GetImplementations() for the first encoder.
+std::optional<VideoEncoderBackend> EffectiveBackend(
+    const webrtc::SdpVideoFormat& format) {
+  std::optional<VideoEncoderBackend> selected = BackendForCurrentTaskQueue();
+  return selected ? selected : BackendFromFormat(format);
 }
 
 webrtc::SdpVideoFormat StripBackendParameter(
@@ -303,6 +341,28 @@ void AddVaapiFactory(
 }
 
 }  // namespace
+
+void SetEncoderBackendForTaskQueue(webrtc::TaskQueueBase* queue,
+                                   const void* owner,
+                                   VideoEncoderBackend backend) {
+  if (!queue) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(QueueBackendMutex());
+  QueueBackends()[queue] = QueueBackend{owner, backend};
+}
+
+void ClearEncoderBackendForTaskQueue(webrtc::TaskQueueBase* queue,
+                                     const void* owner) {
+  if (!queue) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(QueueBackendMutex());
+  auto it = QueueBackends().find(queue);
+  if (it != QueueBackends().end() && it->second.owner == owner) {
+    QueueBackends().erase(it);
+  }
+}
 
 using Factory = webrtc::VideoEncoderFactoryTemplate<
     webrtc::LibvpxVp8EncoderTemplateAdapter,
@@ -532,7 +592,15 @@ std::unique_ptr<webrtc::VideoEncoder>
 VideoEncoderFactory::InternalFactory::Create(
     const webrtc::Environment& env,
     const webrtc::SdpVideoFormat& format) {
-  auto requested_backend = BackendFromFormat(format);
+  auto requested_backend = EffectiveBackend(format);
+  if (requested_backend != BackendFromFormat(format)) {
+    RTC_LOG(LS_INFO) << format.name << " encoder created with the sender's "
+                     << BackendName(*requested_backend)
+                     << " backend instead of the format's "
+                     << (BackendFromFormat(format)
+                             ? BackendName(*BackendFromFormat(format))
+                             : "untagged");
+  }
   auto stripped_format = StripBackendParameter(format);
   bool requested_backend_unavailable = false;
 
@@ -611,8 +679,36 @@ VideoEncoderFactory::InternalFactory::Create(
   return nullptr;
 }
 
+std::vector<webrtc::SdpVideoFormat>
+VideoEncoderFactory::SoftwareFallbackFactory::GetSupportedFormats() const {
+  return Factory().GetSupportedFormats();
+}
+
+std::unique_ptr<webrtc::VideoEncoder>
+VideoEncoderFactory::SoftwareFallbackFactory::Create(
+    const webrtc::Environment& env,
+    const webrtc::SdpVideoFormat& format) {
+  auto backend = EffectiveBackend(format);
+  if (backend == VideoEncoderBackend::Software ||
+      backend == VideoEncoderBackend::PreEncoded) {
+    return nullptr;
+  }
+  auto stripped_format = StripBackendParameter(format);
+  // Only H.264 has both hardware encoders and a software encoder here.
+  if (!EqualsIgnoreAsciiCase(stripped_format.name, webrtc::kH264CodecName)) {
+    return nullptr;
+  }
+  auto original_format = webrtc::FuzzyMatchSdpVideoFormat(
+      Factory().GetSupportedFormats(), stripped_format);
+  if (!original_format) {
+    return nullptr;
+  }
+  return Factory().Create(env, *original_format);
+}
+
 VideoEncoderFactory::VideoEncoderFactory() {
   internal_factory_ = std::make_unique<InternalFactory>();
+  software_fallback_factory_ = std::make_unique<SoftwareFallbackFactory>();
 }
 
 std::vector<webrtc::SdpVideoFormat> VideoEncoderFactory::GetSupportedFormats()
@@ -637,7 +733,8 @@ std::unique_ptr<webrtc::VideoEncoder> VideoEncoderFactory::Create(
   std::unique_ptr<webrtc::VideoEncoder> encoder;
   if (format.IsCodecInList(internal_factory_->GetSupportedFormats())) {
     encoder = std::make_unique<webrtc::SimulcastEncoderAdapter>(
-        env, internal_factory_.get(), nullptr, format);
+        env, internal_factory_.get(), software_fallback_factory_.get(),
+        format);
   }
 
   return encoder;

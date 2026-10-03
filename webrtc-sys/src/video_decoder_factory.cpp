@@ -20,6 +20,7 @@
 #include "api/environment/environment.h"
 #include "api/video_codecs/av1_profile.h"
 #include "api/video_codecs/sdp_video_format.h"
+#include "api/video_codecs/video_decoder_software_fallback_wrapper.h"
 #include "livekit/objc_video_factory.h"
 #include "media/base/media_constants.h"
 #include "modules/video_coding/codecs/h264/include/h264.h"
@@ -144,12 +145,24 @@ VideoDecoderFactory::CodecSupport VideoDecoderFactory::QueryCodecSupport(
   return codec_support;
 }
 
+std::unique_ptr<webrtc::VideoDecoder> VideoDecoderFactory::WithSoftwareFallback(
+    const webrtc::Environment& env,
+    const webrtc::SdpVideoFormat& format,
+    std::unique_ptr<webrtc::VideoDecoder> decoder) const {
+  if (!decoder || !internal_h264_decoder_works_ ||
+      !absl::EqualsIgnoreCase(format.name, webrtc::kH264CodecName)) {
+    return decoder;
+  }
+  return webrtc::CreateVideoDecoderSoftwareFallbackWrapper(
+      env, webrtc::H264Decoder::Create(), std::move(decoder));
+}
+
 std::unique_ptr<webrtc::VideoDecoder> VideoDecoderFactory::Create(
     const webrtc::Environment& env, const webrtc::SdpVideoFormat& format) {
   for (const auto& factory : factories_) {
     for (const auto& supported_format : factory->GetSupportedFormats()) {
       if (supported_format.IsSameCodec(format))
-        return factory->Create(env, format);
+        return WithSoftwareFallback(env, format, factory->Create(env, format));
     }
   }
 
@@ -169,7 +182,8 @@ std::unique_ptr<webrtc::VideoDecoder> VideoDecoderFactory::Create(
         else
           adjusted.parameters.erase("packetization-mode");
         if (sf.IsSameCodec(adjusted))
-          return factory->Create(env, adjusted);
+          return WithSoftwareFallback(env, adjusted,
+                                      factory->Create(env, adjusted));
       }
     }
   }

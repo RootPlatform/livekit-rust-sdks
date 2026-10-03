@@ -28,6 +28,9 @@
 #include <codecapi.h>
 
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <initializer_list>
 #include <utility>
 
 #include "rtc_base/logging.h"
@@ -84,6 +87,53 @@ std::string HResultToString(HRESULT hr) {
   char buf[16];
   std::snprintf(buf, sizeof(buf), "0x%08lX", static_cast<unsigned long>(hr));
   return buf;
+}
+
+std::optional<std::string> GetEnvVar(const char* name) {
+  char buf[256];
+  const DWORD n = GetEnvironmentVariableA(name, buf, sizeof(buf));
+  if (n == 0 || n >= sizeof(buf)) {
+    return std::nullopt;
+  }
+  return std::string(buf, n);
+}
+
+namespace {
+
+bool EnvValueIn(const char* name, std::initializer_list<const char*> values) {
+  std::optional<std::string> value = GetEnvVar(name);
+  if (!value) {
+    return false;
+  }
+  for (const char* candidate : values) {
+    if (_stricmp(value->c_str(), candidate) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+}  // namespace
+
+bool EnvFlagSet(const char* name) {
+  return EnvValueIn(name, {"1", "true", "yes", "on"});
+}
+
+bool EnvFlagCleared(const char* name) {
+  return EnvValueIn(name, {"0", "false", "no", "off"});
+}
+
+std::optional<int64_t> GetEnvInt(const char* name) {
+  std::optional<std::string> value = GetEnvVar(name);
+  if (!value || value->empty()) {
+    return std::nullopt;
+  }
+  char* end = nullptr;
+  const long long parsed = std::strtoll(value->c_str(), &end, 10);
+  if (end == value->c_str() || *end != '\0') {
+    return std::nullopt;
+  }
+  return parsed;
 }
 
 namespace {

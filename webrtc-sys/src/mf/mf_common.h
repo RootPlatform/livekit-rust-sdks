@@ -28,6 +28,7 @@
 #include <wrl/client.h>
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -56,6 +57,16 @@ HRESULT CreateD3D11DeviceBundleForActivate(IMFActivate* activate,
 // Hardware H264 encoder MFTs accepting NV12, best first
 // (MFT_ENUM_FLAG_SORTANDFILTER order).
 std::vector<ComPtr<IMFActivate>> EnumHardwareH264Encoders();
+
+// Reads a process environment variable through the Win32 environment, so a
+// value set by the host after this DLL loaded (where the CRT getenv snapshot
+// would miss it) is still seen.
+std::optional<std::string> GetEnvVar(const char* name);
+// "1"/"true"/"yes"/"on" (any case).
+bool EnvFlagSet(const char* name);
+// "0"/"false"/"no"/"off" (any case).
+bool EnvFlagCleared(const char* name);
+std::optional<int64_t> GetEnvInt(const char* name);
 
 std::string GetFriendlyName(IMFActivate* activate);
 
