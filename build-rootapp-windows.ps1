@@ -24,11 +24,10 @@ function Get-VsInstalls {
 }
 
 function Get-MsvcToolDirs {
-    foreach ($vs in Get-VsInstalls) {
-        Get-ChildItem "$vs\VC\Tools\MSVC" -Directory -ErrorAction SilentlyContinue |
-            Where-Object { Test-Path "$($_.FullName)\include\vcruntime.h" } |
-            Sort-Object { [version]$_.Name } -Descending
-    }
+    Get-VsInstalls |
+        ForEach-Object { Get-ChildItem "$_\VC\Tools\MSVC" -Directory -ErrorAction SilentlyContinue } |
+        Where-Object { Test-Path "$($_.FullName)\include\vcruntime.h" } |
+        Sort-Object { [version]$_.Name } -Descending
 }
 
 function Test-NativeArm64Msvc {
@@ -41,13 +40,39 @@ function Test-NativeArm64Msvc {
 
 $arm64CrtLibs = @('libcmt.lib', 'libvcruntime.lib', 'libcpmt.lib', 'oldnames.lib', 'delayimp.lib')
 
-function Find-Arm64CrtDir {
-    if ($Arm64CrtLibDir) { return $Arm64CrtLibDir }
-    foreach ($dir in Get-MsvcToolDirs) {
-        $candidate = "$($dir.FullName)\lib\arm64"
-        if (Test-Path "$candidate\libcmt.lib") { return $candidate }
+function Resolve-Arm64Crt {
+    if ($Arm64CrtLibDir) {
+        $lib = [IO.Path]::GetFullPath($Arm64CrtLibDir).TrimEnd('\')
+        $arch = Split-Path $lib -Leaf
+        $libParent = Split-Path $lib -Parent
+        $crtRoot = Split-Path $libParent -Parent
+        if ((Split-Path $libParent -Leaf) -eq 'lib' -and (Test-Path "$crtRoot\include\vcruntime.h")) {
+            $crt = @{ Lib = $lib; Include = "$crtRoot\include"; SdkInclude = $null; SdkLib = $null; Arch = $arch }
+            $splat = Split-Path $crtRoot -Parent
+            if ((Split-Path $crtRoot -Leaf) -eq 'crt' -and
+                (Test-Path "$splat\sdk\include\um\windows.h") -and
+                (Test-Path "$splat\sdk\lib\um\$arch\kernel32.lib") -and
+                (Test-Path "$splat\sdk\lib\ucrt\$arch\libucrt.lib")) {
+                $crt.SdkInclude = "$splat\sdk\include"
+                $crt.SdkLib = "$splat\sdk\lib"
+            }
+            return $crt
+        }
+        $msvc = Get-MsvcToolDirs | Select-Object -First 1
+        if (-not $msvc) { throw "no MSVC headers next to $lib (expected ..\..\include\vcruntime.h) and no MSVC toolset installed" }
+        Write-Warning ("Cannot tell which MSVC version the runtime libraries in $lib belong to; compiling against " +
+            "the $($msvc.Name) headers. If the versions differ the link can fail with unresolved __std_* or " +
+            "vcruntime symbols. Point -Arm64CrtLibDir at <toolset>\lib\arm64 or an xwin splat's crt\lib\aarch64 " +
+            "so the matching headers are used.")
+        return @{ Lib = $lib; Include = "$($msvc.FullName)\include"; SdkInclude = $null; SdkLib = $null; Arch = $arch }
     }
-    return $null
+    $toolsets = @(Get-MsvcToolDirs)
+    if (-not $toolsets) { throw "no MSVC toolset with headers found" }
+    $match = $toolsets | Where-Object { Test-Path "$($_.FullName)\lib\arm64\libcmt.lib" } | Select-Object -First 1
+    if ($match) {
+        return @{ Lib = "$($match.FullName)\lib\arm64"; Include = "$($match.FullName)\include"; SdkInclude = $null; SdkLib = $null; Arch = 'arm64' }
+    }
+    return @{ Lib = $null; Include = "$($toolsets[0].FullName)\include"; SdkInclude = $null; SdkLib = $null; Arch = 'arm64' }
 }
 
 function Get-Arm64CrossEnv {
@@ -58,17 +83,26 @@ function Get-Arm64CrossEnv {
         if (-not (Test-Path $tool)) { throw "$tool not found; the arm64 cross build needs LLVM under $tools\llvm" }
     }
 
-    $msvc = Get-MsvcToolDirs | Select-Object -First 1
-    if (-not $msvc) { throw "no MSVC toolset with headers found" }
+    $crt = Resolve-Arm64Crt
+    $crtDir = $crt.Lib
 
-    $kits = "${env:ProgramFiles(x86)}\Windows Kits\10"
-    $sdk = Get-ChildItem "$kits\Lib" -Directory |
-        Where-Object { Test-Path "$($_.FullName)\um\arm64\kernel32.lib" } |
-        Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
-    if (-not $sdk) { throw "no Windows SDK with arm64 libraries under $kits\Lib" }
-    $sdkInc = "$kits\Include\$($sdk.Name)"
+    if ($crt.SdkInclude) {
+        $sdkInc = $crt.SdkInclude
+        $sdkLibPaths = @("$($crt.SdkLib)\ucrt\$($crt.Arch)", "$($crt.SdkLib)\um\$($crt.Arch)")
+    }
+    else {
+        $kits = "${env:ProgramFiles(x86)}\Windows Kits\10"
+        $sdk = Get-ChildItem "$kits\Lib" -Directory |
+            Where-Object { Test-Path "$($_.FullName)\um\arm64\kernel32.lib" } |
+            Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
+        if (-not $sdk) { throw "no Windows SDK with arm64 libraries under $kits\Lib" }
+        $sdkInc = "$kits\Include\$($sdk.Name)"
+        $sdkLibPaths = @("$($sdk.FullName)\ucrt\arm64", "$($sdk.FullName)\um\arm64")
+    }
+    Write-Host "arm64 CRT headers: $($crt.Include)"
+    Write-Host "arm64 CRT libs:    $(if ($crtDir) { $crtDir } else { '(none)' })"
+    Write-Host "arm64 SDK headers: $sdkInc"
 
-    $crtDir = Find-Arm64CrtDir
     $missing = if ($crtDir) { $arm64CrtLibs | Where-Object { -not (Test-Path (Join-Path $crtDir $_)) } } else { $arm64CrtLibs }
     if ($missing -and -not $CompileOnly) {
         throw ("The ARM64 MSVC runtime libraries are missing ($($missing -join ', ')" +
@@ -79,11 +113,11 @@ function Get-Arm64CrossEnv {
     }
 
     $include = @(
-        "$($msvc.FullName)\include",
+        $crt.Include,
         "$sdkInc\ucrt", "$sdkInc\um", "$sdkInc\shared", "$sdkInc\winrt", "$sdkInc\cppwinrt"
     ) -join ';'
 
-    $libPaths = @("$($sdk.FullName)\ucrt\arm64", "$($sdk.FullName)\um\arm64")
+    $libPaths = $sdkLibPaths
     if ($crtDir) { $libPaths = @($crtDir) + $libPaths }
     $rustflags = @('-C', 'target-feature=+crt-static') +
         ($libPaths | ForEach-Object { '-C'; "link-arg=/LIBPATH:$_" })

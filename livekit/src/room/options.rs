@@ -255,7 +255,17 @@ pub fn compute_video_encodings(
     }
 
     if let Some(custom) = options.simulcast_layers.as_ref().filter(|layers| !layers.is_empty()) {
-        return compute_custom_simulcast_encodings(width, height, initial_preset, custom);
+        let valid: Vec<VideoPreset> =
+            custom.iter().filter(|preset| is_valid_simulcast_layer(preset)).cloned().collect();
+        if valid.len() != custom.len() {
+            log::warn!(
+                "dropping {} invalid simulcast layer(s) (zero size/bitrate or non-positive framerate)",
+                custom.len() - valid.len()
+            );
+        }
+        if !valid.is_empty() {
+            return compute_custom_simulcast_encodings(width, height, initial_preset, &valid);
+        }
     }
 
     let mut simulcast_presets = compute_default_simulcast_presets(screenshare, &initial_preset);
@@ -280,6 +290,14 @@ pub fn compute_video_encodings(
     into_rtp_encodings(width, height, &[initial_preset])
 }
 
+fn is_valid_simulcast_layer(preset: &VideoPreset) -> bool {
+    preset.width > 0
+        && preset.height > 0
+        && preset.encoding.max_bitrate > 0
+        && preset.encoding.max_framerate.is_finite()
+        && preset.encoding.max_framerate > 0.0
+}
+
 /// Mirrors livekit-client's `computeVideoEncodings` for caller-provided layers:
 /// presets are sorted by (max_bitrate, max_framerate); the lowest is always used
 /// from 480px, the second-lowest is added from 960px. Extra presets are ignored.
@@ -291,12 +309,10 @@ fn compute_custom_simulcast_encodings(
 ) -> Vec<RtpEncodingParameters> {
     let mut presets = custom.to_vec();
     presets.sort_by(|a, b| {
-        a.encoding.max_bitrate.cmp(&b.encoding.max_bitrate).then(
-            a.encoding
-                .max_framerate
-                .partial_cmp(&b.encoding.max_framerate)
-                .unwrap_or(std::cmp::Ordering::Equal),
-        )
+        a.encoding
+            .max_bitrate
+            .cmp(&b.encoding.max_bitrate)
+            .then(a.encoding.max_framerate.total_cmp(&b.encoding.max_framerate))
     });
     let mut presets = presets.into_iter();
     let low_preset = presets.next();
@@ -658,6 +674,44 @@ mod tests {
             layer_summary(2560, 1440, &options),
             vec![("h".to_string(), 1.0, 2_500_000, 30.0), ("q".to_string(), 2.0, 1_200_000, 30.0)]
         );
+    }
+
+    #[test]
+    fn invalid_custom_layers_are_dropped() {
+        let options = TrackPublishOptions {
+            source: TrackSource::Camera,
+            video_encoding: Some(VideoEncoding { max_bitrate: 1_700_000, max_framerate: 30.0 }),
+            simulcast_layers: Some(vec![
+                VideoPreset::new(0, 0, 100_000, 15.0),
+                VideoPreset::new(320, 0, 100_000, 15.0),
+                VideoPreset::new(320, 180, 0, 15.0),
+                VideoPreset::new(320, 180, 120_000, 0.0),
+                VideoPreset::new(320, 180, 120_000, -5.0),
+                VideoPreset::new(320, 180, 120_000, f64::NAN),
+                VideoPreset::new(320, 180, 120_000, f64::INFINITY),
+                VideoPreset::new(640, 360, 450_000, 30.0),
+            ]),
+            ..Default::default()
+        };
+        assert_eq!(
+            layer_summary(1280, 720, &options),
+            vec![("h".to_string(), 1.0, 1_700_000, 30.0), ("q".to_string(), 2.0, 450_000, 30.0)]
+        );
+        for (_, scale, _, fps) in layer_summary(1280, 720, &options) {
+            assert!(scale.is_finite() && scale >= 1.0);
+            assert!(fps.is_finite() && fps > 0.0);
+        }
+    }
+
+    #[test]
+    fn all_invalid_custom_layers_use_defaults() {
+        let custom = TrackPublishOptions {
+            source: TrackSource::Camera,
+            simulcast_layers: Some(vec![VideoPreset::new(0, 0, 0, f64::NAN)]),
+            ..Default::default()
+        };
+        let default = TrackPublishOptions { source: TrackSource::Camera, ..Default::default() };
+        assert_eq!(layer_summary(1280, 720, &custom), layer_summary(1280, 720, &default));
     }
 
     #[test]

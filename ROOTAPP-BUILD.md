@@ -56,6 +56,11 @@ VS component *MSVC ARM64/ARM64EC build tools*
 the ASan libraries in `VC\Tools\MSVC\<ver>\lib\arm64`. If they live somewhere else,
 for example in an `xwin splat` output (`crt\lib\aarch64`), pass `-Arm64CrtLibDir <dir>`
 or set `LK_ARM64_CRT_LIB_DIR`. Without them the script stops before cargo with that message.
+The script compiles against the MSVC headers that belong to those libraries: a toolset's
+`lib\arm64` pairs with that toolset's `include`, and an xwin splat's `crt\lib\aarch64` pairs
+with its `crt\include` (plus its `sdk\include` and `sdk\lib` when present). For any other
+folder it warns and falls back to the newest installed toolset's headers, which must be the
+same MSVC version as the libraries or the link fails on `__std_*` / vcruntime symbols.
 `-CompileOnly` still builds `target\aarch64-pc-windows-msvc\release\livekit_ffi.lib`
 (staticlib, no link step), which proves every C/C++/Rust unit compiles for ARM64.
 
