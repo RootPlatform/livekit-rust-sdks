@@ -39,6 +39,7 @@
 #include "rtc_base/logging.h"
 #include "system_wrappers/include/metrics.h"
 #include "third_party/libyuv/include/libyuv/convert_from.h"
+#include "third_party/libyuv/include/libyuv/planar_functions.h"
 
 namespace webrtc {
 
@@ -65,6 +66,13 @@ constexpr size_t kMaxPendingFrames = 4;
 // kMaxPendingFrames of them, the rest is headroom for drivers that release
 // input samples late.
 constexpr size_t kMaxInputTextures = 16;
+constexpr size_t kStagingTextureCount = 3;
+// Rate-control (VBV) buffer. Without it the driver default let a screen
+// scene change burst to 1.37-1.52x the 3.5 Mbps cap over a full second (the
+// screenshare bitrate cliff); 500 ms holds that second to 1.03x. A one-frame
+// buffer starves NVIDIA's CBR to about a third of the target, so screen
+// content uses the same buffer plus a max bitrate equal to the target.
+constexpr uint32_t kVbvMs = 500;
 
 // Every runtime hardware failure asks the VideoEncoderSoftwareFallbackWrapper
 // that SimulcastEncoderAdapter puts around this encoder to continue in
@@ -275,8 +283,16 @@ class MFAsyncEventPump : public IMFAsyncCallback {
     if (SUCCEEDED(hr)) {
       MediaEventType type = MEUnknown;
       event->GetType(&type);
-      events_.push_back(type);
-      hr = generator_->BeginGetEvent(this, nullptr);
+      if (type == MEError) {
+        // The MFT hit an unrecoverable error (e.g. device loss); it will not
+        // signal input or output again.
+        HRESULT status = S_OK;
+        event->GetStatus(&status);
+        hr = FAILED(status) ? status : E_FAIL;
+      } else {
+        events_.push_back(type);
+        hr = generator_->BeginGetEvent(this, nullptr);
+      }
     }
     if (FAILED(hr)) {
       error_ = hr;
@@ -307,6 +323,115 @@ class MFAsyncEventPump : public IMFAsyncCallback {
   std::function<void()> drain_task_;
   bool drain_posted_ = false;
 };
+
+// Owns the D3D11 input samples handed to the MFT. Each is an IMFTrackedSample
+// wrapping one NV12 texture; once the MFT and everyone else release a sample,
+// MF invokes this callback and the sample goes back on the free list. A
+// texture is therefore only rewritten after the MFT is done reading it.
+class MFInputSamplePool : public IMFAsyncCallback {
+ public:
+  ComPtr<IMFSample> TakeFree() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (free_.empty()) {
+      return nullptr;
+    }
+    ComPtr<IMFSample> sample = std::move(free_.back());
+    free_.pop_back();
+    return sample;
+  }
+
+  size_t created() const { return created_; }
+  void OnCreated() { created_++; }
+
+  // Arms the sample so its final Release() returns it here.
+  HRESULT Arm(IMFSample* sample) {
+    ComPtr<IMFTrackedSample> tracked;
+    HRESULT hr = sample->QueryInterface(IID_PPV_ARGS(&tracked));
+    if (FAILED(hr)) {
+      return hr;
+    }
+    return tracked->SetAllocator(this, nullptr);
+  }
+
+  // Samples still inside the MFT come back later and are dropped then.
+  void Shutdown() {
+    std::vector<ComPtr<IMFSample>> released;
+    std::lock_guard<std::mutex> lock(mutex_);
+    shutdown_ = true;
+    released.swap(free_);
+  }
+
+  STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
+    if (!ppv) {
+      return E_POINTER;
+    }
+    if (riid == __uuidof(IUnknown) || riid == __uuidof(IMFAsyncCallback)) {
+      *ppv = static_cast<IMFAsyncCallback*>(this);
+      AddRef();
+      return S_OK;
+    }
+    *ppv = nullptr;
+    return E_NOINTERFACE;
+  }
+  STDMETHODIMP_(ULONG) AddRef() override { return ++ref_count_; }
+  STDMETHODIMP_(ULONG) Release() override {
+    const ULONG count = --ref_count_;
+    if (count == 0) {
+      delete this;
+    }
+    return count;
+  }
+  STDMETHODIMP GetParameters(DWORD*, DWORD*) override { return E_NOTIMPL; }
+
+  STDMETHODIMP Invoke(IMFAsyncResult* result) override {
+    ComPtr<IUnknown> object;
+    ComPtr<IMFSample> sample;
+    if (SUCCEEDED(result->GetObject(&object)) && object) {
+      object.As(&sample);
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (sample && !shutdown_) {
+      free_.push_back(std::move(sample));
+    }
+    return S_OK;
+  }
+
+ private:
+  virtual ~MFInputSamplePool() = default;
+
+  std::atomic<ULONG> ref_count_{1};
+  std::mutex mutex_;
+  std::vector<ComPtr<IMFSample>> free_;
+  bool shutdown_ = false;
+  size_t created_ = 0;
+};
+
+namespace {
+
+// Writes an I420 or NV12 buffer as NV12 (Y plane, then interleaved UV at
+// dst_uv), both planes with `dst_stride`.
+int WriteNV12(const VideoFrameBuffer& buffer,
+              uint8_t* dst_y,
+              uint8_t* dst_uv,
+              int dst_stride) {
+  const int width = buffer.width();
+  const int height = buffer.height();
+  if (buffer.type() == VideoFrameBuffer::Type::kNV12) {
+    const NV12BufferInterface* nv12 = buffer.GetNV12();
+    libyuv::CopyPlane(nv12->DataY(), nv12->StrideY(), dst_y, dst_stride, width,
+                      height);
+    libyuv::CopyPlane(nv12->DataUV(), nv12->StrideUV(), dst_uv, dst_stride,
+                      2 * ((width + 1) / 2), (height + 1) / 2);
+    return 0;
+  }
+  const I420BufferInterface* i420 = buffer.GetI420();
+  return libyuv::I420ToNV12(i420->DataY(), i420->StrideY(), i420->DataU(),
+                            i420->StrideU(), i420->DataV(), i420->StrideV(),
+                            dst_y, dst_stride, dst_uv, dst_stride, width,
+                            height);
+}
+
+}  // namespace
 
 MFH264EncoderImpl::MFH264EncoderImpl(const Environment& env,
                                      const SdpVideoFormat& format)
@@ -409,7 +534,11 @@ int32_t MFH264EncoderImpl::InitEncode(const VideoCodec* inst,
                    << "fps, target_bps=" << configuration_.target_bps
                    << ", level=" << static_cast<int>(level_)
                    << ", input=" << (d3d_.manager ? "d3d11" : "system memory")
-                   << ", async=" << is_async_;
+                   << ", async=" << is_async_ << ", mode="
+                   << (codec_.mode == VideoCodecMode::kScreensharing ? "screen"
+                                                                     : "camera")
+                   << ", vbv_ms=" << kVbvMs
+                   << (buffer_size_supported_ ? "" : " (rejected)");
 
   SimulcastRateAllocator init_allocator(env_, codec_);
   VideoBitrateAllocation allocation =
@@ -557,7 +686,33 @@ int32_t MFH264EncoderImpl::ApplyCodecApiSettings(bool log_failures) {
       log_failures) {
     RTC_LOG(LS_WARNING) << "Encoder MFT rejected infinite GOP size.";
   }
+  ApplyRateControlBuffer(configuration_.target_bps, log_failures);
   return WEBRTC_VIDEO_CODEC_OK;
+}
+
+void MFH264EncoderImpl::ApplyRateControlBuffer(uint32_t target_bps,
+                                               bool final_pass) {
+  const bool screenshare = codec_.mode == VideoCodecMode::kScreensharing;
+  const uint32_t buffer_bits = static_cast<uint32_t>(std::min<uint64_t>(
+      UINT32_MAX, static_cast<uint64_t>(target_bps) * kVbvMs / 1000));
+  if (buffer_size_supported_) {
+    HRESULT hr = SetCodecApiUInt32(codec_api_.Get(),
+                                   CODECAPI_AVEncCommonBufferSize, buffer_bits);
+    if (FAILED(hr) && final_pass) {
+      buffer_size_supported_ = false;
+      RTC_LOG(LS_WARNING) << "Encoder MFT rejected VBV buffer size "
+                          << buffer_bits << ": " << HResultToString(hr);
+    }
+  }
+  if (screenshare && max_bitrate_supported_) {
+    HRESULT hr = SetCodecApiUInt32(codec_api_.Get(),
+                                   CODECAPI_AVEncCommonMaxBitRate, target_bps);
+    if (FAILED(hr) && final_pass) {
+      max_bitrate_supported_ = false;
+      RTC_LOG(LS_WARNING) << "Encoder MFT rejected max bitrate " << target_bps
+                          << ": " << HResultToString(hr);
+    }
+  }
 }
 
 int32_t MFH264EncoderImpl::ConfigureTransform() {
@@ -573,6 +728,8 @@ int32_t MFH264EncoderImpl::ConfigureTransform() {
   }
   input_stream_id_ = input_ids[0];
   output_stream_id_ = output_ids[0];
+  buffer_size_supported_ = true;
+  max_bitrate_supported_ = true;
 
   const UINT32 fps =
       std::max(1u, static_cast<UINT32>(configuration_.max_frame_rate + 0.5f));
@@ -738,6 +895,8 @@ int32_t MFH264EncoderImpl::Release() {
   pending_frames_.clear();
   frame_count_ = 0;
   frames_submitted_ = 0;
+  first_timestamp_us_.reset();
+  last_sample_time_100ns_.reset();
   return WEBRTC_VIDEO_CODEC_OK;
 }
 
@@ -768,8 +927,12 @@ void MFH264EncoderImpl::ReleaseTransform() {
     activate_->ShutdownObject();
     activate_.Reset();
   }
-  input_textures_.clear();
-  staging_texture_.Reset();
+  if (input_pool_) {
+    input_pool_->Shutdown();
+    input_pool_.Reset();
+  }
+  staging_textures_.clear();
+  next_staging_ = 0;
   d3d_ = livekit_ffi::D3D11DeviceBundle();
   need_input_credits_ = 0;
   sequence_header_.clear();
@@ -777,7 +940,7 @@ void MFH264EncoderImpl::ReleaseTransform() {
   requested_keyframes_ = 0;
 }
 
-HRESULT MFH264EncoderImpl::CreateInputSample(const I420BufferInterface& buffer,
+HRESULT MFH264EncoderImpl::CreateInputSample(const VideoFrameBuffer& buffer,
                                              int64_t sample_time_100ns,
                                              int64_t duration_100ns,
                                              IMFSample** sample_out) {
@@ -807,10 +970,7 @@ HRESULT MFH264EncoderImpl::CreateInputSample(const I420BufferInterface& buffer,
   // directly after it.
   uint8_t* dst_y = scanline0;
   uint8_t* dst_uv = scanline0 + static_cast<size_t>(pitch) * height;
-  int ret = libyuv::I420ToNV12(buffer.DataY(), buffer.StrideY(), buffer.DataU(),
-                               buffer.StrideU(), buffer.DataV(),
-                               buffer.StrideV(), dst_y, pitch, dst_uv, pitch,
-                               width, height);
+  int ret = WriteNV12(buffer, dst_y, dst_uv, pitch);
   buffer_2d->Unlock2D();
   if (ret != 0) {
     return E_FAIL;
@@ -834,20 +994,32 @@ HRESULT MFH264EncoderImpl::CreateInputSample(const I420BufferInterface& buffer,
   return S_OK;
 }
 
-HRESULT MFH264EncoderImpl::AcquireInputTexture(ID3D11Texture2D** texture_out) {
-  for (const ComPtr<ID3D11Texture2D>& texture : input_textures_) {
-    // Only the pool's reference left means the MFT has released the sample
-    // and DXGI buffer that wrapped this texture.
-    texture->AddRef();
-    if (texture->Release() == 1) {
-      *texture_out = texture.Get();
-      (*texture_out)->AddRef();
-      return S_OK;
-    }
+HRESULT MFH264EncoderImpl::AcquireInputSample(IMFSample** sample_out,
+                                              ID3D11Texture2D** texture_out) {
+  if (!input_pool_) {
+    input_pool_.Attach(new MFInputSamplePool());
   }
-  if (input_textures_.size() >= kMaxInputTextures) {
-    RTC_LOG(LS_ERROR) << "All " << input_textures_.size()
-                      << " encoder input textures are still owned by the MFT.";
+  ComPtr<IMFSample> sample = input_pool_->TakeFree();
+  if (sample) {
+    ComPtr<IMFMediaBuffer> media_buffer;
+    ComPtr<IMFDXGIBuffer> dxgi_buffer;
+    HRESULT hr = sample->GetBufferByIndex(0, &media_buffer);
+    if (SUCCEEDED(hr)) {
+      hr = media_buffer.As(&dxgi_buffer);
+    }
+    if (SUCCEEDED(hr)) {
+      hr = dxgi_buffer->GetResource(IID_PPV_ARGS(texture_out));
+    }
+    if (FAILED(hr)) {
+      return hr;
+    }
+    sample->DeleteAllItems();
+    *sample_out = sample.Detach();
+    return S_OK;
+  }
+  if (input_pool_->created() >= kMaxInputTextures) {
+    RTC_LOG(LS_ERROR) << "All " << input_pool_->created()
+                      << " encoder input samples are still owned by the MFT.";
     return MF_E_SAMPLEALLOCATOR_EMPTY;
   }
 
@@ -875,72 +1047,6 @@ HRESULT MFH264EncoderImpl::AcquireInputTexture(ID3D11Texture2D** texture_out) {
                       << HResultToString(hr);
     return hr;
   }
-  input_textures_.push_back(texture);
-  RTC_LOG(LS_INFO) << "Allocated D3D11 encoder input texture "
-                   << input_textures_.size() << " (" << desc.Width << "x"
-                   << desc.Height << ", bind flags " << desc.BindFlags << ")";
-  *texture_out = texture.Detach();
-  return S_OK;
-}
-
-HRESULT MFH264EncoderImpl::CreateD3DInputSample(
-    const I420BufferInterface& buffer,
-    int64_t sample_time_100ns,
-    int64_t duration_100ns,
-    IMFSample** sample_out) {
-  const int width = buffer.width();
-  const int height = buffer.height();
-  if (width != configuration_.width || height != configuration_.height) {
-    RTC_LOG(LS_ERROR) << "Frame size " << width << "x" << height
-                      << " does not match encoder configuration "
-                      << configuration_.width << "x" << configuration_.height;
-    return E_INVALIDARG;
-  }
-
-  if (!staging_texture_) {
-    D3D11_TEXTURE2D_DESC desc = {};
-    desc.Width = static_cast<UINT>(width);
-    desc.Height = static_cast<UINT>(height);
-    desc.MipLevels = 1;
-    desc.ArraySize = 1;
-    desc.Format = DXGI_FORMAT_NV12;
-    desc.SampleDesc.Count = 1;
-    desc.Usage = D3D11_USAGE_STAGING;
-    desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-    HRESULT hr = d3d_.device->CreateTexture2D(&desc, nullptr, &staging_texture_);
-    if (FAILED(hr)) {
-      RTC_LOG(LS_ERROR) << "Failed to create NV12 staging texture: "
-                        << HResultToString(hr);
-      return hr;
-    }
-  }
-
-  D3D11_MAPPED_SUBRESOURCE mapped = {};
-  HRESULT hr = d3d_.context->Map(staging_texture_.Get(), 0, D3D11_MAP_WRITE, 0,
-                                 &mapped);
-  if (FAILED(hr)) {
-    return hr;
-  }
-  // Mapped NV12: Y rows at RowPitch, then the interleaved UV plane starting
-  // Height rows below with the same pitch.
-  uint8_t* dst_y = static_cast<uint8_t*>(mapped.pData);
-  uint8_t* dst_uv = dst_y + static_cast<size_t>(mapped.RowPitch) * height;
-  const int pitch = static_cast<int>(mapped.RowPitch);
-  int ret = libyuv::I420ToNV12(buffer.DataY(), buffer.StrideY(), buffer.DataU(),
-                               buffer.StrideU(), buffer.DataV(),
-                               buffer.StrideV(), dst_y, pitch, dst_uv, pitch,
-                               width, height);
-  d3d_.context->Unmap(staging_texture_.Get(), 0);
-  if (ret != 0) {
-    return E_FAIL;
-  }
-
-  ComPtr<ID3D11Texture2D> texture;
-  hr = AcquireInputTexture(&texture);
-  if (FAILED(hr)) {
-    return hr;
-  }
-  d3d_.context->CopyResource(texture.Get(), staging_texture_.Get());
 
   ComPtr<IMFMediaBuffer> media_buffer;
   hr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), texture.Get(), 0,
@@ -957,14 +1063,102 @@ HRESULT MFH264EncoderImpl::CreateD3DInputSample(
     media_buffer->SetCurrentLength(length);
   }
 
-  ComPtr<IMFSample> sample;
-  hr = MFCreateSample(&sample);
+  // A tracked sample tells the pool when the MFT has released it.
+  ComPtr<IMFTrackedSample> tracked;
+  hr = MFCreateTrackedSample(&tracked);
+  if (SUCCEEDED(hr)) {
+    hr = tracked.As(&sample);
+  }
+  if (FAILED(hr)) {
+    RTC_LOG(LS_ERROR) << "MFCreateTrackedSample failed: "
+                      << HResultToString(hr);
+    return hr;
+  }
+  hr = sample->AddBuffer(media_buffer.Get());
   if (FAILED(hr)) {
     return hr;
   }
-  sample->AddBuffer(media_buffer.Get());
+  input_pool_->OnCreated();
+  RTC_LOG(LS_INFO) << "Allocated D3D11 encoder input sample "
+                   << input_pool_->created() << " (" << desc.Width << "x"
+                   << desc.Height << ", bind flags " << desc.BindFlags << ")";
+  *texture_out = texture.Detach();
+  *sample_out = sample.Detach();
+  return S_OK;
+}
+
+HRESULT MFH264EncoderImpl::CreateD3DInputSample(const VideoFrameBuffer& buffer,
+                                                int64_t sample_time_100ns,
+                                                int64_t duration_100ns,
+                                                IMFSample** sample_out) {
+  const int width = buffer.width();
+  const int height = buffer.height();
+  if (width != configuration_.width || height != configuration_.height) {
+    RTC_LOG(LS_ERROR) << "Frame size " << width << "x" << height
+                      << " does not match encoder configuration "
+                      << configuration_.width << "x" << configuration_.height;
+    return E_INVALIDARG;
+  }
+
+  // A ring of staging textures so mapping this frame's upload never waits
+  // for the GPU copy of the previous one.
+  if (staging_textures_.empty()) {
+    D3D11_TEXTURE2D_DESC desc = {};
+    desc.Width = static_cast<UINT>(width);
+    desc.Height = static_cast<UINT>(height);
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_NV12;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    for (size_t i = 0; i < kStagingTextureCount; i++) {
+      ComPtr<ID3D11Texture2D> staging;
+      HRESULT hr = d3d_.device->CreateTexture2D(&desc, nullptr, &staging);
+      if (FAILED(hr)) {
+        RTC_LOG(LS_ERROR) << "Failed to create NV12 staging texture: "
+                          << HResultToString(hr);
+        staging_textures_.clear();
+        return hr;
+      }
+      staging_textures_.push_back(staging);
+    }
+    next_staging_ = 0;
+  }
+  ID3D11Texture2D* staging = staging_textures_[next_staging_].Get();
+  next_staging_ = (next_staging_ + 1) % staging_textures_.size();
+
+  D3D11_MAPPED_SUBRESOURCE mapped = {};
+  HRESULT hr = d3d_.context->Map(staging, 0, D3D11_MAP_WRITE, 0, &mapped);
+  if (FAILED(hr)) {
+    return hr;
+  }
+  // Mapped NV12: Y rows at RowPitch, then the interleaved UV plane starting
+  // Height rows below with the same pitch.
+  uint8_t* dst_y = static_cast<uint8_t*>(mapped.pData);
+  uint8_t* dst_uv = dst_y + static_cast<size_t>(mapped.RowPitch) * height;
+  int ret = WriteNV12(buffer, dst_y, dst_uv, static_cast<int>(mapped.RowPitch));
+  d3d_.context->Unmap(staging, 0);
+  if (ret != 0) {
+    return E_FAIL;
+  }
+
+  ComPtr<IMFSample> sample;
+  ComPtr<ID3D11Texture2D> texture;
+  hr = AcquireInputSample(&sample, &texture);
+  if (FAILED(hr)) {
+    return hr;
+  }
+  d3d_.context->CopyResource(texture.Get(), staging);
+
   sample->SetSampleTime(sample_time_100ns);
   sample->SetSampleDuration(duration_100ns);
+  hr = input_pool_->Arm(sample.Get());
+  if (FAILED(hr)) {
+    RTC_LOG(LS_ERROR) << "Failed to track encoder input sample: "
+                      << HResultToString(hr);
+    return hr;
+  }
 
   *sample_out = sample.Detach();
   return S_OK;
@@ -1043,16 +1237,21 @@ int32_t MFH264EncoderImpl::Encode(
     }
   }
 
-  webrtc::scoped_refptr<I420BufferInterface> frame_buffer =
-      input_frame.video_frame_buffer()->ToI420();
-  if (!frame_buffer) {
-    RTC_LOG(LS_ERROR) << "Failed to convert "
-                      << VideoFrameBufferTypeToString(
-                             input_frame.video_frame_buffer()->type())
-                      << " image to I420. Can't encode frame.";
-    return kHardwareFailure;
+  // NV12 is the MFT's input format and is copied as is; anything else goes
+  // through I420.
+  webrtc::scoped_refptr<VideoFrameBuffer> frame_buffer =
+      input_frame.video_frame_buffer();
+  if (frame_buffer->type() != VideoFrameBuffer::Type::kNV12 &&
+      frame_buffer->type() != VideoFrameBuffer::Type::kI420) {
+    webrtc::scoped_refptr<I420BufferInterface> i420 = frame_buffer->ToI420();
+    if (!i420) {
+      RTC_LOG(LS_ERROR) << "Failed to convert "
+                        << VideoFrameBufferTypeToString(frame_buffer->type())
+                        << " image to I420. Can't encode frame.";
+      return kHardwareFailure;
+    }
+    frame_buffer = i420;
   }
-  RTC_CHECK(frame_buffer->type() == VideoFrameBuffer::Type::kI420);
 
   bool is_keyframe_needed = false;
   if (configuration_.key_frame_request && configuration_.sending) {
@@ -1101,10 +1300,33 @@ int32_t MFH264EncoderImpl::Encode(
     requested_keyframes_++;
   }
 
+  // Sample times follow the capture clock, so rate control budgets bits for
+  // the frames that actually arrive (screen content is variable-rate, and
+  // webrtc drops frames under load) instead of assuming max_frame_rate.
   const int64_t fps =
       std::max<int64_t>(1, static_cast<int64_t>(configuration_.max_frame_rate));
-  const int64_t duration_100ns = 10'000'000 / fps;
-  const int64_t sample_time_100ns = frame_count_ * duration_100ns;
+  const int64_t nominal_duration_100ns = 10'000'000 / fps;
+  int64_t sample_time_100ns;
+  const int64_t timestamp_us = input_frame.timestamp_us();
+  if (timestamp_us > 0) {
+    if (!first_timestamp_us_) {
+      first_timestamp_us_ = timestamp_us;
+    }
+    sample_time_100ns = (timestamp_us - *first_timestamp_us_) * 10;
+  } else {
+    sample_time_100ns = last_sample_time_100ns_
+                            ? *last_sample_time_100ns_ + nominal_duration_100ns
+                            : 0;
+  }
+  if (last_sample_time_100ns_ && sample_time_100ns <= *last_sample_time_100ns_) {
+    sample_time_100ns = *last_sample_time_100ns_ + 1;
+  }
+  const int64_t duration_100ns =
+      last_sample_time_100ns_
+          ? std::clamp<int64_t>(sample_time_100ns - *last_sample_time_100ns_,
+                                10'000, 10'000'000)
+          : nominal_duration_100ns;
+  last_sample_time_100ns_ = sample_time_100ns;
   frame_count_++;
 
   ComPtr<IMFSample> sample;
@@ -1427,7 +1649,8 @@ VideoEncoder::EncoderInfo MFH264EncoderImpl::GetEncoderInfo() const {
   info.supports_simulcast = false;
   // NV12 surfaces (and most hardware encoders) need even dimensions.
   info.requested_resolution_alignment = 2;
-  info.preferred_pixel_formats = {VideoFrameBuffer::Type::kI420};
+  info.preferred_pixel_formats = {VideoFrameBuffer::Type::kNV12,
+                                  VideoFrameBuffer::Type::kI420};
   return info;
 }
 
@@ -1440,6 +1663,7 @@ void MFH264EncoderImpl::ApplyBitrate(uint32_t bitrate_bps) {
         codec_api_.Get(), CODECAPI_AVEncCommonMeanBitRate, bitrate_bps);
     if (SUCCEEDED(hr)) {
       active_bitrate_bps_ = bitrate_bps;
+      ApplyRateControlBuffer(bitrate_bps, /*final_pass=*/true);
       return;
     }
     dynamic_bitrate_supported_ = false;

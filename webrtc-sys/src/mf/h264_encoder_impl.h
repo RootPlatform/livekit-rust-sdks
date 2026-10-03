@@ -41,6 +41,7 @@
 namespace webrtc {
 
 class MFAsyncEventPump;
+class MFInputSamplePool;
 
 // H264 encoder on top of a hardware Media Foundation transform (MFT). The
 // vendor's driver registers the MFT (Intel QuickSync, AMD VCN, NVIDIA NVENC),
@@ -104,17 +105,21 @@ class MFH264EncoderImpl : public VideoEncoder {
   int32_t ReinitTransform();
   HRESULT NegotiateOutputType();
   void CacheSequenceHeader();
-  HRESULT CreateInputSample(const I420BufferInterface& buffer,
+  // `buffer` is I420 or NV12.
+  HRESULT CreateInputSample(const VideoFrameBuffer& buffer,
                             int64_t sample_time_100ns,
                             int64_t duration_100ns,
                             IMFSample** sample_out);
-  // D3D11-aware MFTs: uploads I420 into a pooled NV12 texture on the MFT's
-  // adapter and wraps it in a DXGI surface buffer.
-  HRESULT CreateD3DInputSample(const I420BufferInterface& buffer,
+  // D3D11-aware MFTs: uploads the frame into a pooled NV12 texture on the
+  // MFT's adapter, wrapped in a tracked DXGI surface sample.
+  HRESULT CreateD3DInputSample(const VideoFrameBuffer& buffer,
                                int64_t sample_time_100ns,
                                int64_t duration_100ns,
                                IMFSample** sample_out);
-  HRESULT AcquireInputTexture(ID3D11Texture2D** texture_out);
+  HRESULT AcquireInputSample(IMFSample** sample_out,
+                             ID3D11Texture2D** texture_out);
+  // VBV buffer size (and, for screen content, max bitrate) for `target_bps`.
+  void ApplyRateControlBuffer(uint32_t target_bps, bool final_pass);
   // Runs the async MFT event loop until the requested goals are met: an input
   // credit is available (when `until_need_input`) and at most
   // `until_pending_at_most` frames are in flight. Encoded output that becomes
@@ -159,10 +164,15 @@ class MFH264EncoderImpl : public VideoEncoder {
   bool initialized_ = false;
   int requested_keyframes_ = 0;
   livekit_ffi::D3D11DeviceBundle d3d_;
-  livekit_ffi::ComPtr<ID3D11Texture2D> staging_texture_;
-  // Input textures handed to the MFT. A texture is reused only once nothing
-  // but this pool references it (the MFT released the sample wrapping it).
-  std::vector<livekit_ffi::ComPtr<ID3D11Texture2D>> input_textures_;
+  std::vector<livekit_ffi::ComPtr<ID3D11Texture2D>> staging_textures_;
+  size_t next_staging_ = 0;
+  livekit_ffi::ComPtr<MFInputSamplePool> input_pool_;
+  bool buffer_size_supported_ = true;
+  bool max_bitrate_supported_ = true;
+  // Capture timestamp of the first frame since InitEncode; sample times are
+  // relative to it.
+  std::optional<int64_t> first_timestamp_us_;
+  std::optional<int64_t> last_sample_time_100ns_;
   bool is_async_ = false;
   DWORD input_stream_id_ = 0;
   DWORD output_stream_id_ = 0;
