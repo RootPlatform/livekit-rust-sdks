@@ -53,6 +53,7 @@ class MFH264DecoderImpl : public VideoDecoder {
   DecoderInfo GetDecoderInfo() const override;
 
  private:
+  int32_t DecodeFrame(const EncodedImage& input_image);
   HRESULT SetupD3D();
   // Selects an NV12 output type and refreshes coded size, display aperture
   // and stride. Also called on MF_E_TRANSFORM_STREAM_CHANGE (fires on
@@ -77,6 +78,9 @@ class MFH264DecoderImpl : public VideoDecoder {
   // unset until the first output.
   std::optional<bool> output_is_dxgi_;
   int64_t frames_decoded_ = 0;
+  // Decode() errors, and keyframes among them, since the last decoded frame.
+  int consecutive_errors_ = 0;
+  int failed_keyframes_ = 0;
   DWORD input_stream_id_ = 0;
   DWORD output_stream_id_ = 0;
 

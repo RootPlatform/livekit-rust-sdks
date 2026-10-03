@@ -119,7 +119,11 @@ class MFH264EncoderImpl : public VideoEncoder {
   HRESULT AcquireInputSample(IMFSample** sample_out,
                              ID3D11Texture2D** texture_out);
   // VBV buffer size (and, for screen content, max bitrate) for `target_bps`.
-  void ApplyRateControlBuffer(uint32_t target_bps, bool final_pass);
+  // False when the MFT rejected one of them.
+  bool ApplyRateControlBuffer(uint32_t target_bps, bool final_pass);
+  bool UpdateRateControlBuffer(uint32_t target_bps);
+  void RequestReinitOnDrift(uint32_t reference_bps, uint32_t target_bps);
+  HRESULT SetRateControl(const GUID& property, UINT32 value);
   // Runs the async MFT event loop until the requested goals are met: an input
   // credit is available (when `until_need_input`) and at most
   // `until_pending_at_most` frames are in flight. Encoded output that becomes
@@ -191,6 +195,15 @@ class MFH264EncoderImpl : public VideoEncoder {
   uint32_t active_bitrate_bps_ = 0;
   bool dynamic_bitrate_supported_ = true;
   bool pending_bitrate_reinit_ = false;
+  // Bitrate the VBV buffer and max bitrate on the MFT were sized for.
+  uint32_t rc_buffer_bps_ = 0;
+  // Cleared when the MFT rejects a runtime VBV / max bitrate update; kept
+  // across re-inits so each drift re-init does not retry it.
+  bool dynamic_rc_buffer_supported_ = true;
+  bool transform_configured_ = false;
+  std::optional<uint32_t> fault_mean_bps_;
+  std::optional<uint32_t> fault_max_bps_;
+  std::optional<uint32_t> fault_buffer_bits_;
 
   EncodedImageCallback* encoded_image_callback_ = nullptr;
   LayerConfig configuration_;

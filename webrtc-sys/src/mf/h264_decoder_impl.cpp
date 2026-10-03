@@ -66,20 +66,49 @@ int32_t DecodeFailure(HRESULT hr) {
   }
 }
 
-// Test-only: LK_MF_FAULT_DECODE_AFTER_FRAMES=N makes ProcessInput report
-// DXGI_ERROR_DEVICE_REMOVED once N frames have been decoded.
-std::optional<int64_t> DecodeFaultAfterFrames() {
-  static const std::optional<int64_t> frames = [] {
-    std::optional<int64_t> n =
-        livekit_ffi::GetEnvInt("LK_MF_FAULT_DECODE_AFTER_FRAMES");
-    if (n) {
-      RTC_LOG(LS_WARNING) << "MF decoder fault injection active: device "
-                             "removal after "
-                          << *n << " frames";
+// A hardware failure that is not in DecodeFailure's list still returns plain
+// errors forever; after this many failed Decode() calls, or failed keyframes,
+// without a decoded frame in between the decoder asks for the software one.
+constexpr int kMaxConsecutiveDecodeErrors = 30;
+constexpr int kMaxFailedKeyframes = 2;
+
+// Test-only: once LK_MF_FAULT_DECODE_AFTER_FRAMES=N frames have been decoded,
+// LK_MF_FAULT_DECODE_MODE picks the failure:
+//   device-removed (default)  ProcessInput reports DXGI_ERROR_DEVICE_REMOVED.
+//   unlisted                  ProcessInput reports E_FAIL.
+//   renegotiate               ProcessOutput reports a stream change whose
+//                             output renegotiation fails.
+enum class DecodeFaultMode { kDeviceRemoved, kUnlisted, kRenegotiate };
+
+struct DecodeFault {
+  std::optional<int64_t> after_frames;
+  DecodeFaultMode mode = DecodeFaultMode::kDeviceRemoved;
+};
+
+const DecodeFault& DecodeFaults() {
+  static const DecodeFault fault = [] {
+    DecodeFault f;
+    f.after_frames = livekit_ffi::GetEnvInt("LK_MF_FAULT_DECODE_AFTER_FRAMES");
+    std::optional<std::string> mode =
+        livekit_ffi::GetEnvVar("LK_MF_FAULT_DECODE_MODE");
+    if (mode && *mode == "unlisted") {
+      f.mode = DecodeFaultMode::kUnlisted;
+    } else if (mode && *mode == "renegotiate") {
+      f.mode = DecodeFaultMode::kRenegotiate;
     }
-    return n;
+    if (f.after_frames) {
+      RTC_LOG(LS_WARNING) << "MF decoder fault injection active: mode "
+                          << static_cast<int>(f.mode) << " after "
+                          << *f.after_frames << " frames";
+    }
+    return f;
   }();
-  return frames;
+  return fault;
+}
+
+bool FaultReached(DecodeFaultMode mode, int64_t frames_decoded) {
+  return DecodeFaults().after_frames && DecodeFaults().mode == mode &&
+         frames_decoded >= *DecodeFaults().after_frames;
 }
 
 }  // namespace
@@ -323,6 +352,8 @@ int32_t MFH264DecoderImpl::Release() {
   d3d_device_.Reset();
   use_d3d_ = false;
   frames_decoded_ = 0;
+  consecutive_errors_ = 0;
+  failed_keyframes_ = 0;
   buffer_pool_.Release();
   return WEBRTC_VIDEO_CODEC_OK;
 }
@@ -330,6 +361,31 @@ int32_t MFH264DecoderImpl::Release() {
 int32_t MFH264DecoderImpl::Decode(const EncodedImage& input_image,
                                   bool missing_frames,
                                   int64_t render_time_ms) {
+  const int64_t decoded_before = frames_decoded_;
+  const int32_t ret = DecodeFrame(input_image);
+  if (frames_decoded_ != decoded_before) {
+    consecutive_errors_ = 0;
+    failed_keyframes_ = 0;
+  }
+  if (ret != WEBRTC_VIDEO_CODEC_ERROR) {
+    return ret;
+  }
+  consecutive_errors_++;
+  if (input_image._frameType == VideoFrameType::kVideoFrameKey) {
+    failed_keyframes_++;
+  }
+  if (consecutive_errors_ >= kMaxConsecutiveDecodeErrors ||
+      failed_keyframes_ >= kMaxFailedKeyframes) {
+    RTC_LOG(LS_ERROR) << "MF H264 decoder failed " << consecutive_errors_
+                      << " frames (" << failed_keyframes_
+                      << " keyframes) without output; falling back to "
+                         "software.";
+    return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
+  }
+  return ret;
+}
+
+int32_t MFH264DecoderImpl::DecodeFrame(const EncodedImage& input_image) {
   if (!transform_) {
     RTC_LOG(LS_ERROR) << "decode failed: decoder not configured";
     return WEBRTC_VIDEO_CODEC_UNINITIALIZED;
@@ -375,12 +431,14 @@ int32_t MFH264DecoderImpl::Decode(const EncodedImage& input_image,
   sample->SetSampleTime(RtpToSampleTime(input_image.RtpTimestamp()));
 
   for (int attempt = 0; attempt < 2; attempt++) {
-    if (DecodeFaultAfterFrames() &&
-        frames_decoded_ >= *DecodeFaultAfterFrames()) {
+    const bool unlisted =
+        FaultReached(DecodeFaultMode::kUnlisted, frames_decoded_);
+    if (unlisted ||
+        FaultReached(DecodeFaultMode::kDeviceRemoved, frames_decoded_)) {
+      hr = unlisted ? E_FAIL : DXGI_ERROR_DEVICE_REMOVED;
       RTC_LOG(LS_WARNING) << "LK_MF_FAULT_DECODE_AFTER_FRAMES: simulating "
-                             "device removal after "
+                          << HResultToString(hr) << " after "
                           << frames_decoded_ << " frames.";
-      hr = DXGI_ERROR_DEVICE_REMOVED;
       break;
     }
     hr = transform_->ProcessInput(input_stream_id_, sample.Get(), 0);
@@ -408,7 +466,9 @@ int32_t MFH264DecoderImpl::DrainOutputs(std::optional<int> qp) {
     HRESULT hr =
         transform_->GetOutputStreamInfo(output_stream_id_, &stream_info);
     if (FAILED(hr)) {
-      return WEBRTC_VIDEO_CODEC_ERROR;
+      RTC_LOG(LS_ERROR) << "Decoder GetOutputStreamInfo failed: "
+                        << HResultToString(hr);
+      return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
     }
     const bool transform_allocates =
         stream_info.dwFlags & (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES |
@@ -438,20 +498,27 @@ int32_t MFH264DecoderImpl::DrainOutputs(std::optional<int> qp) {
     output.dwStreamID = output_stream_id_;
     output.pSample = transform_allocates ? nullptr : allocated.Get();
     DWORD status = 0;
-    hr = transform_->ProcessOutput(0, 1, &output, &status);
-    if (output.pEvents) {
-      output.pEvents->Release();
+    const bool renegotiate_fault =
+        FaultReached(DecodeFaultMode::kRenegotiate, frames_decoded_);
+    if (renegotiate_fault) {
+      hr = MF_E_TRANSFORM_STREAM_CHANGE;
+    } else {
+      hr = transform_->ProcessOutput(0, 1, &output, &status);
+      if (output.pEvents) {
+        output.pEvents->Release();
+      }
     }
 
     if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
       return WEBRTC_VIDEO_CODEC_OK;
     }
     if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
-      HRESULT nhr = NegotiateOutputType();
+      HRESULT nhr =
+          renegotiate_fault ? MF_E_INVALIDMEDIATYPE : NegotiateOutputType();
       if (FAILED(nhr)) {
         RTC_LOG(LS_ERROR) << "Decoder output renegotiation failed: "
                           << HResultToString(nhr);
-        return WEBRTC_VIDEO_CODEC_ERROR;
+        return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
       }
       continue;
     }

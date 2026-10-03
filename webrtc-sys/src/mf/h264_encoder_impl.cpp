@@ -86,10 +86,17 @@ constexpr int32_t kHardwareFailure = WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
 //                                from the (N+1)th frame after InitEncode.
 //   LK_MF_MAX_SESSIONS=N         InitEncode fails while N MF encoder sessions
 //                                are open (simulates NVENC session limits).
+//   LK_MF_FAULT_RUNTIME_RC=1     Runtime BufferSize/MaxBitRate updates are
+//                                rejected; MeanBitRate updates still work.
+//   LK_MF_FAULT_STRICT_RC=1      MeanBitRate above the last MaxBitRate (or
+//                                above what the last BufferSize holds in
+//                                kVbvMs) is rejected, and vice versa.
 struct FaultInjection {
   bool fail_init = false;
   std::optional<int64_t> fail_after_frames;
   std::optional<int64_t> max_sessions;
+  bool fail_runtime_rc = false;
+  bool strict_rc = false;
 };
 
 const FaultInjection& Faults() {
@@ -98,11 +105,16 @@ const FaultInjection& Faults() {
     f.fail_init = livekit_ffi::EnvFlagSet("LK_MF_FAULT_INIT");
     f.fail_after_frames = livekit_ffi::GetEnvInt("LK_MF_FAULT_AFTER_FRAMES");
     f.max_sessions = livekit_ffi::GetEnvInt("LK_MF_MAX_SESSIONS");
-    if (f.fail_init || f.fail_after_frames || f.max_sessions) {
+    f.fail_runtime_rc = livekit_ffi::EnvFlagSet("LK_MF_FAULT_RUNTIME_RC");
+    f.strict_rc = livekit_ffi::EnvFlagSet("LK_MF_FAULT_STRICT_RC");
+    if (f.fail_init || f.fail_after_frames || f.max_sessions ||
+        f.fail_runtime_rc || f.strict_rc) {
       RTC_LOG(LS_WARNING) << "MF encoder fault injection active: init="
                           << f.fail_init << " after_frames="
                           << f.fail_after_frames.value_or(-1)
-                          << " max_sessions=" << f.max_sessions.value_or(-1);
+                          << " max_sessions=" << f.max_sessions.value_or(-1)
+                          << " runtime_rc=" << f.fail_runtime_rc
+                          << " strict_rc=" << f.strict_rc;
     }
     return f;
   }();
@@ -510,6 +522,7 @@ int32_t MFH264EncoderImpl::InitEncode(const VideoCodec* inst,
   configuration_.max_frame_rate = codec_.maxFramerate;
   configuration_.target_bps = codec_.startBitrate * 1000;
   configuration_.max_bps = codec_.maxBitrate * 1000;
+  dynamic_rc_buffer_supported_ = true;
 
   if (!livekit_ffi::EnsureComInitialized() || !livekit_ffi::EnsureMFStarted()) {
     ReportError();
@@ -648,8 +661,11 @@ int32_t MFH264EncoderImpl::ApplyCodecApiSettings(bool log_failures) {
     }
     return WEBRTC_VIDEO_CODEC_ERROR;
   }
-  hr = SetCodecApiUInt32(codec_api_.Get(), CODECAPI_AVEncCommonMeanBitRate,
-                         configuration_.target_bps);
+  // Limits before the mean: an MFT that validates mean <= max rejects the
+  // mean otherwise.
+  ApplyRateControlBuffer(configuration_.target_bps, log_failures);
+  hr = SetRateControl(CODECAPI_AVEncCommonMeanBitRate,
+                      configuration_.target_bps);
   if (FAILED(hr)) {
     if (log_failures) {
       RTC_LOG(LS_ERROR) << "Failed to set mean bitrate: "
@@ -686,32 +702,103 @@ int32_t MFH264EncoderImpl::ApplyCodecApiSettings(bool log_failures) {
       log_failures) {
     RTC_LOG(LS_WARNING) << "Encoder MFT rejected infinite GOP size.";
   }
-  ApplyRateControlBuffer(configuration_.target_bps, log_failures);
   return WEBRTC_VIDEO_CODEC_OK;
 }
 
-void MFH264EncoderImpl::ApplyRateControlBuffer(uint32_t target_bps,
+HRESULT MFH264EncoderImpl::SetRateControl(const GUID& property, UINT32 value) {
+  const bool is_mean = property == CODECAPI_AVEncCommonMeanBitRate;
+  const bool is_max = property == CODECAPI_AVEncCommonMaxBitRate;
+  const bool is_buffer = property == CODECAPI_AVEncCommonBufferSize;
+  if (Faults().fail_runtime_rc && transform_configured_ && !is_mean) {
+    return E_INVALIDARG;
+  }
+  if (Faults().strict_rc) {
+    const auto held_bits = [](uint32_t bps) {
+      return static_cast<uint64_t>(bps) * kVbvMs / 1000;
+    };
+    if (is_mean && ((fault_max_bps_ && value > *fault_max_bps_) ||
+                    (fault_buffer_bits_ &&
+                     held_bits(value) > *fault_buffer_bits_))) {
+      return E_INVALIDARG;
+    }
+    if (is_max && fault_mean_bps_ && value < *fault_mean_bps_) {
+      return E_INVALIDARG;
+    }
+    if (is_buffer && fault_mean_bps_ && value < held_bits(*fault_mean_bps_)) {
+      return E_INVALIDARG;
+    }
+  }
+  HRESULT hr = SetCodecApiUInt32(codec_api_.Get(), property, value);
+  if (SUCCEEDED(hr) && Faults().strict_rc) {
+    if (is_mean) {
+      fault_mean_bps_ = value;
+    } else if (is_max) {
+      fault_max_bps_ = value;
+    } else if (is_buffer) {
+      fault_buffer_bits_ = value;
+    }
+  }
+  return hr;
+}
+
+bool MFH264EncoderImpl::ApplyRateControlBuffer(uint32_t target_bps,
                                                bool final_pass) {
   const bool screenshare = codec_.mode == VideoCodecMode::kScreensharing;
   const uint32_t buffer_bits = static_cast<uint32_t>(std::min<uint64_t>(
       UINT32_MAX, static_cast<uint64_t>(target_bps) * kVbvMs / 1000));
+  bool applied = true;
   if (buffer_size_supported_) {
-    HRESULT hr = SetCodecApiUInt32(codec_api_.Get(),
-                                   CODECAPI_AVEncCommonBufferSize, buffer_bits);
-    if (FAILED(hr) && final_pass) {
-      buffer_size_supported_ = false;
-      RTC_LOG(LS_WARNING) << "Encoder MFT rejected VBV buffer size "
-                          << buffer_bits << ": " << HResultToString(hr);
+    HRESULT hr = SetRateControl(CODECAPI_AVEncCommonBufferSize, buffer_bits);
+    if (FAILED(hr)) {
+      applied = false;
+      if (final_pass) {
+        buffer_size_supported_ = false;
+        RTC_LOG(LS_WARNING) << "Encoder MFT rejected VBV buffer size "
+                            << buffer_bits << ": " << HResultToString(hr);
+      }
     }
   }
   if (screenshare && max_bitrate_supported_) {
-    HRESULT hr = SetCodecApiUInt32(codec_api_.Get(),
-                                   CODECAPI_AVEncCommonMaxBitRate, target_bps);
-    if (FAILED(hr) && final_pass) {
-      max_bitrate_supported_ = false;
-      RTC_LOG(LS_WARNING) << "Encoder MFT rejected max bitrate " << target_bps
-                          << ": " << HResultToString(hr);
+    HRESULT hr = SetRateControl(CODECAPI_AVEncCommonMaxBitRate, target_bps);
+    if (FAILED(hr)) {
+      applied = false;
+      if (final_pass) {
+        max_bitrate_supported_ = false;
+        RTC_LOG(LS_WARNING) << "Encoder MFT rejected max bitrate "
+                            << target_bps << ": " << HResultToString(hr);
+      }
     }
+  }
+  return applied;
+}
+
+bool MFH264EncoderImpl::UpdateRateControlBuffer(uint32_t target_bps) {
+  if (!dynamic_rc_buffer_supported_) {
+    return false;
+  }
+  if (ApplyRateControlBuffer(target_bps, /*final_pass=*/false)) {
+    rc_buffer_bps_ = target_bps;
+    return true;
+  }
+  dynamic_rc_buffer_supported_ = false;
+  RTC_LOG(LS_WARNING) << "Encoder MFT rejected a runtime VBV / max bitrate "
+                         "update to "
+                      << target_bps << " bps (still sized for "
+                      << rc_buffer_bps_
+                      << " bps); re-initializing when the target drifts.";
+  return false;
+}
+
+void MFH264EncoderImpl::RequestReinitOnDrift(uint32_t reference_bps,
+                                             uint32_t target_bps) {
+  // A full re-init costs a keyframe, so only when the target has moved more
+  // than 20%.
+  const uint64_t reference = std::max(reference_bps, 1u);
+  const uint64_t delta = target_bps > reference_bps
+                             ? target_bps - reference_bps
+                             : reference_bps - target_bps;
+  if (delta * 5 > reference) {
+    pending_bitrate_reinit_ = true;
   }
 }
 
@@ -730,6 +817,10 @@ int32_t MFH264EncoderImpl::ConfigureTransform() {
   output_stream_id_ = output_ids[0];
   buffer_size_supported_ = true;
   max_bitrate_supported_ = true;
+  transform_configured_ = false;
+  fault_mean_bps_.reset();
+  fault_max_bps_.reset();
+  fault_buffer_bits_.reset();
 
   const UINT32 fps =
       std::max(1u, static_cast<UINT32>(configuration_.max_frame_rate + 0.5f));
@@ -808,8 +899,10 @@ int32_t MFH264EncoderImpl::ConfigureTransform() {
   }
 
   active_bitrate_bps_ = configuration_.target_bps;
+  rc_buffer_bps_ = configuration_.target_bps;
   dynamic_bitrate_supported_ = true;
   pending_bitrate_reinit_ = false;
+  transform_configured_ = true;
 
   hr = transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
   if (FAILED(hr)) {
@@ -831,7 +924,9 @@ int32_t MFH264EncoderImpl::ConfigureTransform() {
 int32_t MFH264EncoderImpl::ReinitTransform() {
   RTC_LOG(LS_INFO) << "Reinitializing MF H264 encoder (bitrate "
                    << active_bitrate_bps_ << " -> "
-                   << configuration_.target_bps << " bps).";
+                   << configuration_.target_bps
+                   << " bps, rate control sized for " << rc_buffer_bps_
+                   << " bps).";
   ReleaseTransform();
   pending_frames_.clear();
   frame_count_ = 0;
@@ -1659,11 +1754,19 @@ void MFH264EncoderImpl::ApplyBitrate(uint32_t bitrate_bps) {
     return;
   }
   if (dynamic_bitrate_supported_) {
-    HRESULT hr = SetCodecApiUInt32(
-        codec_api_.Get(), CODECAPI_AVEncCommonMeanBitRate, bitrate_bps);
+    // Max bitrate and VBV go up before the mean and come down after it, so
+    // an MFT that validates mean <= max accepts every step.
+    const bool raising = bitrate_bps > active_bitrate_bps_;
+    bool limits_updated = !raising || UpdateRateControlBuffer(bitrate_bps);
+    HRESULT hr = SetRateControl(CODECAPI_AVEncCommonMeanBitRate, bitrate_bps);
     if (SUCCEEDED(hr)) {
       active_bitrate_bps_ = bitrate_bps;
-      ApplyRateControlBuffer(bitrate_bps, /*final_pass=*/true);
+      if (!raising) {
+        limits_updated = UpdateRateControlBuffer(bitrate_bps);
+      }
+      if (!limits_updated) {
+        RequestReinitOnDrift(rc_buffer_bps_, bitrate_bps);
+      }
       return;
     }
     dynamic_bitrate_supported_ = false;
@@ -1672,15 +1775,7 @@ void MFH264EncoderImpl::ApplyBitrate(uint32_t bitrate_bps) {
         << HResultToString(hr)
         << "); falling back to re-init with hysteresis.";
   }
-  // Dynamic update unsupported: re-initialize, but only when the target has
-  // moved enough to matter — a full re-init costs a keyframe.
-  const uint32_t reference = std::max(active_bitrate_bps_, 1u);
-  const uint32_t delta = bitrate_bps > active_bitrate_bps_
-                             ? bitrate_bps - active_bitrate_bps_
-                             : active_bitrate_bps_ - bitrate_bps;
-  if (delta * 5 > reference) {  // > 20% change
-    pending_bitrate_reinit_ = true;
-  }
+  RequestReinitOnDrift(active_bitrate_bps_, bitrate_bps);
 }
 
 void MFH264EncoderImpl::SetRates(const RateControlParameters& parameters) {
