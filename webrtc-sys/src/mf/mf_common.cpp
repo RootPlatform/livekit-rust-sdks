@@ -33,6 +33,7 @@
 #include <cwchar>
 #include <initializer_list>
 #include <iterator>
+#include <mutex>
 #include <utility>
 
 #include "rtc_base/logging.h"
@@ -199,28 +200,41 @@ HRESULT FindAdapterByLuid(const LUID& luid, ComPtr<IDXGIAdapter1>* out) {
   }
 }
 
-}  // namespace
-
-HRESULT CreateD3D11DeviceBundle(const LUID* luid, D3D11DeviceBundle* out) {
-  ComPtr<IDXGIAdapter1> adapter;
-  if (luid) {
-    HRESULT hr = FindAdapterByLuid(*luid, &adapter);
-    if (FAILED(hr)) {
-      RTC_LOG(LS_WARNING) << "No DXGI adapter with LUID " << LuidToString(*luid)
-                          << ": " << HResultToString(hr);
-      return hr;
-    }
-    DXGI_ADAPTER_DESC1 desc = {};
-    adapter->GetDesc1(&desc);
-    std::string name;
-    for (const WCHAR* c = desc.Description; *c; c++) {
-      name.push_back(*c < 0x80 ? static_cast<char>(*c) : '?');
-    }
-    RTC_LOG(LS_INFO) << "Creating D3D11 device on adapter \"" << name
-                     << "\" (LUID " << LuidToString(*luid) << ")";
-  } else {
-    RTC_LOG(LS_INFO) << "Creating D3D11 device on the default adapter";
+HRESULT DefaultAdapterLuid(LUID* out) {
+  ComPtr<IDXGIFactory1> factory;
+  HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(&factory));
+  if (FAILED(hr)) {
+    return hr;
   }
+  ComPtr<IDXGIAdapter1> adapter;
+  hr = factory->EnumAdapters1(0, &adapter);
+  if (FAILED(hr)) {
+    return hr;
+  }
+  DXGI_ADAPTER_DESC1 desc = {};
+  hr = adapter->GetDesc1(&desc);
+  if (SUCCEEDED(hr)) {
+    *out = desc.AdapterLuid;
+  }
+  return hr;
+}
+
+HRESULT CreateD3D11DeviceBundle(const LUID& luid, D3D11DeviceBundle* out) {
+  ComPtr<IDXGIAdapter1> adapter;
+  HRESULT hr = FindAdapterByLuid(luid, &adapter);
+  if (FAILED(hr)) {
+    RTC_LOG(LS_WARNING) << "No DXGI adapter with LUID " << LuidToString(luid)
+                        << ": " << HResultToString(hr);
+    return hr;
+  }
+  DXGI_ADAPTER_DESC1 desc = {};
+  adapter->GetDesc1(&desc);
+  std::string name;
+  for (const WCHAR* c = desc.Description; *c; c++) {
+    name.push_back(*c < 0x80 ? static_cast<char>(*c) : '?');
+  }
+  RTC_LOG(LS_INFO) << "Creating D3D11 device on adapter \"" << name
+                   << "\" (LUID " << LuidToString(luid) << ")";
 
   const D3D_FEATURE_LEVEL feature_levels[] = {
       D3D_FEATURE_LEVEL_11_1,
@@ -231,11 +245,10 @@ HRESULT CreateD3D11DeviceBundle(const LUID* luid, D3D11DeviceBundle* out) {
   const UINT flags =
       D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT;
   D3D11DeviceBundle bundle;
-  HRESULT hr = D3D11CreateDevice(
-      adapter.Get(),
-      adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE, nullptr,
-      flags, feature_levels, ARRAYSIZE(feature_levels), D3D11_SDK_VERSION,
-      &bundle.device, nullptr, &bundle.context);
+  hr = D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+                         flags, feature_levels, ARRAYSIZE(feature_levels),
+                         D3D11_SDK_VERSION, &bundle.device, nullptr,
+                         &bundle.context);
   if (FAILED(hr)) {
     return hr;
   }
@@ -261,8 +274,109 @@ HRESULT CreateD3D11DeviceBundle(const LUID* luid, D3D11DeviceBundle* out) {
   return S_OK;
 }
 
-HRESULT CreateD3D11DeviceBundleForActivate(IMFActivate* activate,
-                                           D3D11DeviceBundle* out) {
+enum class SharingMode { kPerAdapter, kPerUser, kOff };
+
+SharingMode D3D11SharingMode() {
+  static const SharingMode mode = [] {
+    std::optional<std::string> value = GetEnvVar("LK_MF_D3D11_SHARING");
+    if (value && _stricmp(value->c_str(), "user") == 0) {
+      return SharingMode::kPerUser;
+    }
+    if (value && _stricmp(value->c_str(), "off") == 0) {
+      return SharingMode::kOff;
+    }
+    return SharingMode::kPerAdapter;
+  }();
+  return mode;
+}
+
+struct SharedDeviceEntry {
+  uint64_t luid = 0;
+  int user = 0;
+  std::weak_ptr<const D3D11DeviceBundle> device;
+};
+
+std::mutex& SharedDeviceMutex() {
+  static std::mutex* mutex = new std::mutex();
+  return *mutex;
+}
+
+std::vector<SharedDeviceEntry>& SharedDevices() {
+  static auto* entries = new std::vector<SharedDeviceEntry>();
+  return *entries;
+}
+
+uint64_t LuidKey(const LUID& luid) {
+  return (static_cast<uint64_t>(static_cast<uint32_t>(luid.HighPart)) << 32) |
+         luid.LowPart;
+}
+
+}  // namespace
+
+HRESULT AcquireD3D11Device(const LUID* luid,
+                           D3D11DeviceUser user,
+                           SharedD3D11Device* out) {
+  out->reset();
+  LUID resolved = {};
+  if (luid) {
+    resolved = *luid;
+  } else {
+    HRESULT hr = DefaultAdapterLuid(&resolved);
+    if (FAILED(hr)) {
+      RTC_LOG(LS_WARNING) << "No default DXGI adapter: " << HResultToString(hr);
+      return hr;
+    }
+  }
+
+  const SharingMode mode = D3D11SharingMode();
+  if (mode == SharingMode::kOff) {
+    auto bundle = std::make_shared<D3D11DeviceBundle>();
+    HRESULT hr = CreateD3D11DeviceBundle(resolved, bundle.get());
+    if (SUCCEEDED(hr)) {
+      *out = std::move(bundle);
+    }
+    return hr;
+  }
+
+  const uint64_t key = LuidKey(resolved);
+  const int user_key =
+      mode == SharingMode::kPerUser ? static_cast<int>(user) : 0;
+  std::lock_guard<std::mutex> lock(SharedDeviceMutex());
+  std::vector<SharedDeviceEntry>& entries = SharedDevices();
+  for (auto it = entries.begin(); it != entries.end();) {
+    SharedD3D11Device existing = it->device.lock();
+    if (!existing) {
+      it = entries.erase(it);
+      continue;
+    }
+    if (it->luid == key && it->user == user_key) {
+      const HRESULT removed = existing->device->GetDeviceRemovedReason();
+      if (SUCCEEDED(removed)) {
+        *out = std::move(existing);
+        return S_OK;
+      }
+      RTC_LOG(LS_WARNING) << "Shared D3D11 device on adapter "
+                          << LuidToString(resolved) << " was removed ("
+                          << HResultToString(removed) << "); creating a new one.";
+      it = entries.erase(it);
+      continue;
+    }
+    ++it;
+  }
+
+  auto bundle = std::make_shared<D3D11DeviceBundle>();
+  HRESULT hr = CreateD3D11DeviceBundle(resolved, bundle.get());
+  if (FAILED(hr)) {
+    return hr;
+  }
+  SharedD3D11Device shared = std::move(bundle);
+  entries.push_back({key, user_key, shared});
+  *out = std::move(shared);
+  return S_OK;
+}
+
+HRESULT AcquireD3D11DeviceForActivate(IMFActivate* activate,
+                                      SharedD3D11Device* out) {
   LUID luid = {};
   bool has_luid = false;
   UINT64 luid_u64 = 0;
@@ -275,7 +389,8 @@ HRESULT CreateD3D11DeviceBundleForActivate(IMFActivate* activate,
                                          sizeof(luid), nullptr))) {
     has_luid = true;
   }
-  return CreateD3D11DeviceBundle(has_luid ? &luid : nullptr, out);
+  return AcquireD3D11Device(has_luid ? &luid : nullptr,
+                            D3D11DeviceUser::kEncoder, out);
 }
 
 namespace {
@@ -517,9 +632,9 @@ std::string GetFriendlyName(IMFActivate* activate) {
 HRESULT PrepareHardwareTransform(IMFActivate* activate,
                                  IMFTransform* transform,
                                  bool* is_async,
-                                 D3D11DeviceBundle* bundle) {
+                                 SharedD3D11Device* device) {
   *is_async = false;
-  *bundle = D3D11DeviceBundle();
+  device->reset();
 
   ComPtr<IMFAttributes> attributes;
   HRESULT hr = transform->GetAttributes(&attributes);
@@ -544,8 +659,8 @@ HRESULT PrepareHardwareTransform(IMFActivate* activate,
     return S_OK;
   }
 
-  D3D11DeviceBundle created;
-  hr = CreateD3D11DeviceBundleForActivate(activate, &created);
+  SharedD3D11Device acquired;
+  hr = AcquireD3D11DeviceForActivate(activate, &acquired);
   if (FAILED(hr)) {
     RTC_LOG(LS_WARNING) << "Failed to create D3D11 device for MFT adapter: "
                         << HResultToString(hr);
@@ -553,13 +668,13 @@ HRESULT PrepareHardwareTransform(IMFActivate* activate,
   }
   hr = transform->ProcessMessage(
       MFT_MESSAGE_SET_D3D_MANAGER,
-      reinterpret_cast<ULONG_PTR>(created.manager.Get()));
+      reinterpret_cast<ULONG_PTR>(acquired->manager.Get()));
   if (FAILED(hr)) {
     RTC_LOG(LS_WARNING) << "MFT rejected D3D11 device manager: "
                         << HResultToString(hr);
     return hr;
   }
-  *bundle = std::move(created);
+  *device = std::move(acquired);
   return S_OK;
 }
 

@@ -52,7 +52,7 @@ use crate::{
 use crate::{
     id::ParticipantSid,
     options::TrackPublishOptions,
-    prelude::TrackKind,
+    prelude::{TrackKind, TrackSource},
     room::{e2ee::manager::E2eeManager, DisconnectReason},
     rtc_engine::{
         lk_runtime::LkRuntime,
@@ -1908,7 +1908,13 @@ impl SessionInner {
                 let sum: u64 = encodings.iter().filter_map(|e| e.max_bitrate).sum();
                 (sum > 0).then_some(sum)
             };
-            self.publisher_pc.set_max_send_bitrate_bps(ultimate_bps).await;
+            self.publisher_pc
+                .set_max_send_bitrate_bps(
+                    track.rtc_track().id(),
+                    ultimate_bps,
+                    options.source == TrackSource::Screenshare,
+                )
+                .await;
         }
 
         if track.kind() == TrackKind::Audio && options.force_stereo {

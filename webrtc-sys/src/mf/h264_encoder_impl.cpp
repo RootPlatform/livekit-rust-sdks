@@ -67,12 +67,16 @@ constexpr size_t kMaxPendingFrames = 4;
 // input samples late.
 constexpr size_t kMaxInputTextures = 16;
 constexpr size_t kStagingTextureCount = 3;
-// Rate-control (VBV) buffer. Without it the driver default let a screen
-// scene change burst to 1.37-1.52x the 3.5 Mbps cap over a full second (the
-// screenshare bitrate cliff); 500 ms holds that second to 1.03x. A one-frame
-// buffer starves NVIDIA's CBR to about a third of the target, so screen
-// content uses the same buffer plus a max bitrate equal to the target.
-constexpr uint32_t kVbvMs = 500;
+// Rate-control (VBV) buffer: 100 ms of the target, and at least three frames
+// at the configured max frame rate. Without one the driver default let a
+// screen scene change burst to 1.37-1.52x the cap over a full second (the
+// screenshare bitrate cliff). A 500 ms buffer at the current target kept 2K
+// simulcast top layers 0.5-1 s behind in the sender's pacer; 100 ms matches
+// what healthy layers ran with while NVIDIA held the buffer at their start
+// bitrate.
+constexpr uint32_t kVbvMs = 100;
+constexpr uint32_t kVbvMinFrames = 3;
+constexpr uint32_t kVbvMaxMs = 1000;
 
 // Every runtime hardware failure asks the VideoEncoderSoftwareFallbackWrapper
 // that SimulcastEncoderAdapter puts around this encoder to continue in
@@ -90,13 +94,17 @@ constexpr int32_t kHardwareFailure = WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
 //                                rejected; MeanBitRate updates still work.
 //   LK_MF_FAULT_STRICT_RC=1      MeanBitRate above the last MaxBitRate (or
 //                                above what the last BufferSize holds in
-//                                kVbvMs) is rejected, and vice versa.
+//                                one VBV duration) is rejected, and vice
+//                                versa.
+//   LK_MF_FAULT_INIT_BPS=N       InitEncode sizes rate control for N bps
+//                                whatever the start bitrate.
 struct FaultInjection {
   bool fail_init = false;
   std::optional<int64_t> fail_after_frames;
   std::optional<int64_t> max_sessions;
   bool fail_runtime_rc = false;
   bool strict_rc = false;
+  std::optional<int64_t> init_bps;
 };
 
 const FaultInjection& Faults() {
@@ -107,14 +115,19 @@ const FaultInjection& Faults() {
     f.max_sessions = livekit_ffi::GetEnvInt("LK_MF_MAX_SESSIONS");
     f.fail_runtime_rc = livekit_ffi::EnvFlagSet("LK_MF_FAULT_RUNTIME_RC");
     f.strict_rc = livekit_ffi::EnvFlagSet("LK_MF_FAULT_STRICT_RC");
+    f.init_bps = livekit_ffi::GetEnvInt("LK_MF_FAULT_INIT_BPS");
+    if (f.init_bps && *f.init_bps <= 0) {
+      f.init_bps.reset();
+    }
     if (f.fail_init || f.fail_after_frames || f.max_sessions ||
-        f.fail_runtime_rc || f.strict_rc) {
+        f.fail_runtime_rc || f.strict_rc || f.init_bps) {
       RTC_LOG(LS_WARNING) << "MF encoder fault injection active: init="
                           << f.fail_init << " after_frames="
                           << f.fail_after_frames.value_or(-1)
                           << " max_sessions=" << f.max_sessions.value_or(-1)
                           << " runtime_rc=" << f.fail_runtime_rc
-                          << " strict_rc=" << f.strict_rc;
+                          << " strict_rc=" << f.strict_rc
+                          << " init_bps=" << f.init_bps.value_or(-1);
     }
     return f;
   }();
@@ -520,8 +533,15 @@ int32_t MFH264EncoderImpl::InitEncode(const VideoCodec* inst,
   configuration_.width = codec_.width;
   configuration_.height = codec_.height;
   configuration_.max_frame_rate = codec_.maxFramerate;
+  max_fps_ = codec_.maxFramerate;
+  vbv_ms_ = std::min(std::max(kVbvMs, kVbvMinFrames * 1000 / max_fps_),
+                     kVbvMaxMs);
   configuration_.target_bps = codec_.startBitrate * 1000;
   configuration_.max_bps = codec_.maxBitrate * 1000;
+  if (Faults().init_bps) {
+    configuration_.target_bps = static_cast<uint32_t>(
+        std::min<int64_t>(*Faults().init_bps, UINT32_MAX));
+  }
   dynamic_rc_buffer_supported_ = true;
 
   if (!livekit_ffi::EnsureComInitialized() || !livekit_ffi::EnsureMFStarted()) {
@@ -546,11 +566,11 @@ int32_t MFH264EncoderImpl::InitEncode(const VideoCodec* inst,
                    << codec_.height << " @ " << codec_.maxFramerate
                    << "fps, target_bps=" << configuration_.target_bps
                    << ", level=" << static_cast<int>(level_)
-                   << ", input=" << (d3d_.manager ? "d3d11" : "system memory")
+                   << ", input=" << (d3d_ ? "d3d11" : "system memory")
                    << ", async=" << is_async_ << ", mode="
                    << (codec_.mode == VideoCodecMode::kScreensharing ? "screen"
                                                                      : "camera")
-                   << ", vbv_ms=" << kVbvMs
+                   << ", vbv_ms=" << vbv_ms_
                    << (buffer_size_supported_ ? "" : " (rejected)");
 
   SimulcastRateAllocator init_allocator(env_, codec_);
@@ -713,8 +733,8 @@ HRESULT MFH264EncoderImpl::SetRateControl(const GUID& property, UINT32 value) {
     return E_INVALIDARG;
   }
   if (Faults().strict_rc) {
-    const auto held_bits = [](uint32_t bps) {
-      return static_cast<uint64_t>(bps) * kVbvMs / 1000;
+    const auto held_bits = [this](uint32_t bps) {
+      return static_cast<uint64_t>(bps) * vbv_ms_ / 1000;
     };
     if (is_mean && ((fault_max_bps_ && value > *fault_max_bps_) ||
                     (fault_buffer_bits_ &&
@@ -745,7 +765,7 @@ bool MFH264EncoderImpl::ApplyRateControlBuffer(uint32_t target_bps,
                                                bool final_pass) {
   const bool screenshare = codec_.mode == VideoCodecMode::kScreensharing;
   const uint32_t buffer_bits = static_cast<uint32_t>(std::min<uint64_t>(
-      UINT32_MAX, static_cast<uint64_t>(target_bps) * kVbvMs / 1000));
+      UINT32_MAX, static_cast<uint64_t>(target_bps) * vbv_ms_ / 1000));
   bool applied = true;
   if (buffer_size_supported_) {
     HRESULT hr = SetRateControl(CODECAPI_AVEncCommonBufferSize, buffer_bits);
@@ -772,21 +792,32 @@ bool MFH264EncoderImpl::ApplyRateControlBuffer(uint32_t target_bps,
   return applied;
 }
 
-bool MFH264EncoderImpl::UpdateRateControlBuffer(uint32_t target_bps) {
-  if (!dynamic_rc_buffer_supported_) {
-    return false;
-  }
-  if (ApplyRateControlBuffer(target_bps, /*final_pass=*/false)) {
-    rc_buffer_bps_ = target_bps;
-    return true;
+void MFH264EncoderImpl::UpdateRateControlBuffer(uint32_t target_bps) {
+  if (!dynamic_rc_buffer_supported_ ||
+      ApplyRateControlBuffer(target_bps, /*final_pass=*/false)) {
+    return;
   }
   dynamic_rc_buffer_supported_ = false;
   RTC_LOG(LS_WARNING) << "Encoder MFT rejected a runtime VBV / max bitrate "
                          "update to "
-                      << target_bps << " bps (still sized for "
-                      << rc_buffer_bps_
-                      << " bps); re-initializing when the target drifts.";
-  return false;
+                      << target_bps << " bps (sized for "
+                      << reinit_policy_.configured_bps() << " bps).";
+}
+
+void MFH264EncoderImpl::CheckRateControlStarvation() {
+  if (pending_bitrate_reinit_ || !configuration_.sending) {
+    return;
+  }
+  if (!reinit_policy_.ShouldReinit(configuration_.target_bps,
+                                   env_.clock().TimeInMilliseconds())) {
+    return;
+  }
+  RTC_LOG(LS_INFO) << "MF H264 encoder VBV is sized for "
+                   << reinit_policy_.configured_bps() << " bps, target "
+                   << configuration_.target_bps << " bps, last second "
+                   << reinit_policy_.last_average_frame_bits()
+                   << " bits/frame; re-initializing.";
+  pending_bitrate_reinit_ = true;
 }
 
 void MFH264EncoderImpl::RequestReinitOnDrift(uint32_t reference_bps,
@@ -822,8 +853,7 @@ int32_t MFH264EncoderImpl::ConfigureTransform() {
   fault_max_bps_.reset();
   fault_buffer_bits_.reset();
 
-  const UINT32 fps =
-      std::max(1u, static_cast<UINT32>(configuration_.max_frame_rate + 0.5f));
+  const UINT32 fps = std::max(1u, max_fps_);
 
   // Rate control, GOP and B-frame settings are latched when the media types
   // are set (Microsoft documents this for the encoder MFTs, and NVIDIA
@@ -899,7 +929,10 @@ int32_t MFH264EncoderImpl::ConfigureTransform() {
   }
 
   active_bitrate_bps_ = configuration_.target_bps;
-  rc_buffer_bps_ = configuration_.target_bps;
+  reinit_policy_.OnConfigured(
+      configuration_.target_bps,
+      static_cast<uint64_t>(configuration_.target_bps) * vbv_ms_ / 1000,
+      env_.clock().TimeInMilliseconds());
   dynamic_bitrate_supported_ = true;
   pending_bitrate_reinit_ = false;
   transform_configured_ = true;
@@ -925,8 +958,8 @@ int32_t MFH264EncoderImpl::ReinitTransform() {
   RTC_LOG(LS_INFO) << "Reinitializing MF H264 encoder (bitrate "
                    << active_bitrate_bps_ << " -> "
                    << configuration_.target_bps
-                   << " bps, rate control sized for " << rc_buffer_bps_
-                   << " bps).";
+                   << " bps, rate control sized for "
+                   << reinit_policy_.configured_bps() << " bps).";
   ReleaseTransform();
   pending_frames_.clear();
   frame_count_ = 0;
@@ -1028,7 +1061,7 @@ void MFH264EncoderImpl::ReleaseTransform() {
   }
   staging_textures_.clear();
   next_staging_ = 0;
-  d3d_ = livekit_ffi::D3D11DeviceBundle();
+  d3d_.reset();
   need_input_credits_ = 0;
   sequence_header_.clear();
   is_async_ = false;
@@ -1132,7 +1165,7 @@ HRESULT MFH264EncoderImpl::AcquireInputSample(IMFSample** sample_out,
        {static_cast<UINT>(D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE),
         static_cast<UINT>(D3D11_BIND_SHADER_RESOURCE), 0u}) {
     desc.BindFlags = bind_flags;
-    hr = d3d_.device->CreateTexture2D(&desc, nullptr, &texture);
+    hr = d3d_->device->CreateTexture2D(&desc, nullptr, &texture);
     if (SUCCEEDED(hr)) {
       break;
     }
@@ -1209,7 +1242,7 @@ HRESULT MFH264EncoderImpl::CreateD3DInputSample(const VideoFrameBuffer& buffer,
     desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     for (size_t i = 0; i < kStagingTextureCount; i++) {
       ComPtr<ID3D11Texture2D> staging;
-      HRESULT hr = d3d_.device->CreateTexture2D(&desc, nullptr, &staging);
+      HRESULT hr = d3d_->device->CreateTexture2D(&desc, nullptr, &staging);
       if (FAILED(hr)) {
         RTC_LOG(LS_ERROR) << "Failed to create NV12 staging texture: "
                           << HResultToString(hr);
@@ -1224,7 +1257,7 @@ HRESULT MFH264EncoderImpl::CreateD3DInputSample(const VideoFrameBuffer& buffer,
   next_staging_ = (next_staging_ + 1) % staging_textures_.size();
 
   D3D11_MAPPED_SUBRESOURCE mapped = {};
-  HRESULT hr = d3d_.context->Map(staging, 0, D3D11_MAP_WRITE, 0, &mapped);
+  HRESULT hr = d3d_->context->Map(staging, 0, D3D11_MAP_WRITE, 0, &mapped);
   if (FAILED(hr)) {
     return hr;
   }
@@ -1233,7 +1266,7 @@ HRESULT MFH264EncoderImpl::CreateD3DInputSample(const VideoFrameBuffer& buffer,
   uint8_t* dst_y = static_cast<uint8_t*>(mapped.pData);
   uint8_t* dst_uv = dst_y + static_cast<size_t>(mapped.RowPitch) * height;
   int ret = WriteNV12(buffer, dst_y, dst_uv, static_cast<int>(mapped.RowPitch));
-  d3d_.context->Unmap(staging, 0);
+  d3d_->context->Unmap(staging, 0);
   if (ret != 0) {
     return E_FAIL;
   }
@@ -1244,7 +1277,7 @@ HRESULT MFH264EncoderImpl::CreateD3DInputSample(const VideoFrameBuffer& buffer,
   if (FAILED(hr)) {
     return hr;
   }
-  d3d_.context->CopyResource(texture.Get(), staging);
+  d3d_->context->CopyResource(texture.Get(), staging);
 
   sample->SetSampleTime(sample_time_100ns);
   sample->SetSampleDuration(duration_100ns);
@@ -1324,6 +1357,7 @@ int32_t MFH264EncoderImpl::Encode(
     return WEBRTC_VIDEO_CODEC_UNINITIALIZED;
   }
 
+  CheckRateControlStarvation();
   if (pending_bitrate_reinit_) {
     int32_t ret = ReinitTransform();
     if (ret != WEBRTC_VIDEO_CODEC_OK) {
@@ -1425,7 +1459,7 @@ int32_t MFH264EncoderImpl::Encode(
   frame_count_++;
 
   ComPtr<IMFSample> sample;
-  HRESULT hr = d3d_.manager
+  HRESULT hr = d3d_
                    ? CreateD3DInputSample(*frame_buffer, sample_time_100ns,
                                           duration_100ns, &sample)
                    : CreateInputSample(*frame_buffer, sample_time_100ns,
@@ -1717,6 +1751,7 @@ int32_t MFH264EncoderImpl::ProcessEncodedFrame(std::vector<uint8_t>& packet) {
 
   h264_bitstream_parser_.ParseBitstream(encoded_image_);
   encoded_image_.qp_ = h264_bitstream_parser_.GetLastSliceQp().value_or(-1);
+  reinit_policy_.OnEncoded(packet.size(), env_.clock().TimeInMilliseconds());
 
   CodecSpecificInfo codec_info;
   codec_info.codecType = kVideoCodecH264;
@@ -1757,15 +1792,14 @@ void MFH264EncoderImpl::ApplyBitrate(uint32_t bitrate_bps) {
     // Max bitrate and VBV go up before the mean and come down after it, so
     // an MFT that validates mean <= max accepts every step.
     const bool raising = bitrate_bps > active_bitrate_bps_;
-    bool limits_updated = !raising || UpdateRateControlBuffer(bitrate_bps);
+    if (raising) {
+      UpdateRateControlBuffer(bitrate_bps);
+    }
     HRESULT hr = SetRateControl(CODECAPI_AVEncCommonMeanBitRate, bitrate_bps);
     if (SUCCEEDED(hr)) {
       active_bitrate_bps_ = bitrate_bps;
       if (!raising) {
-        limits_updated = UpdateRateControlBuffer(bitrate_bps);
-      }
-      if (!limits_updated) {
-        RequestReinitOnDrift(rc_buffer_bps_, bitrate_bps);
+        UpdateRateControlBuffer(bitrate_bps);
       }
       return;
     }

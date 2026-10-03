@@ -19,13 +19,15 @@ pub mod ffi {
     #[derive(Debug)]
     #[repr(i32)]
     pub enum VideoFrameBufferType {
-        Native,
-        I420,
-        I420A,
-        I422,
-        I444,
-        I010,
-        NV12,
+        Native = 0,
+        I420 = 1,
+        I420A = 2,
+        I422 = 3,
+        I444 = 4,
+        I010 = 5,
+        I210 = 6,
+        I410 = 7,
+        NV12 = 8,
     }
 
     unsafe extern "C++" {
@@ -188,3 +190,20 @@ impl_thread_safety!(ffi::I422Buffer, Send + Sync);
 impl_thread_safety!(ffi::I444Buffer, Send + Sync);
 impl_thread_safety!(ffi::I010Buffer, Send + Sync);
 impl_thread_safety!(ffi::NV12Buffer, Send + Sync);
+
+#[cfg(test)]
+mod tests {
+    use super::ffi;
+
+    #[test]
+    fn buffer_type_matches_the_webrtc_buffer() {
+        let nv12 = ffi::new_nv12_buffer(64, 32, 64, 64);
+        let i420 = ffi::new_i420_buffer(64, 32, 64, 32, 32);
+        unsafe {
+            let nv12 = ffi::biyuv_to_vfb(ffi::biyuv8_to_biyuv(ffi::nv12_to_biyuv8(&*nv12)));
+            let i420 = ffi::yuv_to_vfb(ffi::yuv8_to_yuv(ffi::i420_to_yuv8(&*i420)));
+            assert_eq!((*nv12).buffer_type(), ffi::VideoFrameBufferType::NV12);
+            assert_eq!((*i420).buffer_type(), ffi::VideoFrameBufferType::I420);
+        }
+    }
+}

@@ -127,6 +127,10 @@ impl VideoTrackObserver {
 
 impl sys_vt::VideoSink for VideoTrackObserver {
     fn on_frame(&self, frame: UniquePtr<webrtc_sys::video_frame::ffi::VideoFrame>) {
+        let Some(buffer) = new_video_frame_buffer(unsafe { frame.video_frame_buffer() }) else {
+            log::warn!("dropping a video frame whose buffer cannot be converted to I420");
+            return;
+        };
         let packet_trailer_handler = self.packet_trailer_handler.lock().clone();
         let frame_metadata =
             self.frame_metadata(frame.timestamp(), packet_trailer_handler.as_ref());
@@ -135,7 +139,7 @@ impl sys_vt::VideoSink for VideoTrackObserver {
             rotation: frame.rotation().into(),
             timestamp_us: frame.timestamp_us(),
             frame_metadata,
-            buffer: new_video_frame_buffer(unsafe { frame.video_frame_buffer() }),
+            buffer,
         });
     }
 

@@ -18,6 +18,7 @@
 #define WEBRTC_MF_H264_ENCODER_IMPL_H_
 
 #include "mf_common.h"
+#include "mf_reinit_policy.h"
 
 #include <codecapi.h>
 
@@ -121,8 +122,9 @@ class MFH264EncoderImpl : public VideoEncoder {
   // VBV buffer size (and, for screen content, max bitrate) for `target_bps`.
   // False when the MFT rejected one of them.
   bool ApplyRateControlBuffer(uint32_t target_bps, bool final_pass);
-  bool UpdateRateControlBuffer(uint32_t target_bps);
+  void UpdateRateControlBuffer(uint32_t target_bps);
   void RequestReinitOnDrift(uint32_t reference_bps, uint32_t target_bps);
+  void CheckRateControlStarvation();
   HRESULT SetRateControl(const GUID& property, UINT32 value);
   // Runs the async MFT event loop until the requested goals are met: an input
   // credit is available (when `until_need_input`) and at most
@@ -167,7 +169,7 @@ class MFH264EncoderImpl : public VideoEncoder {
   // transform_ while this is set means a runtime re-init failed.
   bool initialized_ = false;
   int requested_keyframes_ = 0;
-  livekit_ffi::D3D11DeviceBundle d3d_;
+  livekit_ffi::SharedD3D11Device d3d_;
   std::vector<livekit_ffi::ComPtr<ID3D11Texture2D>> staging_textures_;
   size_t next_staging_ = 0;
   livekit_ffi::ComPtr<MFInputSamplePool> input_pool_;
@@ -195,11 +197,15 @@ class MFH264EncoderImpl : public VideoEncoder {
   uint32_t active_bitrate_bps_ = 0;
   bool dynamic_bitrate_supported_ = true;
   bool pending_bitrate_reinit_ = false;
-  // Bitrate the VBV buffer and max bitrate on the MFT were sized for.
-  uint32_t rc_buffer_bps_ = 0;
   // Cleared when the MFT rejects a runtime VBV / max bitrate update; kept
-  // across re-inits so each drift re-init does not retry it.
+  // across re-inits so they are not retried.
   bool dynamic_rc_buffer_supported_ = true;
+  livekit_ffi::EncoderReinitPolicy reinit_policy_;
+  // From InitEncode's max frame rate; SetRates overwrites
+  // configuration_.max_frame_rate with the input frame rate, which drops
+  // towards 1 fps on static screen content.
+  uint32_t max_fps_ = 30;
+  uint32_t vbv_ms_ = 100;
   bool transform_configured_ = false;
   std::optional<uint32_t> fault_mean_bps_;
   std::optional<uint32_t> fault_max_bps_;

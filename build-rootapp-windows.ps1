@@ -143,13 +143,19 @@ function Get-Arm64CrossEnv {
 foreach ($target in $Targets) {
     Write-Host "=== building livekit-ffi for $target ==="
     $saved = @{}
+    $targetEnv = [ordered]@{}
     if ($target -eq 'aarch64-pc-windows-msvc' -and -not (Test-NativeArm64Msvc)) {
         Write-Host "no MSVC ARM64 cross compiler; using clang-cl + lld-link from $llvmBin"
-        $crossEnv = Get-Arm64CrossEnv
-        foreach ($name in $crossEnv.Keys) {
-            $saved[$name] = [Environment]::GetEnvironmentVariable($name)
-            Set-Item "env:$name" $crossEnv[$name]
-        }
+        $targetEnv = Get-Arm64CrossEnv
+    }
+    if ($target -eq 'x86_64-pc-windows-msvc') {
+        $clangCl = Join-Path $llvmBin 'clang-cl.exe'
+        if (-not (Test-Path $clangCl)) { throw "$clangCl not found; yuv-sys needs clang-cl for libyuv's SSSE3/AVX2 rows" }
+        $targetEnv['LK_YUV_CC'] = $clangCl
+    }
+    foreach ($name in $targetEnv.Keys) {
+        $saved[$name] = [Environment]::GetEnvironmentVariable($name)
+        Set-Item "env:$name" $targetEnv[$name]
     }
     try {
         if ($CompileOnly) {
