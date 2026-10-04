@@ -547,6 +547,21 @@ QP 41-50.
 The policy is `webrtc-sys/src/mf/mf_reinit_policy.h`; the encoder logs
 `MF H264 encoder VBV is sized for ... re-initializing` when it fires.
 
+## Waiting on the shared D3D11 device
+
+Every MF encoder and decoder on an adapter shares one multithread-protected D3D11 device. A
+blocking `Map` holds that device's lock until the GPU is done, which stalls every other stream's
+D3D calls, so neither side waits inside `Map`:
+
+- The decoder's readback signals a `D3D11GpuFence` (`webrtc-sys/src/mf/mf_gpu_fence.h`) after its
+  copy and waits on the fence event, then maps with `D3D11_MAP_FLAG_DO_NOT_WAIT`.
+- The encoder uploads through a ring of staging textures. Each slot records the fence value
+  signalled after its copy and is mapped with `DO_NOT_WAIT` only once that value has completed.
+  When the oldest slot is still busy, the ring grows by one slot, up to 5, and logs
+  `MF encoder upload ring grown to N`. At 5 the encoder waits on the fence.
+- Without `ID3D11Fence` (before WDDM 2.0) both poll with `DO_NOT_WAIT`. After 200 ms both fall
+  back to a blocking `Map`.
+
 ## Start bitrate
 
 `x-google-start-bitrate` is munged per published video track into the m-section carrying
@@ -577,6 +592,7 @@ above typical uplinks.
 | `rootapp/fx-xos` | macOS build script, Linux script for x64/arm64/cross with glibc and link checks, shared `build-info.json` and zips, Windows `-ToolsDir`/`-LlvmDir`/`-Protoc`/`-Zip`, `rootapp-ffi.yml` release workflow, cross-platform audit |
 | `rootapp/fx-encoder` | MF encoder rebuilt when NVIDIA's latched VBV starves it, 3-frame VBV; one shared D3D11 device per adapter, non-blocking decoder readback; per-track start bitrate (screen shares up to 3 Mbps); NV12/I210/I410 buffer types no longer abort the process; x64 libyuv built with clang-cl |
 | `rootapp/fx-review` | Decoder staging readback waits on an `ID3D11Fence` event instead of polling with `Sleep(1)` (polling fallback without WDDM 2.0); MF encoder teardown on a deferred release thread; Linux CI container installs `unzip` for setup-protoc; arm64 cross builds install `g++-aarch64-linux-gnu`; macOS `minos` check no longer exits awk early; libclang lookup resolves bare `CXX` names |
+| `rootapp/fx3` | MF encoder upload ring never blocks in `Map` (fence-gated slots, grows to 5, then a fence wait outside the device lock); `D3D11GpuFence` in `mf_gpu_fence.h` with a WARP test; MF decoder teardown on the deferred release thread; a release run needs all six RIDs and refuses a tag, or a draft, that points at another commit |
 
 `rootapp/fx-session` adds: unpublishing a video track releases its encoder (see above);
 received I420 frames whose planes are already packed are handed to the FFI handle without a
