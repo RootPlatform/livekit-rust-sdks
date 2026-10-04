@@ -572,6 +572,22 @@ answers with 42e01f, so the browser really starts at libwebrtc's default. 3 Mbps
 a 2K share's top layer (low layer 1.2 Mbps) at the first allocation without starting far
 above typical uplinks.
 
+## Tokio runtime size
+
+The FFI's main tokio runtime runs `min(available_parallelism, 4)` workers instead of tokio's one per
+logical CPU (32 on a 32-thread machine). `LK_FFI_WORKER_THREADS=N` overrides that on every platform:
+it is read once, when the first FFI request creates the server; N is clamped to
+`available_parallelism`, and 0 or a value that doesn't parse keeps the default. Workers keep the name
+`tokio-rt-worker`. The blocking pool keeps tokio's on-demand default (DNS, `tokio::fs`, audio filter
+`on_load`; idle threads exit after 10 s), and the audio capture runtime stays at one `livekit-audio`
+worker.
+
+Many FFI paths make synchronous libwebrtc proxy calls on a worker (data channel `Send`, `add_transceiver`,
+`remove_track`, `SetParameters`, `GetStats`, `PeerConnection::Close`), so the worker waits on the
+signaling or network thread while using no CPU. With one worker a reliable-data flood (about 2.8k
+messages/s) backs up for seconds; two workers keep up. Measure with the flood before lowering the
+default.
+
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
 | Commit | Change |
@@ -593,6 +609,7 @@ above typical uplinks.
 | `rootapp/fx-encoder` | MF encoder rebuilt when NVIDIA's latched VBV starves it, 3-frame VBV; one shared D3D11 device per adapter, non-blocking decoder readback; per-track start bitrate (screen shares up to 3 Mbps); NV12/I210/I410 buffer types no longer abort the process; x64 libyuv built with clang-cl |
 | `rootapp/fx-review` | Decoder staging readback waits on an `ID3D11Fence` event instead of polling with `Sleep(1)` (polling fallback without WDDM 2.0); MF encoder teardown on a deferred release thread; Linux CI container installs `unzip` for setup-protoc; arm64 cross builds install `g++-aarch64-linux-gnu`; macOS `minos` check no longer exits awk early; libclang lookup resolves bare `CXX` names |
 | `rootapp/fx3` | MF encoder upload ring never blocks in `Map` (fence-gated slots, grows to 5, then a fence wait outside the device lock); `D3D11GpuFence` in `mf_gpu_fence.h` with a WARP test; MF decoder teardown on the deferred release thread; a release run needs all six RIDs and refuses a tag, or a draft, that points at another commit |
+| `rootapp/fx4-tokio` | FFI tokio runtime capped at 4 workers, `LK_FFI_WORKER_THREADS` override (see Tokio runtime size) |
 
 `rootapp/fx-session` adds: unpublishing a video track releases its encoder (see above);
 received I420 frames whose planes are already packed are handed to the FFI handle without a
