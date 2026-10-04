@@ -219,7 +219,7 @@ echo 'deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy main universe
 deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy-updates main universe
 deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy-security main universe' | sudo tee /etc/apt/sources.list.d/arm64-ports.list
 sudo apt-get update
-sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross libglib2.0-dev:arm64
+sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross libglib2.0-dev:arm64
 ./build-rootapp-linux.sh --rid linux-arm64
 ```
 
@@ -228,7 +228,8 @@ instead of running the `sed`. The script links with `aarch64-linux-gnu-gcc` plus
 `.cargo/config.toml`, and compiles with clang 21 for `aarch64-unknown-linux-gnu`. It reads the arm64
 `.pc` files from `/usr/lib/aarch64-linux-gnu/pkgconfig` (override with `CROSS_PKGCONFIG_DIR`) with
 `PKG_CONFIG_ALLOW_CROSS=1`. The glibc floor is the host's `libc6-dev-arm64-cross` version, which
-matches the distro's glibc.
+matches the distro's glibc. `g++-aarch64-linux-gnu` is needed even though clang compiles: the `cxx`
+crate's runtime and `link-cplusplus` build against the arm64 libstdc++ headers and link `-lstdc++`.
 
 ## Windows
 
@@ -496,6 +497,14 @@ sender's `VideoSendStream` without a source. That destroys the encoder instances
 their D3D11 devices and NVIDIA driver threads); each unpublished video track keeps only an idle
 stream (one `EncoderQueue` thread, stale outbound-rtp counters) until the PeerConnection closes.
 
+libwebrtc's worker thread, which also delivers incoming audio, waits for the encoder's `Release()`
+during that recreate. The MF encoder therefore hands the MFT shutdown and its device references to
+one process-wide release thread (`webrtc-sys/src/mf/mf_deferred_release.h`) and returns at once;
+a teardown on the worker cost 5-30 ms of concealed incoming audio per camera stop (0.1-0.5 s
+without the shared D3D11 device). Opening an encoder session waits for pending teardowns first, so
+a re-init never holds the old and the new NVENC session together and `LK_MF_MAX_SESSIONS` counts
+stay exact. The encoder logs `MF encoder sessions open: N` on every open and close.
+
 Stopping the transceiver instead is not compatible with LiveKit server 1.13.7:
 
 - libwebrtc recycles a rejected m-section for the next transceiver under a new mid, but the
@@ -557,6 +566,7 @@ above typical uplinks.
 | e2a6b46b | win-arm64 clang-cl build disables libyuv NEON/SVE/SME like the official MSVC build |
 | `rootapp/fx-xos` | macOS build script, Linux script for x64/arm64/cross with glibc and link checks, shared `build-info.json` and zips, Windows `-ToolsDir`/`-LlvmDir`/`-Protoc`/`-Zip`, `rootapp-ffi.yml` release workflow, cross-platform audit |
 | `rootapp/fx-encoder` | MF encoder rebuilt when NVIDIA's latched VBV starves it, 3-frame VBV; one shared D3D11 device per adapter, non-blocking decoder readback; per-track start bitrate (screen shares up to 3 Mbps); NV12/I210/I410 buffer types no longer abort the process; x64 libyuv built with clang-cl |
+| `rootapp/fx-review` | Decoder staging readback waits on an `ID3D11Fence` event instead of polling with `Sleep(1)` (polling fallback without WDDM 2.0); MF encoder teardown on a deferred release thread; Linux CI container installs `unzip` for setup-protoc; arm64 cross builds install `g++-aarch64-linux-gnu`; macOS `minos` check no longer exits awk early; libclang lookup resolves bare `CXX` names |
 
 `rootapp/fx-session` adds: unpublishing a video track releases its encoder (see above);
 received I420 frames whose planes are already packed are handed to the FFI handle without a
