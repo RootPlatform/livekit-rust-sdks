@@ -15,6 +15,7 @@
  */
 
 #include "h264_encoder_impl.h"
+#include "mf_deferred_release.h"
 
 #include <algorithm>
 #include <atomic>
@@ -433,6 +434,62 @@ class MFInputSamplePool : public IMFAsyncCallback {
 
 namespace {
 
+// Encoder teardown leaves the encoder queue: on unpublish WebRTC's worker
+// thread, which also delivers incoming audio, blocks until the encoder's
+// Release() returns, and an MFT shutdown plus a possible D3D11 device release
+// takes tens to hundreds of milliseconds.
+livekit_ffi::DeferredReleaseQueue& DeferredReleases() {
+  static auto* queue = new livekit_ffi::DeferredReleaseQueue(
+      [] { livekit_ffi::EnsureComInitialized(); });
+  return *queue;
+}
+
+constexpr std::chrono::milliseconds kDeferredReleaseWait{2000};
+
+// What holds an encoder's hardware session, released in this order.
+struct TransformResources {
+  ComPtr<IMFTransform> transform;
+  ComPtr<IMFActivate> activate;
+  ComPtr<IMFMediaEventGenerator> event_generator;
+  ComPtr<ICodecAPI> codec_api;
+  ComPtr<MFInputSamplePool> input_pool;
+  std::vector<ComPtr<ID3D11Texture2D>> staging_textures;
+  livekit_ffi::SharedD3D11Device d3d;
+  DWORD input_stream_id = 0;
+  bool session_open = false;
+
+  bool empty() const {
+    return !transform && !activate && !event_generator && !codec_api &&
+           !input_pool && staging_textures.empty() && !d3d && !session_open;
+  }
+
+  void Shutdown() {
+    if (transform) {
+      transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM,
+                                input_stream_id);
+      transform->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+      transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+    }
+    event_generator.Reset();
+    codec_api.Reset();
+    transform.Reset();
+    if (activate) {
+      activate->ShutdownObject();
+      activate.Reset();
+    }
+    if (input_pool) {
+      input_pool->Shutdown();
+      input_pool.Reset();
+    }
+    staging_textures.clear();
+    d3d.reset();
+    if (session_open) {
+      session_open = false;
+      RTC_LOG(LS_INFO) << "MF encoder sessions open: " << --g_open_sessions;
+    }
+  }
+};
+
 // Writes an I420 or NV12 buffer as NV12 (Y plane, then interleaved UV at
 // dst_uv), both planes with `dst_stride`.
 int WriteNV12(const VideoFrameBuffer& buffer,
@@ -584,6 +641,14 @@ int32_t MFH264EncoderImpl::InitEncode(const VideoCodec* inst,
 }
 
 int32_t MFH264EncoderImpl::CreateTransform() {
+  // A session released by Release() may still be closing on the deferred
+  // release thread; opening another first could exceed the driver's session
+  // limit (and LK_MF_MAX_SESSIONS).
+  if (!DeferredReleases().WaitIdle(kDeferredReleaseWait)) {
+    RTC_LOG(LS_WARNING) << "MF encoder teardown still running after "
+                        << kDeferredReleaseWait.count()
+                        << " ms; opening a new session anyway.";
+  }
   if (Faults().max_sessions &&
       g_open_sessions.load() >= *Faults().max_sessions) {
     RTC_LOG(LS_WARNING) << "LK_MF_MAX_SESSIONS: " << g_open_sessions.load()
@@ -611,7 +676,7 @@ int32_t MFH264EncoderImpl::CreateTransform() {
     RTC_LOG(LS_WARNING) << "H264 encoder MFT \"" << friendly_name_
                         << "\" unusable (" << HResultToString(hr)
                         << "); trying the next one.";
-    ReleaseTransform();
+    ReleaseTransform(/*defer=*/false);
   }
 
   RTC_LOG(LS_ERROR) << "No hardware H264 encoder MFT accepted the "
@@ -960,7 +1025,7 @@ int32_t MFH264EncoderImpl::ReinitTransform() {
                    << configuration_.target_bps
                    << " bps, rate control sized for "
                    << reinit_policy_.configured_bps() << " bps).";
-  ReleaseTransform();
+  ReleaseTransform(/*defer=*/false);
   pending_frames_.clear();
   frame_count_ = 0;
   if (CreateTransform() != WEBRTC_VIDEO_CODEC_OK) {
@@ -1019,7 +1084,7 @@ int32_t MFH264EncoderImpl::RegisterEncodeCompleteCallback(
 
 int32_t MFH264EncoderImpl::Release() {
   initialized_ = false;
-  ReleaseTransform();
+  ReleaseTransform(/*defer=*/true);
   pending_frames_.clear();
   frame_count_ = 0;
   frames_submitted_ = 0;
@@ -1028,11 +1093,7 @@ int32_t MFH264EncoderImpl::Release() {
   return WEBRTC_VIDEO_CODEC_OK;
 }
 
-void MFH264EncoderImpl::ReleaseTransform() {
-  if (session_open_) {
-    session_open_ = false;
-    --g_open_sessions;
-  }
+void MFH264EncoderImpl::ReleaseTransform(bool defer) {
   if (drain_safety_) {
     drain_safety_->SetNotAlive();
     drain_safety_ = nullptr;
@@ -1042,30 +1103,29 @@ void MFH264EncoderImpl::ReleaseTransform() {
     event_pump_->Stop();
     event_pump_.Reset();
   }
-  if (transform_) {
-    transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM,
-                               input_stream_id_);
-    transform_->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
-    transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
-  }
-  event_generator_.Reset();
-  codec_api_.Reset();
-  transform_.Reset();
-  if (activate_) {
-    activate_->ShutdownObject();
-    activate_.Reset();
-  }
-  if (input_pool_) {
-    input_pool_->Shutdown();
-    input_pool_.Reset();
-  }
-  staging_textures_.clear();
+  auto resources = std::make_shared<TransformResources>();
+  resources->transform = std::move(transform_);
+  resources->activate = std::move(activate_);
+  resources->event_generator = std::move(event_generator_);
+  resources->codec_api = std::move(codec_api_);
+  resources->input_pool = std::move(input_pool_);
+  resources->staging_textures.swap(staging_textures_);
+  resources->d3d = std::move(d3d_);
+  resources->input_stream_id = input_stream_id_;
+  resources->session_open = std::exchange(session_open_, false);
   next_staging_ = 0;
-  d3d_.reset();
   need_input_credits_ = 0;
   sequence_header_.clear();
   is_async_ = false;
   requested_keyframes_ = 0;
+  if (resources->empty()) {
+    return;
+  }
+  if (defer) {
+    DeferredReleases().Post([resources] { resources->Shutdown(); });
+  } else {
+    resources->Shutdown();
+  }
 }
 
 HRESULT MFH264EncoderImpl::CreateInputSample(const VideoFrameBuffer& buffer,

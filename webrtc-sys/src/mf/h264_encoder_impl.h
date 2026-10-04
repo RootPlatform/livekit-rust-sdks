@@ -102,7 +102,9 @@ class MFH264EncoderImpl : public VideoEncoder {
   HRESULT ActivateTransform(IMFActivate* activate);
   int32_t ConfigureTransform();
   int32_t ApplyCodecApiSettings(bool log_failures);
-  void ReleaseTransform();
+  // With `defer` the MFT, its session and the device references are torn
+  // down on the deferred release thread instead of the calling thread.
+  void ReleaseTransform(bool defer);
   int32_t ReinitTransform();
   HRESULT NegotiateOutputType();
   void CacheSequenceHeader();
