@@ -98,12 +98,26 @@ void TestTargetMustStayRaisedForASecond() {
   policy.OnConfigured(1'000'000, 100'000, 0);
   int64_t now = 0;
   Expect(!Run(policy, 1'000'000, 95'000, 6, &now), "settled at the start");
-  Expect(!policy.ShouldReinit(3'000'000, now), "a raise is not yet sustained");
+  Expect(!policy.ShouldReinit(5'000'000, now), "a raise is not yet sustained");
   Run(policy, 1'000'000, 95'000, 1, &now);
-  Expect(!policy.ShouldReinit(3'000'000, now),
+  Expect(!policy.ShouldReinit(5'000'000, now),
          "a dip below 2x restarts the sustain timer");
-  Expect(Run(policy, 3'000'000, 95'000, 2, &now),
+  Expect(Run(policy, 5'000'000, 95'000, 2, &now),
          "a raise held for a second rebuilds");
+}
+
+void TestEncoderMeetingARaisedTargetDoesNotRebuild() {
+  EncoderReinitPolicy at_2x;
+  at_2x.OnConfigured(1'000'000, 100'000, 0);
+  int64_t now = 0;
+  Expect(!Run(at_2x, 2'000'000, 2'000'000 / 30, 20, &now),
+         "frames of target/fps at 2x the configured rate are rate-following");
+
+  EncoderReinitPolicy at_3x;
+  at_3x.OnConfigured(1'000'000, 100'000, 0);
+  now = 0;
+  Expect(!Run(at_3x, 3'000'000, 3'000'000 / 30, 20, &now),
+         "frames of target/fps at 3x the configured rate are rate-following");
 }
 
 void TestStaticOrEasyContentDoesNotRebuild() {
@@ -156,6 +170,7 @@ int main() {
   TestTargetWithinTwiceConfiguredNeverRebuilds();
   TestStarvedEncoderRebuildsAfterCooldown();
   TestTargetMustStayRaisedForASecond();
+  TestEncoderMeetingARaisedTargetDoesNotRebuild();
   TestStaticOrEasyContentDoesNotRebuild();
   TestStaleWindowIsIgnored();
   TestReconfigureResetsState();

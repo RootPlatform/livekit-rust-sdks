@@ -41,6 +41,10 @@ class EncoderReinitPolicy {
   static constexpr int64_t kWindowMs = 1000;
   static constexpr int kMinWindowFrames = 5;
   static constexpr uint64_t kFullBufferPercent = 50;
+  // A buffer-sized average frame alone also describes an encoder that is meeting
+  // a target of 2-3x the configured rate; starvation means it delivers well
+  // below the target too.
+  static constexpr uint64_t kStarvedPercent = 70;
 
   void OnConfigured(uint32_t configured_bps,
                     uint64_t buffer_bits,
@@ -69,6 +73,8 @@ class EncoderReinitPolicy {
       last_.valid = true;
       last_.end_ms = now_ms;
       last_.average_frame_bits = window_.bits / window_.frames;
+      last_.achieved_bps =
+          window_.bits * 1000 / static_cast<uint64_t>(now_ms - window_.start_ms);
     }
     window_ = Window();
     window_.start_ms = now_ms;
@@ -97,7 +103,9 @@ class EncoderReinitPolicy {
       return false;
     }
     return last_.valid && now_ms - last_.end_ms <= 2 * kWindowMs &&
-           last_.average_frame_bits * 100 >= buffer_bits_ * kFullBufferPercent;
+           last_.average_frame_bits * 100 >= buffer_bits_ * kFullBufferPercent &&
+           last_.achieved_bps * 100 <
+               static_cast<uint64_t>(target_bps) * kStarvedPercent;
   }
 
   uint32_t configured_bps() const { return configured_bps_; }
@@ -116,6 +124,7 @@ class EncoderReinitPolicy {
     bool valid = false;
     int64_t end_ms = 0;
     uint64_t average_frame_bits = 0;
+    uint64_t achieved_bps = 0;
   };
 
   uint32_t configured_bps_ = 0;

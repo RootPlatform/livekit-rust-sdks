@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     fmt::{Debug, Formatter},
     sync::Arc,
 };
@@ -32,9 +32,11 @@ struct TransportInner {
     renegotiate: bool,
     restarting_ice: bool,
     single_pc_mode: bool,
-    // x-google-start-bitrate (kbps) per published video track id, munged into that
-    // track's m-section
-    start_bitrates_kbps: HashMap<String, u32>,
+    // Published video track ids whose m-sections carry x-google-start-bitrate, and the one
+    // value they all carry. libwebrtc resets the call's bandwidth estimate whenever a new
+    // send channel applies a different start bitrate, so the first video track fixes it.
+    start_bitrate_track_ids: HashSet<String>,
+    start_bitrate_kbps: Option<u32>,
     pending_initial_offer: Option<SessionDescription>,
     stereo_track_ids: HashSet<String>,
 }
@@ -67,7 +69,8 @@ impl PeerTransport {
                 renegotiate: false,
                 restarting_ice: false,
                 single_pc_mode,
-                start_bitrates_kbps: HashMap::new(),
+                start_bitrate_track_ids: HashSet::new(),
+                start_bitrate_kbps: None,
                 pending_initial_offer: None,
                 stereo_track_ids: HashSet::new(),
             })),
@@ -196,12 +199,13 @@ impl PeerTransport {
         // Before any video track is published there is no start bitrate to apply, and WebRTC
         // uses its default conservative one.
         let mut inner = self.inner.lock().await;
-        if !inner.start_bitrates_kbps.is_empty() {
-            let munged = Self::munge_start_bitrate_for_tracks(&sdp, &inner.start_bitrates_kbps);
+        if let Some(kbps) = inner.start_bitrate_kbps {
+            let munged =
+                Self::munge_start_bitrate_for_tracks(&sdp, &inner.start_bitrate_track_ids, kbps);
             if munged != sdp {
                 log::info!(
-                    "Initial offer: applying x-google-start-bitrate {:?}",
-                    inner.start_bitrates_kbps
+                    "Initial offer: applying x-google-start-bitrate={kbps} to {:?}",
+                    inner.start_bitrate_track_ids
                 );
                 if let Ok(parsed) = SessionDescription::parse(&munged, offer.sdp_type()) {
                     offer = parsed;
@@ -218,14 +222,38 @@ impl PeerTransport {
         inner.pending_initial_offer = None;
     }
 
-    /// Records the start bitrate for the m-section that will carry `track_id`, from the sum of
-    /// its encodings' max bitrates.
+    /// Marks the m-section that will carry `track_id` for start-bitrate munging. The first video
+    /// track's value (from the sum of its encodings' max bitrates) becomes the transport's start
+    /// bitrate and later tracks reuse it.
     pub async fn set_max_send_bitrate_bps(&self, track_id: String, bps: Option<u64>, screen: bool) {
         let mut inner = self.inner.lock().await;
-        match Self::compute_start_bitrate_kbps(bps, screen) {
-            Some(start_kbps) => inner.start_bitrates_kbps.insert(track_id, start_kbps),
-            None => inner.start_bitrates_kbps.remove(&track_id),
-        };
+        let inner = &mut *inner;
+        Self::record_start_bitrate(
+            &mut inner.start_bitrate_track_ids,
+            &mut inner.start_bitrate_kbps,
+            track_id,
+            Self::compute_start_bitrate_kbps(bps, screen),
+        );
+    }
+
+    fn record_start_bitrate(
+        track_ids: &mut HashSet<String>,
+        start_kbps: &mut Option<u32>,
+        track_id: String,
+        computed_kbps: Option<u32>,
+    ) {
+        match computed_kbps {
+            Some(kbps) => {
+                track_ids.insert(track_id);
+                start_kbps.get_or_insert(kbps);
+            }
+            None => {
+                track_ids.remove(&track_id);
+            }
+        }
+        if track_ids.is_empty() {
+            *start_kbps = None;
+        }
     }
 
     /// Maximum x-google-start-bitrate (kbps) for cameras.
@@ -443,17 +471,17 @@ impl PeerTransport {
         Self::join_sdp_sections(eol, sections)
     }
 
-    /// Applies each track's start bitrate to the video codecs of the m-section carrying it
-    /// (matched via `a=msid`), so a screen share and a camera start from their own value.
-    fn munge_start_bitrate_for_tracks(sdp: &str, start_kbps: &HashMap<String, u32>) -> String {
+    /// Applies the transport's start bitrate to the video codecs of every m-section carrying
+    /// one of `track_ids` (matched via `a=msid`).
+    fn munge_start_bitrate_for_tracks(sdp: &str, track_ids: &HashSet<String>, kbps: u32) -> String {
         let (eol, mut sections) = Self::split_sdp_sections(sdp);
         for section in sections.iter_mut().skip(1) {
-            let kbps = Self::section_attribute(section, "msid")
+            let carries_track = Self::section_attribute(section, "msid")
                 .and_then(|msid| msid.split_whitespace().nth(1))
-                .and_then(|track_id| start_kbps.get(track_id).copied());
-            let Some(kbps) = kbps else {
+                .is_some_and(|track_id| track_ids.contains(track_id));
+            if !carries_track {
                 continue;
-            };
+            }
             let munged = Self::munge_x_google_start_bitrate(&section.join(eol), kbps);
             *section = munged
                 .strip_suffix(eol)
@@ -679,10 +707,14 @@ impl PeerTransport {
 
         // Apply x-google-start-bitrate to each published video track's codecs to improve
         // initial quality.
-        if !inner.start_bitrates_kbps.is_empty() {
-            let munged = Self::munge_start_bitrate_for_tracks(&sdp, &inner.start_bitrates_kbps);
+        if let Some(kbps) = inner.start_bitrate_kbps {
+            let munged =
+                Self::munge_start_bitrate_for_tracks(&sdp, &inner.start_bitrate_track_ids, kbps);
             if munged != sdp {
-                log::info!("Applying x-google-start-bitrate {:?}", inner.start_bitrates_kbps);
+                log::info!(
+                    "Applying x-google-start-bitrate={kbps} to {:?}",
+                    inner.start_bitrate_track_ids
+                );
                 match SessionDescription::parse(&munged, offer.sdp_type()) {
                     Ok(parsed) => offer = parsed,
                     Err(e) => log::warn!(
@@ -704,7 +736,7 @@ impl PeerTransport {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::HashSet;
 
     use super::PeerTransport;
 
@@ -1158,22 +1190,43 @@ a=recvonly\r\n\
 a=rtpmap:96 VP8/90000\r\n\
 a=rtpmap:98 H264/90000\r\n\
 a=fmtp:98 packetization-mode=1;profile-level-id=42e01f\r\n";
-        let start: HashMap<String, u32> =
-            [("camera-track".to_string(), 1000), ("screen-track".to_string(), 3000)]
-                .into_iter()
-                .collect();
-        let out = PeerTransport::munge_start_bitrate_for_tracks(sdp, &start);
+        let tracks: HashSet<String> =
+            ["camera-track".to_string(), "screen-track".to_string()].into_iter().collect();
+        let out = PeerTransport::munge_start_bitrate_for_tracks(sdp, &tracks, 1000);
         assert!(out.contains(
             "a=msid:- camera-track\r\na=rtpmap:96 VP8/90000\r\na=fmtp:96 x-google-start-bitrate=1000\r\na=rtpmap:98 H264/90000\r\na=fmtp:98 packetization-mode=1;profile-level-id=42e01f;x-google-start-bitrate=1000\r\n"
         ));
         assert!(out.contains(
-            "a=msid:- screen-track\r\na=rtpmap:96 VP8/90000\r\na=fmtp:96 x-google-start-bitrate=3000\r\na=rtpmap:98 H264/90000\r\na=fmtp:98 packetization-mode=1;profile-level-id=42e01f;x-google-start-bitrate=3000\r\n"
+            "a=msid:- screen-track\r\na=rtpmap:96 VP8/90000\r\na=fmtp:96 x-google-start-bitrate=1000\r\na=rtpmap:98 H264/90000\r\na=fmtp:98 packetization-mode=1;profile-level-id=42e01f;x-google-start-bitrate=1000\r\n"
         ));
         assert!(out.ends_with(
             "a=mid:2\r\na=recvonly\r\na=rtpmap:96 VP8/90000\r\na=rtpmap:98 H264/90000\r\na=fmtp:98 packetization-mode=1;profile-level-id=42e01f\r\n"
         ));
         assert_eq!(out.matches("x-google-start-bitrate=").count(), 4);
-        assert_eq!(PeerTransport::munge_start_bitrate_for_tracks(sdp, &HashMap::new()), sdp);
+        assert_eq!(PeerTransport::munge_start_bitrate_for_tracks(sdp, &HashSet::new(), 1000), sdp);
+    }
+
+    #[test]
+    fn first_video_track_fixes_the_transport_start_bitrate() {
+        let mut tracks = HashSet::new();
+        let mut start = None;
+
+        PeerTransport::record_start_bitrate(&mut tracks, &mut start, "screen".into(), Some(3000));
+        PeerTransport::record_start_bitrate(&mut tracks, &mut start, "camera".into(), Some(1000));
+        assert_eq!(start, Some(3000));
+        assert_eq!(tracks.len(), 2);
+
+        PeerTransport::record_start_bitrate(&mut tracks, &mut start, "low".into(), None);
+        assert_eq!(start, Some(3000));
+        assert_eq!(tracks.len(), 2);
+
+        PeerTransport::record_start_bitrate(&mut tracks, &mut start, "screen".into(), None);
+        PeerTransport::record_start_bitrate(&mut tracks, &mut start, "camera".into(), None);
+        assert_eq!(start, None);
+
+        PeerTransport::record_start_bitrate(&mut tracks, &mut start, "camera2".into(), Some(1000));
+        PeerTransport::record_start_bitrate(&mut tracks, &mut start, "screen2".into(), Some(3000));
+        assert_eq!(start, Some(1000));
     }
 
     #[test]

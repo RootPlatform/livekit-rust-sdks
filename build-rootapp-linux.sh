@@ -19,6 +19,7 @@
 # Environment:
 #   CUDA_HOME=/path    CUDA root with include/cuda.h (default /usr/local/cuda, else /usr/include/cuda.h)
 #   ALLOW_NO_NVIDIA=1  linux-x64: build without NVENC/NVDEC when cuda.h is missing
+#   ALLOW_CUDA13=1     accept CUDA 13+ headers (the result then needs NVIDIA driver r555+)
 #   ALLOW_NO_VAAPI=1   linux-x64: build without VAAPI when libva-dev is missing
 #   ARM64_NVIDIA=1     linux-arm64: also build NVENC/NVDEC (needs cuda.h)
 #   ALLOW_JETSON=1     linux-arm64: allow a Jetson host (the result hard-links Jetson libraries)
@@ -314,6 +315,10 @@ if [ "$want_nvidia" = 1 ]; then
     NVIDIA=1
     export CUDA_HOME
     rk_info "NVENC/NVDEC: on (cuda.h via $CUDA_HOME/include; libcuda, libnvcuvid and libnvidia-encode are dlopened at runtime)"
+    cuda_version=$(sed -n 's/^#define[[:space:]]\{1,\}CUDA_VERSION[[:space:]]\{1,\}\([0-9]\{1,\}\).*/\1/p' "$CUDA_HOME/include/cuda.h" | head -n 1)
+    if [ -n "$cuda_version" ] && [ "$cuda_version" -ge 13000 ] && [ "${ALLOW_CUDA13:-0}" != 1 ]; then
+      rk_missing "cuda.h is from CUDA $((cuda_version / 1000)).$((cuda_version % 1000 / 10)); a library built against CUDA 13+ headers aborts on NVIDIA drivers older than r555. Point CUDA_HOME at CUDA 12.x headers, or set ALLOW_CUDA13=1 if every target machine runs r555 or newer"
+    fi
   elif [ "$require_nvidia" = 1 ]; then
     rk_missing "cuda.h for NVENC/NVDEC: sudo apt-get install --no-install-recommends nvidia-cuda-dev (Ubuntu multiverse) or NVIDIA's CUDA toolkit, or set CUDA_HOME. ALLOW_NO_NVIDIA=1 builds without it, but download_ffi.sh rejects a linux-x64 build that lacks NVIDIA"
   else
