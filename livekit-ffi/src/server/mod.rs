@@ -97,10 +97,34 @@ pub struct FfiServer {
     handle_dropped_txs: DashMap<FfiHandleId, Vec<oneshot::Sender<()>>>,
 }
 
+const DEFAULT_MAX_WORKER_THREADS: usize = 4;
+const WORKER_THREADS_ENV: &str = "LK_FFI_WORKER_THREADS";
+
+fn resolve_worker_threads(available: usize, requested: Option<&str>) -> usize {
+    let available = available.max(1);
+    match requested.and_then(|value| value.trim().parse::<usize>().ok()) {
+        Some(requested) if requested > 0 => requested.min(available),
+        _ => available.min(DEFAULT_MAX_WORKER_THREADS),
+    }
+}
+
+fn async_worker_threads() -> usize {
+    let available = thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    resolve_worker_threads(available, std::env::var(WORKER_THREADS_ENV).ok().as_deref())
+}
+
+fn build_async_runtime(worker_threads: usize) -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .thread_name("tokio-rt-worker")
+        .enable_all()
+        .build()
+        .unwrap()
+}
+
 impl Default for FfiServer {
     fn default() -> Self {
-        let async_runtime =
-            tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        let async_runtime = build_async_runtime(async_worker_threads());
 
         // Dedicated single-threaded runtime for audio capture
         // This ensures audio tasks never compete with other operations
@@ -154,7 +178,11 @@ impl FfiServer {
         *self.config.lock() = Some(config.clone());
         self.logger.set_capture_logs(config.capture_logs);
 
-        log::debug!("initializing ffi server v{}", env!("CARGO_PKG_VERSION")); // TODO: Move this log
+        log::debug!(
+            "initializing ffi server v{} ({} async workers)",
+            env!("CARGO_PKG_VERSION"),
+            self.async_runtime.metrics().num_workers()
+        ); // TODO: Move this log
     }
 
     /// Returns whether the server has been setup.
@@ -300,5 +328,53 @@ impl FfiServer {
             }
         });
         handle
+    }
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::{async_worker_threads, build_async_runtime, resolve_worker_threads};
+    use crate::FFI_SERVER;
+
+    #[test]
+    fn default_caps_workers_at_four() {
+        assert_eq!(resolve_worker_threads(32, None), 4);
+        assert_eq!(resolve_worker_threads(8, None), 4);
+        assert_eq!(resolve_worker_threads(4, None), 4);
+        assert_eq!(resolve_worker_threads(2, None), 2);
+        assert_eq!(resolve_worker_threads(1, None), 1);
+        assert_eq!(resolve_worker_threads(0, None), 1);
+    }
+
+    #[test]
+    fn override_is_bounded_by_available_parallelism() {
+        assert_eq!(resolve_worker_threads(32, Some("1")), 1);
+        assert_eq!(resolve_worker_threads(32, Some(" 8 ")), 8);
+        assert_eq!(resolve_worker_threads(32, Some("32")), 32);
+        assert_eq!(resolve_worker_threads(32, Some("64")), 32);
+        assert_eq!(resolve_worker_threads(2, Some("4")), 2);
+    }
+
+    #[test]
+    fn invalid_override_falls_back_to_default() {
+        for value in ["", "0", "-2", "four", "2.5"] {
+            assert_eq!(resolve_worker_threads(32, Some(value)), 4, "override {value:?}");
+        }
+    }
+
+    #[test]
+    fn async_runtime_runs_the_requested_named_workers() {
+        let runtime = build_async_runtime(3);
+        assert_eq!(runtime.metrics().num_workers(), 3);
+        let name = runtime.block_on(async {
+            tokio::spawn(async { std::thread::current().name().map(str::to_owned) }).await.unwrap()
+        });
+        assert_eq!(name.as_deref(), Some("tokio-rt-worker"));
+    }
+
+    #[test]
+    fn ffi_server_uses_the_resolved_worker_count() {
+        assert_eq!(FFI_SERVER.async_runtime.metrics().num_workers(), async_worker_threads());
+        assert_eq!(FFI_SERVER.audio_runtime.metrics().num_workers(), 1);
     }
 }
