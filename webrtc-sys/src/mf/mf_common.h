@@ -20,7 +20,6 @@
 #include <windows.h>
 
 #include <d3d11.h>
-#include <d3d11_4.h>
 #include <mfapi.h>
 #include <mferror.h>
 #include <mfidl.h>
@@ -28,12 +27,13 @@
 #include <strmif.h>  // ICodecAPI
 #include <wrl/client.h>
 
-#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
 #include <vector>
+
+#include "mf_gpu_fence.h"
 
 namespace livekit_ffi {
 
@@ -47,37 +47,6 @@ struct D3D11DeviceBundle {
 };
 
 using SharedD3D11Device = std::shared_ptr<const D3D11DeviceBundle>;
-
-// Waits for GPU work on a shared, multithread-protected device without
-// holding its lock, which a blocking Map keeps for the whole wait. Needs
-// ID3D11Device5 (WDDM 2.0+); without it Init() fails and callers poll Map
-// with D3D11_MAP_FLAG_DO_NOT_WAIT instead.
-class D3D11GpuFence {
- public:
-  D3D11GpuFence() = default;
-  D3D11GpuFence(D3D11GpuFence&& other) noexcept;
-  D3D11GpuFence& operator=(D3D11GpuFence&& other) noexcept;
-  ~D3D11GpuFence();
-
-  bool Init(const D3D11DeviceBundle& d3d);
-  void Reset();
-  explicit operator bool() const { return event_ != nullptr; }
-
-  // Queues a signal behind the work already recorded on the device context;
-  // 0 when the fence is unavailable or the signal failed.
-  UINT64 Signal();
-  // True for 0 and whenever the fence is unavailable.
-  bool Completed(UINT64 value) const;
-  // Flushes the context, then waits until `value` completes or `deadline`
-  // passes.
-  bool WaitUntil(UINT64 value, std::chrono::steady_clock::time_point deadline);
-
- private:
-  ComPtr<ID3D11DeviceContext4> context_;
-  ComPtr<ID3D11Fence> fence_;
-  HANDLE event_ = nullptr;
-  UINT64 last_value_ = 0;
-};
 
 enum class D3D11DeviceUser { kEncoder, kDecoder };
 

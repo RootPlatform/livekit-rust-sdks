@@ -1381,7 +1381,7 @@ HRESULT MFH264EncoderImpl::CreateD3DInputSample(const VideoFrameBuffer& buffer,
     }
     next_staging_ = 0;
     if (!upload_fence_) {
-      upload_fence_.Init(*d3d_);
+      upload_fence_.Init(d3d_->device.Get(), d3d_->context.Get());
     }
   }
 

@@ -151,7 +151,7 @@ HRESULT MFH264DecoderImpl::SetupD3D() {
   if (FAILED(hr)) {
     return hr;
   }
-  readback_fence_.Init(*d3d_);
+  readback_fence_.Init(d3d_->device.Get(), d3d_->context.Get());
   return S_OK;
 }
 

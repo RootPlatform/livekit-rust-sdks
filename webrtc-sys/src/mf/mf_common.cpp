@@ -27,7 +27,6 @@
 
 #include <codecapi.h>
 
-#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -392,95 +391,6 @@ HRESULT AcquireD3D11DeviceForActivate(IMFActivate* activate,
   }
   return AcquireD3D11Device(has_luid ? &luid : nullptr,
                             D3D11DeviceUser::kEncoder, out);
-}
-
-D3D11GpuFence::D3D11GpuFence(D3D11GpuFence&& other) noexcept
-    : context_(std::move(other.context_)),
-      fence_(std::move(other.fence_)),
-      event_(std::exchange(other.event_, nullptr)),
-      last_value_(std::exchange(other.last_value_, 0)) {}
-
-D3D11GpuFence& D3D11GpuFence::operator=(D3D11GpuFence&& other) noexcept {
-  if (this != &other) {
-    Reset();
-    context_ = std::move(other.context_);
-    fence_ = std::move(other.fence_);
-    event_ = std::exchange(other.event_, nullptr);
-    last_value_ = std::exchange(other.last_value_, 0);
-  }
-  return *this;
-}
-
-D3D11GpuFence::~D3D11GpuFence() {
-  Reset();
-}
-
-bool D3D11GpuFence::Init(const D3D11DeviceBundle& d3d) {
-  Reset();
-  ComPtr<ID3D11Device5> device5;
-  if (SUCCEEDED(d3d.device.As(&device5)) &&
-      SUCCEEDED(d3d.context.As(&context_)) &&
-      SUCCEEDED(device5->CreateFence(0, D3D11_FENCE_FLAG_NONE,
-                                     IID_PPV_ARGS(&fence_)))) {
-    event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-  }
-  if (!event_) {
-    Reset();
-    return false;
-  }
-  return true;
-}
-
-void D3D11GpuFence::Reset() {
-  // A wait that timed out leaves SetEventOnCompletion armed, and the GPU
-  // sets the event when it gets there, so the handle is leaked rather than
-  // closed and possibly recycled under it.
-  if (event_ && (!fence_ || fence_->GetCompletedValue() >= last_value_)) {
-    CloseHandle(event_);
-  }
-  event_ = nullptr;
-  fence_.Reset();
-  context_.Reset();
-  last_value_ = 0;
-}
-
-UINT64 D3D11GpuFence::Signal() {
-  if (!event_) {
-    return 0;
-  }
-  const UINT64 value = last_value_ + 1;
-  if (FAILED(context_->Signal(fence_.Get(), value))) {
-    return 0;
-  }
-  last_value_ = value;
-  return value;
-}
-
-bool D3D11GpuFence::Completed(UINT64 value) const {
-  return !fence_ || fence_->GetCompletedValue() >= value;
-}
-
-bool D3D11GpuFence::WaitUntil(UINT64 value,
-                              std::chrono::steady_clock::time_point deadline) {
-  if (Completed(value)) {
-    return true;
-  }
-  context_->Flush();
-  if (FAILED(fence_->SetEventOnCompletion(value, event_))) {
-    return false;
-  }
-  // The event is auto-reset and may carry a late signal from an earlier wait
-  // that timed out, so the fence value decides.
-  while (!Completed(value)) {
-    const auto left = std::chrono::ceil<std::chrono::milliseconds>(
-        deadline - std::chrono::steady_clock::now());
-    const DWORD wait_ms =
-        static_cast<DWORD>(std::max<int64_t>(left.count(), 0));
-    if (WaitForSingleObject(event_, wait_ms) != WAIT_OBJECT_0) {
-      return Completed(value);
-    }
-  }
-  return true;
 }
 
 namespace {
