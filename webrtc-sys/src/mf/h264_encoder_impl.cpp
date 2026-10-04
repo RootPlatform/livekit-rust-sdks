@@ -68,6 +68,10 @@ constexpr size_t kMaxPendingFrames = 4;
 // input samples late.
 constexpr size_t kMaxInputTextures = 16;
 constexpr size_t kStagingTextureCount = 3;
+constexpr size_t kMaxStagingTextures = 5;
+// After this long waiting on the upload fence, MapStagingSlot falls back to a
+// blocking Map.
+constexpr std::chrono::milliseconds kStagingWait{200};
 // Rate-control (VBV) buffer: 100 ms of the target, and at least three frames
 // at the configured max frame rate. Without one the driver default let a
 // screen scene change burst to 1.37-1.52x the cap over a full second (the
@@ -454,13 +458,15 @@ struct TransformResources {
   ComPtr<ICodecAPI> codec_api;
   ComPtr<MFInputSamplePool> input_pool;
   std::vector<ComPtr<ID3D11Texture2D>> staging_textures;
+  livekit_ffi::D3D11GpuFence upload_fence;
   livekit_ffi::SharedD3D11Device d3d;
   DWORD input_stream_id = 0;
   bool session_open = false;
 
   bool empty() const {
     return !transform && !activate && !event_generator && !codec_api &&
-           !input_pool && staging_textures.empty() && !d3d && !session_open;
+           !input_pool && staging_textures.empty() && !upload_fence && !d3d &&
+           !session_open;
   }
 
   void Shutdown() {
@@ -482,6 +488,7 @@ struct TransformResources {
       input_pool.Reset();
     }
     staging_textures.clear();
+    upload_fence.Reset();
     d3d.reset();
     if (session_open) {
       session_open = false;
@@ -1109,7 +1116,11 @@ void MFH264EncoderImpl::ReleaseTransform(bool defer) {
   resources->event_generator = std::move(event_generator_);
   resources->codec_api = std::move(codec_api_);
   resources->input_pool = std::move(input_pool_);
-  resources->staging_textures.swap(staging_textures_);
+  for (StagingSlot& slot : staging_) {
+    resources->staging_textures.push_back(std::move(slot.texture));
+  }
+  staging_.clear();
+  resources->upload_fence = std::move(upload_fence_);
   resources->d3d = std::move(d3d_);
   resources->input_stream_id = input_stream_id_;
   resources->session_open = std::exchange(session_open_, false);
@@ -1275,6 +1286,76 @@ HRESULT MFH264EncoderImpl::AcquireInputSample(IMFSample** sample_out,
   return S_OK;
 }
 
+HRESULT MFH264EncoderImpl::AddStagingSlot(size_t index) {
+  D3D11_TEXTURE2D_DESC desc = {};
+  desc.Width = static_cast<UINT>(configuration_.width);
+  desc.Height = static_cast<UINT>(configuration_.height);
+  desc.MipLevels = 1;
+  desc.ArraySize = 1;
+  desc.Format = DXGI_FORMAT_NV12;
+  desc.SampleDesc.Count = 1;
+  desc.Usage = D3D11_USAGE_STAGING;
+  desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+  StagingSlot slot;
+  HRESULT hr = d3d_->device->CreateTexture2D(&desc, nullptr, &slot.texture);
+  if (FAILED(hr)) {
+    RTC_LOG(LS_ERROR) << "Failed to create NV12 staging texture: "
+                      << HResultToString(hr);
+    return hr;
+  }
+  staging_.insert(staging_.begin() + static_cast<ptrdiff_t>(index),
+                  std::move(slot));
+  return S_OK;
+}
+
+HRESULT MFH264EncoderImpl::MapStagingSlot(size_t* slot_out,
+                                          D3D11_MAPPED_SUBRESOURCE* mapped) {
+  const auto deadline = std::chrono::steady_clock::now() + kStagingWait;
+  for (int attempt = 0;; attempt++) {
+    StagingSlot& slot = staging_[next_staging_];
+    const bool timed_out = std::chrono::steady_clock::now() >= deadline;
+    HRESULT hr = DXGI_ERROR_WAS_STILL_DRAWING;
+    if (timed_out) {
+      RTC_LOG(LS_WARNING) << "MF encoder upload copy still pending after "
+                          << kStagingWait.count() << " ms; mapping it blocking.";
+      hr = d3d_->context->Map(slot.texture.Get(), 0, D3D11_MAP_WRITE, 0,
+                              mapped);
+    } else if (upload_fence_.Completed(slot.copy_fence_value)) {
+      hr = d3d_->context->Map(slot.texture.Get(), 0, D3D11_MAP_WRITE,
+                              D3D11_MAP_FLAG_DO_NOT_WAIT, mapped);
+    }
+    if (timed_out || hr != DXGI_ERROR_WAS_STILL_DRAWING) {
+      if (SUCCEEDED(hr)) {
+        *slot_out = next_staging_;
+        next_staging_ = (next_staging_ + 1) % staging_.size();
+      }
+      return hr;
+    }
+    if (attempt == 0) {
+      d3d_->context->Flush();
+    }
+    // The GPU runs the copies in order, so the oldest slot being busy means
+    // every slot is. A new slot goes in front of it and is used now.
+    if (staging_.size() < kMaxStagingTextures &&
+        SUCCEEDED(AddStagingSlot(next_staging_))) {
+      RTC_LOG(LS_INFO) << "MF encoder upload ring grown to " << staging_.size()
+                       << " staging textures (" << configuration_.width << "x"
+                       << configuration_.height
+                       << "); the GPU is behind on upload copies.";
+      continue;
+    }
+    if (!upload_fence_.Completed(slot.copy_fence_value)) {
+      upload_fence_.WaitUntil(slot.copy_fence_value, deadline);
+    } else if (attempt < 64) {
+      YieldProcessor();
+    } else if (attempt < 256) {
+      SwitchToThread();
+    } else {
+      Sleep(1);
+    }
+  }
+}
+
 HRESULT MFH264EncoderImpl::CreateD3DInputSample(const VideoFrameBuffer& buffer,
                                                 int64_t sample_time_100ns,
                                                 int64_t duration_100ns,
@@ -1290,37 +1371,27 @@ HRESULT MFH264EncoderImpl::CreateD3DInputSample(const VideoFrameBuffer& buffer,
 
   // A ring of staging textures so mapping this frame's upload never waits
   // for the GPU copy of the previous one.
-  if (staging_textures_.empty()) {
-    D3D11_TEXTURE2D_DESC desc = {};
-    desc.Width = static_cast<UINT>(width);
-    desc.Height = static_cast<UINT>(height);
-    desc.MipLevels = 1;
-    desc.ArraySize = 1;
-    desc.Format = DXGI_FORMAT_NV12;
-    desc.SampleDesc.Count = 1;
-    desc.Usage = D3D11_USAGE_STAGING;
-    desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+  if (staging_.empty()) {
     for (size_t i = 0; i < kStagingTextureCount; i++) {
-      ComPtr<ID3D11Texture2D> staging;
-      HRESULT hr = d3d_->device->CreateTexture2D(&desc, nullptr, &staging);
+      HRESULT hr = AddStagingSlot(i);
       if (FAILED(hr)) {
-        RTC_LOG(LS_ERROR) << "Failed to create NV12 staging texture: "
-                          << HResultToString(hr);
-        staging_textures_.clear();
+        staging_.clear();
         return hr;
       }
-      staging_textures_.push_back(staging);
     }
     next_staging_ = 0;
+    if (!upload_fence_) {
+      upload_fence_.Init(*d3d_);
+    }
   }
-  ID3D11Texture2D* staging = staging_textures_[next_staging_].Get();
-  next_staging_ = (next_staging_ + 1) % staging_textures_.size();
 
+  size_t slot = 0;
   D3D11_MAPPED_SUBRESOURCE mapped = {};
-  HRESULT hr = d3d_->context->Map(staging, 0, D3D11_MAP_WRITE, 0, &mapped);
+  HRESULT hr = MapStagingSlot(&slot, &mapped);
   if (FAILED(hr)) {
     return hr;
   }
+  ID3D11Texture2D* staging = staging_[slot].texture.Get();
   // Mapped NV12: Y rows at RowPitch, then the interleaved UV plane starting
   // Height rows below with the same pitch.
   uint8_t* dst_y = static_cast<uint8_t*>(mapped.pData);
@@ -1338,6 +1409,7 @@ HRESULT MFH264EncoderImpl::CreateD3DInputSample(const VideoFrameBuffer& buffer,
     return hr;
   }
   d3d_->context->CopyResource(texture.Get(), staging);
+  staging_[slot].copy_fence_value = upload_fence_.Signal();
 
   sample->SetSampleTime(sample_time_100ns);
   sample->SetSampleDuration(duration_100ns);

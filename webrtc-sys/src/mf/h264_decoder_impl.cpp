@@ -139,7 +139,7 @@ VideoDecoder::DecoderInfo MFH264DecoderImpl::GetDecoderInfo() const {
 }
 
 HRESULT MFH264DecoderImpl::SetupD3D() {
-  ReleaseReadbackFence();
+  readback_fence_.Reset();
   HRESULT hr = livekit_ffi::AcquireD3D11Device(
       nullptr, livekit_ffi::D3D11DeviceUser::kDecoder, &d3d_);
   if (FAILED(hr)) {
@@ -151,57 +151,15 @@ HRESULT MFH264DecoderImpl::SetupD3D() {
   if (FAILED(hr)) {
     return hr;
   }
-  ComPtr<ID3D11Device5> device5;
-  if (SUCCEEDED(d3d_->device.As(&device5)) &&
-      SUCCEEDED(d3d_->context.As(&fence_context_)) &&
-      SUCCEEDED(device5->CreateFence(0, D3D11_FENCE_FLAG_NONE,
-                                     IID_PPV_ARGS(&readback_fence_)))) {
-    readback_event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-  }
-  if (!readback_event_) {
-    readback_fence_.Reset();
-    fence_context_.Reset();
-  }
+  readback_fence_.Init(*d3d_);
   return S_OK;
-}
-
-void MFH264DecoderImpl::ReleaseReadbackFence() {
-  // A Signal still queued on the GPU sets the event when it completes, so the
-  // handle is leaked rather than closed and possibly recycled under it.
-  if (readback_event_ &&
-      (!readback_fence_ ||
-       readback_fence_->GetCompletedValue() >= readback_fence_value_)) {
-    CloseHandle(readback_event_);
-  }
-  readback_event_ = nullptr;
-  readback_fence_.Reset();
-  fence_context_.Reset();
-  readback_fence_value_ = 0;
 }
 
 HRESULT MFH264DecoderImpl::MapStaging(D3D11_MAPPED_SUBRESOURCE* mapped) {
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
-  if (readback_event_) {
-    const UINT64 value = readback_fence_value_ + 1;
-    if (SUCCEEDED(fence_context_->Signal(readback_fence_.Get(), value))) {
-      readback_fence_value_ = value;
-      d3d_->context->Flush();
-      if (SUCCEEDED(
-              readback_fence_->SetEventOnCompletion(value, readback_event_))) {
-        // The event is auto-reset and may carry a late signal from an earlier
-        // wait that timed out, so the fence value decides.
-        while (readback_fence_->GetCompletedValue() < value) {
-          const auto left = std::chrono::ceil<std::chrono::milliseconds>(
-              deadline - std::chrono::steady_clock::now());
-          const DWORD wait_ms =
-              static_cast<DWORD>(std::max<int64_t>(left.count(), 0));
-          if (WaitForSingleObject(readback_event_, wait_ms) != WAIT_OBJECT_0) {
-            break;
-          }
-        }
-      }
-    }
+  if (const UINT64 value = readback_fence_.Signal()) {
+    readback_fence_.WaitUntil(value, deadline);
   }
   d3d_->context->Flush();
   for (int attempt = 0;; attempt++) {
@@ -275,7 +233,7 @@ bool MFH264DecoderImpl::Configure(const Settings& settings) {
     RTC_LOG(LS_WARNING)
         << "D3D11 unavailable for H264 decode, falling back to software: "
         << HResultToString(hr);
-    ReleaseReadbackFence();
+    readback_fence_.Reset();
     d3d_.reset();
   }
 
@@ -392,7 +350,7 @@ int32_t MFH264DecoderImpl::Release() {
   }
   staging_texture_.Reset();
   transform_.Reset();
-  ReleaseReadbackFence();
+  readback_fence_.Reset();
   d3d_.reset();
   use_d3d_ = false;
   frames_decoded_ = 0;

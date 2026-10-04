@@ -66,7 +66,6 @@ class MFH264DecoderImpl : public VideoDecoder {
   // while the GPU finishes the copy: waits on a fence event when the device
   // has ID3D11Fence (WDDM 2.0+), otherwise polls.
   HRESULT MapStaging(D3D11_MAPPED_SUBRESOURCE* mapped);
-  void ReleaseReadbackFence();
   int32_t DeliverNV12(const uint8_t* data_y,
                       int stride_y,
                       const uint8_t* data_uv,
@@ -77,10 +76,7 @@ class MFH264DecoderImpl : public VideoDecoder {
   livekit_ffi::ComPtr<IMFTransform> transform_;
   livekit_ffi::SharedD3D11Device d3d_;
   livekit_ffi::ComPtr<ID3D11Texture2D> staging_texture_;
-  livekit_ffi::ComPtr<ID3D11DeviceContext4> fence_context_;
-  livekit_ffi::ComPtr<ID3D11Fence> readback_fence_;
-  HANDLE readback_event_ = nullptr;
-  UINT64 readback_fence_value_ = 0;
+  livekit_ffi::D3D11GpuFence readback_fence_;
   bool use_d3d_ = false;
   // Whether decoded samples arrive as D3D11 surfaces (DXVA) or system memory;
   // unset until the first output.

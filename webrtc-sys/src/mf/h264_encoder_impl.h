@@ -121,6 +121,12 @@ class MFH264EncoderImpl : public VideoEncoder {
                                IMFSample** sample_out);
   HRESULT AcquireInputSample(IMFSample** sample_out,
                              ID3D11Texture2D** texture_out);
+  HRESULT AddStagingSlot(size_t index);
+  // Maps the oldest upload slot for writing. A slot whose copy the GPU has
+  // not run yet is never mapped with a blocking Map, which would hold the
+  // shared device's lock and stall every other encoder and decoder on it:
+  // the ring grows to kMaxStagingTextures, then waits on the upload fence.
+  HRESULT MapStagingSlot(size_t* slot_out, D3D11_MAPPED_SUBRESOURCE* mapped);
   // VBV buffer size (and, for screen content, max bitrate) for `target_bps`.
   // False when the MFT rejected one of them.
   bool ApplyRateControlBuffer(uint32_t target_bps, bool final_pass);
@@ -172,8 +178,14 @@ class MFH264EncoderImpl : public VideoEncoder {
   bool initialized_ = false;
   int requested_keyframes_ = 0;
   livekit_ffi::SharedD3D11Device d3d_;
-  std::vector<livekit_ffi::ComPtr<ID3D11Texture2D>> staging_textures_;
+  struct StagingSlot {
+    livekit_ffi::ComPtr<ID3D11Texture2D> texture;
+    // Signalled on upload_fence_ after the GPU copy that reads `texture`.
+    UINT64 copy_fence_value = 0;
+  };
+  std::vector<StagingSlot> staging_;
   size_t next_staging_ = 0;
+  livekit_ffi::D3D11GpuFence upload_fence_;
   livekit_ffi::ComPtr<MFInputSamplePool> input_pool_;
   bool buffer_size_supported_ = true;
   bool max_bitrate_supported_ = true;
