@@ -111,6 +111,34 @@ bool FaultReached(DecodeFaultMode mode, int64_t frames_decoded) {
          frames_decoded >= *DecodeFaults().after_frames;
 }
 
+// What a configured decoder holds, released in this order on the deferred
+// release thread: on unsubscribe WebRTC's worker thread waits for Release().
+struct DecoderResources {
+  ComPtr<IMFTransform> transform;
+  ComPtr<ID3D11Texture2D> staging_texture;
+  livekit_ffi::D3D11GpuFence readback_fence;
+  livekit_ffi::SharedD3D11Device d3d;
+  DWORD input_stream_id = 0;
+
+  bool empty() const {
+    return !transform && !staging_texture && !readback_fence && !d3d;
+  }
+
+  void Shutdown() {
+    if (transform) {
+      transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM,
+                                input_stream_id);
+      transform->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+      transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+      transform->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
+    }
+    staging_texture.Reset();
+    transform.Reset();
+    readback_fence.Reset();
+    d3d.reset();
+  }
+};
+
 }  // namespace
 
 MFH264DecoderImpl::MFH264DecoderImpl() : buffer_pool_(false) {}
@@ -341,17 +369,16 @@ int32_t MFH264DecoderImpl::RegisterDecodeCompleteCallback(
 }
 
 int32_t MFH264DecoderImpl::Release() {
-  if (transform_) {
-    transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM,
-                               input_stream_id_);
-    transform_->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
-    transform_->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
-    transform_->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, 0);
+  auto resources = std::make_shared<DecoderResources>();
+  resources->transform = std::move(transform_);
+  resources->staging_texture = std::move(staging_texture_);
+  resources->readback_fence = std::move(readback_fence_);
+  resources->d3d = std::move(d3d_);
+  resources->input_stream_id = input_stream_id_;
+  if (!resources->empty()) {
+    livekit_ffi::MFDeferredReleases().Post(
+        [resources] { resources->Shutdown(); });
   }
-  staging_texture_.Reset();
-  transform_.Reset();
-  readback_fence_.Reset();
-  d3d_.reset();
   use_d3d_ = false;
   frames_decoded_ = 0;
   consecutive_errors_ = 0;

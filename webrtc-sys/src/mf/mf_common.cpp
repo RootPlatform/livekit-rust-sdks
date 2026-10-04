@@ -113,6 +113,12 @@ std::string HResultToString(HRESULT hr) {
   return buf;
 }
 
+DeferredReleaseQueue& MFDeferredReleases() {
+  static auto* queue =
+      new DeferredReleaseQueue([] { EnsureComInitialized(); });
+  return *queue;
+}
+
 std::optional<std::string> GetEnvVar(const char* name) {
   char buf[256];
   const DWORD n = GetEnvironmentVariableA(name, buf, sizeof(buf));

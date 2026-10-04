@@ -14,8 +14,9 @@
  * limitations under the License.
  */
 
-// Standalone unit test for the MediaFoundation encoder's deferred release
-// queue. It depends on nothing but the C++ standard library:
+// Standalone unit test for the deferred release queue that MediaFoundation
+// encoder and decoder teardown runs on. It depends on nothing but the C++
+// standard library:
 //
 //   cl /std:c++20 /EHsc /I ..\src\mf mf_deferred_release_test.cc
 //   c++ -std=c++17 -pthread -I ../src/mf mf_deferred_release_test.cc -o mf_deferred_release_test

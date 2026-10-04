@@ -15,7 +15,6 @@
  */
 
 #include "h264_encoder_impl.h"
-#include "mf_deferred_release.h"
 
 #include <algorithm>
 #include <atomic>
@@ -438,16 +437,6 @@ class MFInputSamplePool : public IMFAsyncCallback {
 
 namespace {
 
-// Encoder teardown leaves the encoder queue: on unpublish WebRTC's worker
-// thread, which also delivers incoming audio, blocks until the encoder's
-// Release() returns, and an MFT shutdown plus a possible D3D11 device release
-// takes tens to hundreds of milliseconds.
-livekit_ffi::DeferredReleaseQueue& DeferredReleases() {
-  static auto* queue = new livekit_ffi::DeferredReleaseQueue(
-      [] { livekit_ffi::EnsureComInitialized(); });
-  return *queue;
-}
-
 constexpr std::chrono::milliseconds kDeferredReleaseWait{2000};
 
 // What holds an encoder's hardware session, released in this order.
@@ -651,8 +640,8 @@ int32_t MFH264EncoderImpl::CreateTransform() {
   // A session released by Release() may still be closing on the deferred
   // release thread; opening another first could exceed the driver's session
   // limit (and LK_MF_MAX_SESSIONS).
-  if (!DeferredReleases().WaitIdle(kDeferredReleaseWait)) {
-    RTC_LOG(LS_WARNING) << "MF encoder teardown still running after "
+  if (!livekit_ffi::MFDeferredReleases().WaitIdle(kDeferredReleaseWait)) {
+    RTC_LOG(LS_WARNING) << "MF codec teardown still running after "
                         << kDeferredReleaseWait.count()
                         << " ms; opening a new session anyway.";
   }
@@ -1133,7 +1122,8 @@ void MFH264EncoderImpl::ReleaseTransform(bool defer) {
     return;
   }
   if (defer) {
-    DeferredReleases().Post([resources] { resources->Shutdown(); });
+    livekit_ffi::MFDeferredReleases().Post(
+        [resources] { resources->Shutdown(); });
   } else {
     resources->Shutdown();
   }

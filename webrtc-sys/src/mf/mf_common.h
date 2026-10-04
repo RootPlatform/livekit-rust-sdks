@@ -33,6 +33,7 @@
 #include <string>
 #include <vector>
 
+#include "mf_deferred_release.h"
 #include "mf_gpu_fence.h"
 
 namespace livekit_ffi {
@@ -121,6 +122,13 @@ bool EnsureMFStarted();
 
 // Formats an HRESULT as "0x8007000E" for log output.
 std::string HResultToString(HRESULT hr);
+
+// The one thread MF encoder and decoder teardown runs on, in Release() order.
+// On unpublish or unsubscribe WebRTC's worker thread, which also delivers
+// incoming audio, blocks until the codec's Release() returns, and an MFT
+// shutdown plus a possible D3D11 device release takes tens to hundreds of
+// milliseconds.
+DeferredReleaseQueue& MFDeferredReleases();
 
 }  // namespace livekit_ffi
 

@@ -510,6 +510,11 @@ without the shared D3D11 device). Opening an encoder session waits for pending t
 a re-init never holds the old and the new NVENC session together and `LK_MF_MAX_SESSIONS` counts
 stay exact. The encoder logs `MF encoder sessions open: N` on every open and close.
 
+The MF decoder's `Release()` hands its MFT, staging texture and device reference to the same
+thread. When a subscribed track goes away the worker waits for it too, and in the same process the
+two teardowns used to run at once on the shared device. Because the queue is shared, opening an
+encoder session also waits for a pending decoder teardown.
+
 Stopping the transceiver instead is not compatible with LiveKit server 1.13.7:
 
 - libwebrtc recycles a rejected m-section for the next transceiver under a new mid, but the
