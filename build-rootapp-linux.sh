@@ -262,7 +262,8 @@ if [ -n "${CXX:-}" ] && command -v "$CXX" >/dev/null 2>&1; then
     rk_info "clang: $CXX ($("$CXX" --version | head -n 1))"
   fi
   if [ -z "${LIBCLANG_PATH:-}" ]; then
-    for d in "$(dirname "$CXX")/../lib" /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu /usr/lib64; do
+    cxx_dir="$(dirname "$(readlink -f "$(command -v "$CXX")")")"
+    for d in "$cxx_dir/../lib" ${clang_major:+"/usr/lib/llvm-$clang_major/lib"} /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu /usr/lib64; do
       if ls "$d"/libclang.so* >/dev/null 2>&1; then
         LIBCLANG_PATH="$(cd "$d" && pwd)"
         export LIBCLANG_PATH

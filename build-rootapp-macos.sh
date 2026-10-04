@@ -219,7 +219,7 @@ verify_dylib() {
     fail=1
   fi
 
-  minos="$(otool -l "$f" | awk '$1 == "cmd" { c = $2 } c == "LC_BUILD_VERSION" && $1 == "minos" { print $2; exit } c == "LC_VERSION_MIN_MACOSX" && $1 == "version" { print $2; exit }')"
+  minos="$(otool -l "$f" | awk '$1 == "cmd" { c = $2 } !done && c == "LC_BUILD_VERSION" && $1 == "minos" { print $2; done = 1 } !done && c == "LC_VERSION_MIN_MACOSX" && $1 == "version" { print $2; done = 1 }')"
   if [ "$minos" = "$dt" ]; then
     rk_info "minimum macOS: $minos"
   else
