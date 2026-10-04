@@ -148,7 +148,7 @@ APT_PACKAGES="build-essential pkg-config curl unzip zip xz-utils git ca-certific
   libssl-dev libglib2.0-dev libx11-dev libxext-dev libxfixes-dev libxdamage-dev libxrandr-dev libxcomposite-dev
   libgl1-mesa-dev libdrm-dev libgbm-dev libasound2-dev libpulse-dev"
 if [ "$RID" = linux-x64 ]; then APT_PACKAGES="$APT_PACKAGES libva-dev"; fi
-if [ "$CROSS" = 1 ]; then APT_PACKAGES="$APT_PACKAGES gcc-aarch64-linux-gnu libc6-dev-arm64-cross"; fi
+if [ "$CROSS" = 1 ]; then APT_PACKAGES="$APT_PACKAGES gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross"; fi
 # shellcheck disable=SC2086
 APT_PACKAGES="$(echo $APT_PACKAGES)"
 
@@ -205,6 +205,11 @@ rk_info "cmake/ninja: not needed (nothing in the livekit-ffi dependency graph us
 if [ "$CROSS" = 1 ]; then
   rk_log "cross toolchain (x86_64 -> aarch64)"
   need_tool aarch64-linux-gnu-gcc gcc-aarch64-linux-gnu
+  need_tool aarch64-linux-gnu-g++ g++-aarch64-linux-gnu
+  if [ "$APT_PENDING" != 1 ] && command -v aarch64-linux-gnu-gcc >/dev/null 2>&1 &&
+    [ "$(aarch64-linux-gnu-gcc -print-file-name=libstdc++.so)" = libstdc++.so ]; then
+    rk_missing "arm64 libstdc++.so for cxx and link-cplusplus (Debian/Ubuntu package g++-aarch64-linux-gnu)"
+  fi
   CROSS_PC_DIR="${CROSS_PKGCONFIG_DIR:-/usr/lib/aarch64-linux-gnu/pkgconfig}"
   for pc in glib-2.0 gobject-2.0 gio-2.0; do
     if [ -f "$CROSS_PC_DIR/$pc.pc" ]; then
