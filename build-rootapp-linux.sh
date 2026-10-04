@@ -394,6 +394,12 @@ if ls -d "$TARGET_DIR/$TARGET/release/build/webrtc-sys-"* >/dev/null 2>&1; then
     cargo clean --release --target "$TARGET" -p webrtc-sys
   fi
 fi
+# yuv-sys's bindgen loads libclang from LIBCLANG_PATH, which misses the LLVM tarball's builtin
+# headers (stddef.h) unless the compiler's resource directory is passed explicitly.
+if [ -z "${BINDGEN_EXTRA_CLANG_ARGS:-}" ] && resource_dir="$("$CC" -print-resource-dir 2>/dev/null)" && [ -d "$resource_dir/include" ]; then
+  export BINDGEN_EXTRA_CLANG_ARGS="-resource-dir=$resource_dir"
+  rk_info "bindgen: -resource-dir=$resource_dir"
+fi
 cargo build --release -p livekit-ffi --target "$TARGET"
 printf '%s\n' "$hw_config" > "$stamp"
 
