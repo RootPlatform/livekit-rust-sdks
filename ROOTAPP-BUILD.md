@@ -334,6 +334,7 @@ still apply. Flags accept `1/true/yes/on`. `LK_MF_ALLOW_AMD` also accepts `0/fal
 | `LK_MF_ENCODER_ADAPTER=nvidia\|amd\|intel` | Try that vendor's encoder MFT first. |
 | `LK_MF_ALLOW_AMD=0` | Skip AMD encoder MFTs (browser-parity workaround for AMD CBP black remote video). Allowed by default. |
 | `LK_MF_D3D11_SHARING=off\|user` | `off` gives every MF encoder and decoder, and every host acquire of the shared device, its own D3D11 device again; `user` shares one device per adapter among encoders and the host and another among decoders. The default shares one device per adapter between all of them. Read once per process. |
+| `LK_MF_D3D11_DRIVER_THREADING=off` | Create the shared D3D11 devices with `D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS`. On NVIDIA a device then runs 35 driver threads instead of 37, and the first shader on it (the desktop capture's GPU scaler) no longer starts a 32-thread compiler pool. Read once per process. |
 
 Fault injection, for testing recovery only:
 
@@ -606,8 +607,8 @@ The contract:
   live until the device is released. A host compute shader on the shared device keeps those 32
   threads alive until the codecs and the host have all let go. A device created with
   `D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS` has 35 threads and compiles shaders
-  on the calling thread instead (measured on an RTX 5090, driver of 2026-10); the shared device
-  does not use that flag.
+  on the calling thread instead (measured on an RTX 5090, driver of 2026-10). The shared device gets
+  that flag only with `LK_MF_D3D11_DRIVER_THREADING=off`.
 - Test: `cargo test -p webrtc-sys mf_device` covers the contract on a real adapter and skips on a
   machine without a hardware D3D11 video device. `LK_MF_FAULT_HOST_DEVICE_REMOVED=1` makes acquire
   report the device as removed.

@@ -248,8 +248,16 @@ HRESULT CreateD3D11DeviceBundle(const LUID& luid, D3D11DeviceBundle* out) {
       D3D_FEATURE_LEVEL_10_1,
       D3D_FEATURE_LEVEL_10_0,
   };
+  // LK_MF_D3D11_DRIVER_THREADING=off: on NVIDIA such a device runs 35 driver
+  // threads instead of 37 and compiles shaders on the calling thread, where
+  // the first shader would otherwise start a pool of one thread per CPU.
+  static const bool prevent_driver_threading =
+      EnvFlagCleared("LK_MF_D3D11_DRIVER_THREADING");
   const UINT flags =
-      D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+      D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT |
+      (prevent_driver_threading
+           ? D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS
+           : 0);
   D3D11DeviceBundle bundle;
   hr = D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
                          flags, feature_levels, ARRAYSIZE(feature_levels),
