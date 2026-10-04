@@ -66,6 +66,20 @@ HRESULT AcquireD3D11Device(const LUID* luid,
 HRESULT AcquireD3D11DeviceForActivate(IMFActivate* activate,
                                       SharedD3D11Device* out);
 
+// The encoders' shared device on `luid` (the default adapter when null) for
+// code outside the codecs, such as the host's screen capture. On success
+// `*out` carries one COM reference for the caller to Release, and the device
+// stays the adapter's shared device, also for codecs opened later, until
+// ReleaseSharedD3D11DeviceForHost is called with it once for every successful
+// acquire. A removed device is never handed out: the call fails with the
+// removal reason and `*out` is null.
+HRESULT AcquireSharedD3D11DeviceForHost(const LUID* luid, ID3D11Device** out);
+
+// Drops one host reference taken by AcquireSharedD3D11DeviceForHost. The
+// pointer is only compared, so the caller may already have released its own
+// COM reference. E_INVALIDARG when no host reference to `device` is left.
+HRESULT ReleaseSharedD3D11DeviceForHost(ID3D11Device* device);
+
 constexpr uint32_t kVendorNvidia = 0x10DE;
 constexpr uint32_t kVendorAmd = 0x1002;
 constexpr uint32_t kVendorAmdAlt = 0x1022;
