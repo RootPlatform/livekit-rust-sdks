@@ -58,6 +58,7 @@ jobs:
           INPUT_RIDS: ${{ inputs.rids }}
           INPUT_TAG: ${{ inputs.tag }}
           INPUT_PUBLISH: ${{ inputs.publish }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           all="win-x64 win-arm64 osx-arm64 osx-x64 linux-x64 linux-arm64"
@@ -65,7 +66,9 @@ jobs:
           win=""
           mac=""
           lin=""
+          seen=" "
           for rid in $rids; do
+            seen="$seen$rid "
             case "$rid" in
               win-x64) win="$win,{\"rid\":\"win-x64\",\"target\":\"x86_64-pc-windows-msvc\"}" ;;
               win-arm64) win="$win,{\"rid\":\"win-arm64\",\"target\":\"aarch64-pc-windows-msvc\"}" ;;
@@ -85,6 +88,20 @@ jobs:
           if [ -n "$tag" ] && ! printf '%s' "$tag" | grep -qE '^rootapp-ffi/v[0-9A-Za-z._+-]+$'; then
             echo "::error::release tag '$tag' must look like rootapp-ffi/v0.12.76-hw.1"
             exit 1
+          fi
+          if [ -n "$tag" ]; then
+            for rid in $all; do
+              case "$seen" in
+                *" $rid "*) ;;
+                *) echo "::error::a release build needs all six RIDs ($all); without $rid the release's SHA256SUMS would leave out zips still attached to it"; exit 1 ;;
+              esac
+            done
+            auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
+            refs="$(git -c "http.extraheader=$auth" ls-remote --tags "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" "refs/tags/$tag" "refs/tags/$tag^{}")"
+            if [ -n "$refs" ] && [[ $'\n'"$refs" != *$'\n'"$GITHUB_SHA"$'\t'* ]]; then
+              echo "::error::tag $tag already points to $(printf '%s\n' "$refs" | awk 'END { print $1 }'), but this run builds $GITHUB_SHA; run the workflow from the tag or use a new tag"
+              exit 1
+            fi
           fi
           matrix() {
             if [ -n "$1" ]; then printf '{"include":[%s]}' "${1#,}"; fi
@@ -369,7 +386,12 @@ jobs:
         run: |
           set -euo pipefail
           notes="RootApp livekit-ffi fork build of $GITHUB_SHA. SHA256SUMS lists every zip; the desktop pins each one as rootapp/<asset> in external/LivekitRtc/ffi-checksums.sha256."
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+          if release="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,targetCommitish --jq '"\(.isDraft) \(.targetCommitish)"' 2> /dev/null)"; then
+            read -r draft target <<< "$release"
+            if [ "$draft" = true ] && [ "$target" != "$GITHUB_SHA" ]; then
+              echo "::error::draft release $TAG targets $target, so publishing it would tag $target with binaries built from $GITHUB_SHA; delete the draft or run the workflow from $target"
+              exit 1
+            fi
             echo "release $TAG exists; replacing its assets"
           else
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --target "$GITHUB_SHA" --title "$TAG" --notes "$notes"

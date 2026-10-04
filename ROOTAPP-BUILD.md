@@ -390,7 +390,10 @@ Nothing here has been done. Creating the repo, pushing and tagging are Jesse's c
      That builds all six RIDs and publishes the release.
    - Run **Actions → RootApp FFI → Run workflow**, with an optional `tag`, `rids` and `publish`. Without
      a tag it only uploads workflow artifacts, and without `publish` the release stays a draft.
-   Tags look like `rootapp-ffi/v<ffi version>-hw.<n>`.
+   Tags look like `rootapp-ffi/v<ffi version>-hw.<n>`. A run with a tag must build all six RIDs, since
+   `SHA256SUMS` only lists the zips that run built. It also refuses a tag that already points to another
+   commit, or a draft release that targets one, because the release would then hold binaries that don't
+   match its tag.
 5. The release gets the six zips, `SHA256SUMS` and `build-info-<rid>.json`. The release job checks
    that each zip has the library, `livekit_ffi.h` and `LICENSE.md` at its root, and that `file` reports
    the asset's architecture. The job summary lists the lines for the desktop's checksum file.
