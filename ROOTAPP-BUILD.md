@@ -55,7 +55,7 @@ Use a git bundle. Don't copy the Windows working tree: it has CRLF line endings 
 
 ```powershell
 # Windows, in C:\Users\daerc\Documents\GitHub\livekit-rust-sdks
-git bundle create rootapp-fork.bundle ^2d9f01ab rootapp/mf-hw-video
+git bundle create rootapp-fork.bundle ^2d9f01ab rootapp/fx-int
 ```
 
 ```bash
@@ -63,14 +63,16 @@ git bundle create rootapp-fork.bundle ^2d9f01ab rootapp/mf-hw-video
 git clone https://github.com/livekit/rust-sdks.git livekit-rust-sdks
 cd livekit-rust-sdks
 git fetch /path/to/rootapp-fork.bundle 'refs/heads/rootapp/*:refs/heads/rootapp/*'
-git checkout rootapp/mf-hw-video
+git checkout rootapp/fx-int
 git submodule update --init --recursive
+test -x ./build-rootapp-macos.sh && test -f ./build-rootapp-common.sh || echo "WRONG BRANCH: no build-rootapp-macos.sh/build-rootapp-common.sh"
 ```
 
 The bundle holds only the fork's commits, so it stays small. 2d9f01ab is on upstream `main`. The
-submodules (`livekit/protocol`, `libyuv`) come from their public upstreams. To test a branch that
-isn't merged yet, name it as well (for example `rootapp/fx-xos`). To pick up later fork commits,
-create a new bundle with the same command and fetch it again.
+submodules (`livekit/protocol`, `libyuv`) come from their public upstreams. Bundle rootapp/fx-int
+until the fx-* branches are merged into rootapp/mf-hw-video. That branch has no Mac script, and its
+Linux script ignores --check. To pick up later fork commits, create a new bundle with the same
+command and fetch it again.
 
 ## macOS
 
