@@ -1323,16 +1323,17 @@ HRESULT MFH264EncoderImpl::MapStagingSlot(size_t* slot_out,
     }
     if (attempt == 0) {
       d3d_->context->Flush();
-    }
-    // The GPU runs the copies in order, so the oldest slot being busy means
-    // every slot is. A new slot goes in front of it and is used now.
-    if (staging_.size() < kMaxStagingTextures &&
-        SUCCEEDED(AddStagingSlot(next_staging_))) {
-      RTC_LOG(LS_INFO) << "MF encoder upload ring grown to " << staging_.size()
-                       << " staging textures (" << configuration_.width << "x"
-                       << configuration_.height
-                       << "); the GPU is behind on upload copies.";
-      continue;
+      // The GPU runs the copies in order, so the oldest slot being busy means
+      // every slot is. A new slot goes in front of it and is used now.
+      if (staging_.size() < kMaxStagingTextures &&
+          SUCCEEDED(AddStagingSlot(next_staging_))) {
+        RTC_LOG(LS_INFO) << "MF encoder upload ring grown to "
+                         << staging_.size() << " staging textures ("
+                         << configuration_.width << "x"
+                         << configuration_.height
+                         << "); the GPU is behind on upload copies.";
+        continue;
+      }
     }
     if (!upload_fence_.Completed(slot.copy_fence_value)) {
       upload_fence_.WaitUntil(slot.copy_fence_value, deadline);
