@@ -519,9 +519,11 @@ release:
   may hold the NVENC session until then; the encoder logs `MF encoder sessions open: N` (and
   `(M closing)`) on every open and final release, and `LK_MF_MAX_SESSIONS` counts closing
   sessions too.
-- When no hardware MFT accepts a new session while sessions are closing, the encoder waits for
-  their final release (at most 2.5 s, on the encoder's task queue, never WebRTC's worker thread)
-  and tries once more before falling back to software.
+- When no hardware MFT accepts a new session while sessions are closing, `InitEncode` (or the
+  bitrate re-init) still succeeds, `Encode()` drops frames until those sessions' final release
+  (at most 2.5 s) and then tries once more before falling back to software. Nothing blocks: the
+  encoder's task queue keeps running, so WebRTC's worker thread, which waits for that queue when it
+  destroys the stream (unpublish), is not held up.
 - The delayed release also holds the encoder's reference to the adapter's shared D3D11 device, so
   a codec opened within the window reuses it instead of creating a second device (35 NVIDIA
   driver threads) while the old one is still alive.

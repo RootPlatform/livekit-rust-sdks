@@ -17,8 +17,6 @@
 #ifndef WEBRTC_MF_ENCODER_SESSIONS_H_
 #define WEBRTC_MF_ENCODER_SESSIONS_H_
 
-#include <chrono>
-#include <condition_variable>
 #include <mutex>
 
 namespace livekit_ffi {
@@ -52,7 +50,6 @@ class EncoderSessionCount {
     std::lock_guard<std::mutex> lock(mutex_);
     --counts_.closing;
     --counts_.open;
-    closed_.notify_all();
     return counts_;
   }
 
@@ -68,16 +65,8 @@ class EncoderSessionCount {
     return counts_;
   }
 
-  // True once no session is closing, false when `timeout` passes first.
-  bool WaitForClosing(std::chrono::milliseconds timeout) {
-    std::unique_lock<std::mutex> lock(mutex_);
-    return closed_.wait_for(lock, timeout,
-                            [this] { return counts_.closing == 0; });
-  }
-
  private:
   std::mutex mutex_;
-  std::condition_variable closed_;
   Counts counts_;
 };
 

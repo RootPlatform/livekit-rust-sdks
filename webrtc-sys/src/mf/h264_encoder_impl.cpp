@@ -670,7 +670,8 @@ int32_t MFH264EncoderImpl::InitEncode(const VideoCodec* inst,
     return ret;
   }
 
-  RTC_LOG(LS_INFO) << "MediaFoundation H264 encoder initialized ("
+  RTC_LOG_IF(LS_INFO, transform_ != nullptr)
+      << "MediaFoundation H264 encoder initialized ("
                    << friendly_name_ << "): " << codec_.width << "x"
                    << codec_.height << " @ " << codec_.maxFramerate
                    << "fps, target_bps=" << configuration_.target_bps
@@ -701,18 +702,40 @@ int32_t MFH264EncoderImpl::CreateTransform() {
                         << kDeferredReleaseWait.count()
                         << " ms; opening a new session anyway.";
   }
-  int32_t ret = OpenSession();
+  reopen_deadline_ms_.reset();
+  const int32_t ret = OpenSession();
   const int closing = Sessions().Get().closing;
   if (ret != WEBRTC_VIDEO_CODEC_OK && closing > 0) {
     // A shut-down transform may hold its hardware session until its final
-    // release, so retry once those have run before falling back.
+    // release, so Encode() retries once those have run instead of falling
+    // back. It does not wait here: WebRTC's worker thread waits for this task
+    // queue whenever it destroys the stream.
     RTC_LOG(LS_INFO) << "No MF encoder session opened while " << closing
                      << " closing; retrying after their final release.";
-    if (Sessions().WaitForClosing(kClosingSessionWait)) {
-      ret = OpenSession();
-    }
+    reopen_deadline_ms_ =
+        env_.clock().TimeInMilliseconds() + kClosingSessionWait.count();
+    return WEBRTC_VIDEO_CODEC_OK;
   }
   return ret;
+}
+
+int32_t MFH264EncoderImpl::OpenDeferredSession() {
+  const bool closing = Sessions().Get().closing > 0 ||
+                       !livekit_ffi::MFDeferredReleases().WaitIdle(
+                           std::chrono::milliseconds(0));
+  if (closing && env_.clock().TimeInMilliseconds() < *reopen_deadline_ms_) {
+    return WEBRTC_VIDEO_CODEC_NO_OUTPUT;
+  }
+  reopen_deadline_ms_.reset();
+  if (OpenSession() != WEBRTC_VIDEO_CODEC_OK) {
+    RTC_LOG(LS_ERROR) << "No MF encoder session after the closing ones were "
+                         "released; falling back to software.";
+    return kHardwareFailure;
+  }
+  RTC_LOG(LS_INFO) << "MF H264 encoder session opened (" << friendly_name_
+                   << ") after the closing sessions were released.";
+  configuration_.key_frame_request = true;
+  return WEBRTC_VIDEO_CODEC_OK;
 }
 
 int32_t MFH264EncoderImpl::OpenSession() {
@@ -1150,6 +1173,7 @@ int32_t MFH264EncoderImpl::RegisterEncodeCompleteCallback(
 
 int32_t MFH264EncoderImpl::Release() {
   initialized_ = false;
+  reopen_deadline_ms_.reset();
   ReleaseTransform(/*defer=*/true);
   pending_frames_.clear();
   frame_count_ = 0;
@@ -1538,6 +1562,12 @@ int32_t MFH264EncoderImpl::Encode(
     ReportError();
     return WEBRTC_VIDEO_CODEC_UNINITIALIZED;
   }
+  if (!transform_ && reopen_deadline_ms_) {
+    const int32_t ret = OpenDeferredSession();
+    if (ret != WEBRTC_VIDEO_CODEC_OK) {
+      return ret;
+    }
+  }
   if (!transform_ || async_failed_) {
     ReportError();
     return kHardwareFailure;
@@ -1556,6 +1586,9 @@ int32_t MFH264EncoderImpl::Encode(
     if (ret != WEBRTC_VIDEO_CODEC_OK) {
       ReportError();
       return ret;
+    }
+    if (!transform_) {
+      return WEBRTC_VIDEO_CODEC_NO_OUTPUT;
     }
   }
 
@@ -2006,7 +2039,7 @@ void MFH264EncoderImpl::ApplyBitrate(uint32_t bitrate_bps) {
 }
 
 void MFH264EncoderImpl::SetRates(const RateControlParameters& parameters) {
-  if (!transform_) {
+  if (!transform_ && !reopen_deadline_ms_) {
     RTC_LOG(LS_WARNING) << "SetRates() while uninitialized.";
     return;
   }
@@ -2028,7 +2061,9 @@ void MFH264EncoderImpl::SetRates(const RateControlParameters& parameters) {
   configuration_.max_frame_rate = parameters.framerate_fps;
 
   if (configuration_.target_bps) {
-    ApplyBitrate(configuration_.target_bps);
+    if (transform_) {
+      ApplyBitrate(configuration_.target_bps);
+    }
     configuration_.SetStreamState(true);
   } else {
     configuration_.SetStreamState(false);

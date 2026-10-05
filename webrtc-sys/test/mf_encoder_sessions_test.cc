@@ -46,6 +46,19 @@ void Expect(bool condition, const char* what) {
   }
 }
 
+// Polls like the encoder's Encode() does while its session waits.
+bool WaitUntilNoneClosing(EncoderSessionCount& sessions,
+                          milliseconds timeout) {
+  const Clock::time_point deadline = Clock::now() + timeout;
+  while (sessions.Get().closing > 0) {
+    if (Clock::now() >= deadline) {
+      return false;
+    }
+    std::this_thread::sleep_for(milliseconds(5));
+  }
+  return true;
+}
+
 void TestClosingSessionsStayOpenUntilTheirFinalRelease() {
   EncoderSessionCount sessions;
   sessions.Open();
@@ -68,31 +81,10 @@ void TestClosingSessionsStayOpenUntilTheirFinalRelease() {
   Expect(counts.open == 1 && counts.closing == 0, "Get reports the counts");
 }
 
-void TestWaitForClosingWithNothingClosing() {
-  EncoderSessionCount sessions;
-  sessions.Open();
-  const Clock::time_point start = Clock::now();
-  Expect(sessions.WaitForClosing(milliseconds(1000)),
-         "nothing closing: the wait succeeds");
-  Expect(Clock::now() - start < milliseconds(20),
-         "nothing closing: the wait returns at once");
-}
-
-void TestWaitForClosingTimesOut() {
-  EncoderSessionCount sessions;
-  sessions.Open();
-  sessions.BeginClose();
-  const Clock::time_point start = Clock::now();
-  Expect(!sessions.WaitForClosing(milliseconds(50)),
-         "a session that never finishes closing times the wait out");
-  Expect(Clock::now() - start >= milliseconds(50),
-         "the wait lasted its timeout");
-}
-
 // The encoder's flow: the shut-down transform's final release, and with it
-// the end of its session, runs on the delayed release queue. A new session
-// that finds the limit reached waits for it instead of being refused.
-void TestNewSessionWaitsForTheDelayedFinalRelease() {
+// the end of its session, runs on the delayed release queue, and the session
+// stays counted (keeping a session limit reached) until then.
+void TestSessionClosesWithTheDelayedFinalRelease() {
   EncoderSessionCount sessions;
   auto* delayed = new livekit_ffi::DelayedReleaseQueue({});
   constexpr int kMaxSessions = 2;
@@ -103,19 +95,20 @@ void TestNewSessionWaitsForTheDelayedFinalRelease() {
   const Clock::time_point closed_at = Clock::now();
   delayed->Post(milliseconds(200), [&sessions] { sessions.FinishClose(); });
 
+  std::this_thread::sleep_for(milliseconds(100));
   Expect(sessions.Get().open >= kMaxSessions,
-         "the closing session keeps the limit reached");
+         "the closing session keeps the limit reached before its release");
   Expect(sessions.Get().closing == 1, "one session is closing");
-  Expect(sessions.WaitForClosing(milliseconds(2000)),
-         "the wait ends with the final release");
+  Expect(WaitUntilNoneClosing(sessions, milliseconds(2000)),
+         "the closing session ends with the final release");
   const Clock::duration waited = Clock::now() - closed_at;
-  Expect(waited >= milliseconds(190), "the wait lasted until the release");
-  Expect(waited < milliseconds(1000), "the wait ended soon after it");
+  Expect(waited >= milliseconds(190), "it stayed open until the release");
+  Expect(waited < milliseconds(1000), "it closed soon after the release");
   Expect(sessions.Get().open < kMaxSessions,
          "a session can open after the final release");
 }
 
-void TestWaitCoversEveryClosingSession() {
+void TestEveryClosingSessionEndsWithItsRelease() {
   EncoderSessionCount sessions;
   auto* delayed = new livekit_ffi::DelayedReleaseQueue({});
   std::atomic<int> released{0};
@@ -123,13 +116,14 @@ void TestWaitCoversEveryClosingSession() {
     sessions.Open();
     sessions.BeginClose();
     delayed->Post(milliseconds(50 + 50 * i), [&sessions, &released] {
-      sessions.FinishClose();
       released++;
+      sessions.FinishClose();
     });
   }
-  Expect(sessions.WaitForClosing(milliseconds(2000)),
-         "the wait ends once every session closed");
-  Expect(released.load() == 3, "the wait outlasted every final release");
+  Expect(sessions.Get().closing == 3, "three sessions closing");
+  Expect(WaitUntilNoneClosing(sessions, milliseconds(2000)),
+         "every closing session ends");
+  Expect(released.load() == 3, "after every final release");
   Expect(sessions.Get().open == 0, "no session is left open");
 }
 
@@ -137,10 +131,8 @@ void TestWaitCoversEveryClosingSession() {
 
 int main() {
   TestClosingSessionsStayOpenUntilTheirFinalRelease();
-  TestWaitForClosingWithNothingClosing();
-  TestWaitForClosingTimesOut();
-  TestNewSessionWaitsForTheDelayedFinalRelease();
-  TestWaitCoversEveryClosingSession();
+  TestSessionClosesWithTheDelayedFinalRelease();
+  TestEveryClosingSessionEndsWithItsRelease();
 
   if (g_failures != 0) {
     std::fprintf(stderr, "%d test(s) failed\n", g_failures);

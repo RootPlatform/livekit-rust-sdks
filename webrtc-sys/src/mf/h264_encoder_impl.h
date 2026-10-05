@@ -97,10 +97,12 @@ class MFH264EncoderImpl : public VideoEncoder {
   };
 
   // Tries every hardware encoder MFT in preference order and keeps the first
-  // one that accepts the configuration; when none does while sessions are
-  // closing, tries once more after their final release.
+  // one that accepts the configuration. When none does while sessions are
+  // closing, it succeeds without a transform and Encode() drops frames until
+  // OpenDeferredSession() can try again after their final release.
   int32_t CreateTransform();
   int32_t OpenSession();
+  int32_t OpenDeferredSession();
   HRESULT ActivateTransform(IMFActivate* activate);
   int32_t ConfigureTransform();
   int32_t ApplyCodecApiSettings(bool log_failures);
@@ -206,6 +208,9 @@ class MFH264EncoderImpl : public VideoEncoder {
   int64_t frames_submitted_ = 0;
   // This encoder holds a hardware session (counted for LK_MF_MAX_SESSIONS).
   bool session_open_ = false;
+  // Set while the session waits for closing sessions; past it, the encoder
+  // falls back to software.
+  std::optional<int64_t> reopen_deadline_ms_;
   std::vector<uint8_t> sequence_header_;
   std::vector<uint8_t> packet_;
   std::string friendly_name_;
