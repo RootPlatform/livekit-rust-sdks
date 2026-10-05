@@ -334,7 +334,7 @@ still apply. Flags accept `1/true/yes/on`. `LK_MF_ALLOW_AMD` also accepts `0/fal
 | `LK_MF_ENCODER_ADAPTER=nvidia\|amd\|intel` | Try that vendor's encoder MFT first. |
 | `LK_MF_ALLOW_AMD=0` | Skip AMD encoder MFTs (browser-parity workaround for AMD CBP black remote video). Allowed by default. |
 | `LK_MF_D3D11_SHARING=off\|user` | `off` gives every MF encoder and decoder, and every host acquire of the shared device, its own D3D11 device again; `user` shares one device per adapter among encoders and the host and another among decoders. The default shares one device per adapter between all of them. Read once per process. |
-| `LK_MF_D3D11_DRIVER_THREADING=off` | Create the shared D3D11 devices with `D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS`. On NVIDIA a device then runs 35 driver threads instead of 37, and the first shader on it (the desktop capture's GPU scaler) no longer starts a 32-thread compiler pool. Read once per process. |
+| `LK_MF_D3D11_DRIVER_THREADING=on` | Create the shared D3D11 devices without `D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS`, as before `rootapp/fx4-dev` (see "Sharing the D3D11 device with the host"). Read once per process. |
 
 Fault injection, for testing recovery only:
 
@@ -581,7 +581,8 @@ The contract:
   `D3D11CreateDevice(nullptr, ...)` picks).
 - Acquire returns the adapter's shared device, the one MF encoders and decoders use. If no codec
   holds one yet, it creates it: a hardware device at feature level 11.1 down to 10.0, created with
-  `VIDEO_SUPPORT | BGRA_SUPPORT` and multithread protected, plus its DXGI device manager.
+  `VIDEO_SUPPORT | BGRA_SUPPORT | PREVENT_INTERNAL_THREADING_OPTIMIZATIONS` (see below) and
+  multithread protected, plus its DXGI device manager.
 - On success `*out_device` carries one COM reference, which the caller releases with `Release()`
   like any COM out-parameter. Besides that, the FFI keeps a host reference to the device until the
   matching release. While that reference exists, the device stays the adapter's shared device, so
@@ -602,13 +603,17 @@ The contract:
   must not block in `Map` (signal a fence or poll with `DO_NOT_WAIT`, as above), must hold
   `ID3D11Multithread::Enter`/`Leave` around call sequences that bind pipeline state, and must not
   turn multithread protection off.
-- On NVIDIA every D3D11 device costs 37 driver threads, and the first shader created on a device
-  starts 32 more (a compiler pool, one thread per logical CPU on the 32-thread test machine) that
-  live until the device is released. A host compute shader on the shared device keeps those 32
-  threads alive until the codecs and the host have all let go. A device created with
-  `D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS` has 35 threads and compiles shaders
-  on the calling thread instead (measured on an RTX 5090, driver of 2026-10). The shared device gets
-  that flag only with `LK_MF_D3D11_DRIVER_THREADING=off`.
+- Driver threads, measured on an RTX 5090 and the Ryzen's Radeon iGPU (drivers of 2026-10): a
+  default NVIDIA D3D11 device runs 37-38 driver threads, and the first shader created on it starts
+  32 more, a compiler pool with one thread per logical CPU, which lives until the device is
+  released. On the shared device that pool would outlive the share that created it for as long as
+  any codec, camera or remote video, keeps the device. `PREVENT_INTERNAL_THREADING_OPTIMIZATIONS`
+  brings an NVIDIA device to 35 threads with no pool (the scaler's shader compiles in 0.5 ms on the
+  calling thread), and an AMD one from 33 to 30 (AMD starts no pool). In a harness call with a
+  2K screen share, a 3-layer HW camera and an MF-decoded remote camera, the flag left encode and
+  decode times unchanged (screen 3.3-3.5 ms/frame, camera 0.8-1.2, decode 0.11 vs 0.15) and cut
+  the capture's arrival-to-delivered latency from 6.8 ms to 1.9 ms at the median.
+  `LK_MF_D3D11_DRIVER_THREADING=on` drops the flag.
 - Test: `cargo test -p webrtc-sys mf_device` covers the contract on a real adapter and skips on a
   machine without a hardware D3D11 video device. `LK_MF_FAULT_HOST_DEVICE_REMOVED=1` makes acquire
   report the device as removed.
@@ -651,7 +656,7 @@ above typical uplinks.
 | `rootapp/fx-encoder` | MF encoder rebuilt when NVIDIA's latched VBV starves it, 3-frame VBV; one shared D3D11 device per adapter, non-blocking decoder readback; per-track start bitrate (screen shares up to 3 Mbps); NV12/I210/I410 buffer types no longer abort the process; x64 libyuv built with clang-cl |
 | `rootapp/fx-review` | Decoder staging readback waits on an `ID3D11Fence` event instead of polling with `Sleep(1)` (polling fallback without WDDM 2.0); MF encoder teardown on a deferred release thread; Linux CI container installs `unzip` for setup-protoc; arm64 cross builds install `g++-aarch64-linux-gnu`; macOS `minos` check no longer exits awk early; libclang lookup resolves bare `CXX` names |
 | `rootapp/fx3` | MF encoder upload ring never blocks in `Map` (fence-gated slots, grows to 5, then a fence wait outside the device lock); `D3D11GpuFence` in `mf_gpu_fence.h` with a WARP test; MF decoder teardown on the deferred release thread; a release run needs all six RIDs and refuses a tag, or a draft, that points at another commit |
-| `rootapp/fx4-dev` | Windows exports `livekit_ffi_d3d11_acquire_shared_device` / `_release_shared_device`, so the desktop's screen capture runs on the codecs' shared D3D11 device (see "Sharing the D3D11 device with the host") |
+| `rootapp/fx4-dev` | Windows exports `livekit_ffi_d3d11_acquire_shared_device` / `_release_shared_device`, so the desktop's screen capture runs on the codecs' shared D3D11 device; the shared device is created without the driver's internal threading optimizations (`LK_MF_D3D11_DRIVER_THREADING=on` restores them). See "Sharing the D3D11 device with the host" |
 
 `rootapp/fx-session` adds: unpublishing a video track releases its encoder (see above);
 received I420 frames whose planes are already packed are handed to the FFI handle without a

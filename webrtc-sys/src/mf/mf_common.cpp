@@ -248,16 +248,18 @@ HRESULT CreateD3D11DeviceBundle(const LUID& luid, D3D11DeviceBundle* out) {
       D3D_FEATURE_LEVEL_10_1,
       D3D_FEATURE_LEVEL_10_0,
   };
-  // LK_MF_D3D11_DRIVER_THREADING=off: on NVIDIA such a device runs 35 driver
-  // threads instead of 37 and compiles shaders on the calling thread, where
-  // the first shader would otherwise start a pool of one thread per CPU.
-  static const bool prevent_driver_threading =
-      EnvFlagCleared("LK_MF_D3D11_DRIVER_THREADING");
+  // Without the driver's threading optimizations an NVIDIA device runs 35
+  // driver threads instead of 37, compiles shaders on the calling thread
+  // instead of starting a pool of one thread per CPU with the first one, and
+  // completes the host capture's GPU work about 5 ms sooner.
+  // LK_MF_D3D11_DRIVER_THREADING=on turns them back on.
+  static const bool driver_threading =
+      EnvFlagSet("LK_MF_D3D11_DRIVER_THREADING");
   const UINT flags =
       D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT |
-      (prevent_driver_threading
-           ? D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS
-           : 0);
+      (driver_threading
+           ? 0
+           : D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS);
   D3D11DeviceBundle bundle;
   hr = D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
                          flags, feature_levels, ARRAYSIZE(feature_levels),

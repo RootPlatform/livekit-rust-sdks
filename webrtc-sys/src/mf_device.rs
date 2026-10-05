@@ -45,6 +45,7 @@ mod tests {
     const E_POINTER: i32 = 0x8000_4003_u32 as i32;
     const E_INVALIDARG: i32 = 0x8007_0057_u32 as i32;
     const DXGI_ERROR_DEVICE_REMOVED: i32 = 0x887A_0005_u32 as i32;
+    const D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS: u32 = 0x8;
     const D3D11_CREATE_DEVICE_BGRA_SUPPORT: u32 = 0x20;
     const D3D11_CREATE_DEVICE_VIDEO_SUPPORT: u32 = 0x800;
 
@@ -110,6 +111,12 @@ mod tests {
                 D3D11_CREATE_DEVICE_VIDEO_SUPPORT
             );
             assert_eq!(flags & D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_BGRA_SUPPORT);
+            if std::env::var_os("LK_MF_D3D11_DRIVER_THREADING").is_none() {
+                assert_eq!(
+                    flags & D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS,
+                    D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS
+                );
+            }
 
             let (hr, second) = acquire(None);
             assert_eq!(hr, S_OK);
