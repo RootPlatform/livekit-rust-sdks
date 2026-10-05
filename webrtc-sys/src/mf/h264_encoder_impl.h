@@ -97,8 +97,10 @@ class MFH264EncoderImpl : public VideoEncoder {
   };
 
   // Tries every hardware encoder MFT in preference order and keeps the first
-  // one that accepts the configuration.
+  // one that accepts the configuration; when none does while sessions are
+  // closing, tries once more after their final release.
   int32_t CreateTransform();
+  int32_t OpenSession();
   HRESULT ActivateTransform(IMFActivate* activate);
   int32_t ConfigureTransform();
   int32_t ApplyCodecApiSettings(bool log_failures);

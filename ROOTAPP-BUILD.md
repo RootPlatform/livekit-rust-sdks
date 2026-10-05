@@ -342,7 +342,7 @@ Fault injection, for testing recovery only:
 |---|---|
 | `LK_MF_FAULT_INIT=1` | MF H.264 `InitEncode` fails, which must fall back to software. |
 | `LK_MF_FAULT_AFTER_FRAMES=N` | The encoder simulates device removal after N frames. |
-| `LK_MF_MAX_SESSIONS=N` | Refuse to open more than N concurrent MF encoder sessions. |
+| `LK_MF_MAX_SESSIONS=N` | Refuse to open more than N concurrent MF encoder sessions. A session counts until its transform's delayed final release; an encoder at the limit waits for closing sessions before it is refused. |
 | `LK_MF_FAULT_RUNTIME_RC=1` | Runtime VBV/max bitrate updates fail, as if the VBV were fixed at configuration (what NVIDIA does silently). |
 | `LK_MF_FAULT_STRICT_RC=1` | Enforce strict rate-control ordering, like drivers that reject max < mean or an undersized VBV. |
 | `LK_MF_FAULT_INIT_BPS=N` | Every MF encoder sizes its rate control for N bps at InitEncode, whatever its start bitrate. `30000` reproduces a simulcast top layer started at its placeholder minimum; `300000` a low start that the starvation re-init has to fix. |
@@ -508,9 +508,23 @@ libwebrtc's worker thread, which also delivers incoming audio, waits for the enc
 during that recreate. The MF encoder therefore hands the MFT shutdown and its device references to
 one process-wide release thread (`webrtc-sys/src/mf/mf_deferred_release.h`) and returns at once;
 a teardown on the worker cost 5-30 ms of concealed incoming audio per camera stop (0.1-0.5 s
-without the shared D3D11 device). Opening an encoder session waits for pending teardowns first, so
-a re-init never holds the old and the new NVENC session together and `LK_MF_MAX_SESSIONS` counts
-stay exact. The encoder logs `MF encoder sessions open: N` on every open and close.
+without the shared D3D11 device). Opening an encoder session waits for pending teardowns first.
+
+The teardown ends streaming, shuts the asynchronous MFT down through `IMFShutdown` and
+`IMFActivate::ShutdownObject`, and releases the last transform references 1.5 s later on a
+`DelayedReleaseQueue`, so work items the MFT queued before shutdown have run. Until that final
+release:
+
+- The session still counts as open (`webrtc-sys/src/mf/mf_encoder_sessions.h`), since the driver
+  may hold the NVENC session until then; the encoder logs `MF encoder sessions open: N` (and
+  `(M closing)`) on every open and final release, and `LK_MF_MAX_SESSIONS` counts closing
+  sessions too.
+- When no hardware MFT accepts a new session while sessions are closing, the encoder waits for
+  their final release (at most 2.5 s, on the encoder's task queue, never WebRTC's worker thread)
+  and tries once more before falling back to software.
+- The delayed release also holds the encoder's reference to the adapter's shared D3D11 device, so
+  a codec opened within the window reuses it instead of creating a second device (35 NVIDIA
+  driver threads) while the old one is still alive.
 
 The MF decoder's `Release()` hands its MFT, staging texture and device reference to the same
 thread. When a subscribed track goes away the worker waits for it too, and in the same process the

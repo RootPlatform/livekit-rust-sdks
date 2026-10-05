@@ -32,6 +32,7 @@
 #include "api/task_queue/task_queue_base.h"
 #include "common_video/libyuv/include/webrtc_libyuv.h"
 #include "mf_common.h"
+#include "mf_encoder_sessions.h"
 #include "modules/video_coding/include/video_codec_interface.h"
 #include "modules/video_coding/include/video_error_codes.h"
 #include "modules/video_coding/utility/simulcast_rate_allocator.h"
@@ -138,7 +139,19 @@ const FaultInjection& Faults() {
   return faults;
 }
 
-std::atomic<int> g_open_sessions{0};
+livekit_ffi::EncoderSessionCount& Sessions() {
+  static auto* sessions = new livekit_ffi::EncoderSessionCount();
+  return *sessions;
+}
+
+void LogSessions(const livekit_ffi::EncoderSessionCount::Counts& counts) {
+  if (counts.closing > 0) {
+    RTC_LOG(LS_INFO) << "MF encoder sessions open: " << counts.open << " ("
+                     << counts.closing << " closing)";
+  } else {
+    RTC_LOG(LS_INFO) << "MF encoder sessions open: " << counts.open;
+  }
+}
 
 HRESULT SetCodecApiUInt32(ICodecAPI* api, const GUID& guid, UINT32 value) {
   VARIANT v = {};
@@ -440,6 +453,8 @@ namespace {
 constexpr std::chrono::milliseconds kDeferredReleaseWait{2000};
 constexpr std::chrono::milliseconds kShutdownWait{500};
 constexpr std::chrono::milliseconds kFinalReleaseDelay{1500};
+constexpr std::chrono::milliseconds kClosingSessionWait =
+    kFinalReleaseDelay + std::chrono::milliseconds(1000);
 
 // Asynchronous MFTs must be shut down through IMFShutdown before their last
 // release; NVIDIA's H.264 MFT otherwise runs a queued work item against freed
@@ -492,27 +507,38 @@ struct TransformResources {
       activate->ShutdownObject();
     }
     codec_api.Reset();
-    if (transform || activate || event_generator) {
-      livekit_ffi::MFDelayedReleases().Post(
-          kFinalReleaseDelay,
-          [transform = std::move(transform), activate = std::move(activate),
-           event_generator = std::move(event_generator)]() mutable {
-            event_generator.Reset();
-            transform.Reset();
-            activate.Reset();
-          });
-    }
     if (input_pool) {
       input_pool->Shutdown();
       input_pool.Reset();
     }
     staging_textures.clear();
     upload_fence.Reset();
-    d3d.reset();
-    if (session_open) {
-      session_open = false;
-      RTC_LOG(LS_INFO) << "MF encoder sessions open: " << --g_open_sessions;
+    const bool closing = std::exchange(session_open, false);
+    if (!transform && !activate && !event_generator) {
+      d3d.reset();
+      if (closing) {
+        LogSessions(Sessions().Close());
+      }
+      return;
     }
+    // The device is held until the transform's final release, so a codec
+    // opened meanwhile gets this device instead of creating a second one.
+    if (closing) {
+      Sessions().BeginClose();
+    }
+    livekit_ffi::MFDelayedReleases().Post(
+        kFinalReleaseDelay,
+        [transform = std::move(transform), activate = std::move(activate),
+         event_generator = std::move(event_generator), d3d = std::move(d3d),
+         closing]() mutable {
+          event_generator.Reset();
+          transform.Reset();
+          activate.Reset();
+          d3d.reset();
+          if (closing) {
+            LogSessions(Sessions().FinishClose());
+          }
+        });
   }
 };
 
@@ -675,9 +701,24 @@ int32_t MFH264EncoderImpl::CreateTransform() {
                         << kDeferredReleaseWait.count()
                         << " ms; opening a new session anyway.";
   }
-  if (Faults().max_sessions &&
-      g_open_sessions.load() >= *Faults().max_sessions) {
-    RTC_LOG(LS_WARNING) << "LK_MF_MAX_SESSIONS: " << g_open_sessions.load()
+  int32_t ret = OpenSession();
+  const int closing = Sessions().Get().closing;
+  if (ret != WEBRTC_VIDEO_CODEC_OK && closing > 0) {
+    // A shut-down transform may hold its hardware session until its final
+    // release, so retry once those have run before falling back.
+    RTC_LOG(LS_INFO) << "No MF encoder session opened while " << closing
+                     << " closing; retrying after their final release.";
+    if (Sessions().WaitForClosing(kClosingSessionWait)) {
+      ret = OpenSession();
+    }
+  }
+  return ret;
+}
+
+int32_t MFH264EncoderImpl::OpenSession() {
+  const int open = Sessions().Get().open;
+  if (Faults().max_sessions && open >= *Faults().max_sessions) {
+    RTC_LOG(LS_WARNING) << "LK_MF_MAX_SESSIONS: " << open
                         << " MF encoder sessions open, refusing another.";
     return WEBRTC_VIDEO_CODEC_ERROR;
   }
@@ -693,8 +734,7 @@ int32_t MFH264EncoderImpl::CreateTransform() {
     if (SUCCEEDED(hr)) {
       if (ConfigureTransform() == WEBRTC_VIDEO_CODEC_OK) {
         session_open_ = true;
-        RTC_LOG(LS_INFO) << "MF encoder sessions open: "
-                         << ++g_open_sessions;
+        LogSessions(Sessions().Open());
         return WEBRTC_VIDEO_CODEC_OK;
       }
       hr = E_FAIL;
