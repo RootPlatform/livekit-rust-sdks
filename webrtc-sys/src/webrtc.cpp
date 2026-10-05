@@ -150,7 +150,8 @@ std::shared_ptr<VideoTrack> RtcRuntime::get_or_create_video_track(
 }
 
 LogSink::LogSink(
-    rust::Fn<void(rust::String message, LoggingSeverity severity)> fnc)
+    rust::Fn<void(rust::String message, LoggingSeverity severity)> fnc,
+    LoggingSeverity min_severity)
     : fnc_(fnc) {
   // m150 replaced the old "release builds don't log" default with LoggingConfig,
   // which defaults to log_to_stderr=true / debug_severity=LS_INFO and installs
@@ -160,7 +161,7 @@ LogSink::LogSink(
   webrtc::LogMessage::SetLogToStderr(false);
   webrtc::LogMessage::LogToDebug(webrtc::LoggingSeverity::LS_NONE);
 
-  webrtc::LogMessage::AddLogToStream(this, webrtc::LoggingSeverity::LS_VERBOSE);
+  set_min_severity(min_severity);
 }
 
 LogSink::~LogSink() {
@@ -172,9 +173,18 @@ void LogSink::OnLogMessage(const std::string& message,
   fnc_(rust::String::lossy(message), static_cast<LoggingSeverity>(severity));
 }
 
+void LogSink::set_min_severity(LoggingSeverity severity) {
+  const auto native = static_cast<webrtc::LoggingSeverity>(severity);
+  webrtc::LogMessage::RemoveLogToStream(this);
+  if (native != webrtc::LoggingSeverity::LS_NONE) {
+    webrtc::LogMessage::AddLogToStream(this, native);
+  }
+}
+
 std::unique_ptr<LogSink> new_log_sink(
-    rust::Fn<void(rust::String, LoggingSeverity)> fnc) {
-  return std::make_unique<LogSink>(fnc);
+    rust::Fn<void(rust::String, LoggingSeverity)> fnc,
+    LoggingSeverity min_severity) {
+  return std::make_unique<LogSink>(fnc, min_severity);
 }
 
 rust::String create_random_uuid() {

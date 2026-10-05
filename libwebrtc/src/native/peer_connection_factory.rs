@@ -31,17 +31,55 @@ use crate::{
     MediaType, RtcError,
 };
 
+struct LogSinkState {
+    sink: Option<UniquePtr<sys_rtc::ffi::LogSink>>,
+    level: log::LevelFilter,
+}
+
 lazy_static! {
-    static ref LOG_SINK: Mutex<Option<UniquePtr<sys_rtc::ffi::LogSink>>> = Default::default();
+    static ref LOG_SINK: Mutex<LogSinkState> =
+        Mutex::new(LogSinkState { sink: None, level: log::LevelFilter::Trace });
+}
+
+// libwebrtc's warnings and errors keep their level; LS_INFO is logged at debug and
+// LS_VERBOSE at trace.
+fn native_log_severity(level: log::LevelFilter) -> sys_rtc::ffi::LoggingSeverity {
+    match level {
+        log::LevelFilter::Off => sys_rtc::ffi::LoggingSeverity::None,
+        log::LevelFilter::Error => sys_rtc::ffi::LoggingSeverity::Error,
+        log::LevelFilter::Warn | log::LevelFilter::Info => sys_rtc::ffi::LoggingSeverity::Warning,
+        log::LevelFilter::Debug => sys_rtc::ffi::LoggingSeverity::Info,
+        log::LevelFilter::Trace => sys_rtc::ffi::LoggingSeverity::Verbose,
+    }
+}
+
+/// The most verbose level libwebrtc's own log lines are forwarded to the `log` facade at
+/// (target `libwebrtc`). libwebrtc does not format lines below it. Defaults to trace.
+pub fn set_log_level(level: log::LevelFilter) {
+    let mut state = LOG_SINK.lock();
+    state.level = level;
+    if let Some(sink) = state.sink.as_mut() {
+        sink.pin_mut().set_min_severity(native_log_severity(level));
+    }
 }
 
 fn ensure_log_sink() {
-    let mut log_sink = LOG_SINK.lock();
-    if log_sink.is_none() {
-        *log_sink = Some(sys_rtc::ffi::new_log_sink(|msg, _| {
-            let msg = msg.strip_suffix("\r\n").or(msg.strip_suffix('\n')).unwrap_or(&msg);
-            log::debug!(target: "libwebrtc", "{}", msg);
-        }));
+    let mut state = LOG_SINK.lock();
+    if state.sink.is_none() {
+        let severity = native_log_severity(state.level);
+        state.sink = Some(sys_rtc::ffi::new_log_sink(
+            |msg, severity| {
+                let msg = msg.strip_suffix("\r\n").or(msg.strip_suffix('\n')).unwrap_or(&msg);
+                let level = match severity {
+                    sys_rtc::ffi::LoggingSeverity::Error => log::Level::Error,
+                    sys_rtc::ffi::LoggingSeverity::Warning => log::Level::Warn,
+                    sys_rtc::ffi::LoggingSeverity::Info => log::Level::Debug,
+                    _ => log::Level::Trace,
+                };
+                log::log!(target: "libwebrtc", level, "{}", msg);
+            },
+            severity,
+        ));
     }
 }
 

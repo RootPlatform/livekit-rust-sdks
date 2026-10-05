@@ -73,7 +73,12 @@ pub mod ffi {
 
         fn create_random_uuid() -> String;
         fn video_encoder_backend_list() -> Vec<VideoEncoderBackend>;
-        fn new_log_sink(fnc: fn(String, LoggingSeverity)) -> UniquePtr<LogSink>;
+        fn new_log_sink(
+            fnc: fn(String, LoggingSeverity),
+            min_severity: LoggingSeverity,
+        ) -> UniquePtr<LogSink>;
+        // None stops forwarding; libwebrtc skips formatting lines below the minimum.
+        fn set_min_severity(self: Pin<&mut LogSink>, severity: LoggingSeverity);
     }
 }
 
