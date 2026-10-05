@@ -776,6 +776,10 @@ impl RtcSession {
         self.inner.remove_track(sender)
     }
 
+    pub fn release_send_section(&self, mid: String) {
+        self.inner.publisher_pc.release_send_section(mid)
+    }
+
     pub fn publisher_negotiation_needed(&self) {
         self.inner.publisher_negotiation_needed()
     }

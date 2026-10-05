@@ -499,13 +499,32 @@ This applies to `rootapp/fx-encoder`, `rootapp/fx-session` and later branches. B
 ## Unpublish and the publisher SDP
 
 `unpublish_track` keeps upstream's `remove_track` (the m-section goes inactive and stays in
-the SDP) and then calls `RtpSender::release_video_encoder`, which makes libwebrtc recreate the
-sender's `VideoSendStream` without a source. That destroys the encoder instances (MF sessions,
-their D3D11 devices and NVIDIA driver threads); each unpublished video track keeps only an idle
-stream (one `EncoderQueue` thread, stale outbound-rtp counters) until the PeerConnection closes.
+the SDP, as in livekit-client), calls `RtpSender::release_video_encoder` for video (libwebrtc
+recreates the sender's `VideoSendStream` without a source, which destroys the encoder instances
+at once), and marks the transceiver's mid as released on the publisher transport.
+
+JSEP keeps a sender's msid and SSRCs in every later m-section once it has sent, so the
+transceiver's media channel keeps the send stream: before this, every unpublished video track
+kept a `VideoEncoderQueue` thread and every unpublished audio track an `AudioEncoderQueue` thread
+until the PeerConnection closed (six camera + screen + screen-audio cycles: 18 dead queue
+threads). Every later publisher offer now leaves the stream lines (`a=msid`, `a=ssrc`,
+`a=ssrc-group`, `a=rid`, `a=simulcast`) out of released m-sections, so `SetLocalDescription`
+removes the send stream through libwebrtc's own `BaseChannel::UpdateLocalStreams_w`, and later
+offers keep it out. libwebrtc accepts this munging by default; the server sees an inactive
+m-section without an msid. In the harness the six cycles left no encoder queue thread behind, and
+the subscriber saw every publish and unpublish.
+
+Removing the stream behind libwebrtc's back (`RemoveSendStream` on the media channel) does not
+work: the sender's parameters then come back without encodings, the next offer drops
+`a=simulcast`, a parsed offer drops the rids, and `SetLocalDescription` fails trying to remove the
+stream a second time.
+
+The m-sections themselves still accumulate (three per camera + screen + screen-audio cycle), as
+they do in livekit-client; only stopping the transceiver would let libwebrtc recycle them (see
+below).
 
 libwebrtc's worker thread, which also delivers incoming audio, waits for the encoder's `Release()`
-during that recreate. The MF encoder therefore hands the MFT shutdown and its device references to
+when the send stream goes away. The MF encoder therefore hands the MFT shutdown and its device references to
 one process-wide release thread (`webrtc-sys/src/mf/mf_deferred_release.h`) and returns at once;
 a teardown on the worker cost 5-30 ms of concealed incoming audio per camera stop (0.1-0.5 s
 without the shared D3D11 device). Opening an encoder session waits for pending teardowns first.
@@ -538,7 +557,8 @@ Stopping the transceiver instead is not compatible with LiveKit server 1.13.7:
 - libwebrtc recycles a rejected m-section for the next transceiver under a new mid, but the
   server only treats m-sections after the last answered mid as new. A recycled slot that is not
   the last video section gets no simulcast rid mapping (`adding up track failed: duplicate
-  layer`) and the track never reaches subscribers.
+  layer` for rids h and f). Re-checked on 2026-10-04 against the local 1.13.7 server: a camera
+  republished into its recycled m-section reached the subscriber at 320x180 only.
 - A rejected m-section keeps its old ICE credentials, so the next ICE-restart offer has
   conflicting `ice-ufrag` values; the server answers with `LEAVE STATE_MISMATCH` and the resume
   escalates to a full reconnect.

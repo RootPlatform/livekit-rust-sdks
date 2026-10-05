@@ -678,11 +678,15 @@ impl LocalParticipant {
         let publication = self.remove_publication(sid);
         if let Some(TrackPublication::Local(publication)) = publication {
             let track = publication.track().unwrap();
-            let sender = track.transceiver().unwrap().sender();
+            let transceiver = track.transceiver().unwrap();
+            let sender = transceiver.sender();
 
             self.inner.rtc_engine.remove_track(sender.clone())?;
             if matches!(track, LocalTrack::Video(_)) {
                 sender.release_video_encoder();
+            }
+            if let Some(mid) = transceiver.mid() {
+                self.inner.rtc_engine.release_send_section(mid);
             }
             track.set_transceiver(None);
 

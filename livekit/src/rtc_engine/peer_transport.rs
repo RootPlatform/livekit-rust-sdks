@@ -74,7 +74,10 @@ impl BitratePreferences {
 
     fn on_video_track_removed(&mut self, track_id: &str) -> Option<BitrateSettings> {
         self.video_max_bps.remove(track_id)?;
-        Some(BitrateSettings { max_bitrate_bps: Some(self.max_bitrate_bps()), ..Default::default() })
+        Some(BitrateSettings {
+            max_bitrate_bps: Some(self.max_bitrate_bps()),
+            ..Default::default()
+        })
     }
 
     /// Without a max bitrate libwebrtc caps every bandwidth probe at 5 Mbps. With periodic ALR
@@ -95,6 +98,7 @@ pub struct PeerTransport {
     on_offer_handler: Mutex<Option<OnOfferCreated>>,
     inner: Arc<AsyncMutex<TransportInner>>,
     bitrate: Mutex<BitratePreferences>,
+    released_send_mids: Mutex<HashSet<String>>,
 }
 
 impl Debug for PeerTransport {
@@ -122,7 +126,20 @@ impl PeerTransport {
                 stereo_track_ids: HashSet::new(),
             })),
             bitrate: Mutex::new(BitratePreferences::default()),
+            released_send_mids: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Leaves the sender's stream out of the m-section `mid` in every later offer, once its
+    /// track was removed.
+    ///
+    /// JSEP keeps a sender's msid and SSRCs in its m-section once it has sent, so the
+    /// transceiver's media channel would keep the send stream, and with it an encoder task
+    /// queue thread, until the PeerConnection closes. Without the stream in the local
+    /// description, libwebrtc removes it. Stopping the transceiver would also free it, but LiveKit
+    /// server 1.13 cannot map simulcast layers onto the m-section libwebrtc then recycles.
+    pub fn release_send_section(&self, mid: String) {
+        self.released_send_mids.lock().insert(mid);
     }
 
     pub fn is_connected(&self) -> bool {
@@ -496,6 +513,19 @@ impl PeerTransport {
         Self::join_sdp_sections(eol, sections)
     }
 
+    /// Removes the sender's stream (msid, SSRCs, rids, simulcast) from the m-sections in `mids`.
+    fn munge_released_send_sections(sdp: &str, mids: &HashSet<String>) -> String {
+        const STREAM_ATTRIBUTES: [&str; 5] =
+            ["a=msid:", "a=ssrc:", "a=ssrc-group:", "a=rid:", "a=simulcast:"];
+        let (eol, mut sections) = Self::split_sdp_sections(sdp);
+        for section in sections.iter_mut().skip(1) {
+            if Self::section_attribute(section, "mid").is_some_and(|mid| mids.contains(mid)) {
+                section.retain(|line| !STREAM_ATTRIBUTES.iter().any(|a| line.starts_with(a)));
+            }
+        }
+        Self::join_sdp_sections(eol, sections)
+    }
+
     /// livekit-client parity (`ensureAudioNackAndStereo`): the subscriber answer gets
     /// `stereo=1` for every mid whose offered Opus fmtp carries `sprop-stereo=1`, otherwise
     /// libwebrtc opens a mono decoder and downmixes stereo publishers.
@@ -588,9 +618,25 @@ impl PeerTransport {
             let stereo_munged = Self::munge_stereo_for_tracks(&sdp, &inner.stereo_track_ids);
             if stereo_munged != sdp {
                 match SessionDescription::parse(&stereo_munged, offer.sdp_type()) {
-                    Ok(parsed) => offer = parsed,
+                    Ok(parsed) => {
+                        offer = parsed;
+                        sdp = stereo_munged;
+                    }
                     Err(e) => {
                         log::warn!("Failed to parse stereo-track-munged SDP, using original: {e}");
+                    }
+                }
+            }
+        }
+
+        let released_mids = self.released_send_mids.lock().clone();
+        if !released_mids.is_empty() {
+            let released = Self::munge_released_send_sections(&sdp, &released_mids);
+            if released != sdp {
+                match SessionDescription::parse(&released, offer.sdp_type()) {
+                    Ok(parsed) => offer = parsed,
+                    Err(e) => {
+                        log::warn!("Failed to parse released-sender SDP, using original: {e}")
                     }
                 }
             }
@@ -608,6 +654,8 @@ impl PeerTransport {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use libwebrtc::peer_connection::BitrateSettings;
 
     use super::{BitratePreferences, PeerTransport};
@@ -816,13 +864,20 @@ a=fmtp:111 minptime=10;useinbandfec=1\r\n";
     }
 
     fn settings(start: Option<i32>, max: i32) -> BitrateSettings {
-        BitrateSettings { start_bitrate_bps: start, max_bitrate_bps: Some(max), ..Default::default() }
+        BitrateSettings {
+            start_bitrate_bps: start,
+            max_bitrate_bps: Some(max),
+            ..Default::default()
+        }
     }
 
     #[test]
     fn only_the_first_video_track_applies_a_start_bitrate() {
         let mut prefs = BitratePreferences::default();
-        assert_eq!(prefs.on_video_track("low".into(), Some(200_000), false), settings(None, 5_000_000));
+        assert_eq!(
+            prefs.on_video_track("low".into(), Some(200_000), false),
+            settings(None, 5_000_000)
+        );
         assert_eq!(
             prefs.on_video_track("screen".into(), Some(16_200_000), true),
             settings(Some(3_000_000), 32_800_000)
@@ -852,6 +907,164 @@ a=fmtp:111 minptime=10;useinbandfec=1\r\n";
         assert_eq!(prefs.max_bitrate_bps(), i32::MAX);
     }
 
+    #[test]
+    fn released_send_sections_lose_their_stream() {
+        let sdp = "v=0\r\n\
+o=- 0 0 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+a=msid-semantic: WMS\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+a=mid:1\r\n\
+a=inactive\r\n\
+a=msid:- camera\r\n\
+a=rtpmap:96 VP8/90000\r\n\
+a=rid:q send\r\n\
+a=rid:f send\r\n\
+a=simulcast:send q;f\r\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+a=mid:2\r\n\
+a=inactive\r\n\
+a=msid:- screen-audio\r\n\
+a=rtpmap:111 opus/48000/2\r\n\
+a=ssrc:1234 cname:abc\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+a=mid:3\r\n\
+a=sendonly\r\n\
+a=msid:- screen\r\n\
+a=rtpmap:96 VP8/90000\r\n\
+a=ssrc-group:FID 1 2\r\n\
+a=ssrc:1 cname:abc\r\n\
+a=ssrc:2 cname:abc\r\n";
+        let mids = ["1".to_string(), "2".to_string()].into_iter().collect();
+        let out = PeerTransport::munge_released_send_sections(sdp, &mids);
+        assert!(out.contains(
+            "a=mid:1\r\na=inactive\r\na=rtpmap:96 VP8/90000\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+a=mid:2\r\na=inactive\r\na=rtpmap:111 opus/48000/2\r\nm=video"
+        ));
+        assert!(out.contains("a=msid-semantic: WMS\r\n"));
+        assert!(out.ends_with(
+            "a=mid:3\r\na=sendonly\r\na=msid:- screen\r\na=rtpmap:96 VP8/90000\r\n\
+a=ssrc-group:FID 1 2\r\na=ssrc:1 cname:abc\r\na=ssrc:2 cname:abc\r\n"
+        ));
+        assert_eq!(PeerTransport::munge_released_send_sections(sdp, &HashSet::new()), sdp);
+    }
+
+    #[tokio::test]
+    async fn a_released_send_section_drops_its_send_stream() {
+        use std::time::{Duration, Instant};
+
+        use libwebrtc::{
+            peer_connection_factory::native::PeerConnectionFactoryExt, prelude::*, stats::RtcStats,
+            video_source::native::NativeVideoSource,
+        };
+        use livekit_protocol as proto;
+
+        async fn video_sizes(pc: &PeerConnection) -> Vec<(u32, u32)> {
+            pc.get_stats()
+                .await
+                .unwrap()
+                .into_iter()
+                .filter_map(|stats| match stats {
+                    RtcStats::OutboundRtp(o) if o.stream.kind == "video" => {
+                        Some((o.outbound.frame_width, o.outbound.frame_height))
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        let factory = PeerConnectionFactory::default();
+        let alice = factory.create_peer_connection(RtcConfiguration::default()).unwrap();
+        let bob = factory.create_peer_connection(RtcConfiguration::default()).unwrap();
+        for (from, to) in [(alice.clone(), bob.clone()), (bob.clone(), alice.clone())] {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<IceCandidate>();
+            from.on_ice_candidate(Some(Box::new(move |candidate| {
+                let _ = tx.send(candidate);
+            })));
+            tokio::spawn(async move {
+                while let Some(candidate) = rx.recv().await {
+                    let _ = to.add_ice_candidate(candidate).await;
+                }
+            });
+        }
+
+        let transport = PeerTransport::new(alice.clone(), proto::SignalTarget::Publisher, false);
+        let offers = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let emitted = offers.clone();
+        transport.on_offer(Some(Box::new(move |offer| emitted.lock().unwrap().push(offer))));
+        let negotiate = || async {
+            transport.create_and_send_offer(OfferOptions::default()).await.unwrap();
+            let offer = offers.lock().unwrap().pop().unwrap();
+            bob.set_remote_description(offer).await.unwrap();
+            let answer = bob.create_answer(AnswerOptions::default()).await.unwrap();
+            bob.set_local_description(answer.clone()).await.unwrap();
+            transport.set_remote_description(answer).await.unwrap();
+        };
+
+        let source = NativeVideoSource::new(VideoResolution { width: 640, height: 360 }, false);
+        let track = factory.create_video_track("camera", source.clone());
+        let send_encodings = [("q", 4.0), ("h", 2.0), ("f", 1.0)]
+            .into_iter()
+            .map(|(rid, scale)| RtpEncodingParameters {
+                rid: rid.to_string(),
+                scale_resolution_down_by: Some(scale),
+                ..Default::default()
+            })
+            .collect();
+        let transceiver = alice
+            .add_transceiver(
+                MediaStreamTrack::Video(track),
+                RtpTransceiverInit {
+                    direction: RtpTransceiverDirection::SendOnly,
+                    stream_ids: Vec::new(),
+                    send_encodings,
+                },
+            )
+            .unwrap();
+        let vp8 = factory
+            .get_rtp_sender_capabilities(MediaType::Video)
+            .codecs
+            .into_iter()
+            .filter(|codec| codec.mime_type.eq_ignore_ascii_case("video/vp8"))
+            .collect();
+        transceiver.set_codec_preferences(vp8).unwrap();
+        negotiate().await;
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut timestamp_us = 0;
+        while !video_sizes(&alice).await.iter().any(|&(width, _)| width > 0) {
+            assert!(Instant::now() < deadline, "the video encoder never produced a frame");
+            timestamp_us += 33_333;
+            source.capture_frame(&VideoFrame {
+                rotation: VideoRotation::VideoRotation0,
+                timestamp_us,
+                frame_metadata: None,
+                buffer: I420Buffer::new(640, 360),
+            });
+            tokio::time::sleep(Duration::from_millis(33)).await;
+        }
+
+        // The stats cache lives 50 ms; each read below must see a fresh report.
+        alice.remove_track(transceiver.sender()).unwrap();
+        negotiate().await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!video_sizes(&alice).await.is_empty(), "the send stream survives remove_track");
+
+        transport.release_send_section(transceiver.mid().unwrap());
+        for _ in 0..3 {
+            negotiate().await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(video_sizes(&alice).await.is_empty(), "the send stream is gone");
+        let sdp = alice.current_local_description().unwrap().to_string();
+        assert!(!sdp.contains("a=msid:") && !sdp.contains("a=rid:"), "{sdp}");
+        assert_eq!(sdp.matches("m=video").count(), 1);
+
+        alice.close();
+        bob.close();
+    }
+
     #[tokio::test]
     async fn video_tracks_never_put_a_start_bitrate_in_the_offer() {
         use libwebrtc::{
@@ -871,7 +1084,8 @@ a=fmtp:111 minptime=10;useinbandfec=1\r\n";
         transport.on_offer(Some(Box::new(move |offer| emitted.lock().unwrap().push(offer))));
 
         for (name, screen) in [("camera", false), ("screen", true)] {
-            let source = NativeVideoSource::new(VideoResolution { width: 1280, height: 720 }, screen);
+            let source =
+                NativeVideoSource::new(VideoResolution { width: 1280, height: 720 }, screen);
             let track = factory.create_video_track(name, source);
             transport.add_video_track(name.to_string(), Some(3_500_000), screen);
             transport

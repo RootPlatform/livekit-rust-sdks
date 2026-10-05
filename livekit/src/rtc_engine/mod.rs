@@ -372,6 +372,13 @@ impl RtcEngine {
                                      // happen on bad timing and it is safe to ignore)
     }
 
+    /// Later publisher offers leave the stream of the m-section `mid` out, so libwebrtc
+    /// destroys the send stream of a removed track.
+    pub fn release_send_section(&self, mid: String) {
+        let session = self.inner.running_handle.read().session.clone();
+        session.release_send_section(mid)
+    }
+
     pub async fn mute_track(&self, req: proto::MuteTrackRequest) -> EngineResult<()> {
         let (session, _r_lock) = {
             let (handle, _r_lock) = self.inner.wait_reconnection().await?;
