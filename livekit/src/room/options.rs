@@ -420,7 +420,8 @@ pub fn into_rtp_encodings(
         })
     }
 
-    encodings.reverse();
+    // Lowest layer first, as livekit-client sends them: libwebrtc sizes the padding
+    // that enables simulcast layers by encoding index, not by bitrate.
     encodings
 }
 
@@ -647,16 +648,16 @@ mod tests {
         assert_eq!(
             layer_summary(1280, 720, &options),
             vec![
-                ("f".to_string(), 1.0, 1_700_000, 30.0),
-                ("h".to_string(), 2.0, 450_000, 30.0),
                 ("q".to_string(), 4.0, 160_000, 30.0),
+                ("h".to_string(), 2.0, 450_000, 30.0),
+                ("f".to_string(), 1.0, 1_700_000, 30.0),
             ]
         );
         assert_eq!(
             layer_summary(640, 480, &options),
             vec![
-                ("h".to_string(), 1.0, 1_700_000, 30.0),
-                ("q".to_string(), 480.0 / 180.0, 160_000, 30.0)
+                ("q".to_string(), 480.0 / 180.0, 160_000, 30.0),
+                ("h".to_string(), 1.0, 1_700_000, 30.0)
             ]
         );
         assert_eq!(layer_summary(320, 240, &options).len(), 1);
@@ -672,7 +673,7 @@ mod tests {
         };
         assert_eq!(
             layer_summary(2560, 1440, &options),
-            vec![("h".to_string(), 1.0, 2_500_000, 30.0), ("q".to_string(), 2.0, 1_200_000, 30.0)]
+            vec![("q".to_string(), 2.0, 1_200_000, 30.0), ("h".to_string(), 1.0, 2_500_000, 30.0)]
         );
     }
 
@@ -695,11 +696,27 @@ mod tests {
         };
         assert_eq!(
             layer_summary(1280, 720, &options),
-            vec![("h".to_string(), 1.0, 1_700_000, 30.0), ("q".to_string(), 2.0, 450_000, 30.0)]
+            vec![("q".to_string(), 2.0, 450_000, 30.0), ("h".to_string(), 1.0, 1_700_000, 30.0)]
         );
         for (_, scale, _, fps) in layer_summary(1280, 720, &options) {
             assert!(scale.is_finite() && scale >= 1.0);
             assert!(fps.is_finite() && fps > 0.0);
+        }
+    }
+
+    #[test]
+    fn simulcast_encodings_are_ordered_lowest_first() {
+        for (source, width, height) in [
+            (TrackSource::Camera, 1280, 720),
+            (TrackSource::Camera, 640, 480),
+            (TrackSource::Screenshare, 2560, 1440),
+        ] {
+            let options = TrackPublishOptions { source, ..Default::default() };
+            let layers = layer_summary(width, height, &options);
+            assert!(layers.len() > 1, "{source:?} {width}x{height} should simulcast");
+            let rids: Vec<&str> = layers.iter().map(|(rid, ..)| rid.as_str()).collect();
+            assert_eq!(rids, ["q", "h", "f"][..layers.len()]);
+            assert!(layers.windows(2).all(|w| w[0].1 > w[1].1 && w[0].2 < w[1].2));
         }
     }
 
