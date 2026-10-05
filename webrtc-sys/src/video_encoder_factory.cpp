@@ -495,7 +495,22 @@ VideoEncoderFactory::InternalFactory::GetSupportedFormats() const {
       }
     }
   }
-  return formats;
+
+  // Backends list codecs the software factory lists too, often at another
+  // level. WebRTC gives formats that IsSameCodec() the same payload type and
+  // keeps only the first, but warns about every other one each time it builds
+  // the codec list.
+  std::vector<webrtc::SdpVideoFormat> unique;
+  for (auto& format : formats) {
+    const bool seen = std::any_of(
+        unique.begin(), unique.end(), [&](const webrtc::SdpVideoFormat& kept) {
+          return kept.IsSameCodec(format);
+        });
+    if (!seen) {
+      unique.push_back(std::move(format));
+    }
+  }
+  return unique;
 }
 
 std::vector<webrtc::SdpVideoFormat>

@@ -16,6 +16,8 @@
 
 #include "livekit/video_decoder_factory.h"
 
+#include <algorithm>
+
 #include <modules/video_coding/codecs/av1/av1_svc_config.h>
 #include "api/environment/environment.h"
 #include "api/video_codecs/av1_profile.h"
@@ -126,7 +128,22 @@ std::vector<webrtc::SdpVideoFormat> VideoDecoderFactory::GetSupportedFormats()
   formats.push_back(webrtc::SdpVideoFormat(
       webrtc::SdpVideoFormat::AV1Profile0(),
       webrtc::LibaomAv1EncoderSupportedScalabilityModes()));
-  return formats;
+
+  // Hardware factories list codecs the software decoders list too, often at
+  // another level. WebRTC gives formats that IsSameCodec() the same payload
+  // type and keeps only the first, but warns about every other one each time
+  // it builds the codec list.
+  std::vector<webrtc::SdpVideoFormat> unique;
+  for (auto& format : formats) {
+    const bool seen = std::any_of(
+        unique.begin(), unique.end(), [&](const webrtc::SdpVideoFormat& kept) {
+          return kept.IsSameCodec(format);
+        });
+    if (!seen) {
+      unique.push_back(std::move(format));
+    }
+  }
+  return unique;
 }
 
 VideoDecoderFactory::CodecSupport VideoDecoderFactory::QueryCodecSupport(
