@@ -97,7 +97,7 @@ pub struct FfiServer {
     handle_dropped_txs: DashMap<FfiHandleId, Vec<oneshot::Sender<()>>>,
 }
 
-const DEFAULT_MAX_WORKER_THREADS: usize = 4;
+const DEFAULT_MAX_WORKER_THREADS: usize = 8;
 const WORKER_THREADS_ENV: &str = "LK_FFI_WORKER_THREADS";
 
 fn resolve_worker_threads(available: usize, requested: Option<&str>) -> usize {
@@ -337,9 +337,10 @@ mod runtime_tests {
     use crate::FFI_SERVER;
 
     #[test]
-    fn default_caps_workers_at_four() {
-        assert_eq!(resolve_worker_threads(32, None), 4);
-        assert_eq!(resolve_worker_threads(8, None), 4);
+    fn default_caps_workers_at_eight() {
+        assert_eq!(resolve_worker_threads(32, None), 8);
+        assert_eq!(resolve_worker_threads(16, None), 8);
+        assert_eq!(resolve_worker_threads(8, None), 8);
         assert_eq!(resolve_worker_threads(4, None), 4);
         assert_eq!(resolve_worker_threads(2, None), 2);
         assert_eq!(resolve_worker_threads(1, None), 1);
@@ -358,7 +359,7 @@ mod runtime_tests {
     #[test]
     fn invalid_override_falls_back_to_default() {
         for value in ["", "0", "-2", "four", "2.5"] {
-            assert_eq!(resolve_worker_threads(32, Some(value)), 4, "override {value:?}");
+            assert_eq!(resolve_worker_threads(32, Some(value)), 8, "override {value:?}");
         }
     }
 

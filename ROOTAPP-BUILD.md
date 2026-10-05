@@ -637,19 +637,32 @@ above typical uplinks.
 
 ## Tokio runtime size
 
-The FFI's main tokio runtime runs `min(available_parallelism, 4)` workers instead of tokio's one per
+The FFI's main tokio runtime runs `min(available_parallelism, 8)` workers instead of tokio's one per
 logical CPU (32 on a 32-thread machine). `LK_FFI_WORKER_THREADS=N` overrides that on every platform:
 it is read once, when the first FFI request creates the server; N is clamped to
-`available_parallelism`, and 0 or a value that doesn't parse keeps the default. Workers keep the name
-`tokio-rt-worker`. The blocking pool keeps tokio's on-demand default (DNS, `tokio::fs`, audio filter
-`on_load`; idle threads exit after 10 s), and the audio capture runtime stays at one `livekit-audio`
-worker.
+`available_parallelism`, and 0 or a value that doesn't parse keeps the default. `TOKIO_WORKER_THREADS`
+no longer affects this runtime, because its size is set explicitly; use `LK_FFI_WORKER_THREADS`.
+Workers keep the name `tokio-rt-worker`. The blocking pool keeps tokio's on-demand default (DNS,
+`tokio::fs`, audio filter `on_load`; idle threads exit after 10 s), and the audio capture runtime stays
+at one `livekit-audio` worker. On Windows `available_parallelism` ignores the process affinity mask.
 
 Many FFI paths make synchronous libwebrtc proxy calls on a worker (data channel `Send`, `add_transceiver`,
 `remove_track`, `SetParameters`, `GetStats`, `PeerConnection::Close`), so the worker waits on the
 signaling or network thread while using no CPU. With one worker a reliable-data flood (about 2.8k
 messages/s) backs up for seconds; two workers keep up. Measure with the flood before lowering the
 default.
+
+Why 8 and not 4: in a two-room harness (mic, camera, screen and screen audio published on room A and
+all subscribed by room B, a third room C sending a tone and data to B) both counts match 32 workers on
+an idle machine, including signal, full and resume-failed reconnects. Under CPU contention (harness and
+a 16-thread spin burner pinned to the same 16 logical CPUs, both below normal priority) the
+resume-failed reconnect, where all four tracks are republished, did not finish within 20 s in 2 of 9
+runs with 4 workers and took 5.6 and 7.6 s in 2 more, while room B's `GetStats` stalled for up to 10 s.
+With 32 workers 1 of 9 runs took 11.5 s, with 8 workers 1 of 7 took 10.9 s, and 16 or 32 workers on
+the capped DLL had none in 4 runs each. Multi-second stalls of the reliable-data flood under the same
+load showed up at every worker count (2 of 9 runs at 32, 3 of 9 at 4, 2 of 7 at 8, 1 of 4 at 16, 1 of
+4 at 32 on the capped DLL), so they do not depend on the runtime size. Remote audio gaps over 30 ms stayed rare in every
+configuration.
 
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
@@ -672,7 +685,7 @@ default.
 | `rootapp/fx-encoder` | MF encoder rebuilt when NVIDIA's latched VBV starves it, 3-frame VBV; one shared D3D11 device per adapter, non-blocking decoder readback; per-track start bitrate (screen shares up to 3 Mbps); NV12/I210/I410 buffer types no longer abort the process; x64 libyuv built with clang-cl |
 | `rootapp/fx-review` | Decoder staging readback waits on an `ID3D11Fence` event instead of polling with `Sleep(1)` (polling fallback without WDDM 2.0); MF encoder teardown on a deferred release thread; Linux CI container installs `unzip` for setup-protoc; arm64 cross builds install `g++-aarch64-linux-gnu`; macOS `minos` check no longer exits awk early; libclang lookup resolves bare `CXX` names |
 | `rootapp/fx3` | MF encoder upload ring never blocks in `Map` (fence-gated slots, grows to 5, then a fence wait outside the device lock); `D3D11GpuFence` in `mf_gpu_fence.h` with a WARP test; MF decoder teardown on the deferred release thread; a release run needs all six RIDs and refuses a tag, or a draft, that points at another commit |
-| `rootapp/fx4-tokio` | FFI tokio runtime capped at 4 workers, `LK_FFI_WORKER_THREADS` override (see Tokio runtime size) |
+| `rootapp/fx4-tokio` | FFI tokio runtime capped at 8 workers, `LK_FFI_WORKER_THREADS` override (see Tokio runtime size) |
 | `rootapp/fx4-dev` | Windows exports `livekit_ffi_d3d11_acquire_shared_device` / `_release_shared_device`, so the desktop's screen capture runs on the codecs' shared D3D11 device; the shared device is created without the driver's internal threading optimizations (`LK_MF_D3D11_DRIVER_THREADING=on` restores them). See "Sharing the D3D11 device with the host" |
 
 `rootapp/fx-session` adds: unpublishing a video track releases its encoder (see above);
