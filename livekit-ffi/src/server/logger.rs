@@ -13,12 +13,12 @@
 // limitations under the License.
 
 use std::{
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     time::Duration,
 };
 
 use env_logger;
-use log::{self, Log};
+use log::{self, LevelFilter, Log};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{proto, FFI_SERVER};
@@ -26,12 +26,25 @@ use crate::{proto, FFI_SERVER};
 pub const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 pub const BATCH_SIZE: usize = 32;
 
+/// Read on every `livekit_ffi_initialize`: the most verbose level forwarded while
+/// capture_logs is on (off, error, warn, info, debug or trace).
+pub const LOG_LEVEL_ENV: &str = "LK_FFI_LOG_LEVEL";
+
+/// The capture level from `LK_FFI_LOG_LEVEL`; warn when it is unset or invalid.
+pub fn capture_level_from_env() -> LevelFilter {
+    std::env::var(LOG_LEVEL_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(LevelFilter::Warn)
+}
+
 /// Logger that forward logs to the FfiClient when capture_logs is enabled
 /// Otherwise fallback to the env_logger
 pub struct FfiLogger {
     async_runtime: tokio::runtime::Handle,
     log_tx: mpsc::UnboundedSender<LogMsg>,
     capture_logs: AtomicBool,
+    capture_level: AtomicUsize,
     env_logger: env_logger::Logger,
 }
 
@@ -51,6 +64,7 @@ impl FfiLogger {
             log_tx,
             capture_logs: AtomicBool::new(false), // Always false by default to ensure the server
             // is always initialized when using capture_logs
+            capture_level: AtomicUsize::new(LevelFilter::Warn as usize),
             env_logger,
         }
     }
@@ -61,8 +75,26 @@ impl FfiLogger {
         self.capture_logs.load(Ordering::Acquire)
     }
 
-    pub fn set_capture_logs(&self, capture: bool) {
+    /// Records above `level` are dropped here instead of crossing the FFI while capturing.
+    pub fn set_capture_logs(&self, capture: bool, level: LevelFilter) {
+        self.capture_level.store(level as usize, Ordering::Release);
         self.capture_logs.store(capture, Ordering::Release);
+    }
+
+    pub fn capture_level(&self) -> LevelFilter {
+        match self.capture_level.load(Ordering::Acquire) {
+            0 => LevelFilter::Off,
+            1 => LevelFilter::Error,
+            2 => LevelFilter::Warn,
+            3 => LevelFilter::Info,
+            4 => LevelFilter::Debug,
+            _ => LevelFilter::Trace,
+        }
+    }
+
+    /// The level env_logger (RUST_LOG) lets through, used while not capturing.
+    pub fn env_filter(&self) -> LevelFilter {
+        self.env_logger.filter()
     }
 }
 
@@ -72,12 +104,15 @@ impl Log for FfiLogger {
             return self.env_logger.enabled(metadata);
         }
 
-        true // The ffi client decides what to log (FfiLogger is just forwarding)
+        metadata.level() <= self.capture_level()
     }
 
     fn log(&self, record: &log::Record) {
         if !self.capture_logs() {
             return self.env_logger.log(record);
+        }
+        if !self.enabled(record.metadata()) {
+            return;
         }
 
         self.log_tx.send(LogMsg::Log(record.into())).unwrap();
@@ -152,6 +187,33 @@ impl From<&log::Record<'_>> for proto::LogRecord {
             line: record.line(),
             message: record.args().to_string(), // Display trait
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use log::{Level, LevelFilter, Log, Metadata};
+
+    use super::FfiLogger;
+
+    #[test]
+    fn capture_forwards_records_up_to_its_level() {
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let logger = FfiLogger::new(runtime.handle().clone());
+        let enabled =
+            |level| logger.enabled(&Metadata::builder().level(level).target("libwebrtc").build());
+
+        logger.set_capture_logs(true, LevelFilter::Warn);
+        assert!(enabled(Level::Error) && enabled(Level::Warn));
+        assert!(!enabled(Level::Info) && !enabled(Level::Debug) && !enabled(Level::Trace));
+
+        logger.set_capture_logs(true, LevelFilter::Debug);
+        assert_eq!(logger.capture_level(), LevelFilter::Debug);
+        assert!(enabled(Level::Info) && enabled(Level::Debug));
+        assert!(!enabled(Level::Trace));
+
+        logger.set_capture_logs(true, LevelFilter::Off);
+        assert!(!enabled(Level::Error));
     }
 }
 

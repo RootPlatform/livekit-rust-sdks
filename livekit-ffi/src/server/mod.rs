@@ -137,7 +137,7 @@ impl Default for FfiServer {
 
         let logger = Box::leak(Box::new(logger::FfiLogger::new(async_runtime.handle().clone())));
         log::set_logger(logger).unwrap();
-        log::set_max_level(log::LevelFilter::Trace);
+        log::set_max_level(logger.env_filter());
 
         #[cfg(feature = "tracing")]
         console_subscriber::init();
@@ -176,13 +176,26 @@ impl Default for FfiServer {
 impl FfiServer {
     pub fn setup(&self, config: FfiConfig) {
         *self.config.lock() = Some(config.clone());
-        self.logger.set_capture_logs(config.capture_logs);
+        let level = if config.capture_logs {
+            logger::capture_level_from_env()
+        } else {
+            self.logger.env_filter()
+        };
+        self.set_log_level(config.capture_logs, level);
 
         log::debug!(
             "initializing ffi server v{} ({} async workers)",
             env!("CARGO_PKG_VERSION"),
             self.async_runtime.metrics().num_workers()
         ); // TODO: Move this log
+    }
+
+    // The log macros and libwebrtc's own log calls skip records above `level`, so nothing is
+    // formatted only to be dropped by the logger.
+    fn set_log_level(&self, capture: bool, level: log::LevelFilter) {
+        self.logger.set_capture_logs(capture, level);
+        log::set_max_level(level);
+        livekit::webrtc::native::set_log_level(level);
     }
 
     /// Returns whether the server has been setup.
@@ -208,7 +221,7 @@ impl FfiServer {
             room.close(self, DisconnectReason::ClientInitiated).await;
         }
 
-        self.logger.set_capture_logs(false);
+        self.set_log_level(false, self.logger.env_filter());
 
         // Drop all handles
         *self.config.lock() = None; // Invalidate the config
