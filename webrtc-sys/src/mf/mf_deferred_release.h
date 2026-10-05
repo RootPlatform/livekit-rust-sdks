@@ -89,6 +89,70 @@ class DeferredReleaseQueue {
   bool started_ = false;
 };
 
+// Runs each task once `delay` has passed since it was posted, in posting order,
+// on one detached worker thread started by the first Post(). Lifetime as for
+// DeferredReleaseQueue: heap-allocated and never freed.
+class DelayedReleaseQueue {
+ public:
+  explicit DelayedReleaseQueue(std::function<void()> thread_init)
+      : thread_init_(std::move(thread_init)) {}
+  DelayedReleaseQueue(const DelayedReleaseQueue&) = delete;
+  DelayedReleaseQueue& operator=(const DelayedReleaseQueue&) = delete;
+  ~DelayedReleaseQueue() = delete;
+
+  void Post(std::chrono::milliseconds delay, std::function<void()> task) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    tasks_.emplace_back(std::chrono::steady_clock::now() + delay,
+                        std::move(task));
+    if (!started_) {
+      started_ = true;
+      std::thread([this] { Run(); }).detach();
+    }
+    cv_.notify_one();
+  }
+
+  size_t Pending() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return tasks_.size() + (running_ ? 1 : 0);
+  }
+
+ private:
+  void Run() {
+    if (thread_init_) {
+      thread_init_();
+    }
+    std::unique_lock<std::mutex> lock(mutex_);
+    for (;;) {
+      if (tasks_.empty()) {
+        cv_.wait(lock);
+        continue;
+      }
+      const auto due = tasks_.front().first;
+      if (std::chrono::steady_clock::now() < due) {
+        cv_.wait_until(lock, due);
+        continue;
+      }
+      std::function<void()> task = std::move(tasks_.front().second);
+      tasks_.pop_front();
+      running_ = true;
+      lock.unlock();
+      task();
+      task = nullptr;
+      lock.lock();
+      running_ = false;
+    }
+  }
+
+  const std::function<void()> thread_init_;
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::deque<std::pair<std::chrono::steady_clock::time_point,
+                       std::function<void()>>>
+      tasks_;
+  bool running_ = false;
+  bool started_ = false;
+};
+
 }  // namespace livekit_ffi
 
 #endif  // WEBRTC_MF_DEFERRED_RELEASE_H_

@@ -126,6 +126,59 @@ void TestInitHookRunsOnceOnTheWorker() {
          "worker is not the posting thread");
 }
 
+void TestDelayedTasksRunAfterTheirDelayInOrder() {
+  auto* queue = new livekit_ffi::DelayedReleaseQueue({});
+  std::mutex mutex;
+  std::vector<std::pair<int, Clock::duration>> ran;
+  const Clock::time_point start = Clock::now();
+  for (int i = 0; i < 3; i++) {
+    queue->Post(milliseconds(150), [&, i] {
+      std::lock_guard<std::mutex> lock(mutex);
+      ran.emplace_back(i, Clock::now() - start);
+    });
+  }
+  Expect(Clock::now() - start < milliseconds(20),
+         "Post of a delayed task returns at once");
+  std::this_thread::sleep_for(milliseconds(60));
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    Expect(ran.empty(), "nothing runs before its delay");
+  }
+  const Clock::time_point deadline = Clock::now() + milliseconds(2000);
+  while (queue->Pending() != 0 && Clock::now() < deadline) {
+    std::this_thread::sleep_for(milliseconds(5));
+  }
+  std::lock_guard<std::mutex> lock(mutex);
+  Expect(ran.size() == 3, "every delayed task runs");
+  bool in_order = true;
+  bool after_delay = true;
+  for (size_t i = 0; i < ran.size(); i++) {
+    in_order = in_order && ran[i].first == static_cast<int>(i);
+    after_delay = after_delay && ran[i].second >= milliseconds(150);
+  }
+  Expect(in_order, "delayed tasks run in posting order");
+  Expect(after_delay, "no delayed task runs early");
+}
+
+void TestDelayedQueueDoesNotBlockTheDeferredQueue() {
+  auto* deferred = NewQueue();
+  auto* delayed = new livekit_ffi::DelayedReleaseQueue({});
+  std::atomic<bool> released{false};
+  deferred->Post([&] {
+    delayed->Post(milliseconds(300), [&] { released = true; });
+  });
+  const Clock::time_point start = Clock::now();
+  Expect(deferred->WaitIdle(milliseconds(1000)), "deferred queue drains");
+  Expect(Clock::now() - start < milliseconds(200),
+         "a pending delayed release does not hold the deferred queue busy");
+  Expect(!released.load(), "the delayed release is still pending");
+  const Clock::time_point deadline = Clock::now() + milliseconds(2000);
+  while (!released.load() && Clock::now() < deadline) {
+    std::this_thread::sleep_for(milliseconds(5));
+  }
+  Expect(released.load(), "the delayed release runs later");
+}
+
 }  // namespace
 
 int main() {
@@ -134,6 +187,8 @@ int main() {
   TestTasksRunInOrder();
   TestWaitIdleCoversTasksPostedWhileBusy();
   TestInitHookRunsOnceOnTheWorker();
+  TestDelayedTasksRunAfterTheirDelayInOrder();
+  TestDelayedQueueDoesNotBlockTheDeferredQueue();
 
   if (g_failures != 0) {
     std::fprintf(stderr, "%d test(s) failed\n", g_failures);

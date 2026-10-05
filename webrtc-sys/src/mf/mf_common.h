@@ -144,6 +144,10 @@ std::string HResultToString(HRESULT hr);
 // milliseconds.
 DeferredReleaseQueue& MFDeferredReleases();
 
+// Holds the last references to MF objects that have already been shut down,
+// for long enough that work items the MFT queued before shutdown have run.
+DelayedReleaseQueue& MFDelayedReleases();
+
 }  // namespace livekit_ffi
 
 #endif  // WEBRTC_MF_COMMON_H_

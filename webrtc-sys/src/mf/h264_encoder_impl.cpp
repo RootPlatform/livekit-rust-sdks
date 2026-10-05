@@ -438,6 +438,28 @@ class MFInputSamplePool : public IMFAsyncCallback {
 namespace {
 
 constexpr std::chrono::milliseconds kDeferredReleaseWait{2000};
+constexpr std::chrono::milliseconds kShutdownWait{500};
+constexpr std::chrono::milliseconds kFinalReleaseDelay{1500};
+
+// Asynchronous MFTs must be shut down through IMFShutdown before their last
+// release; NVIDIA's H.264 MFT otherwise runs a queued work item against freed
+// state (an access violation entering one of its critical sections).
+void ShutdownAsyncTransform(IMFTransform* transform) {
+  ComPtr<IMFShutdown> shutdown;
+  if (FAILED(transform->QueryInterface(IID_PPV_ARGS(&shutdown)))) {
+    return;
+  }
+  if (FAILED(shutdown->Shutdown())) {
+    return;
+  }
+  const auto deadline = std::chrono::steady_clock::now() + kShutdownWait;
+  MFSHUTDOWN_STATUS status = MFSHUTDOWN_INITIATED;
+  while (SUCCEEDED(shutdown->GetShutdownStatus(&status)) &&
+         status != MFSHUTDOWN_COMPLETED &&
+         std::chrono::steady_clock::now() < deadline) {
+    Sleep(2);
+  }
+}
 
 // What holds an encoder's hardware session, released in this order.
 struct TransformResources {
@@ -464,13 +486,21 @@ struct TransformResources {
                                 input_stream_id);
       transform->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
       transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
+      ShutdownAsyncTransform(transform.Get());
     }
-    event_generator.Reset();
-    codec_api.Reset();
-    transform.Reset();
     if (activate) {
       activate->ShutdownObject();
-      activate.Reset();
+    }
+    codec_api.Reset();
+    if (transform || activate || event_generator) {
+      livekit_ffi::MFDelayedReleases().Post(
+          kFinalReleaseDelay,
+          [transform = std::move(transform), activate = std::move(activate),
+           event_generator = std::move(event_generator)]() mutable {
+            event_generator.Reset();
+            transform.Reset();
+            activate.Reset();
+          });
     }
     if (input_pool) {
       input_pool->Shutdown();
