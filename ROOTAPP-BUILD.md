@@ -659,6 +659,15 @@ it. With the start munged per track, every camera publish or new screen share dr
 28 Mbps estimate to the start value (`BWE Setting start bitrate to: ...` in the libwebrtc
 log) and the new share started soft for 20-25 s.
 
+Every video publish and unpublish also sets the estimate's max through `SetBitrate`: twice the
+sum of the published video tracks' encoding max bitrates, at least 5 Mbps. Without a max,
+libwebrtc caps every bandwidth probe at 5 Mbps (`kDefaultMaxProbingBitrate`). With simulcast
+encodings lowest-first and periodic ALR probing (see the padding notes in the commit history), the
+sender no longer pads up to its top layer, so on static content the estimate sat at 5-6 Mbps and a
+15 Mbps top layer needed ~14 s of AIMD increase once the content moved. With the max, ALR probes
+reach twice the estimate (libwebrtc limits them to twice the allocated bitrate), and in the
+harness the top layer reached 14.3 Mbps within a second of a static share turning to motion.
+
 ## Tokio runtime size
 
 The FFI's main tokio runtime runs `min(available_parallelism, 8)` workers instead of tokio's one per

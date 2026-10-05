@@ -1882,6 +1882,8 @@ impl SessionInner {
         if let Some(track) = sender.track() {
             let mut pending_tracks = self.pending_tracks.lock();
             pending_tracks.remove(&track.id());
+            drop(pending_tracks);
+            self.publisher_pc.remove_video_track(&track.id());
         }
 
         self.publisher_pc.peer_connection().remove_track(sender)?;
@@ -1908,8 +1910,11 @@ impl SessionInner {
                 let sum: u64 = encodings.iter().filter_map(|e| e.max_bitrate).sum();
                 (sum > 0).then_some(sum)
             };
-            self.publisher_pc
-                .add_video_track(ultimate_bps, options.source == TrackSource::Screenshare);
+            self.publisher_pc.add_video_track(
+                track.rtc_track().id(),
+                ultimate_bps,
+                options.source == TrackSource::Screenshare,
+            );
         }
 
         if track.kind() == TrackKind::Audio && options.force_stereo {

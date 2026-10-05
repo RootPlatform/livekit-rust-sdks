@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt::{Debug, Formatter},
     sync::Arc,
 };
@@ -39,19 +39,53 @@ struct TransportInner {
 #[derive(Default)]
 struct BitratePreferences {
     start_applied: bool,
+    // Sum of the encodings' max bitrates of each published video track, by track id.
+    video_max_bps: HashMap<String, u64>,
 }
 
 impl BitratePreferences {
+    /// libwebrtc's probe ceiling when no max bitrate is set.
+    const DEFAULT_MAX_PROBE_BPS: u64 = 5_000_000;
+
     /// The settings to apply for a newly published video track. Applying a start bitrate
     /// resets the transport's bandwidth estimate to it, so only the first video track that
     /// has one sets it.
-    fn on_video_track(&mut self, max_bps: Option<u64>, screen: bool) -> Option<BitrateSettings> {
-        if self.start_applied {
-            return None;
+    fn on_video_track(
+        &mut self,
+        track_id: String,
+        max_bps: Option<u64>,
+        screen: bool,
+    ) -> BitrateSettings {
+        if let Some(bps) = max_bps {
+            self.video_max_bps.insert(track_id, bps);
         }
-        let kbps = PeerTransport::compute_start_bitrate_kbps(max_bps, screen)?;
-        self.start_applied = true;
-        Some(BitrateSettings { start_bitrate_bps: Some(kbps as i32 * 1000), ..Default::default() })
+        let start_kbps = if self.start_applied {
+            None
+        } else {
+            PeerTransport::compute_start_bitrate_kbps(max_bps, screen)
+        };
+        self.start_applied |= start_kbps.is_some();
+        BitrateSettings {
+            start_bitrate_bps: start_kbps.map(|kbps| kbps as i32 * 1000),
+            max_bitrate_bps: Some(self.max_bitrate_bps()),
+            ..Default::default()
+        }
+    }
+
+    fn on_video_track_removed(&mut self, track_id: &str) -> Option<BitrateSettings> {
+        self.video_max_bps.remove(track_id)?;
+        Some(BitrateSettings { max_bitrate_bps: Some(self.max_bitrate_bps()), ..Default::default() })
+    }
+
+    /// Without a max bitrate libwebrtc caps every bandwidth probe at 5 Mbps. With periodic ALR
+    /// probing instead of padding, that holds the estimate near 5-6 Mbps while the content is
+    /// static, and a 15 Mbps top layer then needs ~15 s of AIMD increase once it moves. Twice
+    /// the published video's max bitrates matches the ceiling libwebrtc puts on probes once
+    /// that video is allocated (twice the max allocated bitrate).
+    fn max_bitrate_bps(&self) -> i32 {
+        let max = self.video_max_bps.values().fold(0u64, |sum, bps| sum.saturating_add(*bps));
+        let max = max.saturating_mul(2);
+        max.clamp(Self::DEFAULT_MAX_PROBE_BPS, i32::MAX as u64) as i32
     }
 }
 
@@ -223,14 +257,27 @@ impl PeerTransport {
     /// SetBitrate. It used to be munged into the offer as x-google-start-bitrate, but every
     /// send channel applies its codec's start bitrate to the whole call, a channel without one
     /// clears it, and the next different value resets the established estimate, so each later
-    /// publish dropped the estimate back to the start bitrate.
-    pub fn add_video_track(&self, max_bps: Option<u64>, screen: bool) {
-        let Some(settings) = self.bitrate.lock().on_video_track(max_bps, screen) else {
-            return;
-        };
+    /// publish dropped the estimate back to the start bitrate. Every track also raises the
+    /// estimate's max (see `BitratePreferences::max_bitrate_bps`).
+    pub fn add_video_track(&self, track_id: String, max_bps: Option<u64>, screen: bool) {
+        let settings = self.bitrate.lock().on_video_track(track_id, max_bps, screen);
+        self.apply_bitrate(settings);
+    }
+
+    pub fn remove_video_track(&self, track_id: &str) {
+        if let Some(settings) = self.bitrate.lock().on_video_track_removed(track_id) {
+            self.apply_bitrate(settings);
+        }
+    }
+
+    fn apply_bitrate(&self, settings: BitrateSettings) {
         match self.peer_connection.set_bitrate(settings) {
-            Ok(()) => log::info!("Applied start bitrate {:?} bps", settings.start_bitrate_bps),
-            Err(e) => log::warn!("Failed to apply start bitrate {settings:?}: {e:?}"),
+            Ok(()) => log::info!(
+                "Publisher bitrate: start {:?} bps, max {:?} bps",
+                settings.start_bitrate_bps,
+                settings.max_bitrate_bps
+            ),
+            Err(e) => log::warn!("Failed to apply publisher bitrate {settings:?}: {e:?}"),
         }
     }
 
@@ -768,16 +815,41 @@ a=fmtp:111 minptime=10;useinbandfec=1\r\n";
         assert_eq!(PeerTransport::compute_start_bitrate_kbps(Some(299_000), true), None);
     }
 
+    fn settings(start: Option<i32>, max: i32) -> BitrateSettings {
+        BitrateSettings { start_bitrate_bps: start, max_bitrate_bps: Some(max), ..Default::default() }
+    }
+
     #[test]
     fn only_the_first_video_track_applies_a_start_bitrate() {
         let mut prefs = BitratePreferences::default();
-        assert_eq!(prefs.on_video_track(Some(200_000), false), None);
+        assert_eq!(prefs.on_video_track("low".into(), Some(200_000), false), settings(None, 5_000_000));
         assert_eq!(
-            prefs.on_video_track(Some(16_200_000), true),
-            Some(BitrateSettings { start_bitrate_bps: Some(3_000_000), ..Default::default() })
+            prefs.on_video_track("screen".into(), Some(16_200_000), true),
+            settings(Some(3_000_000), 32_800_000)
         );
-        assert_eq!(prefs.on_video_track(Some(4_110_000), false), None);
-        assert_eq!(prefs.on_video_track(Some(16_200_000), true), None);
+        assert_eq!(
+            prefs.on_video_track("camera".into(), Some(4_110_000), false),
+            settings(None, 41_020_000)
+        );
+        assert_eq!(
+            prefs.on_video_track("screen2".into(), Some(16_200_000), true),
+            settings(None, 73_420_000)
+        );
+    }
+
+    #[test]
+    fn max_bitrate_follows_the_published_video() {
+        let mut prefs = BitratePreferences::default();
+        prefs.on_video_track("camera".into(), Some(4_110_000), false);
+        prefs.on_video_track("screen".into(), Some(16_200_000), true);
+        prefs.on_video_track("unknown".into(), None, false);
+        assert_eq!(prefs.on_video_track_removed("unknown"), None);
+        assert_eq!(prefs.on_video_track_removed("screen"), Some(settings(None, 8_220_000)));
+        assert_eq!(prefs.on_video_track_removed("screen"), None);
+        assert_eq!(prefs.on_video_track_removed("camera"), Some(settings(None, 5_000_000)));
+
+        prefs.on_video_track("huge".into(), Some(u64::MAX / 2), true);
+        assert_eq!(prefs.max_bitrate_bps(), i32::MAX);
     }
 
     #[tokio::test]
@@ -801,7 +873,7 @@ a=fmtp:111 minptime=10;useinbandfec=1\r\n";
         for (name, screen) in [("camera", false), ("screen", true)] {
             let source = NativeVideoSource::new(VideoResolution { width: 1280, height: 720 }, screen);
             let track = factory.create_video_track(name, source);
-            transport.add_video_track(Some(3_500_000), screen);
+            transport.add_video_track(name.to_string(), Some(3_500_000), screen);
             transport
                 .peer_connection()
                 .add_transceiver(
