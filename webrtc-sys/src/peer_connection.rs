@@ -199,6 +199,13 @@ pub mod ffi {
             on_complete: fn(ctx: Box<PeerContext>, error: RtcError),
         );
         fn restart_ice(self: &PeerConnection);
+        // PeerConnectionInterface::SetBitrate; a negative value leaves that bound unset.
+        fn set_bitrate(
+            self: &PeerConnection,
+            min_bps: i32,
+            start_bps: i32,
+            max_bps: i32,
+        ) -> Result<()>;
         fn current_local_description(self: &PeerConnection) -> UniquePtr<SessionDescription>;
         fn current_remote_description(self: &PeerConnection) -> UniquePtr<SessionDescription>;
         fn connection_state(self: &PeerConnection) -> PeerConnectionState;

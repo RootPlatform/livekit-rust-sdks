@@ -627,13 +627,21 @@ failure, it creates its own device as before.
 
 ## Start bitrate
 
-`x-google-start-bitrate` is munged per published video track into the m-section carrying
-it (matched by `a=msid`): 0.9 × the sum of its encodings' max bitrates, capped at 1 Mbps
+The publisher transport's first video track sets its start bitrate through
+`PeerConnection::SetBitrate`: 0.9 × the sum of its encodings' max bitrates, capped at 1 Mbps
 for cameras and 3 Mbps for screen shares. livekit-client leaves screen shares uncapped,
 but Chromium writes its value only on the first H.264 payload type (42001f) while the SFU
 answers with 42e01f, so the browser really starts at libwebrtc's default. 3 Mbps turns on
 a 2K share's top layer (low layer 1.2 Mbps) at the first allocation without starting far
 above typical uplinks.
+
+It is applied once per PeerConnection and never as `x-google-start-bitrate`. Every video
+send channel hands its codec's start bitrate to the whole call
+(`RtpBitrateConfigurator::UpdateWithSdpParameters`), a channel without one clears the
+remembered value, and the next channel that applies one resets the established estimate to
+it. With the start munged per track, every camera publish or new screen share dropped a
+28 Mbps estimate to the start value (`BWE Setting start bitrate to: ...` in the libwebrtc
+log) and the new share started soft for 20-25 s.
 
 ## Tokio runtime size
 

@@ -101,6 +101,8 @@ class PeerConnection : webrtc::PeerConnectionObserver {
 
   void restart_ice() const;
 
+  void set_bitrate(int32_t min_bps, int32_t start_bps, int32_t max_bps) const;
+
   std::shared_ptr<RtpTransceiver> add_transceiver(
       std::shared_ptr<MediaStreamTrack> track,
       RtpTransceiverInit init) const;

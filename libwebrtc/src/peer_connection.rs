@@ -78,6 +78,15 @@ pub struct OfferOptions {
 #[derive(Debug, Clone, Default)]
 pub struct AnswerOptions {}
 
+/// Send-side bandwidth estimation bounds (`PeerConnectionInterface::SetBitrate`); `None`
+/// leaves a bound as it is. A start bitrate resets the current estimate to it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BitrateSettings {
+    pub min_bitrate_bps: Option<i32>,
+    pub start_bitrate_bps: Option<i32>,
+    pub max_bitrate_bps: Option<i32>,
+}
+
 #[derive(Debug, Clone)]
 pub struct IceCandidateError {
     pub address: String,
@@ -187,6 +196,10 @@ impl PeerConnection {
 
     pub fn restart_ice(&self) {
         self.handle.restart_ice()
+    }
+
+    pub fn set_bitrate(&self, settings: BitrateSettings) -> Result<(), RtcError> {
+        self.handle.set_bitrate(settings)
     }
 
     pub fn connection_state(&self) -> PeerConnectionState {

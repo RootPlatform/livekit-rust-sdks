@@ -33,8 +33,8 @@ use crate::{
     media_stream::MediaStream,
     media_stream_track::MediaStreamTrack,
     peer_connection::{
-        AnswerOptions, IceCandidateError, IceConnectionState, IceGatheringState, OfferOptions,
-        OnConnectionChange, OnDataChannel, OnIceCandidate, OnIceCandidateError,
+        AnswerOptions, BitrateSettings, IceCandidateError, IceConnectionState, IceGatheringState,
+        OfferOptions, OnConnectionChange, OnDataChannel, OnIceCandidate, OnIceCandidateError,
         OnIceConnectionChange, OnIceGatheringChange, OnNegotiationNeeded, OnSignalingChange,
         OnTrack, PeerConnectionState, SignalingState, TrackEvent,
     },
@@ -363,6 +363,16 @@ impl PeerConnection {
 
     pub fn restart_ice(&self) {
         self.sys_handle.restart_ice();
+    }
+
+    pub fn set_bitrate(&self, settings: BitrateSettings) -> Result<(), RtcError> {
+        self.sys_handle
+            .set_bitrate(
+                settings.min_bitrate_bps.unwrap_or(-1),
+                settings.start_bitrate_bps.unwrap_or(-1),
+                settings.max_bitrate_bps.unwrap_or(-1),
+            )
+            .map_err(|e| unsafe { sys_err::ffi::RtcError::from(e.what()).into() })
     }
 
     pub fn close(&self) {
