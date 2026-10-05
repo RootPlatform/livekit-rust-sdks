@@ -28,6 +28,8 @@ pub mod helper;
 pub mod jsep;
 pub mod media_stream;
 pub mod media_stream_track;
+#[cfg(target_os = "windows")]
+pub mod mf_device;
 pub mod packet_trailer;
 pub mod peer_connection;
 pub mod peer_connection_factory;

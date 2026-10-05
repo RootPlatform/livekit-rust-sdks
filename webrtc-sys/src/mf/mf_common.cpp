@@ -248,8 +248,18 @@ HRESULT CreateD3D11DeviceBundle(const LUID& luid, D3D11DeviceBundle* out) {
       D3D_FEATURE_LEVEL_10_1,
       D3D_FEATURE_LEVEL_10_0,
   };
+  // Without the driver's threading optimizations an NVIDIA device runs 35
+  // driver threads instead of 37, compiles shaders on the calling thread
+  // instead of starting a pool of one thread per CPU with the first one, and
+  // completes the host capture's GPU work about 5 ms sooner.
+  // LK_MF_D3D11_DRIVER_THREADING=on turns them back on.
+  static const bool driver_threading =
+      EnvFlagSet("LK_MF_D3D11_DRIVER_THREADING");
   const UINT flags =
-      D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+      D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT |
+      (driver_threading
+           ? 0
+           : D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS);
   D3D11DeviceBundle bundle;
   hr = D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
                          flags, feature_levels, ARRAYSIZE(feature_levels),
@@ -397,6 +407,91 @@ HRESULT AcquireD3D11DeviceForActivate(IMFActivate* activate,
   }
   return AcquireD3D11Device(has_luid ? &luid : nullptr,
                             D3D11DeviceUser::kEncoder, out);
+}
+
+namespace {
+
+std::mutex& HostDeviceMutex() {
+  static std::mutex* mutex = new std::mutex();
+  return *mutex;
+}
+
+std::vector<SharedD3D11Device>& HostDevices() {
+  static auto* devices = new std::vector<SharedD3D11Device>();
+  return *devices;
+}
+
+}  // namespace
+
+HRESULT AcquireSharedD3D11DeviceForHost(const LUID* luid, ID3D11Device** out) {
+  if (!out) {
+    return E_POINTER;
+  }
+  *out = nullptr;
+  if (!EnsureMFStarted()) {
+    return MF_E_PLATFORM_NOT_INITIALIZED;
+  }
+
+  SharedD3D11Device shared;
+  HRESULT hr = AcquireD3D11Device(luid, D3D11DeviceUser::kEncoder, &shared);
+  if (FAILED(hr)) {
+    return hr;
+  }
+  HRESULT removed = shared->device->GetDeviceRemovedReason();
+  if (SUCCEEDED(removed) && EnvFlagSet("LK_MF_FAULT_HOST_DEVICE_REMOVED")) {
+    RTC_LOG(LS_WARNING) << "LK_MF_FAULT_HOST_DEVICE_REMOVED: reporting the "
+                           "shared D3D11 device as removed.";
+    removed = DXGI_ERROR_DEVICE_REMOVED;
+  }
+  if (FAILED(removed)) {
+    RTC_LOG(LS_WARNING) << "Shared D3D11 device was removed ("
+                        << HResultToString(removed)
+                        << "); not handing it to the host.";
+    return removed;
+  }
+
+  size_t held = 0;
+  {
+    std::lock_guard<std::mutex> lock(HostDeviceMutex());
+    HostDevices().push_back(shared);
+    held = HostDevices().size();
+  }
+  shared->device->AddRef();
+  *out = shared->device.Get();
+  RTC_LOG(LS_INFO) << "Shared D3D11 device handed to the host (" << held
+                   << " host reference(s)).";
+  return S_OK;
+}
+
+HRESULT ReleaseSharedD3D11DeviceForHost(ID3D11Device* device) {
+  if (!device) {
+    return E_POINTER;
+  }
+  SharedD3D11Device released;
+  size_t held = 0;
+  {
+    std::lock_guard<std::mutex> lock(HostDeviceMutex());
+    std::vector<SharedD3D11Device>& devices = HostDevices();
+    for (auto it = devices.begin(); it != devices.end(); ++it) {
+      if ((*it)->device.Get() == device) {
+        released = std::move(*it);
+        devices.erase(it);
+        break;
+      }
+    }
+    held = devices.size();
+  }
+  if (!released) {
+    return E_INVALIDARG;
+  }
+  RTC_LOG(LS_INFO) << "Host released the shared D3D11 device (" << held
+                   << " host reference(s) left).";
+  // The last reference tears the device and its driver threads down, which
+  // takes tens of milliseconds; the host should not wait for it.
+  MFDeferredReleases().Post([device = std::move(released)]() mutable {
+    device.reset();
+  });
+  return S_OK;
 }
 
 namespace {
@@ -685,3 +780,22 @@ HRESULT PrepareHardwareTransform(IMFActivate* activate,
 }
 
 }  // namespace livekit_ffi
+
+// C entry points for webrtc-sys's mf_device.rs, which livekit-ffi exports as
+// livekit_ffi_d3d11_acquire_shared_device / _release_shared_device.
+extern "C" HRESULT lk_mf_acquire_host_d3d11_device(const LUID* luid,
+                                                   ID3D11Device** out) {
+  try {
+    return livekit_ffi::AcquireSharedD3D11DeviceForHost(luid, out);
+  } catch (...) {
+    return E_OUTOFMEMORY;
+  }
+}
+
+extern "C" HRESULT lk_mf_release_host_d3d11_device(ID3D11Device* device) {
+  try {
+    return livekit_ffi::ReleaseSharedD3D11DeviceForHost(device);
+  } catch (...) {
+    return E_OUTOFMEMORY;
+  }
+}

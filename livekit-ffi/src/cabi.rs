@@ -113,6 +113,42 @@ pub extern "C" fn livekit_ffi_dispose() {
     FFI_SERVER.async_runtime.block_on(FFI_SERVER.dispose());
 }
 
+/// The MediaFoundation codecs' shared D3D11 device on the adapter `adapter_luid`
+/// names (the default adapter when null), so the host can render or capture on
+/// the device the encoders already use. Returns an HRESULT. On success
+/// `*out_device` is an `ID3D11Device*` with one COM reference for the caller to
+/// release, and the device stays the adapter's shared device until
+/// `livekit_ffi_d3d11_release_shared_device` is called with it once per
+/// successful acquire. See ROOTAPP-BUILD.md.
+///
+/// # Safety
+///
+/// `out_device` must be valid for a pointer write; `adapter_luid` must be null
+/// or point to a LUID.
+#[cfg(target_os = "windows")]
+#[no_mangle]
+pub unsafe extern "C" fn livekit_ffi_d3d11_acquire_shared_device(
+    adapter_luid: *const webrtc_sys::mf_device::Luid,
+    out_device: *mut *mut std::ffi::c_void,
+) -> i32 {
+    webrtc_sys::mf_device::lk_mf_acquire_host_d3d11_device(adapter_luid, out_device)
+}
+
+/// Drops one reference taken by `livekit_ffi_d3d11_acquire_shared_device`.
+/// Returns an HRESULT. The pointer is only compared, so the caller's own COM
+/// reference may already be released.
+///
+/// # Safety
+///
+/// `device` must be null or a pointer the acquire call returned.
+#[cfg(target_os = "windows")]
+#[no_mangle]
+pub unsafe extern "C" fn livekit_ffi_d3d11_release_shared_device(
+    device: *mut std::ffi::c_void,
+) -> i32 {
+    webrtc_sys::mf_device::lk_mf_release_host_d3d11_device(device)
+}
+
 #[cfg(target_os = "android")]
 pub mod android {
     use jni::{
