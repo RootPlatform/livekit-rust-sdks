@@ -292,6 +292,7 @@ mod tests {
             continual_gathering_policy: ContinualGatheringPolicy::GatherOnce,
             ice_transport_type: IceTransportsType::All,
             enable_sctp_snap: false,
+            periodic_alr_bandwidth_probing: true,
         };
 
         let bob = factory.create_peer_connection(config.clone()).unwrap();

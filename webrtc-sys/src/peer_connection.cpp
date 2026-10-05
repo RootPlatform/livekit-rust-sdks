@@ -56,6 +56,8 @@ webrtc::PeerConnectionInterface::RTCConfiguration to_native_rtc_configuration(
           config.ice_transport_type);
 
   rtc_config.enable_sctp_snap = config.enable_sctp_snap;
+  rtc_config.media_config.video.periodic_alr_bandwidth_probing =
+      config.periodic_alr_bandwidth_probing;
 
   return rtc_config;
 }

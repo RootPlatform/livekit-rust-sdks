@@ -59,6 +59,12 @@ pub struct RtcConfiguration {
     /// `enable_sctp_snap` RTCConfiguration field, so it must be set the same at
     /// PeerConnection creation and every set_configuration.
     pub enable_sctp_snap: bool,
+    /// Periodic ALR probing on every video send stream (`MediaConfig::Video::
+    /// periodic_alr_bandwidth_probing`): while the sender is application limited, the
+    /// bandwidth estimate is kept up by short probes instead of padding up to the
+    /// simulcast layers' targets. Part of the immutable media config, so it must be set
+    /// the same at PeerConnection creation and every set_configuration.
+    pub periodic_alr_bandwidth_probing: bool,
 }
 
 impl Default for RtcConfiguration {
@@ -68,6 +74,7 @@ impl Default for RtcConfiguration {
             continual_gathering_policy: ContinualGatheringPolicy::GatherContinually,
             ice_transport_type: IceTransportsType::All,
             enable_sctp_snap: false,
+            periodic_alr_bandwidth_probing: true,
         }
     }
 }
