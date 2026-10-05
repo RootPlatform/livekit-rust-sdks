@@ -717,6 +717,34 @@ load showed up at every worker count (2 of 9 runs at 32, 3 of 9 at 4, 2 of 7 at 
 4 at 32 on the capped DLL), so they do not depend on the runtime size. Remote audio gaps over 30 ms stayed rare in every
 configuration.
 
+## Logging
+
+With `capture_logs` set in `livekit_ffi_initialize`, records reach the host as `LogBatch` events,
+filtered at the source by `LK_FFI_LOG_LEVEL` (`off`, `error`, `warn`, `info`, `debug` or `trace`,
+case-insensitive; `warn` when unset or invalid). It is read on every `livekit_ffi_initialize` call
+and sets three things: the logger's filter, `log::set_max_level` (so the `log` macros skip records
+above it) and the minimum severity of libwebrtc's log sink (so libwebrtc does not format lines
+that would be dropped). Without `capture_logs` the env_logger filter (`RUST_LOG`) sets all three.
+
+libwebrtc records have the target `libwebrtc` and the message `(file.cc:line): text`:
+
+| libwebrtc | Record level | Sink minimum severity for the level |
+|---|---|---|
+| `LS_ERROR` | `LogError` | `error` → `LS_ERROR` |
+| `LS_WARNING` | `LogWarn` | `warn` and `info` → `LS_WARNING` |
+| `LS_INFO` | `LogDebug` | `debug` → `LS_INFO` |
+| `LS_VERBOSE` | `LogTrace` | `trace` → `LS_VERBOSE` |
+
+`off` removes the sink. libwebrtc's info lines are many and mostly routine, so they need `debug`;
+`info` adds the Rust SDK's info records only. In a 20 s two-room harness session (camera, screen
+and mic published, camera republished once) the FFI forwarded 76,507 records before, 517 at the
+default level and about 6,500 at `debug`.
+
+The variable is read through the C runtime's environment. On Windows, .NET's
+`Environment.SetEnvironmentVariable` before `livekit_ffi_initialize` is enough; on macOS and Linux
+it only changes .NET's own copy, so set the variable before the process starts or through
+`setenv`.
+
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
 | Commit | Change |
@@ -738,7 +766,7 @@ configuration.
 | `rootapp/fx-encoder` | MF encoder rebuilt when NVIDIA's latched VBV starves it, 3-frame VBV; one shared D3D11 device per adapter, non-blocking decoder readback; per-track start bitrate (screen shares up to 3 Mbps); NV12/I210/I410 buffer types no longer abort the process; x64 libyuv built with clang-cl |
 | `rootapp/fx-review` | Decoder staging readback waits on an `ID3D11Fence` event instead of polling with `Sleep(1)` (polling fallback without WDDM 2.0); MF encoder teardown on a deferred release thread; Linux CI container installs `unzip` for setup-protoc; arm64 cross builds install `g++-aarch64-linux-gnu`; macOS `minos` check no longer exits awk early; libclang lookup resolves bare `CXX` names |
 | `rootapp/fx3` | MF encoder upload ring never blocks in `Map` (fence-gated slots, grows to 5, then a fence wait outside the device lock); `D3D11GpuFence` in `mf_gpu_fence.h` with a WARP test; MF decoder teardown on the deferred release thread; a release run needs all six RIDs and refuses a tag, or a draft, that points at another commit |
-| `rootapp/fx4-tokio` | FFI tokio runtime capped at 8 workers, `LK_FFI_WORKER_THREADS` override (see Tokio runtime size) |
+| `rootapp/fx4-tokio` | FFI tokio runtime capped at 8 workers, `LK_FFI_WORKER_THREADS` override (see Tokio runtime size). Later: simulcast encodings lowest-first, periodic ALR probing, start bitrate through `SetBitrate` once per PeerConnection with a max that follows the published video (see Start bitrate), MF sessions counted until their delayed release with the D3D11 device kept alive that long, unpublished senders' streams left out of offers (see Unpublish and the publisher SDP), libwebrtc log levels and `LK_FFI_LOG_LEVEL` (see Logging), each video codec listed once by the codec factories |
 | `rootapp/fx4-dev` | Windows exports `livekit_ffi_d3d11_acquire_shared_device` / `_release_shared_device`, so the desktop's screen capture runs on the codecs' shared D3D11 device; the shared device is created without the driver's internal threading optimizations (`LK_MF_D3D11_DRIVER_THREADING=on` restores them). See "Sharing the D3D11 device with the host" |
 
 `rootapp/fx-session` adds: unpublishing a video track releases its encoder (see above);
