@@ -25,6 +25,36 @@
 namespace livekit_ffi {
 namespace {
 
+AudioDeviceOutcome ToOutcome(const AdmDirectionOutcome& outcome) {
+  AudioDeviceOutcome result{};
+  result.requested = outcome.requested;
+  result.found = outcome.found;
+  result.attempted = outcome.attempted;
+  result.stop_result = outcome.stop_result;
+  result.init_result = outcome.init_result;
+  result.start_result = outcome.start_result;
+  return result;
+}
+
+AdmRequestCallback ToAdmCallback(
+    rust::Box<AudioDeviceRequestCallback> callback) {
+  auto shared =
+      std::make_shared<rust::Box<AudioDeviceRequestCallback>>(
+          std::move(callback));
+  return [shared](const AdmRequestOutcome& outcome) {
+    (*shared)->on_complete(ToRequestOutcome(outcome));
+  };
+}
+
+}  // namespace
+
+AudioDeviceRequestOutcome ToRequestOutcome(const AdmRequestOutcome& outcome) {
+  AudioDeviceRequestOutcome result{};
+  result.recording = ToOutcome(outcome.recording);
+  result.playout = ToOutcome(outcome.playout);
+  return result;
+}
+
 AdmDeviceSelection ToAdmSelection(const AudioDeviceSelection& selection) {
   AdmDeviceSelection result;
   switch (selection.kind) {
@@ -45,31 +75,6 @@ AdmDeviceSelection ToAdmSelection(const AudioDeviceSelection& selection) {
   result.index = selection.index;
   return result;
 }
-
-AudioDeviceOutcome ToOutcome(const AdmDirectionOutcome& outcome) {
-  AudioDeviceOutcome result{};
-  result.requested = outcome.requested;
-  result.found = outcome.found;
-  result.attempted = outcome.attempted;
-  result.init_result = outcome.init_result;
-  result.start_result = outcome.start_result;
-  return result;
-}
-
-AdmRequestCallback ToAdmCallback(
-    rust::Box<AudioDeviceRequestCallback> callback) {
-  auto shared =
-      std::make_shared<rust::Box<AudioDeviceRequestCallback>>(
-          std::move(callback));
-  return [shared](const AdmRequestOutcome& outcome) {
-    AudioDeviceRequestOutcome result{};
-    result.recording = ToOutcome(outcome.recording);
-    result.playout = ToOutcome(outcome.playout);
-    (*shared)->on_complete(result);
-  };
-}
-
-}  // namespace
 
 AudioDeviceController::AudioDeviceController(
     webrtc::scoped_refptr<AdmProxy> adm_proxy)
@@ -274,35 +279,70 @@ RootAudioNativeStats AudioDeviceController::root_audio_stats() const {
   }
   stats.mix_out_sumsq = native.mix_out_sumsq;
   stats.mix_out_samples = native.mix_out_samples;
+  stats.echo_cancellation_active = native.echo_cancellation;
+  stats.webrtc_ns_active = native.noise_suppression;
+  stats.audio_thread_lock_violations = native.audio_thread_lock_violations;
+  stats.audio_thread_logs_dropped = native.audio_thread_logs_dropped;
+  stats.overlapping_callbacks = native.overlapping_callbacks;
+  stats.device_stop_failures = native.device_stop_failures;
   return stats;
 }
 
+#if LK_ADM_MOBILE
+
 bool AudioDeviceController::stop_recording() const {
   return adm_proxy_->StopRecording() == 0;
-}
-
-bool AudioDeviceController::init_recording() const {
-  return adm_proxy_->InitRecording() == 0;
 }
 
 bool AudioDeviceController::start_recording() const {
   return adm_proxy_->StartRecording() == 0;
 }
 
-bool AudioDeviceController::recording_is_initialized() const {
-  return adm_proxy_->RecordingIsInitialized();
-}
-
 bool AudioDeviceController::stop_playout() const {
   return adm_proxy_->StopPlayout() == 0;
 }
 
-bool AudioDeviceController::init_playout() const {
-  return adm_proxy_->InitPlayout() == 0;
+bool AudioDeviceController::start_playout() const {
+  return adm_proxy_->StartPlayout() == 0;
+}
+
+#else
+
+// The app's requests, kept apart from libwebrtc's own Start/Stop: an app stop
+// never closes a device libwebrtc uses, and an app start never makes libwebrtc
+// believe it started playout or recording itself.
+bool AudioDeviceController::stop_recording() const {
+  adm_proxy_->SetAppRecording(false);
+  return true;
+}
+
+bool AudioDeviceController::start_recording() const {
+  adm_proxy_->SetAppRecording(true);
+  return true;
+}
+
+bool AudioDeviceController::stop_playout() const {
+  adm_proxy_->SetAppPlayout(false);
+  return true;
 }
 
 bool AudioDeviceController::start_playout() const {
-  return adm_proxy_->StartPlayout() == 0;
+  adm_proxy_->SetAppPlayout(true);
+  return true;
+}
+
+#endif
+
+bool AudioDeviceController::init_recording() const {
+  return adm_proxy_->InitRecording() == 0;
+}
+
+bool AudioDeviceController::recording_is_initialized() const {
+  return adm_proxy_->RecordingIsInitialized();
+}
+
+bool AudioDeviceController::init_playout() const {
+  return adm_proxy_->InitPlayout() == 0;
 }
 
 bool AudioDeviceController::playout_is_initialized() const {

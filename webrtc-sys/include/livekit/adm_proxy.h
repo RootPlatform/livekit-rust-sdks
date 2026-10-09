@@ -46,9 +46,10 @@ namespace livekit_ffi {
 
 class RootAudioMixer;
 
-// Last Init/Start results: 0 is success, negative values are ADM errors.
+// Last Stop/Init/Start results: 0 is success, other values are ADM errors,
+// except these two, which no ADM returns.
 constexpr int32_t kAdmResultNotAttempted = 1;
-constexpr int32_t kAdmResultDeviceNotFound = -2;
+constexpr int32_t kAdmResultDeviceNotFound = -10000;
 
 enum class AdmSelectionKind : uint8_t {
   kDefault = 0,
@@ -82,6 +83,7 @@ struct AdmDirectionOutcome {
   bool requested = false;
   bool found = true;
   bool attempted = false;
+  int32_t stop_result = kAdmResultNotAttempted;
   int32_t init_result = kAdmResultNotAttempted;
   int32_t start_result = kAdmResultNotAttempted;
 };
@@ -106,6 +108,7 @@ struct AdmTapStats {
   uint64_t capture_raw_samples = 0;
   uint32_t playout_delay_ms = 0;
   uint32_t recording_delay_ms = 0;
+  uint64_t overlapping_callbacks = 0;
 };
 
 struct AdmNativeStats {
@@ -122,11 +125,22 @@ struct AdmNativeStats {
   std::vector<uint32_t> mix_ssrcs;
   double mix_out_sumsq = 0;
   uint64_t mix_out_samples = 0;
+  bool echo_cancellation = false;
+  bool noise_suppression = false;
+  uint64_t audio_thread_lock_violations = 0;
+  uint64_t audio_thread_logs_dropped = 0;
+  uint64_t overlapping_callbacks = 0;
+  uint64_t device_stop_failures = 0;
 };
 
 // Registered with the platform ADM in place of libwebrtc's AudioTransport. It
 // runs on the device's capture and render threads: it forwards, counts and
 // keeps the last-callback times, using only its own atomics.
+//
+// One capture and one render callback reach libwebrtc at a time. A callback
+// that starts while another one of its direction is in flight (a device thread
+// the ADM failed to stop, or the synthetic pump during a hand-over) is answered
+// with silence and counted instead.
 class AdmTransportTap : public webrtc::AudioTransport {
  public:
   void set_transport(webrtc::AudioTransport* transport);
@@ -169,6 +183,17 @@ class AdmTransportTap : public webrtc::AudioTransport {
                       int64_t* elapsed_time_ms,
                       int64_t* ntp_time_ms) override;
 
+  // A render pull that is not a device callback (the synthetic pump): guarded
+  // like one, but not counted.
+  int32_t RenderUncounted(size_t samples_per_channel,
+                          size_t bytes_per_frame,
+                          size_t channels,
+                          uint32_t sample_rate,
+                          void* audio_samples,
+                          size_t& samples_out,
+                          int64_t* elapsed_time_ms,
+                          int64_t* ntp_time_ms);
+
   // The next callback after these does not count the time before it as a gap.
   void ResetCaptureClock();
   void ResetRenderClock();
@@ -195,10 +220,22 @@ class AdmTransportTap : public webrtc::AudioTransport {
                     size_t frames,
                     uint32_t sample_rate,
                     uint32_t delay_ms);
+  int32_t Render(bool count,
+                 size_t samples_per_channel,
+                 size_t bytes_per_frame,
+                 size_t channels,
+                 uint32_t sample_rate,
+                 void* audio_samples,
+                 size_t& samples_out,
+                 int64_t* elapsed_time_ms,
+                 int64_t* ntp_time_ms);
 
   std::atomic<webrtc::AudioTransport*> transport_{nullptr};
   Direction capture_;
   Direction render_;
+  std::atomic<bool> capture_busy_{false};
+  std::atomic<bool> render_busy_{false};
+  std::atomic<uint64_t> overlapping_{0};
   std::atomic<uint32_t> capture_rate_{0};
   std::atomic<uint32_t> capture_channels_{0};
   std::atomic<double> capture_sumsq_{0.0};
@@ -207,15 +244,55 @@ class AdmTransportTap : public webrtc::AudioTransport {
   std::atomic<uint16_t> playout_delay_ms_{0};
 };
 
+// What the synthetic ADM pulls through: the tap's render guard, so it never
+// runs libwebrtc's render path next to a platform render thread.
+class AdmSyntheticTransport : public webrtc::AudioTransport {
+ public:
+  explicit AdmSyntheticTransport(AdmTransportTap* tap) : tap_(tap) {}
+
+  using webrtc::AudioTransport::RecordedDataIsAvailable;
+  int32_t RecordedDataIsAvailable(const void* audio_samples,
+                                  size_t samples_per_channel,
+                                  size_t bytes_per_frame,
+                                  size_t channels,
+                                  uint32_t sample_rate,
+                                  uint32_t total_delay_ms,
+                                  int32_t clock_drift,
+                                  uint32_t current_mic_level,
+                                  bool key_pressed,
+                                  uint32_t& new_mic_level) override;
+  int32_t NeedMorePlayData(size_t samples_per_channel,
+                           size_t bytes_per_frame,
+                           size_t channels,
+                           uint32_t sample_rate,
+                           void* audio_samples,
+                           size_t& samples_out,
+                           int64_t* elapsed_time_ms,
+                           int64_t* ntp_time_ms) override;
+  void PullRenderData(int bits_per_sample,
+                      int sample_rate,
+                      size_t number_of_channels,
+                      size_t number_of_frames,
+                      void* audio_data,
+                      int64_t* elapsed_time_ms,
+                      int64_t* ntp_time_ms) override;
+
+ private:
+  AdmTransportTap* const tap_;
+};
+
+static_assert(std::atomic<double>::is_always_lock_free);
+
 /// ADM Proxy that manages synthetic and platform audio modes.
 ///
 /// - **Playout**: the Platform ADM plays while `ref_count > 0 &&
-///   playout_enabled` and either libwebrtc started playout or the app holds it
-///   (`SetPlayoutHold`); otherwise the synthetic ADM pumps the pipeline while
-///   libwebrtc wants playout.
+///   playout_enabled` and libwebrtc started playout, the app holds it
+///   (`SetPlayoutHold`) or the app started it (`SetAppPlayout`); otherwise the
+///   synthetic ADM pumps the pipeline while libwebrtc wants playout.
 /// - **Recording**: the Platform ADM records while `ref_count > 0 &&
 ///   recording_enabled` and libwebrtc started recording (a device track's send
-///   stream). Synthetic mode has no microphone.
+///   stream) or the app started it (`SetAppRecording`). Synthetic mode has no
+///   microphone.
 ///
 /// libwebrtc's and the app's calls only record the desired state. On desktop a
 /// dedicated `audio-device` thread brings the devices to it, so neither the
@@ -225,12 +302,20 @@ class AdmTransportTap : public webrtc::AudioTransport {
 ///
 /// On desktop the OS effects (Windows' voice capture DMO) are off and refused,
 /// mute never stops recording or touches the endpoint mute, and recording only
-/// opens for a device track (`InitRecording` alone opens nothing).
+/// opens for a device track (`InitRecording` alone opens nothing). A device
+/// that fails to stop (the Windows ADM gives up joining its thread after 2 s)
+/// gets no second puller in that pass; the direction is retried a second later.
 class AdmProxy : public webrtc::AudioDeviceModule {
  public:
   AdmProxy(const webrtc::Environment& env,
            webrtc::Thread* worker_thread,
            webrtc::scoped_refptr<RootAudioMixer> mixer);
+  // Uses `platform_adm` (already created, not yet initialized) as the Platform
+  // ADM, e.g. a fake in tests.
+  AdmProxy(const webrtc::Environment& env,
+           webrtc::Thread* worker_thread,
+           webrtc::scoped_refptr<RootAudioMixer> mixer,
+           webrtc::scoped_refptr<webrtc::AudioDeviceModule> platform_adm);
   ~AdmProxy() override;
 
   // ===========================================================================
@@ -242,7 +327,7 @@ class AdmProxy : public webrtc::AudioDeviceModule {
   bool AcquirePlatformAdm();
 
   /// Releases a reference to the Platform ADM. At zero the proxy returns to
-  /// synthetic mode and the playout hold is dropped.
+  /// synthetic mode and the playout hold and app requests are dropped.
   void ReleasePlatformAdm();
 
   int platform_adm_ref_count() const;
@@ -273,8 +358,20 @@ class AdmProxy : public webrtc::AudioDeviceModule {
   void SetPlayoutHold(bool hold);
   bool playout_hold() const;
 
+  /// The app's own start/stop (PlatformAudio's start_* / stop_*), kept apart
+  /// from libwebrtc's so neither can switch off what the other started.
+  void SetAppPlayout(bool start);
+  void SetAppRecording(bool start);
+
+  /// What the newest device track asked of the shared APM (reported in stats).
+  void SetDeviceTrackProcessing(bool echo_cancellation, bool noise_suppression);
+
   /// Atomics only; the max gaps are reset on read.
   AdmNativeStats ReadNativeStats();
+
+  /// Returns once every device task posted before the call has run.
+  void FlushDeviceTasksForTest();
+  bool SyntheticPlayingForTest() const;
 
   // ===========================================================================
   // AudioDeviceModule Interface
@@ -377,6 +474,8 @@ class AdmProxy : public webrtc::AudioDeviceModule {
     bool engine_playout = false;
     bool engine_recording = false;
     bool hold = false;
+    bool app_playout = false;
+    bool app_recording = false;
     AdmDeviceSelection playout_selection;
     AdmDeviceSelection recording_selection;
     uint64_t playout_selection_gen = 0;
@@ -402,6 +501,8 @@ class AdmProxy : public webrtc::AudioDeviceModule {
                               AdmDirectionOutcome* outcome);
   void ReconcileRecordingLocked(const DesiredState& desired,
                                 AdmDirectionOutcome* outcome);
+  // Returns false when the stop failed and the direction must wait.
+  bool StopDeviceLocked(bool playout, AdmDirectionOutcome* outcome);
   void CompleteOutcomeLocked(const DesiredState& desired,
                              AdmRequestOutcome* outcome);
   void PublishStateLocked(const DesiredState& desired);
@@ -409,6 +510,7 @@ class AdmProxy : public webrtc::AudioDeviceModule {
                                const AdmDeviceSelection& selection);
   int ResolveSelectionLocked(bool playout, const AdmDeviceSelection& selection);
   void SchedulePlayoutDelayRefreshLocked();
+  void ScheduleRetryLocked();
   void ShutdownLocked();
   DesiredState Desired() const;
 
@@ -434,17 +536,22 @@ class AdmProxy : public webrtc::AudioDeviceModule {
   webrtc::scoped_refptr<webrtc::AudioDeviceModule> platform_adm_;
   std::atomic<webrtc::AudioDeviceModule*> platform_raw_{nullptr};
   AdmTransportTap tap_;
+  AdmSyntheticTransport synthetic_transport_{&tap_};
   webrtc::AudioTransport* audio_transport_ = nullptr;
 
   uint64_t playout_opened_selection_gen_ = 0;
   uint64_t playout_opened_restart_gen_ = 0;
   uint64_t recording_opened_selection_gen_ = 0;
   uint64_t recording_opened_restart_gen_ = 0;
+#if !LK_ADM_MOBILE
   bool delay_refresh_scheduled_ = false;
+  bool retry_scheduled_ = false;
+#endif
   bool terminated_ = false;
 
   std::atomic<bool> engine_playout_{false};
   std::atomic<bool> engine_recording_{false};
+  std::atomic<bool> platform_active_{false};
   std::atomic<bool> platform_playout_mode_{false};
   std::atomic<bool> device_playing_{false};
   std::atomic<bool> device_playout_initialized_{false};
@@ -456,6 +563,9 @@ class AdmProxy : public webrtc::AudioDeviceModule {
   std::atomic<int32_t> playout_start_result_{kAdmResultNotAttempted};
   std::atomic<int32_t> recording_init_result_{kAdmResultNotAttempted};
   std::atomic<int32_t> recording_start_result_{kAdmResultNotAttempted};
+  std::atomic<uint64_t> device_stop_failures_{0};
+  std::atomic<bool> device_track_echo_cancellation_{false};
+  std::atomic<bool> device_track_noise_suppression_{false};
 };
 
 }  // namespace livekit_ffi

@@ -22,12 +22,15 @@ namespace livekit_ffi {
 
 // Device capture and render threads mark themselves on their first callback and
 // stay marked for their lifetime. Log lines raised on them are dropped (and
-// counted) instead of crossing into Rust, and debug builds assert that no
-// AdmProxy lock is taken on them.
+// counted) instead of crossing into Rust, and every AdmProxy lock taken on one
+// is counted. Both checks run in every build and are reported in the stats.
 void MarkAudioThread();
 bool IsAudioThread();
 
 void CountDroppedAudioThreadLog();
 uint64_t DroppedAudioThreadLogs();
+
+void CountAudioThreadLockViolation();
+uint64_t AudioThreadLockViolations();
 
 }  // namespace livekit_ffi

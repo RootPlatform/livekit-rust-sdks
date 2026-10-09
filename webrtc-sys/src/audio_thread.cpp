@@ -23,6 +23,7 @@ namespace {
 
 thread_local bool t_audio_thread = false;
 std::atomic<uint64_t> g_dropped_audio_thread_logs{0};
+std::atomic<uint64_t> g_audio_thread_lock_violations{0};
 
 }  // namespace
 
@@ -40,6 +41,14 @@ void CountDroppedAudioThreadLog() {
 
 uint64_t DroppedAudioThreadLogs() {
   return g_dropped_audio_thread_logs.load(std::memory_order_relaxed);
+}
+
+void CountAudioThreadLockViolation() {
+  g_audio_thread_lock_violations.fetch_add(1, std::memory_order_relaxed);
+}
+
+uint64_t AudioThreadLockViolations() {
+  return g_audio_thread_lock_violations.load(std::memory_order_relaxed);
 }
 
 }  // namespace livekit_ffi

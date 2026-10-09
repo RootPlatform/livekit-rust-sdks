@@ -35,6 +35,9 @@ pub mod peer_connection;
 pub mod peer_connection_factory;
 pub mod prohibit_libsrtp_initialization;
 pub mod root_audio_mixer;
+
+#[cfg(test)]
+mod adm_proxy_tests;
 pub mod rtc_error;
 pub mod rtp_parameters;
 pub mod rtp_receiver;

@@ -44,8 +44,11 @@
 namespace livekit_ffi {
 namespace {
 
+#if !LK_ADM_MOBILE
 constexpr webrtc::TimeDelta kPlayoutDelayRefresh =
     webrtc::TimeDelta::Millis(100);
+constexpr webrtc::TimeDelta kStopFailureRetry = webrtc::TimeDelta::Seconds(1);
+#endif
 
 int64_t NowNs() {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -68,7 +71,9 @@ void AddTo(std::atomic<double>& total, double value) {
 class AdmLock {
  public:
   explicit AdmLock(webrtc::Mutex* mutex) : mutex_(mutex) {
-    RTC_DCHECK(!IsAudioThread());
+    if (IsAudioThread()) {
+      CountAudioThreadLockViolation();
+    }
     mutex_->Lock();
   }
   ~AdmLock() { mutex_->Unlock(); }
@@ -79,6 +84,38 @@ class AdmLock {
  private:
   webrtc::Mutex* const mutex_;
 };
+
+void Silence(void* audio_samples,
+             size_t samples_per_channel,
+             size_t bytes_per_frame,
+             size_t channels,
+             size_t& samples_out,
+             int64_t* elapsed_time_ms,
+             int64_t* ntp_time_ms) {
+  std::memset(audio_samples, 0, samples_per_channel * bytes_per_frame);
+  samples_out = samples_per_channel * channels;
+  *elapsed_time_ms = -1;
+  *ntp_time_ms = -1;
+}
+
+webrtc::scoped_refptr<webrtc::AudioDeviceModule> CreatePlatformAdm(
+    const webrtc::Environment& env) {
+#if defined(__ANDROID__)
+  // Created on the first AcquirePlatformAdm instead: CreateAudioDeviceModule
+  // needs JNI, which may not be initialized when the factory is built.
+  return nullptr;
+#else
+  // Created eagerly, not on acquire: the iOS audio session needs early setup to
+  // avoid KVO races.
+  webrtc::scoped_refptr<webrtc::AudioDeviceModule> adm =
+      webrtc::CreateAudioDeviceModule(
+          env, webrtc::AudioDeviceModule::kPlatformDefaultAudio);
+  if (!adm) {
+    RTC_LOG(LS_ERROR) << "AdmProxy: CreateAudioDeviceModule returned nullptr";
+  }
+  return adm;
+#endif
+}
 
 }  // namespace
 
@@ -173,6 +210,10 @@ int32_t AdmTransportTap::RecordedDataIsAvailable(
     uint32_t& new_mic_level,
     std::optional<int64_t> estimated_capture_time_ns) {
   MarkAudioThread();
+  if (capture_busy_.exchange(true, std::memory_order_acquire)) {
+    overlapping_.fetch_add(1, std::memory_order_relaxed);
+    return 0;
+  }
   const uint32_t playout_delay = playout_delay_ms_.load(std::memory_order_relaxed);
   Count(capture_, samples_per_channel, sample_rate,
         total_delay_ms > playout_delay ? total_delay_ms - playout_delay : 0);
@@ -194,13 +235,15 @@ int32_t AdmTransportTap::RecordedDataIsAvailable(
 
   webrtc::AudioTransport* transport =
       transport_.load(std::memory_order_acquire);
-  if (transport == nullptr) {
-    return 0;
+  int32_t result = 0;
+  if (transport != nullptr) {
+    result = transport->RecordedDataIsAvailable(
+        audio_samples, samples_per_channel, bytes_per_frame, channels,
+        sample_rate, total_delay_ms, clock_drift, current_mic_level,
+        key_pressed, new_mic_level, estimated_capture_time_ns);
   }
-  return transport->RecordedDataIsAvailable(
-      audio_samples, samples_per_channel, bytes_per_frame, channels,
-      sample_rate, total_delay_ms, clock_drift, current_mic_level, key_pressed,
-      new_mic_level, estimated_capture_time_ns);
+  capture_busy_.store(false, std::memory_order_release);
+  return result;
 }
 
 int32_t AdmTransportTap::NeedMorePlayData(size_t samples_per_channel,
@@ -212,21 +255,57 @@ int32_t AdmTransportTap::NeedMorePlayData(size_t samples_per_channel,
                                           int64_t* elapsed_time_ms,
                                           int64_t* ntp_time_ms) {
   MarkAudioThread();
-  Count(render_, samples_per_channel, sample_rate,
-        playout_delay_ms_.load(std::memory_order_relaxed));
+  return Render(true, samples_per_channel, bytes_per_frame, channels,
+                sample_rate, audio_samples, samples_out, elapsed_time_ms,
+                ntp_time_ms);
+}
+
+int32_t AdmTransportTap::RenderUncounted(size_t samples_per_channel,
+                                         size_t bytes_per_frame,
+                                         size_t channels,
+                                         uint32_t sample_rate,
+                                         void* audio_samples,
+                                         size_t& samples_out,
+                                         int64_t* elapsed_time_ms,
+                                         int64_t* ntp_time_ms) {
+  return Render(false, samples_per_channel, bytes_per_frame, channels,
+                sample_rate, audio_samples, samples_out, elapsed_time_ms,
+                ntp_time_ms);
+}
+
+int32_t AdmTransportTap::Render(bool count,
+                                size_t samples_per_channel,
+                                size_t bytes_per_frame,
+                                size_t channels,
+                                uint32_t sample_rate,
+                                void* audio_samples,
+                                size_t& samples_out,
+                                int64_t* elapsed_time_ms,
+                                int64_t* ntp_time_ms) {
+  if (render_busy_.exchange(true, std::memory_order_acquire)) {
+    overlapping_.fetch_add(1, std::memory_order_relaxed);
+    Silence(audio_samples, samples_per_channel, bytes_per_frame, channels,
+            samples_out, elapsed_time_ms, ntp_time_ms);
+    return 0;
+  }
+  if (count) {
+    Count(render_, samples_per_channel, sample_rate,
+          playout_delay_ms_.load(std::memory_order_relaxed));
+  }
 
   webrtc::AudioTransport* transport =
       transport_.load(std::memory_order_acquire);
+  int32_t result = 0;
   if (transport == nullptr) {
-    std::memset(audio_samples, 0, samples_per_channel * bytes_per_frame);
-    samples_out = samples_per_channel * channels;
-    *elapsed_time_ms = -1;
-    *ntp_time_ms = -1;
-    return 0;
+    Silence(audio_samples, samples_per_channel, bytes_per_frame, channels,
+            samples_out, elapsed_time_ms, ntp_time_ms);
+  } else {
+    result = transport->NeedMorePlayData(
+        samples_per_channel, bytes_per_frame, channels, sample_rate,
+        audio_samples, samples_out, elapsed_time_ms, ntp_time_ms);
   }
-  return transport->NeedMorePlayData(samples_per_channel, bytes_per_frame,
-                                     channels, sample_rate, audio_samples,
-                                     samples_out, elapsed_time_ms, ntp_time_ms);
+  render_busy_.store(false, std::memory_order_release);
+  return result;
 }
 
 void AdmTransportTap::PullRenderData(int bits_per_sample,
@@ -288,6 +367,7 @@ AdmTapStats AdmTransportTap::Read() {
   stats.recording_delay_ms = total_delay > stats.playout_delay_ms
                                  ? total_delay - stats.playout_delay_ms
                                  : 0;
+  stats.overlapping_callbacks = overlapping_.load(std::memory_order_relaxed);
   return stats;
 }
 
@@ -312,6 +392,45 @@ std::optional<webrtc::AudioDeviceModule::Stats> AdmTransportTap::DeviceStats()
   return stats;
 }
 
+int32_t AdmSyntheticTransport::RecordedDataIsAvailable(
+    const void* /* audio_samples */,
+    size_t /* samples_per_channel */,
+    size_t /* bytes_per_frame */,
+    size_t /* channels */,
+    uint32_t /* sample_rate */,
+    uint32_t /* total_delay_ms */,
+    int32_t /* clock_drift */,
+    uint32_t /* current_mic_level */,
+    bool /* key_pressed */,
+    uint32_t& /* new_mic_level */) {
+  return 0;
+}
+
+int32_t AdmSyntheticTransport::NeedMorePlayData(size_t samples_per_channel,
+                                                size_t bytes_per_frame,
+                                                size_t channels,
+                                                uint32_t sample_rate,
+                                                void* audio_samples,
+                                                size_t& samples_out,
+                                                int64_t* elapsed_time_ms,
+                                                int64_t* ntp_time_ms) {
+  return tap_->RenderUncounted(samples_per_channel, bytes_per_frame, channels,
+                               sample_rate, audio_samples, samples_out,
+                               elapsed_time_ms, ntp_time_ms);
+}
+
+void AdmSyntheticTransport::PullRenderData(int bits_per_sample,
+                                           int sample_rate,
+                                           size_t number_of_channels,
+                                           size_t number_of_frames,
+                                           void* audio_data,
+                                           int64_t* elapsed_time_ms,
+                                           int64_t* ntp_time_ms) {
+  tap_->PullRenderData(bits_per_sample, sample_rate, number_of_channels,
+                       number_of_frames, audio_data, elapsed_time_ms,
+                       ntp_time_ms);
+}
+
 // =============================================================================
 // AdmProxy
 // =============================================================================
@@ -319,7 +438,17 @@ std::optional<webrtc::AudioDeviceModule::Stats> AdmTransportTap::DeviceStats()
 AdmProxy::AdmProxy(const webrtc::Environment& env,
                    webrtc::Thread* worker_thread,
                    webrtc::scoped_refptr<RootAudioMixer> mixer)
-    : env_(env), worker_thread_(worker_thread), mixer_(std::move(mixer)) {
+    : AdmProxy(env, worker_thread, std::move(mixer), CreatePlatformAdm(env)) {}
+
+AdmProxy::AdmProxy(
+    const webrtc::Environment& env,
+    webrtc::Thread* worker_thread,
+    webrtc::scoped_refptr<RootAudioMixer> mixer,
+    webrtc::scoped_refptr<webrtc::AudioDeviceModule> platform_adm)
+    : env_(env),
+      worker_thread_(worker_thread),
+      mixer_(std::move(mixer)),
+      platform_adm_(std::move(platform_adm)) {
   // Create the synthetic ADM for synthetic mode. SyntheticAudioDevice pumps
   // the WebRTC audio pipeline without platform audio, allowing FFI callbacks
   // to receive decoded remote audio.
@@ -327,23 +456,11 @@ AdmProxy::AdmProxy(const webrtc::Environment& env,
   if (synthetic_adm_->Init() != 0) {
     RTC_LOG(LS_ERROR) << "AdmProxy: Failed to initialize synthetic ADM";
   }
+  // It pulls through the tap's render guard, uncounted; with no transport
+  // registered yet it gets silence.
+  synthetic_adm_->RegisterAudioCallback(&synthetic_transport_);
 
-  // Create the Platform ADM for real audio I/O.
-  // This is created immediately (not lazily) for iOS compatibility.
-  // iOS audio session requires early setup to avoid KVO race conditions.
-  // On Android, we defer Platform ADM creation to AcquirePlatformAdm().
-  // This is because:
-  // 1. CreateAudioDeviceModule requires JNI to be fully initialized
-  // 2. The JNI initialization (via JNI_OnLoad or manual init) may not have
-  //    completed by the time the AdmProxy constructor runs
-  // 3. Deferring creation ensures JNI is ready when we actually need the ADM
-#if !defined(__ANDROID__)
-  platform_adm_ = webrtc::CreateAudioDeviceModule(
-      env_, webrtc::AudioDeviceModule::kPlatformDefaultAudio);
-
-  if (!platform_adm_) {
-    RTC_LOG(LS_ERROR) << "AdmProxy: CreateAudioDeviceModule returned nullptr";
-  } else {
+  if (platform_adm_) {
     int32_t init_result = platform_adm_->Init();
     if (init_result != 0) {
       RTC_LOG(LS_ERROR) << "AdmProxy: Platform ADM Init() failed with error=" << init_result;
@@ -366,7 +483,6 @@ AdmProxy::AdmProxy(const webrtc::Environment& env,
 #endif
     platform_raw_.store(platform_adm_.get(), std::memory_order_release);
   }
-#endif
 
 #if !LK_ADM_MOBILE
   device_thread_ = webrtc::Thread::Create();
@@ -475,21 +591,48 @@ void AdmProxy::ReconcileLocked(AdmRequestOutcome* outcome) {
   }
 }
 
+bool AdmProxy::StopDeviceLocked(bool playout, AdmDirectionOutcome* outcome) {
+  webrtc::AudioDeviceModule* platform_adm = platform();
+  const int32_t result =
+      playout ? platform_adm->StopPlayout() : platform_adm->StopRecording();
+  if (outcome) {
+    outcome->stop_result = result;
+  }
+  if (result == 0) {
+    return true;
+  }
+  device_stop_failures_.fetch_add(1, std::memory_order_relaxed);
+  RTC_LOG(LS_WARNING) << "AdmProxy: Stop" << (playout ? "Playout" : "Recording")
+                      << " failed: " << result;
+  if (outcome) {
+    outcome->attempted = true;
+  }
+#if LK_ADM_MOBILE
+  return true;
+#else
+  // The device thread it could not join may still call back, so no second
+  // puller or recorder starts before the retry.
+  ScheduleRetryLocked();
+  return false;
+#endif
+}
+
 void AdmProxy::ReconcilePlayoutLocked(const DesiredState& desired,
                                       AdmDirectionOutcome* outcome) {
   webrtc::AudioDeviceModule* platform_adm = platform();
   const bool platform_mode =
       platform_adm && desired.ref_count > 0 && desired.playout_enabled;
   const bool want_platform =
-      platform_mode && (desired.engine_playout || desired.hold);
+      platform_mode &&
+      (desired.engine_playout || desired.hold || desired.app_playout);
 
   if (platform_adm &&
       (platform_adm->Playing() || platform_adm->PlayoutIsInitialized())) {
     const bool stale =
         playout_opened_selection_gen_ != desired.playout_selection_gen ||
         playout_opened_restart_gen_ != desired.playout_restart_gen;
-    if (!want_platform || stale) {
-      platform_adm->StopPlayout();
+    if ((!want_platform || stale) && !StopDeviceLocked(true, outcome)) {
+      return;
     }
   }
 
@@ -561,14 +704,14 @@ void AdmProxy::ReconcileRecordingLocked(const DesiredState& desired,
     return;
   }
   const bool want = desired.ref_count > 0 && desired.recording_enabled &&
-                    desired.engine_recording;
+                    (desired.engine_recording || desired.app_recording);
 
   if (platform_adm->Recording() || platform_adm->RecordingIsInitialized()) {
     const bool stale =
         recording_opened_selection_gen_ != desired.recording_selection_gen ||
         recording_opened_restart_gen_ != desired.recording_restart_gen;
-    if (!want || stale) {
-      platform_adm->StopRecording();
+    if ((!want || stale) && !StopDeviceLocked(false, outcome)) {
+      return;
     }
   }
   if (!want) {
@@ -635,8 +778,13 @@ void AdmProxy::PublishStateLocked(const DesiredState& desired) {
   const bool platform_recording_initialized =
       platform_adm && platform_adm->RecordingIsInitialized();
 
+  if (!platform_playing) {
+    tap_.set_playout_delay_ms(0);
+  }
   platform_playing_.store(platform_playing, std::memory_order_release);
   platform_recording_.store(platform_recording, std::memory_order_release);
+  platform_active_.store(platform_adm && desired.ref_count > 0,
+                         std::memory_order_release);
   platform_playout_mode_.store(playout_mode, std::memory_order_release);
   device_playing_.store(
       playout_mode ? platform_playing
@@ -651,8 +799,9 @@ void AdmProxy::PublishStateLocked(const DesiredState& desired) {
       std::memory_order_release);
 }
 
-int AdmProxy::ResolveSelectionLocked(bool playout,
-                                     const AdmDeviceSelection& selection) {
+int AdmProxy::ResolveSelectionLocked(
+    [[maybe_unused]] bool playout,
+    [[maybe_unused]] const AdmDeviceSelection& selection) {
 #if LK_ADM_MOBILE
   return kAdmResolveDefault;
 #else
@@ -682,8 +831,9 @@ int AdmProxy::ResolveSelectionLocked(bool playout,
 #endif
 }
 
-int32_t AdmProxy::ApplySelectionLocked(bool playout,
-                                       const AdmDeviceSelection& selection) {
+int32_t AdmProxy::ApplySelectionLocked(
+    [[maybe_unused]] bool playout,
+    [[maybe_unused]] const AdmDeviceSelection& selection) {
 #if LK_ADM_MOBILE
   return 0;
 #else
@@ -725,9 +875,10 @@ void AdmProxy::SchedulePlayoutDelayRefreshLocked() {
         AdmLock lock(&mutex_);
         delay_refresh_scheduled_ = false;
         webrtc::AudioDeviceModule* platform_adm = platform();
+        // platform_playing_ rather than Playing(), which logs on every call.
         if (terminated_ || !platform_adm ||
             !platform_playout_mode_.load(std::memory_order_acquire) ||
-            !platform_adm->Playing()) {
+            !platform_playing_.load(std::memory_order_acquire)) {
           return;
         }
         uint16_t delay_ms = 0;
@@ -737,6 +888,22 @@ void AdmProxy::SchedulePlayoutDelayRefreshLocked() {
         SchedulePlayoutDelayRefreshLocked();
       },
       kPlayoutDelayRefresh);
+#endif
+}
+
+void AdmProxy::ScheduleRetryLocked() {
+#if !LK_ADM_MOBILE
+  if (retry_scheduled_) {
+    return;
+  }
+  retry_scheduled_ = true;
+  device_thread_->PostDelayedTask(
+      [this] {
+        AdmLock lock(&mutex_);
+        retry_scheduled_ = false;
+        ReconcileLocked(nullptr);
+      },
+      kStopFailureRetry);
 #endif
 }
 
@@ -838,6 +1005,8 @@ void AdmProxy::ReleasePlatformAdm() {
     // destructor, which avoids iOS KVO races from re-creating it.
     if (--desired_.ref_count == 0) {
       desired_.hold = false;
+      desired_.app_playout = false;
+      desired_.app_recording = false;
     }
   }
   RequestReconcile();
@@ -937,6 +1106,38 @@ bool AdmProxy::playout_hold() const {
   return desired_.hold;
 }
 
+void AdmProxy::SetAppPlayout(bool start) {
+  {
+    AdmLock lock(&state_mutex_);
+    desired_.app_playout = start;
+  }
+  RequestReconcile();
+}
+
+void AdmProxy::SetAppRecording(bool start) {
+  {
+    AdmLock lock(&state_mutex_);
+    desired_.app_recording = start;
+  }
+  RequestReconcile();
+}
+
+void AdmProxy::SetDeviceTrackProcessing(bool echo_cancellation,
+                                        bool noise_suppression) {
+  device_track_echo_cancellation_.store(echo_cancellation,
+                                        std::memory_order_relaxed);
+  device_track_noise_suppression_.store(noise_suppression,
+                                        std::memory_order_relaxed);
+}
+
+void AdmProxy::FlushDeviceTasksForTest() {
+  RunDeviceTaskAndWait([] {});
+}
+
+bool AdmProxy::SyntheticPlayingForTest() const {
+  return synthetic_adm_ && synthetic_adm_->Playing();
+}
+
 AdmNativeStats AdmProxy::ReadNativeStats() {
   AdmNativeStats stats;
   stats.tap = tap_.Read();
@@ -950,6 +1151,15 @@ AdmNativeStats AdmProxy::ReadNativeStats() {
       playout_init_result_.load(std::memory_order_relaxed);
   stats.playout_start_result =
       playout_start_result_.load(std::memory_order_relaxed);
+  stats.echo_cancellation =
+      device_track_echo_cancellation_.load(std::memory_order_relaxed);
+  stats.noise_suppression =
+      device_track_noise_suppression_.load(std::memory_order_relaxed);
+  stats.audio_thread_lock_violations = AudioThreadLockViolations();
+  stats.audio_thread_logs_dropped = DroppedAudioThreadLogs();
+  stats.overlapping_callbacks = stats.tap.overlapping_callbacks;
+  stats.device_stop_failures =
+      device_stop_failures_.load(std::memory_order_relaxed);
   if (mixer_) {
     RootAudioMixerStats mix = mixer_->ReadStats();
     stats.mix_calls = mix.mix_calls;
@@ -958,6 +1168,7 @@ AdmNativeStats AdmProxy::ReadNativeStats() {
     stats.mix_ssrcs = std::move(mix.ssrcs);
     stats.mix_out_sumsq = mix.out_sumsq;
     stats.mix_out_samples = mix.out_samples;
+    stats.overlapping_callbacks += mix.overlapping_mixes;
   }
   return stats;
 }
@@ -979,11 +1190,6 @@ int32_t AdmProxy::RegisterAudioCallback(webrtc::AudioTransport* transport) {
     AdmLock lock(&mutex_);
     audio_transport_ = transport;
     tap_.set_transport(transport);
-    // The synthetic ADM pulls libwebrtc directly, so the tap only counts the
-    // platform device.
-    if (synthetic_adm_) {
-      synthetic_adm_->RegisterAudioCallback(transport);
-    }
     if (webrtc::AudioDeviceModule* platform_adm = platform()) {
       platform_adm->RegisterAudioCallback(transport ? &tap_ : nullptr);
     }
@@ -1048,7 +1254,7 @@ int32_t AdmProxy::RecordingDeviceName(uint16_t index,
   return -1;
 }
 
-int32_t AdmProxy::SetPlayoutDevice(uint16_t index) {
+int32_t AdmProxy::SetPlayoutDevice([[maybe_unused]] uint16_t index) {
 #if LK_ADM_MOBILE
   AdmLock lock(&mutex_);
   if (webrtc::AudioDeviceModule* platform_adm = platform()) {
@@ -1058,7 +1264,8 @@ int32_t AdmProxy::SetPlayoutDevice(uint16_t index) {
   return 0;
 }
 
-int32_t AdmProxy::SetPlayoutDevice(WindowsDeviceType device) {
+int32_t AdmProxy::SetPlayoutDevice(
+    [[maybe_unused]] WindowsDeviceType device) {
 #if LK_ADM_MOBILE
   AdmLock lock(&mutex_);
   if (webrtc::AudioDeviceModule* platform_adm = platform()) {
@@ -1068,7 +1275,7 @@ int32_t AdmProxy::SetPlayoutDevice(WindowsDeviceType device) {
   return 0;
 }
 
-int32_t AdmProxy::SetRecordingDevice(uint16_t index) {
+int32_t AdmProxy::SetRecordingDevice([[maybe_unused]] uint16_t index) {
 #if LK_ADM_MOBILE
   AdmLock lock(&mutex_);
   if (webrtc::AudioDeviceModule* platform_adm = platform()) {
@@ -1078,7 +1285,8 @@ int32_t AdmProxy::SetRecordingDevice(uint16_t index) {
   return 0;
 }
 
-int32_t AdmProxy::SetRecordingDevice(WindowsDeviceType device) {
+int32_t AdmProxy::SetRecordingDevice(
+    [[maybe_unused]] WindowsDeviceType device) {
 #if LK_ADM_MOBILE
   AdmLock lock(&mutex_);
   if (webrtc::AudioDeviceModule* platform_adm = platform()) {
@@ -1146,7 +1354,8 @@ int32_t AdmProxy::StopPlayout() {
 }
 
 // What libwebrtc started and the device delivers. A device kept running only by
-// the hold reports false, so AudioState still starts playout for its streams.
+// the hold or the app reports false, so AudioState still starts playout for its
+// streams.
 bool AdmProxy::Playing() const {
   return engine_playout_.load(std::memory_order_acquire) &&
          device_playing_.load(std::memory_order_acquire);
@@ -1327,7 +1536,7 @@ int32_t AdmProxy::MicrophoneMuteIsAvailable(bool* available) {
 
 // On desktop libwebrtc calls this on every mute once stop-on-mute is off, and
 // on Windows it is the system-wide endpoint mute.
-int32_t AdmProxy::SetMicrophoneMute(bool enable) {
+int32_t AdmProxy::SetMicrophoneMute([[maybe_unused]] bool enable) {
 #if LK_ADM_MOBILE
   AdmLock lock(&mutex_);
   if (webrtc::AudioDeviceModule* platform_adm = platform()) {
@@ -1418,7 +1627,8 @@ int32_t AdmProxy::PlayoutDelay(uint16_t* delayMS) const {
   *delayMS = 0;
   return 0;
 #else
-  *delayMS = platform_playout_mode_.load(std::memory_order_acquire)
+  *delayMS = platform_playout_mode_.load(std::memory_order_acquire) &&
+                     platform_playing_.load(std::memory_order_acquire)
                  ? tap_.playout_delay_ms()
                  : 0;
   return 0;
@@ -1488,7 +1698,12 @@ int32_t AdmProxy::EnableBuiltInNS(bool enable) {
 #endif
 }
 
+// Only while platform audio is in use, so a managed call after a platform one
+// does not report the platform device's frozen totals.
 std::optional<webrtc::AudioDeviceModule::Stats> AdmProxy::GetStats() const {
+  if (!platform_active_.load(std::memory_order_acquire)) {
+    return std::nullopt;
+  }
   return tap_.DeviceStats();
 }
 

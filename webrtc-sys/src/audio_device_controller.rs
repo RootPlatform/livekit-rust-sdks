@@ -18,10 +18,10 @@ pub use cxx::SharedPtr;
 
 use crate::impl_thread_safety;
 
-/// `init_result` / `start_result` before an attempt.
+/// `stop_result` / `init_result` / `start_result` before an attempt.
 pub const ADM_RESULT_NOT_ATTEMPTED: i32 = 1;
-/// `init_result` when the selected device is not present.
-pub const ADM_RESULT_DEVICE_NOT_FOUND: i32 = -2;
+/// `init_result` when the selected device is not present (no ADM returns it).
+pub const ADM_RESULT_DEVICE_NOT_FOUND: i32 = -10000;
 
 #[cxx::bridge(namespace = "livekit_ffi")]
 pub mod ffi {
@@ -46,6 +46,7 @@ pub mod ffi {
         pub requested: bool,
         pub found: bool,
         pub attempted: bool,
+        pub stop_result: i32,
         pub init_result: i32,
         pub start_result: i32,
     }
@@ -82,6 +83,12 @@ pub mod ffi {
         pub mix_ssrcs: Vec<u32>,
         pub mix_out_sumsq: f64,
         pub mix_out_samples: u64,
+        pub echo_cancellation_active: bool,
+        pub webrtc_ns_active: bool,
+        pub audio_thread_lock_violations: u64,
+        pub audio_thread_logs_dropped: u64,
+        pub overlapping_callbacks: u64,
+        pub device_stop_failures: u64,
     }
 
     unsafe extern "C++" {
@@ -89,6 +96,7 @@ pub mod ffi {
         include!("livekit/peer_connection_factory.h");
 
         type AudioDeviceController;
+        type AdmProxyHarness;
         type PeerConnectionFactory = crate::peer_connection_factory::ffi::PeerConnectionFactory;
 
         fn audio_device(self: &PeerConnectionFactory) -> SharedPtr<AudioDeviceController>;
@@ -155,6 +163,64 @@ pub mod ffi {
             names: &[String],
             guids: &[String],
         ) -> i32;
+
+        // AdmProxy over a fake platform ADM (tests only; opens no device).
+        fn new_adm_proxy_harness(
+            playout_guids: &[String],
+            recording_guids: &[String],
+        ) -> UniquePtr<AdmProxyHarness>;
+        fn take_calls(self: &AdmProxyHarness) -> Vec<String>;
+        fn set_devices(
+            self: &AdmProxyHarness,
+            playout_guids: &[String],
+            recording_guids: &[String],
+        );
+        fn fail_next_stop_playout(self: &AdmProxyHarness, result: i32);
+        fn set_device_playout_delay(self: &AdmProxyHarness, delay_ms: u16);
+        fn acquire(self: &AdmProxyHarness);
+        fn release(self: &AdmProxyHarness);
+        fn enable(self: &AdmProxyHarness, recording: bool, playout: bool);
+        fn hold(self: &AdmProxyHarness, hold: bool);
+        fn held(self: &AdmProxyHarness) -> bool;
+        fn app_playout(self: &AdmProxyHarness, start: bool);
+        fn app_recording(self: &AdmProxyHarness, start: bool);
+        fn engine_start_playout(self: &AdmProxyHarness);
+        fn engine_stop_playout(self: &AdmProxyHarness);
+        fn engine_start_recording(self: &AdmProxyHarness);
+        fn engine_stop_recording(self: &AdmProxyHarness);
+        fn engine_init_playout(self: &AdmProxyHarness) -> i32;
+        fn engine_init_recording(self: &AdmProxyHarness) -> i32;
+        fn register_transport(self: &AdmProxyHarness);
+        fn terminate(self: &AdmProxyHarness);
+        fn select(
+            self: &AdmProxyHarness,
+            recording: &AudioDeviceSelection,
+            set_recording: bool,
+            playout: &AudioDeviceSelection,
+            set_playout: bool,
+        ) -> AudioDeviceRequestOutcome;
+        fn restart(
+            self: &AdmProxyHarness,
+            recording: bool,
+            playout: bool,
+        ) -> AudioDeviceRequestOutcome;
+        fn flush(self: &AdmProxyHarness);
+        fn playing(self: &AdmProxyHarness) -> bool;
+        fn recording(self: &AdmProxyHarness) -> bool;
+        fn playout_initialized(self: &AdmProxyHarness) -> bool;
+        fn recording_initialized(self: &AdmProxyHarness) -> bool;
+        fn playout_delay(self: &AdmProxyHarness) -> u16;
+        fn has_device_stats(self: &AdmProxyHarness) -> bool;
+        fn stop_on_mute(self: &AdmProxyHarness) -> bool;
+        fn builtin_effects_available(self: &AdmProxyHarness) -> bool;
+        fn set_microphone_mute(self: &AdmProxyHarness, mute: bool) -> i32;
+        fn enable_builtin_effect(self: &AdmProxyHarness, effect: u8, enable: bool) -> i32;
+        fn platform_playing(self: &AdmProxyHarness) -> bool;
+        fn platform_recording(self: &AdmProxyHarness) -> bool;
+        fn synthetic_playing(self: &AdmProxyHarness) -> bool;
+        fn device_callback(self: &AdmProxyHarness, capture: bool, reenter: bool) -> u32;
+        fn lock_on_audio_thread(self: &AdmProxyHarness) -> u64;
+        fn stats(self: &AdmProxyHarness) -> RootAudioNativeStats;
     }
 
     extern "Rust" {
