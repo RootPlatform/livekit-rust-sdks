@@ -26,6 +26,7 @@ import "rpc.proto";
 import "track.proto";
 import "track_publication.proto";
 import "video_frame.proto";
+import "rootapp_audio.proto";
 
 option csharp_namespace = "LiveKit.Proto";
 
@@ -184,6 +185,20 @@ message FfiRequest {
     // Room event ready signal
     ReadyForRoomEventRequest ready_for_room_event = 83;
 
+    // RootApp fork (rootapp_audio.proto), numbered from 1000.
+    RootAudioSelectDevicesRequest root_audio_select_devices = 1000;
+    RootAudioRestartDeviceRequest root_audio_restart_device = 1001;
+    RootAudioSetPlayoutHoldRequest root_audio_set_playout_hold = 1002;
+    RootAudioSetControlRequest root_audio_set_control = 1003;
+    RootAudioSetTrackGainsRequest root_audio_set_track_gains = 1004;
+    RootAudioRegisterEffectRequest root_audio_register_effect = 1005;
+    RootAudioPlayEffectRequest root_audio_play_effect = 1006;
+    RootAudioStopEffectsRequest root_audio_stop_effects = 1007;
+    RootAudioSetDenoiserRequest root_audio_set_denoiser = 1008;
+    RootAudioReturnPipelinesRequest root_audio_return_pipelines = 1009;
+    RootAudioSetMonitorRequest root_audio_set_monitor = 1010;
+    RootAudioStatsRequest root_audio_stats = 1011;
+
     // NEXT_ID: 87
   }
 }
@@ -313,6 +328,20 @@ message FfiResponse {
     // Room event ready signal
     ReadyForRoomEventResponse ready_for_room_event = 82;
 
+    // RootApp fork (rootapp_audio.proto), numbered from 1000.
+    RootAudioSelectDevicesResponse root_audio_select_devices = 1000;
+    RootAudioRestartDeviceResponse root_audio_restart_device = 1001;
+    RootAudioSetPlayoutHoldResponse root_audio_set_playout_hold = 1002;
+    RootAudioSetControlResponse root_audio_set_control = 1003;
+    RootAudioSetTrackGainsResponse root_audio_set_track_gains = 1004;
+    RootAudioRegisterEffectResponse root_audio_register_effect = 1005;
+    RootAudioPlayEffectResponse root_audio_play_effect = 1006;
+    RootAudioStopEffectsResponse root_audio_stop_effects = 1007;
+    RootAudioSetDenoiserResponse root_audio_set_denoiser = 1008;
+    RootAudioReturnPipelinesResponse root_audio_return_pipelines = 1009;
+    RootAudioSetMonitorResponse root_audio_set_monitor = 1010;
+    RootAudioStatsResponse root_audio_stats = 1011;
+
     // NEXT_ID: 87
   }
 }
@@ -381,6 +410,9 @@ message FfiEvent {
     // Data Track (schemas)
     DefineSchemaCallback define_schema = 45;
     GetSchemaCallback get_schema = 46;
+
+    // RootApp fork (rootapp_audio.proto), numbered from 1000.
+    RootAudioEvent root_audio = 1000;
 
     // NEXT_ID: 47
   }

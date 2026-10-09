@@ -1,0 +1,263 @@
+// RootApp fork: all-native call audio on top of PlatformAudio.
+// See RootApp.Client.Desktop/docs/native-platform-audio.md. Fork oneof cases in ffi.proto start at 1000.
+
+syntax = "proto2";
+
+package livekit.proto;
+option csharp_namespace = "LiveKit.Proto";
+
+// Which device a direction uses. system_default follows the OS default (the console role on Windows,
+// index 0 on macOS); guid is the ADM GUID (Windows: MMDevice id; macOS: AudioObjectID as a decimal
+// string); name selects by the ADM device name (Linux, where the ADM leaves GUIDs empty).
+message RootAudioDeviceSelection {
+  oneof device {
+    bool system_default = 1;
+    string guid = 2;
+    string name = 3;
+  }
+}
+
+// Stores the selection and applies it to the next device open. A running direction is restarted on
+// the new device (stop, select, init, start as one operation on the native device thread).
+// Completion arrives as RootAudioEvent.device_result with the same async_id.
+message RootAudioSelectDevicesRequest {
+  required uint64 platform_audio_handle = 1;
+  optional RootAudioDeviceSelection recording = 2;
+  optional RootAudioDeviceSelection playout = 3;
+}
+message RootAudioSelectDevicesResponse {
+  required uint64 async_id = 1;
+}
+
+// Restarts a direction on its current selection (watchdog recovery, default device change).
+message RootAudioRestartDeviceRequest {
+  required uint64 platform_audio_handle = 1;
+  required bool recording = 2;
+  required bool playout = 3;
+}
+message RootAudioRestartDeviceResponse {
+  required uint64 async_id = 1;
+}
+
+// Keeps platform playout running while a call holds platform audio, even with no remote stream, so
+// effects play and the echo canceller keeps a continuous reference.
+message RootAudioSetPlayoutHoldRequest {
+  required uint64 platform_audio_handle = 1;
+  required bool hold = 2;
+}
+message RootAudioSetPlayoutHoldResponse {
+  optional string error = 1;
+}
+
+// Live control. Only the fields that are set change. Values are sanitised natively (finite, clamped).
+message RootAudioControl {
+  // Gate: no audio leaves and no speaking is reported while muted.
+  optional bool mic_muted = 1;
+  // 0 = voice activity, 1 = push-to-talk key held (gate forced open), 2 = key up (gate closed).
+  optional uint32 push_to_talk = 2;
+  // Linear input gain after the gate, 0..2.
+  optional float input_volume = 3;
+  // Output volume slider value / 100 (0..2); the curve is applied natively.
+  optional float master_volume = 4;
+  optional bool deafened = 5;
+  optional bool echo_cancellation = 6;
+  // WebRTC noise suppression (interim denoiser and Effects SDK fallback).
+  optional bool webrtc_noise_suppression = 7;
+  // Effects SDK power 0..1 (0 = pass-through).
+  optional float denoise_power = 8;
+  // Voice gain (the app's automatic gain control).
+  optional bool auto_gain = 9;
+  // Gate threshold, linear RMS (manual sensitivity).
+  optional float gate_threshold = 10;
+  optional bool auto_sensitivity = 11;
+  // Command: restart the voice gain from this gain in dB.
+  optional float gain_reset_db = 12;
+}
+message RootAudioSetControlRequest {
+  required uint64 platform_audio_handle = 1;
+  required RootAudioControl control = 2;
+}
+message RootAudioSetControlResponse {
+  optional string error = 1;
+}
+
+// Per remote track playout gain (already through the app's volume curve: tile volume only; master
+// volume and deafen are applied separately). paused silences a remote screen-audio track.
+message RootAudioTrackGain {
+  required uint64 track_handle = 1;
+  required float gain = 2;
+  optional bool paused = 3;
+}
+message RootAudioSetTrackGainsRequest {
+  required uint64 platform_audio_handle = 1;
+  repeated RootAudioTrackGain gains = 2;
+}
+message RootAudioSetTrackGainsResponse {
+  optional string error = 1;
+}
+
+// Sound effects mixed into playout (and therefore into the echo canceller's reference).
+// Clips are 48 kHz mono int16, copied natively and kept for the life of the factory.
+message RootAudioRegisterEffectRequest {
+  required uint64 platform_audio_handle = 1;
+  required uint32 effect_id = 2;
+  required uint64 data_ptr = 3;
+  required uint32 sample_count = 4;
+}
+message RootAudioRegisterEffectResponse {
+  optional string error = 1;
+}
+message RootAudioPlayEffectRequest {
+  required uint64 platform_audio_handle = 1;
+  required uint32 effect_id = 2;
+  required float gain = 3;
+}
+message RootAudioPlayEffectResponse {
+  optional string error = 1;
+}
+message RootAudioStopEffectsRequest {
+  required uint64 platform_audio_handle = 1;
+}
+message RootAudioStopEffectsResponse {
+  optional string error = 1;
+}
+
+// Effects SDK pipeline hand-off. pipeline_ptr is an audio_effects_sdk::IPipeline* created by the app
+// at the capture rate from RootAudioEvent.capture_format with pcmScale 32768; 0 removes the
+// pipeline. Removed or replaced pipelines come back in RootAudioEvent.pipelines_returned for release.
+message RootAudioSetDenoiserRequest {
+  required uint64 platform_audio_handle = 1;
+  required uint64 pipeline_ptr = 2;
+  required uint32 sample_rate = 3;
+}
+message RootAudioSetDenoiserResponse {
+  required uint64 async_id = 1;
+}
+// Returns every pipeline native holds (app exit). Synchronous; waits for the audio thread to let go.
+message RootAudioReturnPipelinesRequest {
+  required uint64 platform_audio_handle = 1;
+}
+message RootAudioReturnPipelinesResponse {
+  repeated uint64 pipelines = 1;
+  optional string error = 2;
+}
+
+// Mic test: processed capture played back locally, outside the echo canceller's reference.
+message RootAudioSetMonitorRequest {
+  required uint64 platform_audio_handle = 1;
+  required bool enabled = 2;
+}
+message RootAudioSetMonitorResponse {
+  optional string error = 1;
+}
+
+// Counters are cumulative since PlatformAudio creation (the reader takes deltas). Levels are sums of
+// squares in int16 units with their sample counts. Durations are microseconds. The *_max_gap_us and
+// *_max_us fields are the maximum since the previous RootAudioStatsRequest (reset on read: one reader,
+// the app's 100 ms voice sampler).
+message RootAudioStats {
+  // Device IO (AdmProxy transport tap).
+  required uint64 capture_callbacks = 1;
+  required uint64 render_callbacks = 2;
+  required uint64 capture_max_gap_us = 3;
+  required uint64 render_max_gap_us = 4;
+  required uint64 last_capture_age_us = 5;
+  required uint64 last_render_age_us = 6;
+  required bool recording = 7;
+  required bool playing = 8;
+  required int32 recording_init_result = 9;
+  required int32 recording_start_result = 10;
+  required int32 playout_init_result = 11;
+  required int32 playout_start_result = 12;
+  required uint32 capture_rate = 13;
+  required uint32 capture_channels = 14;
+  required double capture_raw_sumsq = 15;
+  required uint64 capture_raw_samples = 16;
+  required uint32 playout_delay_ms = 17;
+  required uint32 recording_delay_ms = 18;
+
+  // Mixer.
+  required uint64 mix_calls = 20;
+  required uint64 mix_max_gap_us = 21;
+  required uint32 mix_sources = 22;
+  repeated uint32 mix_ssrcs = 23;
+  required double mix_out_sumsq = 24;
+  required uint64 mix_out_samples = 25;
+  required uint64 effects_played = 26;
+  required uint64 effects_dropped = 27;
+
+  // Capture processing (zero until the processor runs).
+  required uint64 processed_frames = 30;
+  required uint32 process_rate = 31;
+  required uint32 process_channels = 32;
+  required double apm_out_sumsq = 33;
+  required double denoised_sumsq = 34;
+  required double gate_in_sumsq = 35;
+  required double sent_sumsq = 36;
+  required uint64 stage_samples = 37;
+  required float gate_in_block_peak_db = 38;
+  required float threshold = 39;
+  required float envelope = 40;
+  required bool gate_speaking = 41;
+  required uint64 speaking_seq = 42;
+  required float voice_gain_db = 43;
+  required bool voice_gain_settled = 44;
+  required uint64 gate_open_frames = 45;
+
+  // Denoiser.
+  required bool denoiser_installed = 50;
+  required uint64 denoiser_frames = 51;
+  required uint64 denoiser_misses = 52;
+  required uint64 denoiser_empty_outputs = 53;
+  required uint64 denoiser_process_max_us = 54;
+  required uint64 denoiser_slow_frames = 55;
+  required uint32 denoiser_bypass_reason = 56;
+  required uint64 denoiser_notifications = 57;
+
+  // Echo canceller (APM statistics; NaN when unknown).
+  required double erl_db = 60;
+  required double erle_db = 61;
+  required int32 aec_delay_ms = 62;
+  required double divergent_filter_fraction = 63;
+  required bool echo_cancellation_active = 64;
+  required bool webrtc_ns_active = 65;
+}
+message RootAudioStatsRequest {
+  required uint64 platform_audio_handle = 1;
+}
+message RootAudioStatsResponse {
+  optional RootAudioStats stats = 1;
+  optional string error = 2;
+}
+
+message RootAudioSpeaking {
+  required bool speaking = 1;
+  required uint64 seq = 2;
+}
+message RootAudioCaptureFormat {
+  required uint32 sample_rate = 1;
+  required uint32 channels = 2;
+}
+message RootAudioPipelinesReturned {
+  repeated uint64 pipelines = 1;
+}
+message RootAudioDeviceResult {
+  required uint64 async_id = 1;
+  optional string recording_error = 2;
+  optional string playout_error = 3;
+}
+message RootAudioDenoiserResult {
+  required uint64 async_id = 1;
+  optional string error = 2;
+}
+
+message RootAudioEvent {
+  required uint64 platform_audio_handle = 1;
+  oneof message {
+    RootAudioSpeaking speaking = 2;
+    RootAudioCaptureFormat capture_format = 3;
+    RootAudioPipelinesReturned pipelines_returned = 4;
+    RootAudioDeviceResult device_result = 5;
+    RootAudioDenoiserResult denoiser_result = 6;
+  }
+}
