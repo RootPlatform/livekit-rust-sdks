@@ -50,6 +50,12 @@ fn device_result(outcome: AudioDeviceOutcome) -> AudioResult<()> {
     if !outcome.found {
         return Err(AudioError::DeviceNotFound);
     }
+    if outcome.attempted && failed(outcome.stop_result) {
+        return Err(AudioError::OperationFailed(format!(
+            "device stop failed ({}); retried natively",
+            outcome.stop_result
+        )));
+    }
     if outcome.attempted && failed(outcome.init_result) {
         return Err(AudioError::OperationFailed(format!(
             "device init failed ({})",
@@ -70,9 +76,11 @@ fn device_result(outcome: AudioDeviceOutcome) -> AudioResult<()> {
 /// Counters are cumulative since the engine started (take deltas); levels are sums
 /// of squares in int16 units with their sample counts; durations are microseconds;
 /// `*_max_gap_us` is the maximum since the previous read. Last Init/Start results
-/// are ADM return codes: 0 success, 1 not attempted yet, -2 selected device not
-/// present, other negative values ADM errors. Fields of stages this build does not
-/// have stay 0, `false`, or NaN for dB values and echo statistics.
+/// are ADM return codes: 0 success, 1 not attempted yet, -10000 selected device
+/// not present, other negative values ADM errors. Fields of stages this build does
+/// not have stay 0, `false`, or NaN for dB values and echo statistics; until the
+/// APM decorator exists, `echo_cancellation_active` and `webrtc_ns_active` are what
+/// the newest device track asked of the APM.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RootAudioStats {
     // Device IO (transport tap on the platform ADM).
@@ -140,6 +148,15 @@ pub struct RootAudioStats {
     pub divergent_filter_fraction: f64,
     pub echo_cancellation_active: bool,
     pub webrtc_ns_active: bool,
+
+    // Real-time rule checks. Locks taken and libwebrtc log lines raised on device
+    // threads; device callbacks and mixes that found another one in flight (a
+    // device thread the ADM failed to stop) and were answered with silence;
+    // devices that failed to stop.
+    pub audio_thread_lock_violations: u64,
+    pub audio_thread_logs_dropped: u64,
+    pub overlapping_callbacks: u64,
+    pub device_stop_failures: u64,
 }
 
 impl Default for RootAudioStats {
@@ -201,6 +218,10 @@ impl Default for RootAudioStats {
             divergent_filter_fraction: f64::NAN,
             echo_cancellation_active: false,
             webrtc_ns_active: false,
+            audio_thread_lock_violations: 0,
+            audio_thread_logs_dropped: 0,
+            overlapping_callbacks: 0,
+            device_stop_failures: 0,
         }
     }
 }
@@ -232,6 +253,12 @@ impl RootAudioStats {
             mix_ssrcs: native.mix_ssrcs,
             mix_out_sumsq: native.mix_out_sumsq,
             mix_out_samples: native.mix_out_samples,
+            echo_cancellation_active: native.echo_cancellation_active,
+            webrtc_ns_active: native.webrtc_ns_active,
+            audio_thread_lock_violations: native.audio_thread_lock_violations,
+            audio_thread_logs_dropped: native.audio_thread_logs_dropped,
+            overlapping_callbacks: native.overlapping_callbacks,
+            device_stop_failures: native.device_stop_failures,
             ..Self::default()
         }
     }
@@ -244,7 +271,13 @@ mod tests {
     use super::*;
 
     fn outcome(found: bool, attempted: bool, init: i32, start: i32) -> AudioDeviceOutcome {
-        AudioDeviceOutcome { found, attempted, init_result: init, start_result: start }
+        AudioDeviceOutcome {
+            found,
+            attempted,
+            stop_result: ADM_RESULT_NOT_ATTEMPTED,
+            init_result: init,
+            start_result: start,
+        }
     }
 
     #[test]
@@ -293,6 +326,21 @@ mod tests {
     }
 
     #[test]
+    fn device_results_report_a_device_that_failed_to_stop() {
+        let stuck = AudioDeviceOutcome { stop_result: -1, ..outcome(true, true, 1, 1) };
+        let stopped = AudioDeviceOutcome { stop_result: 0, ..outcome(true, true, 0, 0) };
+        let results = AudioDeviceResults::from_outcome(
+            Some(AudioDeviceRequestOutcome { recording: Some(stopped), playout: Some(stuck) }),
+            (true, true),
+        );
+        assert_eq!(results.recording, Some(Ok(())));
+        assert!(matches!(
+            results.playout,
+            Some(Err(AudioError::OperationFailed(ref m))) if m.contains("stop")
+        ));
+    }
+
+    #[test]
     fn device_results_leave_unrequested_directions_empty() {
         let results = AudioDeviceResults::from_outcome(
             Some(AudioDeviceRequestOutcome {
@@ -327,6 +375,11 @@ mod tests {
             mix_calls: 30,
             mix_sources: 2,
             mix_ssrcs: vec![1, 2],
+            echo_cancellation_active: true,
+            audio_thread_lock_violations: 3,
+            audio_thread_logs_dropped: 4,
+            overlapping_callbacks: 5,
+            device_stop_failures: 6,
             ..Default::default()
         };
         let stats = RootAudioStats::from_native(native);
@@ -338,6 +391,16 @@ mod tests {
         assert_eq!(stats.playout_start_result, -1);
         assert_eq!(stats.capture_rate, 48_000);
         assert_eq!(stats.mix_ssrcs, vec![1, 2]);
+        assert!(stats.echo_cancellation_active && !stats.webrtc_ns_active);
+        assert_eq!(
+            (
+                stats.audio_thread_lock_violations,
+                stats.audio_thread_logs_dropped,
+                stats.overlapping_callbacks,
+                stats.device_stop_failures
+            ),
+            (3, 4, 5, 6)
+        );
         assert_eq!(stats.processed_frames, 0);
         assert!(!stats.denoiser_installed);
         assert!(stats.erle_db.is_nan() && stats.voice_gain_db.is_nan());

@@ -214,13 +214,22 @@ message RootAudioStats {
   required uint32 denoiser_bypass_reason = 56;
   required uint64 denoiser_notifications = 57;
 
-  // Echo canceller (APM statistics; NaN when unknown).
+  // Echo canceller (APM statistics; NaN when unknown). Until the APM decorator (APM_DECORATOR) the
+  // two flags are what the newest device track asked of the APM.
   required double erl_db = 60;
   required double erle_db = 61;
   required int32 aec_delay_ms = 62;
   required double divergent_filter_fraction = 63;
   required bool echo_cancellation_active = 64;
   required bool webrtc_ns_active = 65;
+
+  // Real-time rule checks; absent from builds that predate them. Locks taken and libwebrtc log
+  // lines raised (dropped) on device threads; device callbacks and mixes that found another one
+  // in flight (a device thread the ADM failed to stop) and got silence; device stops that failed.
+  optional uint64 audio_thread_lock_violations = 70;
+  optional uint64 audio_thread_logs_dropped = 71;
+  optional uint64 overlapping_callbacks = 72;
+  optional uint64 device_stop_failures = 73;
 }
 message RootAudioStatsRequest {
   required uint64 platform_audio_handle = 1;

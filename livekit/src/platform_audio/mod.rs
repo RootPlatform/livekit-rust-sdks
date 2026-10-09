@@ -774,6 +774,10 @@ impl PlatformAudio {
     ///
     /// [`set_recording_device`]: Self::set_recording_device
     pub fn switch_recording_device(&self, id: &RecordingDeviceId) -> AudioResult<()> {
+        if cfg!(not(any(target_os = "ios", target_os = "android"))) {
+            // The stored selection moves a running direction to the new device.
+            return self.set_recording_device(id);
+        }
         let runtime = &self.handle.runtime;
         let was_initialized = runtime.recording_is_initialized();
 
@@ -824,6 +828,10 @@ impl PlatformAudio {
     ///
     /// [`set_playout_device`]: Self::set_playout_device
     pub fn switch_playout_device(&self, id: &PlayoutDeviceId) -> AudioResult<()> {
+        if cfg!(not(any(target_os = "ios", target_os = "android"))) {
+            // The stored selection moves a running direction to the new device.
+            return self.set_playout_device(id);
+        }
         let runtime = &self.handle.runtime;
         let was_initialized = runtime.playout_is_initialized();
 
@@ -861,6 +869,10 @@ impl PlatformAudio {
     ///
     /// This method turns on the system's recording privacy indicator (e.g., the orange
     /// dot on iOS, or the microphone icon on macOS).
+    ///
+    /// On desktop this is the app's own request, kept apart from libwebrtc's: the
+    /// mic records while either asks for it, so [`stop_recording`] never closes it
+    /// under a published `RtcAudioSource::Device` track.
     ///
     /// # Errors
     ///

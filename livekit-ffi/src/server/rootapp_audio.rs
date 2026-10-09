@@ -17,9 +17,9 @@
 //! Device requests are queued on the native device thread before the handler
 //! returns and complete with a `RootAudioEvent`; nothing here blocks the caller.
 
-use livekit::{AudioDeviceResults, AudioDeviceSelection, PlatformAudio, RootAudioStats};
+use livekit::{AudioDeviceResults, AudioDeviceSelection, RootAudioStats};
 
-use super::{platform_audio::FfiPlatformAudio, FfiServer};
+use super::{platform_audio::platform_audio_from_handle, FfiServer};
 use crate::{proto, FfiResult};
 
 pub const CAP_SELECT_DEVICES: u64 = 1 << 0;
@@ -44,10 +44,6 @@ pub const ROOTAPP_AUDIO_CAPS: u64 = if cfg!(any(target_os = "ios", target_os = "
 };
 
 const NOT_SUPPORTED: &str = "not supported by this build";
-
-fn platform_audio(server: &'static FfiServer, handle: u64) -> FfiResult<PlatformAudio> {
-    Ok(server.retrieve_handle::<FfiPlatformAudio>(handle)?.audio.clone())
-}
 
 fn device_selection(selection: proto::RootAudioDeviceSelection) -> AudioDeviceSelection {
     use proto::root_audio_device_selection::Device;
@@ -98,7 +94,7 @@ pub fn on_select_devices(
     server: &'static FfiServer,
     req: proto::RootAudioSelectDevicesRequest,
 ) -> FfiResult<proto::RootAudioSelectDevicesResponse> {
-    let audio = platform_audio(server, req.platform_audio_handle)?;
+    let audio = platform_audio_from_handle(server, req.platform_audio_handle)?;
     let async_id = server.next_id();
     let results = audio
         .select_devices(req.recording.map(device_selection), req.playout.map(device_selection));
@@ -110,7 +106,7 @@ pub fn on_restart_device(
     server: &'static FfiServer,
     req: proto::RootAudioRestartDeviceRequest,
 ) -> FfiResult<proto::RootAudioRestartDeviceResponse> {
-    let audio = platform_audio(server, req.platform_audio_handle)?;
+    let audio = platform_audio_from_handle(server, req.platform_audio_handle)?;
     let async_id = server.next_id();
     let results = audio.restart_devices(req.recording, req.playout);
     spawn_device_result(server, req.platform_audio_handle, async_id, results);
@@ -121,7 +117,7 @@ pub fn on_set_playout_hold(
     server: &'static FfiServer,
     req: proto::RootAudioSetPlayoutHoldRequest,
 ) -> FfiResult<proto::RootAudioSetPlayoutHoldResponse> {
-    platform_audio(server, req.platform_audio_handle)?.set_playout_hold(req.hold);
+    platform_audio_from_handle(server, req.platform_audio_handle)?.set_playout_hold(req.hold);
     Ok(proto::RootAudioSetPlayoutHoldResponse { error: None })
 }
 
@@ -129,7 +125,8 @@ pub fn on_stats(
     server: &'static FfiServer,
     req: proto::RootAudioStatsRequest,
 ) -> FfiResult<proto::RootAudioStatsResponse> {
-    let stats = platform_audio(server, req.platform_audio_handle)?.rootapp_audio_stats();
+    let stats =
+        platform_audio_from_handle(server, req.platform_audio_handle)?.rootapp_audio_stats();
     Ok(proto::RootAudioStatsResponse { stats: Some(stats.into()), error: None })
 }
 
@@ -260,6 +257,10 @@ impl From<RootAudioStats> for proto::RootAudioStats {
             divergent_filter_fraction: stats.divergent_filter_fraction,
             echo_cancellation_active: stats.echo_cancellation_active,
             webrtc_ns_active: stats.webrtc_ns_active,
+            audio_thread_lock_violations: Some(stats.audio_thread_lock_violations),
+            audio_thread_logs_dropped: Some(stats.audio_thread_logs_dropped),
+            overlapping_callbacks: Some(stats.overlapping_callbacks),
+            device_stop_failures: Some(stats.device_stop_failures),
         }
     }
 }
@@ -304,6 +305,8 @@ mod tests {
             render_callbacks: 4,
             mix_ssrcs: vec![9],
             playout_start_result: -1,
+            audio_thread_lock_violations: 1,
+            overlapping_callbacks: 2,
             ..Default::default()
         };
         let proto: proto::RootAudioStats = stats.into();
@@ -312,5 +315,9 @@ mod tests {
         assert_eq!(proto.mix_ssrcs, vec![9]);
         assert_eq!(proto.playout_start_result, -1);
         assert!(proto.erle_db.is_nan());
+        assert_eq!(proto.audio_thread_lock_violations, Some(1));
+        assert_eq!(proto.audio_thread_logs_dropped, Some(0));
+        assert_eq!(proto.overlapping_callbacks, Some(2));
+        assert_eq!(proto.device_stop_failures, Some(0));
     }
 }

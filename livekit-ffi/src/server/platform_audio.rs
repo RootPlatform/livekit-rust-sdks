@@ -26,6 +26,15 @@ pub struct FfiPlatformAudio {
 
 impl FfiHandle for FfiPlatformAudio {}
 
+/// A clone of the handle's `PlatformAudio`, so no handle-map lock is held while
+/// it enumerates devices or waits on the ADM.
+pub fn platform_audio_from_handle(
+    server: &'static FfiServer,
+    handle: u64,
+) -> FfiResult<PlatformAudio> {
+    Ok(server.retrieve_handle::<FfiPlatformAudio>(handle)?.audio.clone())
+}
+
 pub fn on_new_platform_audio(
     server: &'static FfiServer,
     _req: proto::NewPlatformAudioRequest,
@@ -79,8 +88,7 @@ pub fn on_get_audio_devices(
     server: &'static FfiServer,
     req: proto::GetAudioDevicesRequest,
 ) -> FfiResult<proto::GetAudioDevicesResponse> {
-    let ffi_audio = server.retrieve_handle::<FfiPlatformAudio>(req.platform_audio_handle)?;
-    let audio = &ffi_audio.audio;
+    let audio = platform_audio_from_handle(server, req.platform_audio_handle)?;
 
     // Use iterator-based device enumeration
     let playout_devices: Vec<_> = audio
@@ -108,10 +116,10 @@ pub fn on_set_recording_device(
     server: &'static FfiServer,
     req: proto::SetRecordingDeviceRequest,
 ) -> FfiResult<proto::SetRecordingDeviceResponse> {
-    let ffi_audio = server.retrieve_handle::<FfiPlatformAudio>(req.platform_audio_handle)?;
+    let audio = platform_audio_from_handle(server, req.platform_audio_handle)?;
 
     let device_id = RecordingDeviceId::from_unchecked_guid(&req.device_id);
-    match ffi_audio.audio.set_recording_device(&device_id) {
+    match audio.set_recording_device(&device_id) {
         Ok(()) => Ok(proto::SetRecordingDeviceResponse { error: None }),
         Err(e) => Ok(proto::SetRecordingDeviceResponse { error: Some(e.to_string()) }),
     }
@@ -121,10 +129,10 @@ pub fn on_set_playout_device(
     server: &'static FfiServer,
     req: proto::SetPlayoutDeviceRequest,
 ) -> FfiResult<proto::SetPlayoutDeviceResponse> {
-    let ffi_audio = server.retrieve_handle::<FfiPlatformAudio>(req.platform_audio_handle)?;
+    let audio = platform_audio_from_handle(server, req.platform_audio_handle)?;
 
     let device_id = PlayoutDeviceId::from_unchecked_guid(&req.device_id);
-    match ffi_audio.audio.set_playout_device(&device_id) {
+    match audio.set_playout_device(&device_id) {
         Ok(()) => Ok(proto::SetPlayoutDeviceResponse { error: None }),
         Err(e) => Ok(proto::SetPlayoutDeviceResponse { error: Some(e.to_string()) }),
     }
@@ -134,9 +142,9 @@ pub fn on_start_recording(
     server: &'static FfiServer,
     req: proto::StartRecordingRequest,
 ) -> FfiResult<proto::StartRecordingResponse> {
-    let ffi_audio = server.retrieve_handle::<FfiPlatformAudio>(req.platform_audio_handle)?;
+    let audio = platform_audio_from_handle(server, req.platform_audio_handle)?;
 
-    match ffi_audio.audio.start_recording() {
+    match audio.start_recording() {
         Ok(()) => Ok(proto::StartRecordingResponse { error: None }),
         Err(e) => Ok(proto::StartRecordingResponse { error: Some(e.to_string()) }),
     }
@@ -146,9 +154,9 @@ pub fn on_stop_recording(
     server: &'static FfiServer,
     req: proto::StopRecordingRequest,
 ) -> FfiResult<proto::StopRecordingResponse> {
-    let ffi_audio = server.retrieve_handle::<FfiPlatformAudio>(req.platform_audio_handle)?;
+    let audio = platform_audio_from_handle(server, req.platform_audio_handle)?;
 
-    match ffi_audio.audio.stop_recording() {
+    match audio.stop_recording() {
         Ok(()) => Ok(proto::StopRecordingResponse { error: None }),
         Err(e) => Ok(proto::StopRecordingResponse { error: Some(e.to_string()) }),
     }

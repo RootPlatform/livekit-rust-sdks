@@ -66,18 +66,16 @@ impl FfiAudioSource {
                 if let (Some(ref options), Some(handle)) =
                     (&new_source.options, new_source.platform_audio_handle)
                 {
-                    if let Ok(ffi_audio) =
-                        server.retrieve_handle::<super::platform_audio::FfiPlatformAudio>(handle)
+                    if let Ok(audio) =
+                        super::platform_audio::platform_audio_from_handle(server, handle)
                     {
                         let processing_options = livekit::AudioProcessingOptions {
                             echo_cancellation: options.echo_cancellation,
                             noise_suppression: options.noise_suppression,
                             auto_gain_control: options.auto_gain_control,
-                            prefer_hardware_processing: options.prefer_hardware.unwrap_or(false),
+                            prefer_hardware_processing: options.prefer_hardware.unwrap_or(true),
                         };
-                        if let Err(e) =
-                            ffi_audio.audio.configure_audio_processing(processing_options)
-                        {
+                        if let Err(e) = audio.configure_audio_processing(processing_options) {
                             log::warn!(
                                 "Failed to configure audio processing for platform source: {}",
                                 e

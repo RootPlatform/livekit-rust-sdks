@@ -59,11 +59,14 @@ pub enum AudioDeviceSelection {
 /// What a device request did for one direction. Results are ADM return codes:
 /// 0 is success, [`ADM_RESULT_NOT_ATTEMPTED`] means no attempt was made (the
 /// direction is not running, or was already running on that device) and
-/// [`ADM_RESULT_DEVICE_NOT_FOUND`] means the selected device is not present.
+/// [`ADM_RESULT_DEVICE_NOT_FOUND`] means the selected device is not present. A
+/// failed stop leaves the direction closed until the native retry a second
+/// later, so its init and start are not attempted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AudioDeviceOutcome {
     pub found: bool,
     pub attempted: bool,
+    pub stop_result: i32,
     pub init_result: i32,
     pub start_result: i32,
 }
@@ -81,6 +84,7 @@ impl From<sys_adc::ffi::AudioDeviceRequestOutcome> for AudioDeviceRequestOutcome
             outcome.requested.then_some(AudioDeviceOutcome {
                 found: outcome.found,
                 attempted: outcome.attempted,
+                stop_result: outcome.stop_result,
                 init_result: outcome.init_result,
                 start_result: outcome.start_result,
             })
