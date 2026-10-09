@@ -182,7 +182,7 @@ PeerConnectionFactory::PeerConnectionFactory(
   // Create AdmProxy - it creates and initializes Platform ADM internally
   adm_proxy_ = rtc_runtime_->worker_thread()->BlockingCall([&] {
     return webrtc::make_ref_counted<livekit_ffi::AdmProxy>(
-        env_, rtc_runtime_->worker_thread());
+        env_, rtc_runtime_->worker_thread(), audio_mixer_);
   });
   audio_device_ = std::make_shared<AudioDeviceController>(adm_proxy_);
 

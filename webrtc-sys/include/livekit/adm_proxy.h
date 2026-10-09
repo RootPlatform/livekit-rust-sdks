@@ -16,8 +16,15 @@
 
 #pragma once
 
+#include <atomic>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <optional>
 #include <string>
+#include <vector>
 
+#include "absl/functional/any_invocable.h"
 #include "api/environment/environment.h"
 #include "api/scoped_refptr.h"
 #include "livekit/synthetic_audio_device.h"
@@ -25,97 +32,249 @@
 #include "modules/audio_device/include/audio_device_defines.h"
 #include "rtc_base/synchronization/mutex.h"
 
+#if defined(WEBRTC_IOS) || defined(__ANDROID__)
+#define LK_ADM_MOBILE 1
+#else
+#define LK_ADM_MOBILE 0
+#endif
+
 namespace webrtc {
 class Thread;
 }  // namespace webrtc
 
 namespace livekit_ffi {
 
+class RootAudioMixer;
+
+// Last Init/Start results: 0 is success, negative values are ADM errors.
+constexpr int32_t kAdmResultNotAttempted = 1;
+constexpr int32_t kAdmResultDeviceNotFound = -2;
+
+enum class AdmSelectionKind : uint8_t {
+  kDefault = 0,
+  kGuid = 1,
+  kName = 2,
+  kIndex = 3,
+};
+
+// Which device a direction opens. Default is the OS default (the console role
+// on Windows, index 0 elsewhere); kIndex only serves the legacy index setters.
+struct AdmDeviceSelection {
+  AdmSelectionKind kind = AdmSelectionKind::kDefault;
+  std::string id;
+  uint16_t index = 0;
+
+  bool operator==(const AdmDeviceSelection& other) const = default;
+};
+
+constexpr int kAdmResolveDefault = -1;
+constexpr int kAdmResolveNotFound = -2;
+
+// Maps a selection onto the current device list: an index, kAdmResolveDefault,
+// or kAdmResolveNotFound (never a fallback to another device).
+int ResolveAdmDeviceIndex(
+    const AdmDeviceSelection& selection,
+    int device_count,
+    const std::function<bool(int index, std::string* name, std::string* guid)>&
+        device_at);
+
+struct AdmDirectionOutcome {
+  bool requested = false;
+  bool found = true;
+  bool attempted = false;
+  int32_t init_result = kAdmResultNotAttempted;
+  int32_t start_result = kAdmResultNotAttempted;
+};
+
+struct AdmRequestOutcome {
+  AdmDirectionOutcome recording;
+  AdmDirectionOutcome playout;
+};
+
+using AdmRequestCallback = std::function<void(const AdmRequestOutcome&)>;
+
+struct AdmTapStats {
+  uint64_t capture_callbacks = 0;
+  uint64_t render_callbacks = 0;
+  uint64_t capture_max_gap_us = 0;
+  uint64_t render_max_gap_us = 0;
+  uint64_t last_capture_age_us = 0;
+  uint64_t last_render_age_us = 0;
+  uint32_t capture_rate = 0;
+  uint32_t capture_channels = 0;
+  double capture_raw_sumsq = 0;
+  uint64_t capture_raw_samples = 0;
+  uint32_t playout_delay_ms = 0;
+  uint32_t recording_delay_ms = 0;
+};
+
+struct AdmNativeStats {
+  AdmTapStats tap;
+  bool recording = false;
+  bool playing = false;
+  int32_t recording_init_result = kAdmResultNotAttempted;
+  int32_t recording_start_result = kAdmResultNotAttempted;
+  int32_t playout_init_result = kAdmResultNotAttempted;
+  int32_t playout_start_result = kAdmResultNotAttempted;
+  uint64_t mix_calls = 0;
+  uint64_t mix_max_gap_us = 0;
+  uint32_t mix_sources = 0;
+  std::vector<uint32_t> mix_ssrcs;
+  double mix_out_sumsq = 0;
+  uint64_t mix_out_samples = 0;
+};
+
+// Registered with the platform ADM in place of libwebrtc's AudioTransport. It
+// runs on the device's capture and render threads: it forwards, counts and
+// keeps the last-callback times, using only its own atomics.
+class AdmTransportTap : public webrtc::AudioTransport {
+ public:
+  void set_transport(webrtc::AudioTransport* transport);
+
+  int32_t RecordedDataIsAvailable(const void* audio_samples,
+                                  size_t samples_per_channel,
+                                  size_t bytes_per_frame,
+                                  size_t channels,
+                                  uint32_t sample_rate,
+                                  uint32_t total_delay_ms,
+                                  int32_t clock_drift,
+                                  uint32_t current_mic_level,
+                                  bool key_pressed,
+                                  uint32_t& new_mic_level) override;
+  int32_t RecordedDataIsAvailable(
+      const void* audio_samples,
+      size_t samples_per_channel,
+      size_t bytes_per_frame,
+      size_t channels,
+      uint32_t sample_rate,
+      uint32_t total_delay_ms,
+      int32_t clock_drift,
+      uint32_t current_mic_level,
+      bool key_pressed,
+      uint32_t& new_mic_level,
+      std::optional<int64_t> estimated_capture_time_ns) override;
+  int32_t NeedMorePlayData(size_t samples_per_channel,
+                           size_t bytes_per_frame,
+                           size_t channels,
+                           uint32_t sample_rate,
+                           void* audio_samples,
+                           size_t& samples_out,
+                           int64_t* elapsed_time_ms,
+                           int64_t* ntp_time_ms) override;
+  void PullRenderData(int bits_per_sample,
+                      int sample_rate,
+                      size_t number_of_channels,
+                      size_t number_of_frames,
+                      void* audio_data,
+                      int64_t* elapsed_time_ms,
+                      int64_t* ntp_time_ms) override;
+
+  // The next callback after these does not count the time before it as a gap.
+  void ResetCaptureClock();
+  void ResetRenderClock();
+
+  void set_playout_delay_ms(uint16_t delay_ms);
+  uint16_t playout_delay_ms() const;
+
+  // Max gaps are reset on read.
+  AdmTapStats Read();
+  std::optional<webrtc::AudioDeviceModule::Stats> DeviceStats() const;
+
+ private:
+  struct Direction {
+    std::atomic<uint64_t> callbacks{0};
+    std::atomic<int64_t> last_ns{0};
+    std::atomic<int64_t> previous_ns{0};
+    std::atomic<uint64_t> max_gap_ns{0};
+    std::atomic<uint64_t> frames{0};
+    std::atomic<double> duration_s{0.0};
+    std::atomic<double> delay_s{0.0};
+  };
+
+  static void Count(Direction& direction,
+                    size_t frames,
+                    uint32_t sample_rate,
+                    uint32_t delay_ms);
+
+  std::atomic<webrtc::AudioTransport*> transport_{nullptr};
+  Direction capture_;
+  Direction render_;
+  std::atomic<uint32_t> capture_rate_{0};
+  std::atomic<uint32_t> capture_channels_{0};
+  std::atomic<double> capture_sumsq_{0.0};
+  std::atomic<uint64_t> capture_samples_{0};
+  std::atomic<uint32_t> capture_total_delay_ms_{0};
+  std::atomic<uint16_t> playout_delay_ms_{0};
+};
+
 /// ADM Proxy that manages synthetic and platform audio modes.
 ///
-/// This proxy implements the AudioDeviceModule interface and switches between:
-/// 1. **Synthetic mode**: Uses `SyntheticAudioDevice`, which pumps the WebRTC
-///    audio pipeline without platform audio. Remote audio is delivered via FFI
-///    callbacks to external audio systems (e.g., Unity AudioSource).
-/// 2. **Platform mode**: Real audio I/O through the Platform ADM with microphone
-///    capture and speaker playout. Used when PlatformAudio is active for VoIP
-///    with AEC.
+/// - **Playout**: the Platform ADM plays while `ref_count > 0 &&
+///   playout_enabled` and either libwebrtc started playout or the app holds it
+///   (`SetPlayoutHold`); otherwise the synthetic ADM pumps the pipeline while
+///   libwebrtc wants playout.
+/// - **Recording**: the Platform ADM records while `ref_count > 0 &&
+///   recording_enabled` and libwebrtc started recording (a device track's send
+///   stream). Synthetic mode has no microphone.
 ///
-/// ## Mode Selection
+/// libwebrtc's and the app's calls only record the desired state. On desktop a
+/// dedicated `audio-device` thread brings the devices to it, so neither the
+/// worker nor an FFI caller ever waits for a device to stop. The queries the
+/// worker makes per audio packet read atomics. The selected device is stored
+/// as {default | GUID | name} per direction and applied before every open.
 ///
-/// - **Playout**: Uses Platform ADM when `ref_count > 0 && playout_enabled`,
-///   otherwise uses synthetic mode (internal audio pumping task).
-/// - **Recording**: Uses Platform ADM when `ref_count > 0 && recording_enabled`,
-///   otherwise recording is unavailable (synthetic mode has no microphone).
-///
-/// ## Lifecycle Management
-///
-/// Platform ADM is created eagerly at construction (for iOS compatibility).
-/// Reference counting controls which mode is active:
-/// - `AcquirePlatformAdm()`: Increments ref count
-/// - `ReleasePlatformAdm()`: Decrements ref count
-/// - When ref_count is 0, playout uses synthetic mode
-///
-/// ## Audio Modes
-///
-/// | Mode | Recording | Playout | Use Case |
-/// |------|-----------|---------|----------|
-/// | Synthetic | NativeAudioSource | Internal task + FFI | Unity audio, agents |
-/// | Platform | Platform ADM mic | Platform ADM speakers | VoIP with AEC |
-///
+/// On desktop the OS effects (Windows' voice capture DMO) are off and refused,
+/// mute never stops recording or touches the endpoint mute, and recording only
+/// opens for a device track (`InitRecording` alone opens nothing).
 class AdmProxy : public webrtc::AudioDeviceModule {
  public:
-  explicit AdmProxy(const webrtc::Environment& env,
-                    webrtc::Thread* worker_thread);
+  AdmProxy(const webrtc::Environment& env,
+           webrtc::Thread* worker_thread,
+           webrtc::scoped_refptr<RootAudioMixer> mixer);
   ~AdmProxy() override;
 
   // ===========================================================================
   // Platform ADM Lifecycle Management
   // ===========================================================================
 
-  /// Acquires a reference to the Platform ADM.
-  ///
-  /// On first call, creates and initializes the Platform ADM. On subsequent
-  /// calls, just increments the reference count.
-  ///
-  /// @return true if Platform ADM is ready for use, false if initialization failed.
+  /// Acquires a reference to the Platform ADM. Returns false if no Platform
+  /// ADM is available.
   bool AcquirePlatformAdm();
 
-  /// Releases a reference to the Platform ADM.
-  ///
-  /// When the reference count reaches zero, the Platform ADM is terminated
-  /// and the proxy returns to synthetic mode.
+  /// Releases a reference to the Platform ADM. At zero the proxy returns to
+  /// synthetic mode and the playout hold is dropped.
   void ReleasePlatformAdm();
 
-  /// Returns the current reference count for the Platform ADM.
   int platform_adm_ref_count() const;
-
-  /// Returns true if Platform ADM is currently active (ref_count > 0).
   bool is_platform_adm_active() const;
 
   // ===========================================================================
   // Recording/Playout Control
   // ===========================================================================
 
-  /// Control whether recording (microphone) is enabled.
-  ///
-  /// When disabled (default), InitRecording/StartRecording return success but
-  /// do nothing. This allows NativeAudioSource to work without interference.
-  ///
-  /// @note Only effective when Platform ADM is active.
   void set_recording_enabled(bool enabled);
   bool recording_enabled() const;
 
-  /// Control whether playout goes through Platform ADM speakers.
-  ///
-  /// When disabled (default), playout uses synthetic mode - remote audio is
-  /// delivered via FFI callbacks to the application (e.g., Unity AudioSource).
-  ///
-  /// When enabled, remote audio plays through the platform speakers with AEC.
-  ///
-  /// @note Only effective when Platform ADM is active.
   void set_playout_enabled(bool enabled);
   bool playout_enabled() const;
+
+  /// Stores the selection per direction (unset directions keep theirs). A
+  /// running direction whose selection changed is restarted on the new device.
+  /// `done` runs on the device thread once that is applied.
+  void SelectDevices(std::optional<AdmDeviceSelection> recording,
+                     std::optional<AdmDeviceSelection> playout,
+                     AdmRequestCallback done);
+
+  /// Stops, re-selects, re-inits and restarts the running directions, playout
+  /// even while held. Directions that are not running are left alone.
+  void RestartDevices(bool recording, bool playout, AdmRequestCallback done);
+
+  /// Keeps platform playout running without any receive stream.
+  void SetPlayoutHold(bool hold);
+  bool playout_hold() const;
+
+  /// Atomics only; the max gaps are reset on read.
+  AdmNativeStats ReadNativeStats();
 
   // ===========================================================================
   // AudioDeviceModule Interface
@@ -137,6 +296,8 @@ class AdmProxy : public webrtc::AudioDeviceModule {
                               char name[webrtc::kAdmMaxDeviceNameSize],
                               char guid[webrtc::kAdmMaxGuidSize]) override;
 
+  // libwebrtc's own selection at engine init; the app selects through
+  // SelectDevices, so on desktop these are ignored.
   int32_t SetPlayoutDevice(uint16_t index) override;
   int32_t SetPlayoutDevice(WindowsDeviceType device) override;
   int32_t SetRecordingDevice(uint16_t index) override;
@@ -198,6 +359,9 @@ class AdmProxy : public webrtc::AudioDeviceModule {
   int32_t EnableBuiltInAGC(bool enable) override;
   int32_t EnableBuiltInNS(bool enable) override;
 
+  std::optional<Stats> GetStats() const override;
+  bool IsStopOnMuteModeEnabled() const override;
+
 #if defined(WEBRTC_IOS)
   int GetPlayoutAudioParameters(webrtc::AudioParameters* params) const override;
   int GetRecordAudioParameters(webrtc::AudioParameters* params) const override;
@@ -206,72 +370,92 @@ class AdmProxy : public webrtc::AudioDeviceModule {
   int32_t SetObserver(webrtc::AudioDeviceObserver* observer) override;
 
  private:
-  // Returns true if platform mode is active for playout
-  // (ref_count > 0 && playout_enabled)
-  bool is_platform_playout_active() const;
+  struct DesiredState {
+    int ref_count = 0;
+    bool recording_enabled = false;
+    bool playout_enabled = false;
+    bool engine_playout = false;
+    bool engine_recording = false;
+    bool hold = false;
+    AdmDeviceSelection playout_selection;
+    AdmDeviceSelection recording_selection;
+    uint64_t playout_selection_gen = 0;
+    uint64_t recording_selection_gen = 0;
+    uint64_t playout_restart_gen = 0;
+    uint64_t recording_restart_gen = 0;
+  };
 
-  // Returns the ADM to use for recording operations
-  // - Platform ADM when recording is enabled (ref_count > 0 && recording_enabled)
-  // - nullptr otherwise (recording not available in synthetic mode)
-  webrtc::AudioDeviceModule* recording_adm() const;
+  webrtc::AudioDeviceModule* platform() const {
+    return platform_raw_.load(std::memory_order_acquire);
+  }
 
-  // Switches playout mode based on current state.
-  // Called when ref_count or playout_enabled changes.
-  // If playout is active, stops the old mode and starts the new one.
-  // Must be called with mutex_ held.
-  void SwitchPlayoutModeIfNeeded();
+  // Desktop: queued on the device thread. Mobile: run inline. Tasks take
+  // mutex_ themselves; callers must not hold it.
+  void PostDeviceTask(absl::AnyInvocable<void() &&> task);
+  void RunDeviceTaskAndWait(absl::AnyInvocable<void() &&> task);
 
-  // Switches recording to the correct ADM based on current mode.
-  // Called when ref_count or recording_enabled changes.
-  // If recording is active, stops the old ADM and starts the new one.
-  // Must be called with mutex_ held.
-  void SwitchRecordingAdmIfNeeded();
+  // The *Locked methods run with mutex_ held.
+  void RequestReconcile();
+  void PostRequest(bool recording, bool playout, AdmRequestCallback done);
+  void ReconcileLocked(AdmRequestOutcome* outcome);
+  void ReconcilePlayoutLocked(const DesiredState& desired,
+                              AdmDirectionOutcome* outcome);
+  void ReconcileRecordingLocked(const DesiredState& desired,
+                                AdmDirectionOutcome* outcome);
+  void CompleteOutcomeLocked(const DesiredState& desired,
+                             AdmRequestOutcome* outcome);
+  void PublishStateLocked(const DesiredState& desired);
+  int32_t ApplySelectionLocked(bool playout,
+                               const AdmDeviceSelection& selection);
+  int ResolveSelectionLocked(bool playout, const AdmDeviceSelection& selection);
+  void SchedulePlayoutDelayRefreshLocked();
+  void ShutdownLocked();
+  DesiredState Desired() const;
 
 #if defined(__ANDROID__)
-  // Lazily creates the Platform ADM on Android.
-  // Must be called with mutex_ held.
-  // Returns true if ADM is available after the call.
   bool EnsurePlatformAdmCreated();
 #endif
 
   const webrtc::Environment env_;
   webrtc::Thread* worker_thread_;
+  const webrtc::scoped_refptr<RootAudioMixer> mixer_;
+  std::unique_ptr<webrtc::Thread> device_thread_;
 
-  // Mutex for thread-safe access to mutable state
+  // Held for every device operation (on desktop only the device thread runs
+  // those) and for the rarely used settings calls that forward to an ADM.
+  // Never taken by a query libwebrtc makes per packet, nor on audio threads.
   mutable webrtc::Mutex mutex_;
+  // Desired state; taken briefly by every thread, never across an ADM call.
+  mutable webrtc::Mutex state_mutex_;
+  DesiredState desired_;
+  std::atomic<bool> reconcile_posted_{false};
 
-  // Synthetic ADM for synthetic mode - pumps the WebRTC audio pipeline without
-  // platform audio via SyntheticAudioDevice's internal task.
   webrtc::scoped_refptr<SyntheticAudioDevice> synthetic_adm_;
-
-  // Platform ADM for real audio I/O (microphone capture, speaker playout with AEC)
   webrtc::scoped_refptr<webrtc::AudioDeviceModule> platform_adm_;
-
-  // Reference count for Platform ADM users (PlatformAudio instances)
-  int platform_adm_ref_count_ = 0;
-
-  // Audio transport callback (registered by WebRTC)
+  std::atomic<webrtc::AudioDeviceModule*> platform_raw_{nullptr};
+  AdmTransportTap tap_;
   webrtc::AudioTransport* audio_transport_ = nullptr;
 
-  // State tracking
-  bool playout_initialized_ = false;
-  bool recording_initialized_ = false;
-  bool playing_ = false;
-  bool recording_ = false;
+  uint64_t playout_opened_selection_gen_ = 0;
+  uint64_t playout_opened_restart_gen_ = 0;
+  uint64_t recording_opened_selection_gen_ = 0;
+  uint64_t recording_opened_restart_gen_ = 0;
+  bool delay_refresh_scheduled_ = false;
+  bool terminated_ = false;
 
-  // Control flags
-  // When false (default), recording operations are no-ops (NativeAudioSource mode)
-  bool recording_enabled_ = false;
-  // When false (default), playout uses synthetic mode (internal task pumps audio)
-  bool playout_enabled_ = false;
-
-  // Selected device information (for re-initialization after ADM restart)
-  // We store both index and GUID. GUID is preferred for restoration as it's
-  // stable across device hot-plug events.
-  uint16_t selected_playout_device_ = 0;
-  uint16_t selected_recording_device_ = 0;
-  std::string selected_playout_guid_;
-  std::string selected_recording_guid_;
+  std::atomic<bool> engine_playout_{false};
+  std::atomic<bool> engine_recording_{false};
+  std::atomic<bool> platform_playout_mode_{false};
+  std::atomic<bool> device_playing_{false};
+  std::atomic<bool> device_playout_initialized_{false};
+  std::atomic<bool> device_recording_{false};
+  std::atomic<bool> device_recording_initialized_{false};
+  std::atomic<bool> platform_playing_{false};
+  std::atomic<bool> platform_recording_{false};
+  std::atomic<int32_t> playout_init_result_{kAdmResultNotAttempted};
+  std::atomic<int32_t> playout_start_result_{kAdmResultNotAttempted};
+  std::atomic<int32_t> recording_init_result_{kAdmResultNotAttempted};
+  std::atomic<int32_t> recording_start_result_{kAdmResultNotAttempted};
 };
 
 }  // namespace livekit_ffi

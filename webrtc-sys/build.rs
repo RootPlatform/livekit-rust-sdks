@@ -91,6 +91,7 @@ fn main() {
         "src/video_decoder_factory.cpp",
         "src/synthetic_audio_device.cpp",
         "src/adm_proxy.cpp",
+        "src/audio_thread.cpp",
         "src/root_audio_mixer.cpp",
         "src/audio_resampler.cpp",
         "src/frame_cryptor.cpp",

@@ -23,6 +23,14 @@
 #include "rust/cxx.h"
 
 namespace livekit_ffi {
+class AudioDeviceController;
+struct AudioDeviceSelection;
+struct AudioDeviceRequestOutcome;
+struct RootAudioNativeStats;
+}  // namespace livekit_ffi
+#include "webrtc-sys/src/audio_device_controller.rs.h"
+
+namespace livekit_ffi {
 
 class AudioDeviceController {
  public:
@@ -41,6 +49,19 @@ class AudioDeviceController {
   bool set_recording_device(uint16_t index) const;
   bool set_playout_device_by_guid(rust::String guid) const;
   bool set_recording_device_by_guid(rust::String guid) const;
+
+  // Selection and restart applied on the device thread; `callback` runs there
+  // once done.
+  void select_devices(const AudioDeviceSelection& recording,
+                      bool set_recording,
+                      const AudioDeviceSelection& playout,
+                      bool set_playout,
+                      rust::Box<AudioDeviceRequestCallback> callback) const;
+  void restart_devices(bool recording,
+                       bool playout,
+                       rust::Box<AudioDeviceRequestCallback> callback) const;
+  void set_playout_hold(bool hold) const;
+  RootAudioNativeStats root_audio_stats() const;
 
   // Recording control
   bool stop_recording() const;
@@ -79,5 +100,10 @@ class AudioDeviceController {
  private:
   webrtc::scoped_refptr<AdmProxy> adm_proxy_;
 };
+
+int32_t resolve_audio_device_index_for_test(
+    const AudioDeviceSelection& selection,
+    rust::Slice<const rust::String> names,
+    rust::Slice<const rust::String> guids);
 
 }  // namespace livekit_ffi

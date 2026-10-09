@@ -21,6 +21,7 @@
 #include <iostream>
 #include <memory>
 
+#include "livekit/audio_thread.h"
 #include "livekit/audio_track.h"
 #include "livekit/media_stream_track.h"
 #include "livekit/rtp_receiver.h"
@@ -170,6 +171,11 @@ LogSink::~LogSink() {
 
 void LogSink::OnLogMessage(const std::string& message,
                            webrtc::LoggingSeverity severity) {
+  // Forwarding allocates and wakes the Rust logger; a device thread must not.
+  if (IsAudioThread()) {
+    CountDroppedAudioThreadLog();
+    return;
+  }
   fnc_(rust::String::lossy(message), static_cast<LoggingSeverity>(severity));
 }
 

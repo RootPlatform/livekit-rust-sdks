@@ -16,10 +16,60 @@
 
 #include "livekit/audio_device_controller.h"
 
+#include <algorithm>
+#include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 
 namespace livekit_ffi {
+namespace {
+
+AdmDeviceSelection ToAdmSelection(const AudioDeviceSelection& selection) {
+  AdmDeviceSelection result;
+  switch (selection.kind) {
+    case AudioDeviceSelectionKind::Guid:
+      result.kind = AdmSelectionKind::kGuid;
+      break;
+    case AudioDeviceSelectionKind::Name:
+      result.kind = AdmSelectionKind::kName;
+      break;
+    case AudioDeviceSelectionKind::Index:
+      result.kind = AdmSelectionKind::kIndex;
+      break;
+    default:
+      result.kind = AdmSelectionKind::kDefault;
+      break;
+  }
+  result.id = std::string(selection.id);
+  result.index = selection.index;
+  return result;
+}
+
+AudioDeviceOutcome ToOutcome(const AdmDirectionOutcome& outcome) {
+  AudioDeviceOutcome result{};
+  result.requested = outcome.requested;
+  result.found = outcome.found;
+  result.attempted = outcome.attempted;
+  result.init_result = outcome.init_result;
+  result.start_result = outcome.start_result;
+  return result;
+}
+
+AdmRequestCallback ToAdmCallback(
+    rust::Box<AudioDeviceRequestCallback> callback) {
+  auto shared =
+      std::make_shared<rust::Box<AudioDeviceRequestCallback>>(
+          std::move(callback));
+  return [shared](const AdmRequestOutcome& outcome) {
+    AudioDeviceRequestOutcome result{};
+    result.recording = ToOutcome(outcome.recording);
+    result.playout = ToOutcome(outcome.playout);
+    (*shared)->on_complete(result);
+  };
+}
+
+}  // namespace
 
 AudioDeviceController::AudioDeviceController(
     webrtc::scoped_refptr<AdmProxy> adm_proxy)
@@ -60,6 +110,8 @@ rust::String AudioDeviceController::recording_device_guid(uint16_t index) const 
   adm_proxy_->RecordingDeviceName(index, name, guid);
   return rust::String(guid);
 }
+
+#if LK_ADM_MOBILE
 
 bool AudioDeviceController::set_playout_device(uint16_t index) const {
   return adm_proxy_->SetPlayoutDevice(index) == 0;
@@ -115,6 +167,114 @@ bool AudioDeviceController::set_recording_device_by_guid(rust::String guid) cons
     return adm_proxy_->SetRecordingDevice(0) == 0;
   }
   return false;
+}
+
+#else
+
+// On desktop the selection is stored and applied before the next open; a
+// running direction moves to the new device. A device that is not present is
+// never replaced by another one.
+bool AudioDeviceController::set_playout_device(uint16_t index) const {
+  if (index >= adm_proxy_->PlayoutDevices()) {
+    return false;
+  }
+  AdmDeviceSelection selection;
+  selection.kind = AdmSelectionKind::kIndex;
+  selection.index = index;
+  adm_proxy_->SelectDevices(std::nullopt, selection, nullptr);
+  return true;
+}
+
+bool AudioDeviceController::set_recording_device(uint16_t index) const {
+  if (index >= adm_proxy_->RecordingDevices()) {
+    return false;
+  }
+  AdmDeviceSelection selection;
+  selection.kind = AdmSelectionKind::kIndex;
+  selection.index = index;
+  adm_proxy_->SelectDevices(selection, std::nullopt, nullptr);
+  return true;
+}
+
+bool AudioDeviceController::set_playout_device_by_guid(rust::String guid) const {
+  AdmDeviceSelection selection;
+  selection.kind = AdmSelectionKind::kGuid;
+  selection.id = std::string(guid);
+  adm_proxy_->SelectDevices(std::nullopt, selection, nullptr);
+  return true;
+}
+
+bool AudioDeviceController::set_recording_device_by_guid(rust::String guid) const {
+  AdmDeviceSelection selection;
+  selection.kind = AdmSelectionKind::kGuid;
+  selection.id = std::string(guid);
+  adm_proxy_->SelectDevices(selection, std::nullopt, nullptr);
+  return true;
+}
+
+#endif
+
+void AudioDeviceController::select_devices(
+    const AudioDeviceSelection& recording,
+    bool set_recording,
+    const AudioDeviceSelection& playout,
+    bool set_playout,
+    rust::Box<AudioDeviceRequestCallback> callback) const {
+  std::optional<AdmDeviceSelection> recording_selection;
+  std::optional<AdmDeviceSelection> playout_selection;
+  if (set_recording) {
+    recording_selection = ToAdmSelection(recording);
+  }
+  if (set_playout) {
+    playout_selection = ToAdmSelection(playout);
+  }
+  adm_proxy_->SelectDevices(std::move(recording_selection),
+                            std::move(playout_selection),
+                            ToAdmCallback(std::move(callback)));
+}
+
+void AudioDeviceController::restart_devices(
+    bool recording,
+    bool playout,
+    rust::Box<AudioDeviceRequestCallback> callback) const {
+  adm_proxy_->RestartDevices(recording, playout,
+                             ToAdmCallback(std::move(callback)));
+}
+
+void AudioDeviceController::set_playout_hold(bool hold) const {
+  adm_proxy_->SetPlayoutHold(hold);
+}
+
+RootAudioNativeStats AudioDeviceController::root_audio_stats() const {
+  AdmNativeStats native = adm_proxy_->ReadNativeStats();
+  RootAudioNativeStats stats{};
+  stats.capture_callbacks = native.tap.capture_callbacks;
+  stats.render_callbacks = native.tap.render_callbacks;
+  stats.capture_max_gap_us = native.tap.capture_max_gap_us;
+  stats.render_max_gap_us = native.tap.render_max_gap_us;
+  stats.last_capture_age_us = native.tap.last_capture_age_us;
+  stats.last_render_age_us = native.tap.last_render_age_us;
+  stats.recording = native.recording;
+  stats.playing = native.playing;
+  stats.recording_init_result = native.recording_init_result;
+  stats.recording_start_result = native.recording_start_result;
+  stats.playout_init_result = native.playout_init_result;
+  stats.playout_start_result = native.playout_start_result;
+  stats.capture_rate = native.tap.capture_rate;
+  stats.capture_channels = native.tap.capture_channels;
+  stats.capture_raw_sumsq = native.tap.capture_raw_sumsq;
+  stats.capture_raw_samples = native.tap.capture_raw_samples;
+  stats.playout_delay_ms = native.tap.playout_delay_ms;
+  stats.recording_delay_ms = native.tap.recording_delay_ms;
+  stats.mix_calls = native.mix_calls;
+  stats.mix_max_gap_us = native.mix_max_gap_us;
+  stats.mix_sources = native.mix_sources;
+  for (uint32_t ssrc : native.mix_ssrcs) {
+    stats.mix_ssrcs.push_back(ssrc);
+  }
+  stats.mix_out_sumsq = native.mix_out_sumsq;
+  stats.mix_out_samples = native.mix_out_samples;
+  return stats;
 }
 
 bool AudioDeviceController::stop_recording() const {
@@ -203,6 +363,20 @@ int AudioDeviceController::platform_adm_ref_count() const {
 
 bool AudioDeviceController::is_platform_adm_active() const {
   return adm_proxy_->is_platform_adm_active();
+}
+
+int32_t resolve_audio_device_index_for_test(
+    const AudioDeviceSelection& selection,
+    rust::Slice<const rust::String> names,
+    rust::Slice<const rust::String> guids) {
+  const int count = static_cast<int>(std::min(names.size(), guids.size()));
+  return ResolveAdmDeviceIndex(
+      ToAdmSelection(selection), count,
+      [&names, &guids](int index, std::string* name, std::string* guid) {
+        *name = std::string(names[index]);
+        *guid = std::string(guids[index]);
+        return true;
+      });
 }
 
 }  // namespace livekit_ffi
