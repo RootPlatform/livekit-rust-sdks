@@ -170,6 +170,10 @@ mod tests {
 
     #[test]
     fn test_new_platform_audio() {
+        if std::env::var_os("LK_HW_AUDIO_TESTS").is_none() {
+            println!("Skipping test_new_platform_audio: opens real audio devices; set LK_HW_AUDIO_TESTS=1");
+            return;
+        }
         let req = proto::NewPlatformAudioRequest {};
         let res = on_new_platform_audio(server(), req).unwrap();
 

@@ -113,6 +113,14 @@ pub extern "C" fn livekit_ffi_dispose() {
     FFI_SERVER.async_runtime.block_on(FFI_SERVER.dispose());
 }
 
+/// Bitmask of the RootApp native audio features this build implements (bits in
+/// `server::rootapp_audio`). Hosts check it before using the RootAudio requests,
+/// which an older library would reject as an empty request.
+#[no_mangle]
+pub extern "C" fn livekit_ffi_rootapp_audio_caps() -> u64 {
+    server::rootapp_audio::ROOTAPP_AUDIO_CAPS
+}
+
 /// The MediaFoundation codecs' shared D3D11 device on the adapter `adapter_luid`
 /// names (the default adapter when null), so the host can render or capture on
 /// the device the encoders already use. Returns an HRESULT. On success

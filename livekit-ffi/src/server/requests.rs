@@ -28,7 +28,7 @@ use super::{
     participant::FfiParticipant,
     platform_audio, resampler,
     room::{self, FfiPublication, FfiTrack},
-    video_source, video_stream, FfiError, FfiResult, FfiServer,
+    rootapp_audio, video_source, video_stream, FfiError, FfiResult, FfiServer,
 };
 use crate::proto;
 
@@ -1488,6 +1488,31 @@ pub fn handle_request(
         }
         Request::StartRecording(req) => platform_audio::on_start_recording(server, req)?.into(),
         Request::StopRecording(req) => platform_audio::on_stop_recording(server, req)?.into(),
+        // RootApp native audio
+        Request::RootAudioSelectDevices(req) => {
+            rootapp_audio::on_select_devices(server, req)?.into()
+        }
+        Request::RootAudioRestartDevice(req) => {
+            rootapp_audio::on_restart_device(server, req)?.into()
+        }
+        Request::RootAudioSetPlayoutHold(req) => {
+            rootapp_audio::on_set_playout_hold(server, req)?.into()
+        }
+        Request::RootAudioSetControl(req) => rootapp_audio::on_set_control(server, req)?.into(),
+        Request::RootAudioSetTrackGains(req) => {
+            rootapp_audio::on_set_track_gains(server, req)?.into()
+        }
+        Request::RootAudioRegisterEffect(req) => {
+            rootapp_audio::on_register_effect(server, req)?.into()
+        }
+        Request::RootAudioPlayEffect(req) => rootapp_audio::on_play_effect(server, req)?.into(),
+        Request::RootAudioStopEffects(req) => rootapp_audio::on_stop_effects(server, req)?.into(),
+        Request::RootAudioSetDenoiser(req) => rootapp_audio::on_set_denoiser(server, req)?.into(),
+        Request::RootAudioReturnPipelines(req) => {
+            rootapp_audio::on_return_pipelines(server, req)?.into()
+        }
+        Request::RootAudioSetMonitor(req) => rootapp_audio::on_set_monitor(server, req)?.into(),
+        Request::RootAudioStats(req) => rootapp_audio::on_stats(server, req)?.into(),
     });
 
     Ok(res)
