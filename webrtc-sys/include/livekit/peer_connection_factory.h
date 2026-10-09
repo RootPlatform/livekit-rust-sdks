@@ -65,9 +65,12 @@ class PeerConnectionFactory {
       std::shared_ptr<AudioTrackSource> source) const;
 
   // Create an audio track that uses the ADM for capture (microphone)
-  // This creates a track that captures from the selected recording device
+  // This creates a track that captures from the selected recording device.
+  // Returns null on failure.
   std::shared_ptr<AudioTrack> create_device_audio_track(
-      rust::String label) const;
+      rust::String label,
+      bool echo_cancellation,
+      bool noise_suppression) const;
 
   RtpCapabilities rtp_sender_capabilities(MediaType type) const;
 

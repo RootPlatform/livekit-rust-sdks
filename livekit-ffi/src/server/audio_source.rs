@@ -24,6 +24,8 @@ pub struct FfiAudioSource {
     pub handle_id: FfiHandleId,
     pub source_type: proto::AudioSourceType,
     pub source: RtcAudioSource,
+    /// Processing for tracks made from a platform source.
+    pub device_options: Option<AudioSourceOptions>,
     capture_tx: Option<mpsc::UnboundedSender<CaptureJob>>,
 }
 
@@ -40,6 +42,7 @@ impl FfiAudioSource {
         new_source: proto::NewAudioSourceRequest,
     ) -> FfiResult<proto::OwnedAudioSource> {
         let source_type = new_source.r#type();
+        let mut device_options = None;
         #[allow(unreachable_patterns)]
         let source_inner = match source_type {
             #[cfg(not(target_arch = "wasm32"))]
@@ -70,7 +73,7 @@ impl FfiAudioSource {
                             echo_cancellation: options.echo_cancellation,
                             noise_suppression: options.noise_suppression,
                             auto_gain_control: options.auto_gain_control,
-                            prefer_hardware_processing: options.prefer_hardware.unwrap_or(true),
+                            prefer_hardware_processing: options.prefer_hardware.unwrap_or(false),
                         };
                         if let Err(e) =
                             ffi_audio.audio.configure_audio_processing(processing_options)
@@ -83,6 +86,17 @@ impl FfiAudioSource {
                     }
                 }
 
+                device_options = Some(AudioSourceOptions {
+                    echo_cancellation: new_source
+                        .options
+                        .as_ref()
+                        .map_or(true, |options| options.echo_cancellation),
+                    noise_suppression: new_source
+                        .options
+                        .as_ref()
+                        .map_or(true, |options| options.noise_suppression),
+                    auto_gain_control: false,
+                });
                 RtcAudioSource::Device
             }
             _ => return Err(FfiError::InvalidRequest("unsupported audio source type".into())),
@@ -102,7 +116,8 @@ impl FfiAudioSource {
         };
 
         let handle_id = server.next_id();
-        let source = Self { handle_id, source_type, source: source_inner, capture_tx };
+        let source =
+            Self { handle_id, source_type, source: source_inner, device_options, capture_tx };
 
         let info = proto::AudioSourceInfo::from(&source);
         server.store_handle(source.handle_id, source);

@@ -18,7 +18,7 @@ pub const DEFAULT_SAMPLE_RATE: u32 = 48000;
 /// Default number of audio channels (mono).
 pub const DEFAULT_NUM_CHANNELS: u32 = 1;
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AudioSourceOptions {
     pub echo_cancellation: bool,
     pub noise_suppression: bool,

@@ -99,7 +99,7 @@ std::shared_ptr<NativeAudioSink> new_native_audio_sink(
 class AudioTrackSource {
   class InternalSource : public webrtc::LocalAudioSource {
    public:
-    InternalSource(const webrtc::AudioOptions& options,
+    InternalSource(const AudioSourceOptions& options,
                    int sample_rate,
                    int num_channels,
                    int buffer_size_ms,
@@ -110,12 +110,14 @@ class AudioTrackSource {
     SourceState state() const override;
     bool remote() const override;
 
+    // What libwebrtc applies when this source is sent.
     const webrtc::AudioOptions options() const override;
 
     void AddSink(webrtc::AudioTrackSinkInterface* sink) override;
     void RemoveSink(webrtc::AudioTrackSinkInterface* sink) override;
 
-    void set_options(const webrtc::AudioOptions& options);
+    AudioSourceOptions requested_options() const;
+    void set_requested_options(const AudioSourceOptions& options);
 
     bool capture_frame(rust::Slice<const int16_t> audio_data,
                        uint32_t sample_rate,
@@ -150,7 +152,7 @@ class AudioTrackSource {
     int queue_size_samples_ = 0;
     int notify_threshold_samples_ = 0;
 
-    webrtc::AudioOptions options_{};
+    AudioSourceOptions requested_options_ RTC_GUARDED_BY(mutex_);
   };
 
  public:

@@ -141,8 +141,11 @@ mod tests {
 pub mod native {
     use super::PeerConnectionFactory;
     use crate::{
-        audio_source::native::NativeAudioSource, audio_track::RtcAudioTrack,
-        video_source::native::NativeVideoSource, video_track::RtcVideoTrack,
+        audio_source::{native::NativeAudioSource, AudioSourceOptions},
+        audio_track::RtcAudioTrack,
+        video_source::native::NativeVideoSource,
+        video_track::RtcVideoTrack,
+        RtcError,
     };
 
     pub trait PeerConnectionFactoryExt {
@@ -150,8 +153,14 @@ pub mod native {
         fn create_audio_track(&self, label: &str, source: NativeAudioSource) -> RtcAudioTrack;
 
         /// Create an audio track that uses the Platform ADM for capture.
-        /// The track will capture audio from the selected recording device.
-        fn create_device_audio_track(&self, label: &str) -> RtcAudioTrack;
+        /// The track will capture audio from the selected recording device, with
+        /// WebRTC's software echo canceller and noise suppressor as `options`
+        /// ask and never AGC.
+        fn create_device_audio_track(
+            &self,
+            label: &str,
+            options: &AudioSourceOptions,
+        ) -> Result<RtcAudioTrack, RtcError>;
 
         // Device enumeration
         fn playout_devices(&self) -> i16;
@@ -221,8 +230,12 @@ pub mod native {
             self.handle.create_audio_track(label, source)
         }
 
-        fn create_device_audio_track(&self, label: &str) -> RtcAudioTrack {
-            self.handle.create_device_audio_track(label)
+        fn create_device_audio_track(
+            &self,
+            label: &str,
+            options: &AudioSourceOptions,
+        ) -> Result<RtcAudioTrack, RtcError> {
+            self.handle.create_device_audio_track(label, options)
         }
 
         fn playout_devices(&self) -> i16 {

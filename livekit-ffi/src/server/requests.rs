@@ -368,13 +368,20 @@ fn on_create_audio_track(
     server: &'static FfiServer,
     create: proto::CreateAudioTrackRequest,
 ) -> FfiResult<proto::CreateAudioTrackResponse> {
-    let source = server
-        .retrieve_handle::<audio_source::FfiAudioSource>(create.source_handle)?
-        .source
-        .clone();
+    let (source, device_options) = {
+        let source =
+            server.retrieve_handle::<audio_source::FfiAudioSource>(create.source_handle)?;
+        (source.source.clone(), source.device_options)
+    };
 
+    let audio_track = match device_options {
+        Some(options) => LocalAudioTrack::create_device_audio_track(&create.name, options),
+        None => LocalAudioTrack::try_create_audio_track(&create.name, source),
+    }
+    .map_err(|e| {
+        FfiError::InvalidRequest(format!("failed to create the audio track: {e}").into())
+    })?;
     let handle_id = server.next_id();
-    let audio_track = LocalAudioTrack::create_audio_track(&create.name, source);
     let ffi_track =
         FfiTrack { handle: handle_id, track: Track::LocalAudio(audio_track), room_handle: None };
     let track_info = proto::TrackInfo::from(&ffi_track);

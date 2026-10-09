@@ -242,13 +242,20 @@ std::shared_ptr<AudioTrack> PeerConnectionFactory::create_audio_track(
           peer_factory_->CreateAudioTrack(label.c_str(), source->get().get())));
 }
 
+// The device track owns the APM settings: software processing only (an
+// automatic mode would turn on Windows' voice capture DMO when it exists),
+// AGC1 off (it targets the OS mic level), AEC and WebRTC NS as asked.
 std::shared_ptr<AudioTrack> PeerConnectionFactory::create_device_audio_track(
-    rust::String label) const {
-  // Create an audio source that uses the ADM for capture
+    rust::String label,
+    bool echo_cancellation,
+    bool noise_suppression) const {
   webrtc::AudioOptions audio_options;
-  audio_options.echo_cancellation = true;
-  audio_options.auto_gain_control = true;
-  audio_options.noise_suppression = true;
+  audio_options.echo_cancellation = echo_cancellation;
+  audio_options.echo_cancellation_mode = webrtc::AudioProcessingMode::kSoftware;
+  audio_options.auto_gain_control = false;
+  audio_options.noise_suppression = noise_suppression;
+  audio_options.noise_suppression_mode = webrtc::AudioProcessingMode::kSoftware;
+  audio_options.highpass_filter = true;
 
   webrtc::scoped_refptr<webrtc::AudioSourceInterface> audio_source =
       peer_factory_->CreateAudioSource(audio_options);
@@ -258,9 +265,15 @@ std::shared_ptr<AudioTrack> PeerConnectionFactory::create_device_audio_track(
     return nullptr;
   }
 
+  webrtc::scoped_refptr<webrtc::AudioTrackInterface> track =
+      peer_factory_->CreateAudioTrack(label.c_str(), audio_source.get());
+  if (!track) {
+    RTC_LOG(LS_ERROR) << "Failed to create device audio track";
+    return nullptr;
+  }
+
   return std::static_pointer_cast<AudioTrack>(
-      rtc_runtime_->get_or_create_media_stream_track(
-          peer_factory_->CreateAudioTrack(label.c_str(), audio_source.get())));
+      rtc_runtime_->get_or_create_media_stream_track(track));
 }
 
 RtpCapabilities PeerConnectionFactory::rtp_sender_capabilities(

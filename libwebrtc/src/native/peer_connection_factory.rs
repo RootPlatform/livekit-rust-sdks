@@ -20,7 +20,7 @@ use parking_lot::Mutex;
 use webrtc_sys::{peer_connection_factory as sys_pcf, rtc_error as sys_err, webrtc as sys_rtc};
 
 use crate::{
-    audio_source::native::NativeAudioSource,
+    audio_source::{native::NativeAudioSource, AudioSourceOptions},
     audio_track::RtcAudioTrack,
     imp::{audio_track as imp_at, peer_connection as imp_pc, video_track as imp_vt},
     peer_connection::PeerConnection,
@@ -28,7 +28,7 @@ use crate::{
     rtp_parameters::RtpCapabilities,
     video_source::native::NativeVideoSource,
     video_track::RtcVideoTrack,
-    MediaType, RtcError,
+    MediaType, RtcError, RtcErrorType,
 };
 
 struct LogSinkState {
@@ -161,14 +161,27 @@ impl PeerConnectionFactory {
 
     /// Create an audio track that uses the Platform ADM for capture.
     ///
-    /// This requires that `enable_platform_adm()` was called first.
-    /// The track will capture audio from the selected recording device.
-    pub fn create_device_audio_track(&self, label: &str) -> RtcAudioTrack {
-        RtcAudioTrack {
-            handle: imp_at::RtcAudioTrack {
-                sys_handle: self.sys_handle.create_device_audio_track(label.to_string()),
-            },
+    /// The track captures from the selected recording device and owns the
+    /// shared APM's settings: WebRTC's software echo canceller and noise
+    /// suppressor as `options` ask, the high-pass filter, and never AGC
+    /// (`options.auto_gain_control` is ignored).
+    pub fn create_device_audio_track(
+        &self,
+        label: &str,
+        options: &AudioSourceOptions,
+    ) -> Result<RtcAudioTrack, RtcError> {
+        let sys_handle = self.sys_handle.create_device_audio_track(
+            label.to_string(),
+            options.echo_cancellation,
+            options.noise_suppression,
+        );
+        if sys_handle.is_null() {
+            return Err(RtcError {
+                error_type: RtcErrorType::Internal,
+                message: "failed to create the device audio track".to_owned(),
+            });
         }
+        Ok(RtcAudioTrack { handle: imp_at::RtcAudioTrack { sys_handle } })
     }
 
     pub fn get_rtp_sender_capabilities(&self, media_type: MediaType) -> RtpCapabilities {

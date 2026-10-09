@@ -115,10 +115,13 @@ pub mod ffi {
             source: SharedPtr<AudioTrackSource>,
         ) -> SharedPtr<AudioTrack>;
 
-        // Create an audio track that uses the ADM for capture (Platform ADM mode)
+        // Create an audio track that uses the ADM for capture (Platform ADM mode).
+        // Null on failure.
         fn create_device_audio_track(
             self: &PeerConnectionFactory,
             label: String,
+            echo_cancellation: bool,
+            noise_suppression: bool,
         ) -> SharedPtr<AudioTrack>;
 
         fn rtp_sender_capabilities(

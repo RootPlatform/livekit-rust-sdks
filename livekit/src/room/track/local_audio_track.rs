@@ -50,28 +50,55 @@ impl LocalAudioTrack {
         }
     }
 
+    /// Panics if the device track can't be created; use [`Self::try_create_audio_track`] to
+    /// handle that.
     pub fn create_audio_track(name: &str, source: RtcAudioSource) -> LocalAudioTrack {
-        let rtc_track = match source.clone() {
+        Self::try_create_audio_track(name, source).expect("failed to create the audio track")
+    }
+
+    /// For `RtcAudioSource::Device` the track uses WebRTC's software echo canceller and
+    /// noise suppressor; see [`Self::create_device_audio_track`] to choose them.
+    pub fn try_create_audio_track(
+        name: &str,
+        source: RtcAudioSource,
+    ) -> Result<LocalAudioTrack, RtcError> {
+        match source {
             #[cfg(not(target_arch = "wasm32"))]
             RtcAudioSource::Native(native_source) => {
                 use libwebrtc::peer_connection_factory::native::PeerConnectionFactoryExt;
-                LkRuntime::instance()
-                    .pc_factory()
-                    .create_audio_track(&libwebrtc::native::create_random_uuid(), native_source)
+                let rtc_track = LkRuntime::instance().pc_factory().create_audio_track(
+                    &libwebrtc::native::create_random_uuid(),
+                    native_source.clone(),
+                );
+                Ok(Self::new(name.to_string(), rtc_track, RtcAudioSource::Native(native_source)))
             }
             #[cfg(not(target_arch = "wasm32"))]
-            RtcAudioSource::Device => {
-                // Create an audio track that uses the Platform ADM for capture.
-                // Use PlatformAudio::new() to enable platform audio before creating this track.
-                use libwebrtc::peer_connection_factory::native::PeerConnectionFactoryExt;
-                LkRuntime::instance()
-                    .pc_factory()
-                    .create_device_audio_track(&libwebrtc::native::create_random_uuid())
-            }
+            RtcAudioSource::Device => Self::create_device_audio_track(
+                name,
+                AudioSourceOptions {
+                    echo_cancellation: true,
+                    noise_suppression: true,
+                    auto_gain_control: false,
+                },
+            ),
             #[allow(unreachable_patterns)]
             _ => panic!("unsupported audio source"),
-        };
-        Self::new(name.to_string(), rtc_track, source)
+        }
+    }
+
+    /// Creates a track that captures from the Platform ADM's selected recording device
+    /// (create a `PlatformAudio` first). `options` choose WebRTC's software echo canceller
+    /// and noise suppressor; AGC is never used.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn create_device_audio_track(
+        name: &str,
+        options: AudioSourceOptions,
+    ) -> Result<LocalAudioTrack, RtcError> {
+        use libwebrtc::peer_connection_factory::native::PeerConnectionFactoryExt;
+        let rtc_track = LkRuntime::instance()
+            .pc_factory()
+            .create_device_audio_track(&libwebrtc::native::create_random_uuid(), &options)?;
+        Ok(Self::new(name.to_string(), rtc_track, RtcAudioSource::Device))
     }
 
     pub fn sid(&self) -> TrackSid {

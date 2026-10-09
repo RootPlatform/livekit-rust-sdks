@@ -37,22 +37,15 @@
 
 namespace livekit_ffi {
 
-inline webrtc::AudioOptions to_native_audio_options(
-    const AudioSourceOptions& options) {
+// External audio never goes through the APM, but libwebrtc applies a sender's
+// options to the one shared APM, and its SetSend opens the mic unless told not
+// to. So these sources set no processing options at all and leave the APM and
+// the mic to the device track. The requested options are only kept to be read
+// back.
+inline webrtc::AudioOptions external_source_audio_options() {
   webrtc::AudioOptions rtc_options{};
-  rtc_options.echo_cancellation = options.echo_cancellation;
-  rtc_options.noise_suppression = options.noise_suppression;
-  rtc_options.auto_gain_control = options.auto_gain_control;
+  rtc_options.init_recording_on_send = false;
   return rtc_options;
-}
-
-inline AudioSourceOptions to_rust_audio_options(
-    const webrtc::AudioOptions& rtc_options) {
-  AudioSourceOptions options{};
-  options.echo_cancellation = rtc_options.echo_cancellation.value_or(false);
-  options.noise_suppression = rtc_options.noise_suppression.value_or(false);
-  options.auto_gain_control = rtc_options.auto_gain_control.value_or(false);
-  return options;
 }
 
 AudioTrack::AudioTrack(std::shared_ptr<RtcRuntime> rtc_runtime,
@@ -130,12 +123,12 @@ std::shared_ptr<NativeAudioSink> new_native_audio_sink(
 }
 
 AudioTrackSource::InternalSource::InternalSource(
-    const webrtc::AudioOptions& options,
+    const AudioSourceOptions& options,
     int sample_rate,
     int num_channels,
     int queue_size_ms,  // must be a multiple of 10ms
     webrtc::TaskQueueFactory* task_queue_factory)
-    : options_(options),
+    : requested_options_(options),
       sample_rate_(sample_rate),
       num_channels_(num_channels),
       capture_userdata_(nullptr),
@@ -243,14 +236,18 @@ bool AudioTrackSource::InternalSource::remote() const {
 }
 
 const webrtc::AudioOptions AudioTrackSource::InternalSource::options() const {
-  webrtc::MutexLock lock(&mutex_);
-  return options_;
+  return external_source_audio_options();
 }
 
-void AudioTrackSource::InternalSource::set_options(
-    const webrtc::AudioOptions& options) {
+AudioSourceOptions AudioTrackSource::InternalSource::requested_options() const {
   webrtc::MutexLock lock(&mutex_);
-  options_ = options;
+  return requested_options_;
+}
+
+void AudioTrackSource::InternalSource::set_requested_options(
+    const AudioSourceOptions& options) {
+  webrtc::MutexLock lock(&mutex_);
+  requested_options_ = options;
 }
 
 void AudioTrackSource::InternalSource::AddSink(
@@ -270,20 +267,19 @@ AudioTrackSource::AudioTrackSource(AudioSourceOptions options,
                                    int num_channels,
                                    int queue_size_ms,
                                    webrtc::TaskQueueFactory* task_queue_factory)
-    : source_(webrtc::make_ref_counted<InternalSource>(
-          to_native_audio_options(options),
-          sample_rate,
-          num_channels,
-          queue_size_ms,
-          task_queue_factory)) {}
+    : source_(webrtc::make_ref_counted<InternalSource>(options,
+                                                       sample_rate,
+                                                       num_channels,
+                                                       queue_size_ms,
+                                                       task_queue_factory)) {}
 
 AudioSourceOptions AudioTrackSource::audio_options() const {
-  return to_rust_audio_options(source_->options());
+  return source_->requested_options();
 }
 
 void AudioTrackSource::set_audio_options(
     const AudioSourceOptions& options) const {
-  source_->set_options(to_native_audio_options(options));
+  source_->set_requested_options(options);
 }
 
 bool AudioTrackSource::capture_frame(
