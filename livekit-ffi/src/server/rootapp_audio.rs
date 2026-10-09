@@ -100,7 +100,9 @@ struct TrackGain {
 
 #[derive(Default)]
 struct SessionState {
-    closed: bool,
+    /// None once the handle is dropped, so this session never keeps the ADM
+    /// referenced past the host's dispose.
+    audio: Option<PlatformAudio>,
     gains: HashMap<FfiHandleId, TrackGain>,
     resolve_passes: u32,
 }
@@ -109,7 +111,6 @@ struct SessionState {
 /// task that turns native state into `RootAudioEvent`s.
 pub struct RootAudioSession {
     handle: FfiHandleId,
-    audio: PlatformAudio,
     state: Mutex<SessionState>,
     resolving: AtomicBool,
 }
@@ -124,8 +125,7 @@ impl RootAudioSession {
     ) -> Arc<Self> {
         let session = Arc::new(Self {
             handle,
-            audio,
-            state: Mutex::new(SessionState::default()),
+            state: Mutex::new(SessionState { audio: Some(audio), ..Default::default() }),
             resolving: AtomicBool::new(false),
         });
         let dropped = server.watch_handle_dropped(handle);
@@ -135,16 +135,14 @@ impl RootAudioSession {
     }
 
     /// The handle was dropped: controls go back to their defaults so the next
-    /// PlatformAudio starts clean, and nothing this session resolves later is
-    /// applied.
+    /// PlatformAudio starts clean, the session lets go of its PlatformAudio,
+    /// and nothing it resolves later is applied.
     pub fn end(&self) {
         let mut state = self.state.lock();
-        if state.closed {
-            return;
-        }
-        state.closed = true;
         state.gains.clear();
-        self.audio.reset_rootapp_controls();
+        if let Some(audio) = state.audio.take() {
+            audio.reset_rootapp_controls();
+        }
     }
 
     async fn run(
@@ -161,7 +159,10 @@ impl RootAudioSession {
                 _ = &mut dropped => break,
                 _ = interval.tick() => {}
             }
-            let format = self.audio.capture_format();
+            let Some(format) = self.state.lock().audio.as_ref().map(PlatformAudio::capture_format)
+            else {
+                break;
+            };
             if format.seq != last_format_seq {
                 last_format_seq = format.seq;
                 send_root_audio_event(
@@ -238,10 +239,11 @@ impl RootAudioSession {
     }
 
     fn set_ssrc(&self, handle: FfiHandleId, (ssrc, from_stats): (u32, bool)) {
-        let mut state = self.state.lock();
-        if state.closed {
+        let mut guard = self.state.lock();
+        let state = &mut *guard;
+        let Some(audio) = state.audio.as_ref() else {
             return;
-        }
+        };
         let Some(gain) = state.gains.get_mut(&handle) else {
             return;
         };
@@ -252,27 +254,17 @@ impl RootAudioSession {
             return;
         }
         if let Some(previous) = previous {
-            self.clear_if_unused(&state, previous);
+            clear_if_unused(audio, &state.gains, previous);
         }
-        self.apply(ssrc, tile, paused);
+        apply_gain(audio, ssrc, tile, paused);
     }
 
     fn forget(&self, handle: FfiHandleId) {
-        let mut state = self.state.lock();
-        if let Some(ssrc) = state.gains.remove(&handle).and_then(|gain| gain.ssrc) {
-            self.clear_if_unused(&state, ssrc);
-        }
-    }
-
-    fn clear_if_unused(&self, state: &SessionState, ssrc: u32) {
-        if !state.closed && !state.gains.values().any(|gain| gain.ssrc == Some(ssrc)) {
-            self.audio.clear_source_gain(ssrc);
-        }
-    }
-
-    fn apply(&self, ssrc: u32, tile: f32, paused: bool) {
-        if !self.audio.set_source_gain(ssrc, tile, paused) {
-            log::warn!("RootAudio: the mixer's gain table is full; ssrc {ssrc} plays at tile 1");
+        let mut guard = self.state.lock();
+        let state = &mut *guard;
+        let ssrc = state.gains.remove(&handle).and_then(|gain| gain.ssrc);
+        if let (Some(audio), Some(ssrc)) = (state.audio.as_ref(), ssrc) {
+            clear_if_unused(audio, &state.gains, ssrc);
         }
     }
 
@@ -282,10 +274,11 @@ impl RootAudioSession {
         &self,
         gains: Vec<(FfiHandleId, RemoteAudioTrack, f32, Option<bool>)>,
     ) -> Result<Vec<FfiHandleId>, ()> {
-        let mut state = self.state.lock();
-        if state.closed {
+        let mut guard = self.state.lock();
+        let state = &mut *guard;
+        let Some(audio) = state.audio.as_ref() else {
             return Err(());
-        }
+        };
         let mut unresolved = Vec::new();
         for (handle, track, tile, paused) in gains {
             let gain = state.gains.entry(handle).or_insert_with(|| TrackGain {
@@ -300,14 +293,23 @@ impl RootAudioSession {
                 gain.paused = paused;
             }
             match gain.ssrc {
-                Some(ssrc) => {
-                    let (tile, paused) = (gain.tile, gain.paused);
-                    self.apply(ssrc, tile, paused);
-                }
+                Some(ssrc) => apply_gain(audio, ssrc, gain.tile, gain.paused),
                 None => unresolved.push(handle),
             }
         }
         Ok(unresolved)
+    }
+}
+
+fn clear_if_unused(audio: &PlatformAudio, gains: &HashMap<FfiHandleId, TrackGain>, ssrc: u32) {
+    if !gains.values().any(|gain| gain.ssrc == Some(ssrc)) {
+        audio.clear_source_gain(ssrc);
+    }
+}
+
+fn apply_gain(audio: &PlatformAudio, ssrc: u32, tile: f32, paused: bool) {
+    if !audio.set_source_gain(ssrc, tile, paused) {
+        log::warn!("RootAudio: the mixer's gain table is full; ssrc {ssrc} plays at tile 1");
     }
 }
 
