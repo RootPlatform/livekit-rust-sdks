@@ -20,6 +20,8 @@
 
 #include "api/scoped_refptr.h"
 #include "livekit/adm_proxy.h"
+#include "livekit/root_audio_mixer.h"
+#include "livekit/root_audio_processing.h"
 #include "rust/cxx.h"
 
 namespace livekit_ffi {
@@ -28,6 +30,9 @@ class AdmProxyHarness;
 struct AudioDeviceSelection;
 struct AudioDeviceRequestOutcome;
 struct RootAudioNativeStats;
+struct RootAudioControlUpdate;
+struct RootAudioCaptureFormat;
+struct RootControlState;
 }  // namespace livekit_ffi
 #include "webrtc-sys/src/audio_device_controller.rs.h"
 
@@ -39,6 +44,11 @@ AudioDeviceRequestOutcome ToRequestOutcome(const AdmRequestOutcome& outcome);
 class AudioDeviceController {
  public:
   explicit AudioDeviceController(webrtc::scoped_refptr<AdmProxy> adm_proxy);
+  // The native audio engine's pieces; any of them may be null (mobile, tests).
+  AudioDeviceController(webrtc::scoped_refptr<AdmProxy> adm_proxy,
+                        webrtc::scoped_refptr<RootAudioMixer> mixer,
+                        webrtc::scoped_refptr<RootApmDecorator> apm,
+                        std::shared_ptr<RootCaptureState> capture);
 
   // Device enumeration
   int16_t playout_devices() const;
@@ -66,6 +76,23 @@ class AudioDeviceController {
                        rust::Box<AudioDeviceRequestCallback> callback) const;
   void set_playout_hold(bool hold) const;
   RootAudioNativeStats root_audio_stats() const;
+
+  // Live control of the native audio engine; values arrive sanitised and are
+  // clamped again here. Never blocks on an audio thread or the APM.
+  void set_root_audio_control(const RootAudioControlUpdate& control) const;
+  bool set_root_audio_source_gain(uint32_t ssrc,
+                                  float tile_volume,
+                                  bool paused) const;
+  void clear_root_audio_source_gain(uint32_t ssrc) const;
+  bool register_root_audio_effect(uint32_t id,
+                                  rust::Slice<const int16_t> samples) const;
+  // 0 queued, 1 unknown clip, 2 dropped, 3 idle.
+  uint8_t play_root_audio_effect(uint32_t id, float gain) const;
+  void stop_root_audio_effects() const;
+  RootAudioCaptureFormat root_audio_capture_format() const;
+  // Controls back to their defaults (gate open, unity volumes, no gains or
+  // effects, AEC/NS following the device track).
+  void reset_root_audio() const;
 
   // Recording control. On desktop start/stop are the app's own request, apart
   // from libwebrtc's; init does nothing (devices open on start).
@@ -104,6 +131,9 @@ class AudioDeviceController {
 
  private:
   webrtc::scoped_refptr<AdmProxy> adm_proxy_;
+  webrtc::scoped_refptr<RootAudioMixer> mixer_;
+  webrtc::scoped_refptr<RootApmDecorator> apm_;
+  std::shared_ptr<RootCaptureState> capture_;
 };
 
 int32_t resolve_audio_device_index_for_test(
@@ -182,8 +212,16 @@ class AdmProxyHarness {
 
   RootAudioNativeStats stats() const;
 
+  // The engine controls behind the controller (no APM in the harness).
+  bool mixer_platform_active() const;
+  void apply_control(const RootAudioControlUpdate& control) const;
+  void reset_root_audio() const;
+  RootControlState control_state() const;
+
  private:
   webrtc::scoped_refptr<FakePlatformAdm> fake_;
+  webrtc::scoped_refptr<RootAudioMixer> mixer_;
+  std::shared_ptr<RootCaptureState> capture_;
   webrtc::scoped_refptr<AdmProxy> proxy_;
   std::unique_ptr<AudioDeviceController> controller_;
   std::unique_ptr<HarnessTransport> transport_;

@@ -56,6 +56,7 @@ fn main() {
         "src/apm.rs",
         "src/audio_mixer.rs",
         "src/root_audio_mixer.rs",
+        "src/root_audio_processing.rs",
         "src/packet_trailer.rs",
     ];
 
@@ -94,6 +95,7 @@ fn main() {
         "src/adm_proxy_harness.cpp",
         "src/audio_thread.cpp",
         "src/root_audio_mixer.cpp",
+        "src/root_audio_processing.cpp",
         "src/audio_resampler.cpp",
         "src/frame_cryptor.cpp",
         "src/global_task_queue.cpp",

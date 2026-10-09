@@ -83,12 +83,77 @@ pub mod ffi {
         pub mix_ssrcs: Vec<u32>,
         pub mix_out_sumsq: f64,
         pub mix_out_samples: u64,
+        pub effects_played: u64,
+        pub effects_dropped: u64,
+        pub processed_frames: u64,
+        pub process_rate: u32,
+        pub process_channels: u32,
+        pub apm_out_sumsq: f64,
+        pub sent_sumsq: f64,
+        pub stage_samples: u64,
+        pub erl_db: f64,
+        pub erle_db: f64,
+        pub aec_delay_ms: i32,
+        pub divergent_filter_fraction: f64,
         pub echo_cancellation_active: bool,
         pub webrtc_ns_active: bool,
         pub audio_thread_lock_violations: u64,
         pub audio_thread_logs_dropped: u64,
         pub overlapping_callbacks: u64,
         pub device_stop_failures: u64,
+    }
+
+    /// One RootAudioControl; `has_*` marks the fields to change.
+    #[derive(Debug, Clone, Copy, Default, PartialEq)]
+    pub struct RootAudioControlUpdate {
+        pub has_mic_muted: bool,
+        pub mic_muted: bool,
+        pub has_push_to_talk: bool,
+        pub push_to_talk: u32,
+        pub has_input_volume: bool,
+        pub input_volume: f32,
+        pub has_master_volume: bool,
+        pub master_volume: f32,
+        pub has_deafened: bool,
+        pub deafened: bool,
+        pub has_echo_cancellation: bool,
+        pub echo_cancellation: bool,
+        pub has_noise_suppression: bool,
+        pub noise_suppression: bool,
+        pub has_denoise_power: bool,
+        pub denoise_power: f32,
+        pub has_auto_gain: bool,
+        pub auto_gain: bool,
+        pub has_gate_threshold: bool,
+        pub gate_threshold: f32,
+        pub has_auto_sensitivity: bool,
+        pub auto_sensitivity: bool,
+        pub has_gain_reset_db: bool,
+        pub gain_reset_db: f32,
+    }
+
+    /// The stored controls (tests).
+    #[derive(Debug, Clone, Copy, Default, PartialEq)]
+    pub struct RootControlState {
+        pub mic_muted: bool,
+        pub push_to_talk: u32,
+        pub input_volume: f32,
+        pub denoise_power: f32,
+        pub auto_gain: bool,
+        pub gate_threshold: f32,
+        pub auto_sensitivity: bool,
+        pub gain_reset_db: f32,
+        pub gain_reset_seq: u64,
+        pub master_volume: f32,
+        pub deafened: bool,
+    }
+
+    /// What the capture post-processor runs at; `seq` moves on every change.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct RootAudioCaptureFormat {
+        pub seq: u64,
+        pub sample_rate: u32,
+        pub channels: u32,
     }
 
     unsafe extern "C++" {
@@ -129,6 +194,22 @@ pub mod ffi {
         );
         fn set_playout_hold(self: &AudioDeviceController, hold: bool);
         fn root_audio_stats(self: &AudioDeviceController) -> RootAudioNativeStats;
+
+        fn set_root_audio_control(self: &AudioDeviceController, control: &RootAudioControlUpdate);
+        fn set_root_audio_source_gain(
+            self: &AudioDeviceController,
+            ssrc: u32,
+            tile_volume: f32,
+            paused: bool,
+        ) -> bool;
+        fn clear_root_audio_source_gain(self: &AudioDeviceController, ssrc: u32);
+        fn register_root_audio_effect(self: &AudioDeviceController, id: u32, samples: &[i16])
+            -> bool;
+        /// 0 queued, 1 unknown clip, 2 dropped (queue full), 3 idle (no platform audio).
+        fn play_root_audio_effect(self: &AudioDeviceController, id: u32, gain: f32) -> u8;
+        fn stop_root_audio_effects(self: &AudioDeviceController);
+        fn root_audio_capture_format(self: &AudioDeviceController) -> RootAudioCaptureFormat;
+        fn reset_root_audio(self: &AudioDeviceController);
 
         fn stop_recording(self: &AudioDeviceController) -> bool;
         fn init_recording(self: &AudioDeviceController) -> bool;
@@ -221,6 +302,10 @@ pub mod ffi {
         fn device_callback(self: &AdmProxyHarness, capture: bool, reenter: bool) -> u32;
         fn lock_on_audio_thread(self: &AdmProxyHarness) -> u64;
         fn stats(self: &AdmProxyHarness) -> RootAudioNativeStats;
+        fn mixer_platform_active(self: &AdmProxyHarness) -> bool;
+        fn apply_control(self: &AdmProxyHarness, control: &RootAudioControlUpdate);
+        fn reset_root_audio(self: &AdmProxyHarness);
+        fn control_state(self: &AdmProxyHarness) -> RootControlState;
     }
 
     extern "Rust" {

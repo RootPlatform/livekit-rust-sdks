@@ -24,7 +24,7 @@ use cxx::UniquePtr;
 use crate::audio_device_controller::{
     ffi::{
         new_adm_proxy_harness, AdmProxyHarness, AudioDeviceOutcome, AudioDeviceSelection,
-        AudioDeviceSelectionKind,
+        AudioDeviceSelectionKind, RootAudioControlUpdate,
     },
     ADM_RESULT_DEVICE_NOT_FOUND, ADM_RESULT_NOT_ATTEMPTED,
 };
@@ -357,4 +357,92 @@ fn adm_proxy_counts_locks_taken_on_audio_threads() {
     let h = platform(&["{spk}"], &["{mic}"]);
     assert_eq!(h.lock_on_audio_thread(), 1);
     assert!(h.stats().audio_thread_lock_violations >= 1);
+}
+
+#[test]
+fn adm_proxy_turns_the_mixers_gains_on_with_the_first_reference() {
+    let h = harness(&["{spk}"], &["{mic}"]);
+    assert!(!h.mixer_platform_active());
+    h.acquire();
+    assert!(h.mixer_platform_active(), "before the device thread's pass");
+    h.acquire();
+    h.release();
+    assert!(h.mixer_platform_active());
+    h.release();
+    assert!(!h.mixer_platform_active());
+}
+
+#[test]
+fn adm_proxy_controller_applies_only_the_fields_that_are_set() {
+    let h = harness(&["{spk}"], &["{mic}"]);
+    let before = h.control_state();
+    h.apply_control(&RootAudioControlUpdate {
+        has_mic_muted: true,
+        mic_muted: true,
+        has_master_volume: true,
+        master_volume: 0.5,
+        ..Default::default()
+    });
+    let after = h.control_state();
+    assert!(after.mic_muted);
+    assert_eq!(after.master_volume, 0.5);
+    assert_eq!(after.push_to_talk, before.push_to_talk);
+    assert_eq!(after.input_volume, before.input_volume);
+    assert_eq!(after.deafened, before.deafened);
+    assert_eq!(after.gain_reset_seq, before.gain_reset_seq);
+}
+
+#[test]
+fn adm_proxy_controller_clamps_what_reaches_the_audio_threads() {
+    let h = harness(&["{spk}"], &["{mic}"]);
+    h.apply_control(&RootAudioControlUpdate {
+        has_push_to_talk: true,
+        push_to_talk: 9,
+        has_input_volume: true,
+        input_volume: f32::NAN,
+        has_master_volume: true,
+        master_volume: 50.0,
+        has_deafened: true,
+        deafened: true,
+        has_denoise_power: true,
+        denoise_power: 4.0,
+        has_gate_threshold: true,
+        gate_threshold: -1.0,
+        has_gain_reset_db: true,
+        gain_reset_db: 99.0,
+        has_auto_gain: true,
+        auto_gain: false,
+        has_auto_sensitivity: true,
+        auto_sensitivity: false,
+        ..Default::default()
+    });
+    let state = h.control_state();
+    assert_eq!(state.push_to_talk, 2, "an unknown state closes the gate");
+    assert_eq!(state.input_volume, 0.0);
+    assert_eq!(state.master_volume, 2.0);
+    assert!(state.deafened);
+    assert_eq!((state.denoise_power, state.gate_threshold), (1.0, 0.0));
+    assert_eq!((state.gain_reset_db, state.gain_reset_seq), (18.0, 1));
+    assert!(!state.auto_gain && !state.auto_sensitivity);
+
+    h.apply_control(&RootAudioControlUpdate {
+        has_gain_reset_db: true,
+        gain_reset_db: f32::INFINITY,
+        ..Default::default()
+    });
+    assert_eq!(h.control_state().gain_reset_seq, 1, "a non-finite command is dropped");
+
+    h.reset_root_audio();
+    let state = h.control_state();
+    assert!(!state.mic_muted && !state.deafened);
+    assert_eq!((state.push_to_talk, state.input_volume, state.master_volume), (0, 1.0, 1.0));
+}
+
+#[test]
+fn adm_proxy_stats_report_unknown_echo_statistics_without_an_apm() {
+    let h = harness(&["{spk}"], &["{mic}"]);
+    let stats = h.stats();
+    assert!(stats.erl_db.is_nan() && stats.erle_db.is_nan());
+    assert!(stats.divergent_filter_fraction.is_nan());
+    assert_eq!((stats.processed_frames, stats.effects_played), (0, 0));
 }

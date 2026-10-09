@@ -17,6 +17,8 @@
 #include "livekit/audio_device_controller.h"
 
 #include <algorithm>
+#include <cmath>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -79,6 +81,16 @@ AdmDeviceSelection ToAdmSelection(const AudioDeviceSelection& selection) {
 AudioDeviceController::AudioDeviceController(
     webrtc::scoped_refptr<AdmProxy> adm_proxy)
     : adm_proxy_(std::move(adm_proxy)) {}
+
+AudioDeviceController::AudioDeviceController(
+    webrtc::scoped_refptr<AdmProxy> adm_proxy,
+    webrtc::scoped_refptr<RootAudioMixer> mixer,
+    webrtc::scoped_refptr<RootApmDecorator> apm,
+    std::shared_ptr<RootCaptureState> capture)
+    : adm_proxy_(std::move(adm_proxy)),
+      mixer_(std::move(mixer)),
+      apm_(std::move(apm)),
+      capture_(std::move(capture)) {}
 
 int16_t AudioDeviceController::playout_devices() const {
   return adm_proxy_->PlayoutDevices();
@@ -279,13 +291,156 @@ RootAudioNativeStats AudioDeviceController::root_audio_stats() const {
   }
   stats.mix_out_sumsq = native.mix_out_sumsq;
   stats.mix_out_samples = native.mix_out_samples;
+  stats.effects_played = native.effects_played;
+  stats.effects_dropped = native.effects_dropped;
   stats.echo_cancellation_active = native.echo_cancellation;
   stats.webrtc_ns_active = native.noise_suppression;
   stats.audio_thread_lock_violations = native.audio_thread_lock_violations;
   stats.audio_thread_logs_dropped = native.audio_thread_logs_dropped;
   stats.overlapping_callbacks = native.overlapping_callbacks;
   stats.device_stop_failures = native.device_stop_failures;
+
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+  stats.erl_db = nan;
+  stats.erle_db = nan;
+  stats.divergent_filter_fraction = nan;
+  if (apm_) {
+    const RootApmStats apm = apm_->ReadStats();
+    stats.erl_db = apm.erl_db;
+    stats.erle_db = apm.erle_db;
+    stats.aec_delay_ms = apm.delay_ms;
+    stats.divergent_filter_fraction = apm.divergent_filter_fraction;
+    stats.echo_cancellation_active = apm.echo_cancellation_active;
+    stats.webrtc_ns_active = apm.noise_suppression_active;
+  }
+  if (capture_) {
+    const RootCaptureFormatSnapshot format = ReadCaptureFormat(*capture_);
+    stats.process_rate = format.sample_rate;
+    stats.process_channels = format.channels;
+    stats.processed_frames =
+        capture_->processed_frames.load(std::memory_order_relaxed);
+    stats.apm_out_sumsq = capture_->apm_out_sumsq.load(std::memory_order_relaxed);
+    stats.sent_sumsq = capture_->sent_sumsq.load(std::memory_order_relaxed);
+    stats.stage_samples =
+        capture_->stage_samples.load(std::memory_order_relaxed);
+  }
   return stats;
+}
+
+void AudioDeviceController::set_root_audio_control(
+    const RootAudioControlUpdate& control) const {
+  auto unit = [](float value) {
+    return std::isnan(value) ? 0.0f : std::min(1.0f, std::max(0.0f, value));
+  };
+  if (capture_) {
+    if (control.has_mic_muted) {
+      capture_->mic_muted.store(control.mic_muted, std::memory_order_relaxed);
+    }
+    if (control.has_push_to_talk) {
+      capture_->push_to_talk.store(
+          std::min<uint32_t>(control.push_to_talk,
+                             static_cast<uint32_t>(RootPushToTalk::kReleased)),
+          std::memory_order_relaxed);
+    }
+    if (control.has_input_volume) {
+      capture_->input_volume.store(RootClampVolume(control.input_volume),
+                                   std::memory_order_relaxed);
+    }
+    if (control.has_denoise_power) {
+      capture_->denoise_power.store(unit(control.denoise_power),
+                                    std::memory_order_relaxed);
+    }
+    if (control.has_auto_gain) {
+      capture_->auto_gain.store(control.auto_gain, std::memory_order_relaxed);
+    }
+    if (control.has_gate_threshold) {
+      capture_->gate_threshold.store(unit(control.gate_threshold),
+                                     std::memory_order_relaxed);
+    }
+    if (control.has_auto_sensitivity) {
+      capture_->auto_sensitivity.store(control.auto_sensitivity,
+                                       std::memory_order_relaxed);
+    }
+    if (control.has_gain_reset_db && std::isfinite(control.gain_reset_db)) {
+      capture_->gain_reset_db.store(
+          std::min(kRootMaxVoiceGainDb, std::max(0.0f, control.gain_reset_db)),
+          std::memory_order_relaxed);
+      capture_->gain_reset_seq.fetch_add(1, std::memory_order_release);
+    }
+  }
+  if (mixer_) {
+    if (control.has_master_volume) {
+      mixer_->SetMasterVolume(control.master_volume);
+    }
+    if (control.has_deafened) {
+      mixer_->SetDeafened(control.deafened);
+    }
+  }
+  if (apm_ && (control.has_echo_cancellation || control.has_noise_suppression)) {
+    apm_->SetPolicy(control.has_echo_cancellation
+                        ? std::optional<bool>(control.echo_cancellation)
+                        : std::nullopt,
+                    control.has_noise_suppression
+                        ? std::optional<bool>(control.noise_suppression)
+                        : std::nullopt);
+  }
+}
+
+bool AudioDeviceController::set_root_audio_source_gain(uint32_t ssrc,
+                                                       float tile_volume,
+                                                       bool paused) const {
+  return mixer_ && mixer_->SetSourceGain(ssrc, tile_volume, paused);
+}
+
+void AudioDeviceController::clear_root_audio_source_gain(uint32_t ssrc) const {
+  if (mixer_) {
+    mixer_->ClearSourceGain(ssrc);
+  }
+}
+
+bool AudioDeviceController::register_root_audio_effect(
+    uint32_t id,
+    rust::Slice<const int16_t> samples) const {
+  return mixer_ &&
+         mixer_->RegisterEffectClip(id, samples.data(), samples.size());
+}
+
+uint8_t AudioDeviceController::play_root_audio_effect(uint32_t id,
+                                                      float gain) const {
+  if (!mixer_) {
+    return static_cast<uint8_t>(RootEffectPlay::kIdle);
+  }
+  return static_cast<uint8_t>(mixer_->PlayEffect(id, gain));
+}
+
+void AudioDeviceController::stop_root_audio_effects() const {
+  if (mixer_) {
+    mixer_->StopEffects();
+  }
+}
+
+RootAudioCaptureFormat AudioDeviceController::root_audio_capture_format()
+    const {
+  RootAudioCaptureFormat format{};
+  if (capture_) {
+    const RootCaptureFormatSnapshot snapshot = ReadCaptureFormat(*capture_);
+    format.seq = snapshot.seq;
+    format.sample_rate = snapshot.sample_rate;
+    format.channels = snapshot.channels;
+  }
+  return format;
+}
+
+void AudioDeviceController::reset_root_audio() const {
+  if (capture_) {
+    capture_->ResetControls();
+  }
+  if (mixer_) {
+    mixer_->ResetControls();
+  }
+  if (apm_) {
+    apm_->ResetPolicy();
+  }
 }
 
 #if LK_ADM_MOBILE

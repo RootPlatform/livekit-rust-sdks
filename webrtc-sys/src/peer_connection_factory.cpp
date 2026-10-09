@@ -39,6 +39,7 @@
 #include "livekit/audio_track.h"
 #include "livekit/peer_connection.h"
 #include "livekit/root_audio_mixer.h"
+#include "livekit/root_audio_processing.h"
 #include "livekit/rtc_error.h"
 #include "livekit/rtp_parameters.h"
 #include "livekit/video_decoder_factory.h"
@@ -184,7 +185,21 @@ PeerConnectionFactory::PeerConnectionFactory(
     return webrtc::make_ref_counted<livekit_ffi::AdmProxy>(
         env_, rtc_runtime_->worker_thread(), audio_mixer_);
   });
-  audio_device_ = std::make_shared<AudioDeviceController>(adm_proxy_);
+
+#if !LK_ADM_MOBILE
+  // Our APM: the capture post-processor (mute/PTT gate, input volume, levels)
+  // behind a decorator that owns the AGC/HPF/AEC/NS policy. Mobile keeps
+  // libwebrtc's own APM and its platform voice processing.
+  capture_state_ = std::make_shared<RootCaptureState>();
+  apm_ = CreateRootAudioProcessing(env_, capture_state_,
+                                   rtc_runtime_->worker_thread());
+  if (!apm_) {
+    RTC_LOG(LS_ERROR) << "Failed to build the RootApp audio processing";
+    capture_state_ = nullptr;
+  }
+#endif
+  audio_device_ = std::make_shared<AudioDeviceController>(
+      adm_proxy_, audio_mixer_, apm_, capture_state_);
 
   dependencies.adm = adm_proxy_;
   dependencies.audio_mixer = audio_mixer_;
@@ -195,7 +210,12 @@ PeerConnectionFactory::PeerConnectionFactory(
       std::move(std::make_unique<livekit_ffi::VideoDecoderFactory>());
   dependencies.audio_encoder_factory = webrtc::CreateBuiltinAudioEncoderFactory();
   dependencies.audio_decoder_factory = webrtc::CreateBuiltinAudioDecoderFactory();
-  dependencies.audio_processing_builder = std::make_unique<webrtc::BuiltinAudioProcessingBuilder>();
+  if (apm_) {
+    dependencies.audio_processing_builder = webrtc::CustomAudioProcessing(apm_);
+  } else {
+    dependencies.audio_processing_builder =
+        std::make_unique<webrtc::BuiltinAudioProcessingBuilder>();
+  }
 
   webrtc::EnableMedia(dependencies);
   peer_factory_ =
