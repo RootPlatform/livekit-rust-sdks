@@ -761,25 +761,52 @@ What changes for every user of the library on Windows, macOS and Linux, the mana
 
 - `AdmProxy` records the desired device state and one `audio-device` thread (COM MTA on Windows)
   applies it; the worker and FFI callers never wait for a device. `PlayoutDelay`, `Playing`,
-  `Recording`, `*IsInitialized` and `BuiltIn*IsAvailable` read atomics.
+  `Recording`, `*IsInitialized` and `BuiltIn*IsAvailable` read atomics. `PlayoutDelay` is 0 unless
+  the platform device plays.
 - Recording opens only on `StartRecording`, i.e. for a device track's send stream; stop-on-mute is
   off and `SetMicrophoneMute` is a no-op (on Windows it is the system-wide endpoint mute). Built-in
   AEC/AGC/NS (Windows' voice capture DMO) are off and refused.
+- `PlatformAudio`'s own start/stop (`start_recording`, `AudioDeviceController::start_playout`, ...)
+  are separate requests: a device runs while libwebrtc or the app asks for it, so neither switches
+  off what the other started. `switch_*_device` is a selection change.
 - The device selection is stored as {default | GUID | name} and applied before every open; default
-  is the console role on Windows. A device that is not present fails the open instead of falling
-  back to index 0. libwebrtc's own engine-init selection (the communications role) is ignored.
+  is the console role on Windows. A device that is not present fails the open (result -10000, a
+  value no ADM returns) instead of falling back to index 0. libwebrtc's own engine-init selection
+  (the communications role) is ignored.
 - Playout runs while libwebrtc plays or the app holds it (`RootAudioSetPlayoutHold`).
-- The device track uses software AEC and NS as asked, AGC off and the high-pass filter; external
-  (`NativeAudioSource`) tracks set no processing options and never initialize the mic.
+- A device that fails to stop (the Windows ADM gives up joining its render or capture thread after
+  2 s and leaks it) gets no second puller or recorder in that pass; the direction is retried a
+  second later and the request reports the stop error.
+- One render and one capture callback reach libwebrtc at a time, the synthetic pump included; one
+  that starts while another is in flight (a leaked device thread) gets silence, as does a second
+  concurrent `RootAudioMixer::Mix`.
+- On desktop the device track uses software AEC and NS as asked, AGC off and the high-pass filter
+  (mobile keeps its platform voice processing and AGC); external (`NativeAudioSource`) tracks set no
+  processing options and never initialize the mic.
 - `RootAudioMixer` replaces `AudioMixerImpl`: fixed 48 kHz, no limiter, float mix, soft clip.
-- A transport tap counts the platform ADM's callbacks (`RootAudioStats`, `GetStats`), and
-  libwebrtc log lines raised on device threads are dropped.
+- A transport tap counts the platform ADM's callbacks (`RootAudioStats`; `GetStats` only while
+  platform audio is in use). In every build, locks taken and libwebrtc log lines raised (and
+  dropped) on device threads are counted; `RootAudioStats` fields 70-73 report them with the
+  overlapping callbacks and failed stops.
 
-Tests that need no device: `cargo test -p webrtc-sys --lib -- root_audio device_selection`,
-`cargo test -p livekit --lib platform_audio::rootapp` and `cargo test -p livekit-ffi --lib
-rootapp_audio`. `test_audio_device_controller_bridge` and `test_new_platform_audio` create the
-platform ADM and run only with `LK_HW_AUDIO_TESTS=1`; `livekit/tests/platform_audio_test.rs` still
-opens real devices.
+`echo_cancellation_active` and `webrtc_ns_active` report what the newest device track asked of the
+APM until the APM decorator reads its real state.
+
+Known limit (libwebrtc prebuilt): `external_audio_source.patch` as built into the pinned prebuilt
+never clears `sending_` in `Stop()`, and `StoreEncoderProperties` still registers a sending external
+stream with AudioState when its send codec changes (format, payload type or RED). That stream would
+then get the mic's audio, and after unpublish AudioState would keep a pointer to the deleted
+stream. The patch in this repo fixes both, but only a libwebrtc built from it has the fix. Until
+then: a published audio track's codec options (RED, DTX, stereo) never change in place (they are
+fixed at publish; stereo munging is keyed to the track id in every offer), and `RtpSender` refuses
+`set_track` and inactive encodings on audio senders (unpublish and republish instead).
+
+Tests that need no device: `cargo test -p webrtc-sys --lib -- adm_proxy root_audio
+device_selection` (AdmProxy over a fake platform ADM that records its calls), `cargo test -p
+libwebrtc --lib imp::rtp_sender`, `cargo test -p livekit --lib platform_audio` and `cargo test -p
+livekit-ffi --lib rootapp_audio`. Every test that creates the platform ADM
+(`test_audio_device_controller_bridge`, `test_new_platform_audio`, the device tests in
+`livekit/tests/platform_audio_test.rs`) runs only with `LK_HW_AUDIO_TESTS=1`.
 
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
@@ -804,7 +831,7 @@ opens real devices.
 | `rootapp/fx3` | MF encoder upload ring never blocks in `Map` (fence-gated slots, grows to 5, then a fence wait outside the device lock); `D3D11GpuFence` in `mf_gpu_fence.h` with a WARP test; MF decoder teardown on the deferred release thread; a release run needs all six RIDs and refuses a tag, or a draft, that points at another commit |
 | `rootapp/fx4-tokio` | FFI tokio runtime capped at 8 workers, `LK_FFI_WORKER_THREADS` override (see Tokio runtime size). Later: simulcast encodings lowest-first, periodic ALR probing, start bitrate through `SetBitrate` once per PeerConnection with a max that follows the published video (see Start bitrate), MF sessions counted until their delayed release with the D3D11 device kept alive that long, unpublished senders' streams left out of offers (see Unpublish and the publisher SDP), libwebrtc log levels and `LK_FFI_LOG_LEVEL` (see Logging), each video codec listed once by the codec factories |
 | `rootapp/fx4-dev` | Windows exports `livekit_ffi_d3d11_acquire_shared_device` / `_release_shared_device`, so the desktop's screen capture runs on the codecs' shared D3D11 device; the shared device is created without the driver's internal threading optimizations (`LK_MF_D3D11_DRIVER_THREADING=on` restores them). See "Sharing the D3D11 device with the host" |
-| `rootapp/native-platform-audio` | Native call audio, Phase 0: `rootapp_audio.proto`, `AdmProxy` on a device thread with stored selection, playout hold, restart and a transport tap, `RootAudioMixer`, explicit device-track options, external sources off the APM and mic, `livekit_ffi_rootapp_audio_caps`. See "Native call audio" |
+| `rootapp/native-platform-audio` | Native call audio, Phase 0: `rootapp_audio.proto`, `AdmProxy` on a device thread with stored selection, playout hold, restart and a transport tap, `RootAudioMixer`, explicit device-track options, external sources off the APM and mic, `livekit_ffi_rootapp_audio_caps`. Review fixes: one mix and one render/capture callback at a time, no second puller after a failed device stop, the app's start/stop apart from libwebrtc's, real-time rule counters in every build, AdmProxy tests over a fake platform ADM. See "Native call audio" |
 
 `rootapp/fx-session` adds: unpublishing a video track releases its encoder (see above);
 received I420 frames whose planes are already packed are handed to the FFI handle without a
