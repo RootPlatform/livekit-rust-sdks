@@ -14,17 +14,28 @@
 
 //! FFI bindings for PlatformAudio device management.
 
+use std::sync::Arc;
+
 use livekit::{PlatformAudio, PlayoutDeviceId, RecordingDeviceId};
 
-use super::{FfiHandle, FfiServer};
+use super::{rootapp_audio::RootAudioSession, FfiHandle, FfiServer};
 use crate::{proto, FfiResult};
 
 /// FFI wrapper for PlatformAudio handle.
 pub struct FfiPlatformAudio {
     pub audio: PlatformAudio,
+    /// RootApp native audio state of this handle (track gains, events).
+    pub rootapp: Arc<RootAudioSession>,
 }
 
 impl FfiHandle for FfiPlatformAudio {}
+
+impl Drop for FfiPlatformAudio {
+    // Runs in livekit_ffi_drop_handle, before the host can create the next one.
+    fn drop(&mut self) {
+        self.rootapp.end();
+    }
+}
 
 /// A clone of the handle's `PlatformAudio`, so no handle-map lock is held while
 /// it enumerates devices or waits on the ADM.
@@ -57,7 +68,8 @@ pub fn on_new_platform_audio(
                 playout_device_count: playout_count,
             };
 
-            server.store_handle(handle_id, FfiPlatformAudio { audio });
+            let rootapp = RootAudioSession::start(server, handle_id, audio.clone());
+            server.store_handle(handle_id, FfiPlatformAudio { audio, rootapp });
 
             Ok(proto::NewPlatformAudioResponse {
                 message: Some(proto::new_platform_audio_response::Message::PlatformAudio(
