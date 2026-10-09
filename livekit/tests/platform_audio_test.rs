@@ -41,6 +41,17 @@ use livekit::prelude::{ConnectionState, LocalAudioTrack, LocalTrack, RoomEvent, 
 #[cfg(feature = "__lk-e2e-test")]
 use tokio::time::timeout;
 
+/// Every test below that creates the platform ADM opens real audio devices (the
+/// mic and speakers on desktop), so it runs only with `LK_HW_AUDIO_TESTS=1`.
+/// The AdmProxy state machine is covered device-free in webrtc-sys.
+fn hw_audio_tests_enabled(test_name: &str) -> bool {
+    let enabled = std::env::var_os("LK_HW_AUDIO_TESTS").is_some();
+    if !enabled {
+        eprintln!("skipped {test_name}: opens real audio devices; set LK_HW_AUDIO_TESTS=1");
+    }
+    enabled
+}
+
 fn try_create_platform_audio(test_name: &str) -> Option<PlatformAudio> {
     match PlatformAudio::new() {
         Ok(audio) => Some(audio),
@@ -199,6 +210,9 @@ fn test_audio_processing_options_clone() {
 #[test_log::test(tokio::test)]
 #[serial]
 async fn test_platform_audio_standalone_creation() -> Result<()> {
+    if !hw_audio_tests_enabled("test_platform_audio_standalone_creation") {
+        return Ok(());
+    }
     use livekit::reset_platform_audio;
 
     // Ensure clean state
@@ -253,6 +267,9 @@ async fn test_platform_audio_standalone_creation() -> Result<()> {
 #[test_log::test(tokio::test)]
 #[serial]
 async fn test_platform_audio_standalone_ref_counting() -> Result<()> {
+    if !hw_audio_tests_enabled("test_platform_audio_standalone_ref_counting") {
+        return Ok(());
+    }
     use livekit::reset_platform_audio;
 
     reset_platform_audio();
@@ -298,6 +315,9 @@ async fn test_platform_audio_standalone_ref_counting() -> Result<()> {
 #[test_log::test(tokio::test)]
 #[serial]
 async fn test_platform_audio_standalone_device_selection() -> Result<()> {
+    if !hw_audio_tests_enabled("test_platform_audio_standalone_device_selection") {
+        return Ok(());
+    }
     use livekit::reset_platform_audio;
 
     reset_platform_audio();
@@ -340,6 +360,9 @@ async fn test_platform_audio_standalone_device_selection() -> Result<()> {
 #[serial]
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 async fn test_platform_audio_invalid_device_id_returns_device_not_found() -> Result<()> {
+    if !hw_audio_tests_enabled("test_platform_audio_invalid_device_id_returns_device_not_found") {
+        return Ok(());
+    }
     use livekit::{reset_platform_audio, PlayoutDeviceId, RecordingDeviceId};
 
     reset_platform_audio();
@@ -366,6 +389,9 @@ async fn test_platform_audio_invalid_device_id_returns_device_not_found() -> Res
 #[test_log::test(tokio::test)]
 #[serial]
 async fn test_platform_audio_standalone_processing_config() -> Result<()> {
+    if !hw_audio_tests_enabled("test_platform_audio_standalone_processing_config") {
+        return Ok(());
+    }
     use livekit::reset_platform_audio;
     use livekit::AudioProcessingOptions;
     use livekit::AudioProcessingType;
@@ -427,6 +453,9 @@ async fn test_platform_audio_standalone_processing_config() -> Result<()> {
 #[test_log::test(tokio::test)]
 #[serial]
 async fn test_platform_audio_standalone_reset() -> Result<()> {
+    if !hw_audio_tests_enabled("test_platform_audio_standalone_reset") {
+        return Ok(());
+    }
     use livekit::reset_platform_audio;
 
     reset_platform_audio();
@@ -477,6 +506,9 @@ async fn test_platform_audio_standalone_reset() -> Result<()> {
 #[test_log::test(tokio::test)]
 #[serial]
 async fn test_platform_audio_standalone_lifecycle() -> Result<()> {
+    if !hw_audio_tests_enabled("test_platform_audio_standalone_lifecycle") {
+        return Ok(());
+    }
     use livekit::reset_platform_audio;
 
     reset_platform_audio();
@@ -537,6 +569,9 @@ async fn test_platform_audio_standalone_lifecycle() -> Result<()> {
 #[test_log::test(tokio::test)]
 #[serial]
 async fn test_platform_audio_creation() -> Result<()> {
+    if !hw_audio_tests_enabled("test_platform_audio_creation") {
+        return Ok(());
+    }
     use livekit::reset_platform_audio;
 
     // Ensure clean state
@@ -567,6 +602,9 @@ async fn test_platform_audio_creation() -> Result<()> {
 #[test_log::test(tokio::test)]
 #[serial]
 async fn test_platform_audio_ref_counting() -> Result<()> {
+    if !hw_audio_tests_enabled("test_platform_audio_ref_counting") {
+        return Ok(());
+    }
     use livekit::reset_platform_audio;
 
     reset_platform_audio();
@@ -603,6 +641,9 @@ async fn test_platform_audio_ref_counting() -> Result<()> {
 #[test_log::test(tokio::test)]
 #[serial]
 async fn test_platform_audio_device_enumeration() -> Result<()> {
+    if !hw_audio_tests_enabled("test_platform_audio_device_enumeration") {
+        return Ok(());
+    }
     use livekit::reset_platform_audio;
 
     reset_platform_audio();
@@ -634,6 +675,9 @@ async fn test_platform_audio_device_enumeration() -> Result<()> {
 #[test_log::test(tokio::test)]
 #[serial]
 async fn test_platform_audio_device_selection() -> Result<()> {
+    if !hw_audio_tests_enabled("test_platform_audio_device_selection") {
+        return Ok(());
+    }
     use livekit::reset_platform_audio;
 
     reset_platform_audio();
@@ -669,6 +713,9 @@ async fn test_platform_audio_device_selection() -> Result<()> {
 #[test_log::test(tokio::test)]
 #[serial]
 async fn test_platform_audio_release() -> Result<()> {
+    if !hw_audio_tests_enabled("test_platform_audio_release") {
+        return Ok(());
+    }
     use livekit::reset_platform_audio;
 
     reset_platform_audio();
@@ -690,6 +737,9 @@ async fn test_platform_audio_release() -> Result<()> {
 #[test_log::test(tokio::test)]
 #[serial]
 async fn test_platform_audio_with_native_source() -> Result<()> {
+    if !hw_audio_tests_enabled("test_platform_audio_with_native_source") {
+        return Ok(());
+    }
     use livekit::reset_platform_audio;
     use livekit::webrtc::audio_source::native::NativeAudioSource;
     use livekit::webrtc::audio_source::AudioSourceOptions;
@@ -724,6 +774,9 @@ async fn test_platform_audio_with_native_source() -> Result<()> {
 #[test_log::test(tokio::test)]
 #[serial]
 async fn test_platform_audio_room_connection() -> Result<()> {
+    if !hw_audio_tests_enabled("test_platform_audio_room_connection") {
+        return Ok(());
+    }
     use livekit::reset_platform_audio;
 
     reset_platform_audio();
@@ -780,6 +833,9 @@ async fn test_platform_audio_room_connection() -> Result<()> {
 #[test_log::test(tokio::test)]
 #[serial]
 async fn test_platform_audio_two_participants() -> Result<()> {
+    if !hw_audio_tests_enabled("test_platform_audio_two_participants") {
+        return Ok(());
+    }
     use livekit::reset_platform_audio;
 
     reset_platform_audio();
@@ -845,6 +901,9 @@ async fn test_platform_audio_two_participants() -> Result<()> {
 #[test_log::test(tokio::test)]
 #[serial]
 async fn test_platform_audio_device_switching() -> Result<()> {
+    if !hw_audio_tests_enabled("test_platform_audio_device_switching") {
+        return Ok(());
+    }
     use livekit::reset_platform_audio;
 
     reset_platform_audio();
@@ -918,6 +977,9 @@ async fn test_platform_audio_device_switching() -> Result<()> {
 #[test_log::test(tokio::test)]
 #[serial]
 async fn test_reset_platform_audio() -> Result<()> {
+    if !hw_audio_tests_enabled("test_reset_platform_audio") {
+        return Ok(());
+    }
     use livekit::reset_platform_audio;
 
     reset_platform_audio();
@@ -948,6 +1010,9 @@ async fn test_reset_platform_audio() -> Result<()> {
 #[test_log::test(tokio::test)]
 #[serial]
 async fn test_platform_audio_hardware_availability() -> Result<()> {
+    if !hw_audio_tests_enabled("test_platform_audio_hardware_availability") {
+        return Ok(());
+    }
     use livekit::reset_platform_audio;
     use livekit::AudioProcessingType;
 
@@ -996,6 +1061,9 @@ async fn test_platform_audio_hardware_availability() -> Result<()> {
 #[test_log::test(tokio::test)]
 #[serial]
 async fn test_platform_audio_configure_processing() -> Result<()> {
+    if !hw_audio_tests_enabled("test_platform_audio_configure_processing") {
+        return Ok(());
+    }
     use livekit::reset_platform_audio;
     use livekit::AudioProcessingOptions;
 
@@ -1048,6 +1116,9 @@ async fn test_platform_audio_configure_processing() -> Result<()> {
 #[test_log::test(tokio::test)]
 #[serial]
 async fn test_platform_audio_individual_controls() -> Result<()> {
+    if !hw_audio_tests_enabled("test_platform_audio_individual_controls") {
+        return Ok(());
+    }
     use livekit::reset_platform_audio;
 
     reset_platform_audio();
@@ -1089,6 +1160,9 @@ async fn test_platform_audio_individual_controls() -> Result<()> {
 #[test_log::test(tokio::test)]
 #[serial]
 async fn test_platform_audio_processing_with_room() -> Result<()> {
+    if !hw_audio_tests_enabled("test_platform_audio_processing_with_room") {
+        return Ok(());
+    }
     use livekit::reset_platform_audio;
     use livekit::AudioProcessingOptions;
 
@@ -1172,6 +1246,9 @@ async fn test_platform_audio_processing_with_room() -> Result<()> {
 #[test_log::test(tokio::test)]
 #[serial]
 async fn test_adm_proxy_platform_ref_counting() -> Result<()> {
+    if !hw_audio_tests_enabled("test_adm_proxy_platform_ref_counting") {
+        return Ok(());
+    }
     use libwebrtc::peer_connection_factory::native::PeerConnectionFactoryExt;
     use livekit::rtc_engine::lk_runtime::LkRuntime;
 
@@ -1254,6 +1331,9 @@ async fn test_adm_proxy_platform_ref_counting() -> Result<()> {
 #[test_log::test(tokio::test)]
 #[serial]
 async fn test_adm_proxy_recording_enabled_flag() -> Result<()> {
+    if !hw_audio_tests_enabled("test_adm_proxy_recording_enabled_flag") {
+        return Ok(());
+    }
     use libwebrtc::peer_connection_factory::native::PeerConnectionFactoryExt;
     use livekit::rtc_engine::lk_runtime::LkRuntime;
 
@@ -1299,6 +1379,9 @@ async fn test_adm_proxy_recording_enabled_flag() -> Result<()> {
 #[test_log::test(tokio::test)]
 #[serial]
 async fn test_adm_proxy_playout_enabled_flag() -> Result<()> {
+    if !hw_audio_tests_enabled("test_adm_proxy_playout_enabled_flag") {
+        return Ok(());
+    }
     use libwebrtc::peer_connection_factory::native::PeerConnectionFactoryExt;
     use livekit::rtc_engine::lk_runtime::LkRuntime;
 
@@ -1349,6 +1432,9 @@ async fn test_adm_proxy_playout_enabled_flag() -> Result<()> {
 #[test_log::test(tokio::test)]
 #[serial]
 async fn test_adm_proxy_playout_mode_switching() -> Result<()> {
+    if !hw_audio_tests_enabled("test_adm_proxy_playout_mode_switching") {
+        return Ok(());
+    }
     use libwebrtc::peer_connection_factory::native::PeerConnectionFactoryExt;
     use livekit::rtc_engine::lk_runtime::LkRuntime;
 
@@ -1435,6 +1521,9 @@ async fn test_adm_proxy_playout_mode_switching() -> Result<()> {
 #[test_log::test(tokio::test)]
 #[serial]
 async fn test_adm_proxy_recording_mode_switching() -> Result<()> {
+    if !hw_audio_tests_enabled("test_adm_proxy_recording_mode_switching") {
+        return Ok(());
+    }
     use libwebrtc::peer_connection_factory::native::PeerConnectionFactoryExt;
     use livekit::rtc_engine::lk_runtime::LkRuntime;
 
@@ -1523,6 +1612,9 @@ async fn test_adm_proxy_recording_mode_switching() -> Result<()> {
 #[test_log::test(tokio::test)]
 #[serial]
 async fn test_platform_audio_adm_lifecycle() -> Result<()> {
+    if !hw_audio_tests_enabled("test_platform_audio_adm_lifecycle") {
+        return Ok(());
+    }
     use libwebrtc::peer_connection_factory::native::PeerConnectionFactoryExt;
     use livekit::reset_platform_audio;
     use livekit::rtc_engine::lk_runtime::LkRuntime;
@@ -1635,6 +1727,9 @@ async fn test_platform_audio_adm_lifecycle() -> Result<()> {
 #[serial]
 #[cfg_attr(target_os = "windows", ignore = "rapid WASAPI ADM mode switching is unstable on CI")]
 async fn test_adm_proxy_rapid_mode_changes() -> Result<()> {
+    if !hw_audio_tests_enabled("test_adm_proxy_rapid_mode_changes") {
+        return Ok(());
+    }
     use libwebrtc::peer_connection_factory::native::PeerConnectionFactoryExt;
     use livekit::rtc_engine::lk_runtime::LkRuntime;
 
