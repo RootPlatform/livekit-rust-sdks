@@ -55,6 +55,7 @@ fn main() {
         "src/prohibit_libsrtp_initialization.rs",
         "src/apm.rs",
         "src/audio_mixer.rs",
+        "src/root_audio_mixer.rs",
         "src/packet_trailer.rs",
     ];
 
@@ -90,6 +91,7 @@ fn main() {
         "src/video_decoder_factory.cpp",
         "src/synthetic_audio_device.cpp",
         "src/adm_proxy.cpp",
+        "src/root_audio_mixer.cpp",
         "src/audio_resampler.cpp",
         "src/frame_cryptor.cpp",
         "src/global_task_queue.cpp",

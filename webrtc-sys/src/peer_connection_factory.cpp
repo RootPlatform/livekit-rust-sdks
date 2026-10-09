@@ -38,6 +38,7 @@
 #include "livekit/adm_proxy.h"
 #include "livekit/audio_track.h"
 #include "livekit/peer_connection.h"
+#include "livekit/root_audio_mixer.h"
 #include "livekit/rtc_error.h"
 #include "livekit/rtp_parameters.h"
 #include "livekit/video_decoder_factory.h"
@@ -176,6 +177,8 @@ PeerConnectionFactory::PeerConnectionFactory(
                         "RtcConfiguration.enable_sctp_snap)";
   }
 
+  audio_mixer_ = webrtc::make_ref_counted<RootAudioMixer>();
+
   // Create AdmProxy - it creates and initializes Platform ADM internally
   adm_proxy_ = rtc_runtime_->worker_thread()->BlockingCall([&] {
     return webrtc::make_ref_counted<livekit_ffi::AdmProxy>(
@@ -184,6 +187,7 @@ PeerConnectionFactory::PeerConnectionFactory(
   audio_device_ = std::make_shared<AudioDeviceController>(adm_proxy_);
 
   dependencies.adm = adm_proxy_;
+  dependencies.audio_mixer = audio_mixer_;
 
   dependencies.video_encoder_factory =
       std::move(std::make_unique<livekit_ffi::VideoEncoderFactory>());
