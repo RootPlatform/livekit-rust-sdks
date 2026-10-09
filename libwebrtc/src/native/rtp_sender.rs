@@ -60,7 +60,17 @@ impl RtpSender {
         })?
     }
 
+    fn is_audio(&self) -> bool {
+        self.sys_handle.media_type() == sys_webrtc::ffi::MediaType::Audio
+    }
+
+    /// Refused for audio senders: libwebrtc's `external_audio_source.patch` never
+    /// clears a stopped send stream's `sending_`, so a stream stopped in place never
+    /// sends again. Unpublish and republish instead.
     pub fn set_track(&self, track: Option<MediaStreamTrack>) -> Result<(), RtcError> {
+        if self.is_audio() {
+            return Err(audio_sender_stopped_in_place("set_track"));
+        }
         if !self.sys_handle.set_track(track.map_or(SharedPtr::null(), |t| t.sys_handle())) {
             return Err(RtcError {
                 error_type: RtcErrorType::InvalidState,
@@ -75,7 +85,11 @@ impl RtpSender {
         self.sys_handle.get_parameters().into()
     }
 
+    /// An audio sender's encodings cannot be made inactive (see [`Self::set_track`]).
     pub fn set_parameters(&self, parameters: RtpParameters) -> Result<(), RtcError> {
+        if self.is_audio() && stops_the_stream(&parameters) {
+            return Err(audio_sender_stopped_in_place("an inactive encoding"));
+        }
         self.sys_handle
             .set_parameters(parameters.into())
             .map_err(|e| unsafe { sys_err::ffi::RtcError::from(e.what()).into() })
@@ -87,6 +101,21 @@ impl RtpSender {
 
     pub fn release_video_encoder(&self) {
         self.sys_handle.release_video_encoder();
+    }
+}
+
+fn stops_the_stream(parameters: &RtpParameters) -> bool {
+    parameters.encodings.iter().any(|encoding| !encoding.active)
+}
+
+fn audio_sender_stopped_in_place(what: &str) -> RtcError {
+    log::error!("refused {what} on an audio sender; unpublish and republish instead");
+    RtcError {
+        error_type: RtcErrorType::InvalidState,
+        message: format!(
+            "{what} would stop an audio send stream in place, which never sends again \
+             (external_audio_source.patch); unpublish and republish instead"
+        ),
     }
 }
 
@@ -125,7 +154,18 @@ pub fn video_encoder_backend_list() -> Vec<VideoEncoderBackend> {
 
 #[cfg(test)]
 mod tests {
-    use super::{sys_webrtc, VideoEncoderBackend};
+    use super::{stops_the_stream, sys_webrtc, VideoEncoderBackend};
+    use crate::rtp_parameters::{RtpEncodingParameters, RtpParameters};
+
+    #[test]
+    fn an_inactive_encoding_stops_the_send_stream() {
+        let mut parameters = RtpParameters::default();
+        assert!(!stops_the_stream(&parameters));
+        parameters.encodings = vec![RtpEncodingParameters::default()];
+        assert!(!stops_the_stream(&parameters));
+        parameters.encodings[0].active = false;
+        assert!(stops_the_stream(&parameters));
+    }
 
     #[test]
     fn video_encoder_backend_maps_to_native_enum() {
