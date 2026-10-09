@@ -237,6 +237,8 @@ void RootAudioMixer::Mix(size_t number_of_channels,
   double sumsq = 0;
   if (mixed_any) {
     int16_t* dst = out->mutable_data();
+    // Remote audio takes the master gain (0 when deafened); the effect bus,
+    // which ignores both, joins after it and before the soft clip.
     const float gain = master_gain_ / kS16Scale;
     for (size_t k = 0; k < kSamplesPerChannel; ++k) {
       for (size_t c = 0; c < out_channels; ++c) {
