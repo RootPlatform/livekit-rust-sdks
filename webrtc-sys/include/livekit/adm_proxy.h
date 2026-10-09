@@ -125,6 +125,8 @@ struct AdmNativeStats {
   std::vector<uint32_t> mix_ssrcs;
   double mix_out_sumsq = 0;
   uint64_t mix_out_samples = 0;
+  uint64_t effects_played = 0;
+  uint64_t effects_dropped = 0;
   bool echo_cancellation = false;
   bool noise_suppression = false;
   uint64_t audio_thread_lock_violations = 0;

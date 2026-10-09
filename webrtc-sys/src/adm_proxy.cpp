@@ -988,6 +988,11 @@ bool AdmProxy::AcquirePlatformAdm() {
   {
     AdmLock lock(&state_mutex_);
     desired_.ref_count++;
+    // Right away, not after the device thread's pass: effects played just
+    // after the acquire must not find the bus idle.
+    if (mixer_) {
+      mixer_->SetPlatformActive(true);
+    }
   }
   RequestReconcile();
   return true;
@@ -1007,6 +1012,9 @@ void AdmProxy::ReleasePlatformAdm() {
       desired_.hold = false;
       desired_.app_playout = false;
       desired_.app_recording = false;
+      if (mixer_) {
+        mixer_->SetPlatformActive(false);
+      }
     }
   }
   RequestReconcile();
@@ -1168,6 +1176,8 @@ AdmNativeStats AdmProxy::ReadNativeStats() {
     stats.mix_ssrcs = std::move(mix.ssrcs);
     stats.mix_out_sumsq = mix.out_sumsq;
     stats.mix_out_samples = mix.out_samples;
+    stats.effects_played = mix.effects_played;
+    stats.effects_dropped = mix.effects_dropped;
     stats.overlapping_callbacks += mix.overlapping_mixes;
   }
   return stats;

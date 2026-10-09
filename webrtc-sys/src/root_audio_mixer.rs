@@ -52,10 +52,20 @@ pub mod ffi {
         pub nested_mix_silent: bool,
     }
 
+    #[derive(Debug, Clone, Default)]
+    pub struct RootMixFrame {
+        pub num_channels: usize,
+        pub muted: bool,
+        pub data: Vec<i16>,
+    }
+
     unsafe extern "C++" {
         include!("livekit/root_audio_mixer.h");
 
+        type RootMixerHarness;
+
         fn root_audio_soft_clip(sample: f32) -> f32;
+        fn root_audio_volume_to_gain(linear_volume: f32) -> f32;
 
         /// Adds `sources`, removes the ones at the `remove` indices, then mixes
         /// once at `out_channels`.
@@ -64,6 +74,25 @@ pub mod ffi {
             remove: &[usize],
             out_channels: usize,
         ) -> RootMixTestResult;
+
+        /// A mixer driven one Mix at a time (tests only; no device).
+        fn new_root_mixer_harness() -> UniquePtr<RootMixerHarness>;
+        fn add_source(self: &RootMixerHarness, spec: &RootMixTestSource) -> usize;
+        fn remove_source(self: &RootMixerHarness, index: usize);
+        fn set_source_value(self: &RootMixerHarness, index: usize, left: i16, right: i16);
+        fn set_platform_active(self: &RootMixerHarness, active: bool);
+        fn set_master_volume(self: &RootMixerHarness, volume: f32);
+        fn set_deafened(self: &RootMixerHarness, deafened: bool);
+        fn set_source_gain(self: &RootMixerHarness, ssrc: u32, tile: f32, paused: bool) -> bool;
+        fn clear_source_gain(self: &RootMixerHarness, ssrc: u32);
+        fn register_effect(self: &RootMixerHarness, id: u32, samples: &[i16]) -> bool;
+        /// 0 queued, 1 unknown clip, 2 dropped (queue full), 3 idle (no platform audio).
+        fn play_effect(self: &RootMixerHarness, id: u32, gain: f32) -> u8;
+        fn stop_effects(self: &RootMixerHarness);
+        fn reset_controls(self: &RootMixerHarness);
+        fn mix(self: &RootMixerHarness, out_channels: usize) -> RootMixFrame;
+        fn effects_played(self: &RootMixerHarness) -> u64;
+        fn effects_dropped(self: &RootMixerHarness) -> u64;
     }
 }
 
@@ -239,5 +268,331 @@ mod tests {
         assert_eq!(result.mix_calls, 1);
         assert_frame(&result, 1, &[3000]);
         assert_eq!(run(&[mono(1000, 1)], &[], 1).overlapping_mixes, 0);
+    }
+}
+
+/// The app's mixer semantics (CallAudioMixerTests, VolumeCurveTests) on the
+/// native mixer while platform audio is in use.
+#[cfg(test)]
+mod gain_tests {
+    use cxx::UniquePtr;
+
+    use super::ffi::{
+        new_root_mixer_harness, root_audio_soft_clip, root_audio_volume_to_gain, RootMixFrame,
+        RootMixTestSource, RootMixerHarness,
+    };
+
+    const BLOCK: usize = 480;
+    const QUEUED: u8 = 0;
+    const UNKNOWN: u8 = 1;
+    const DROPPED: u8 = 2;
+    const IDLE: u8 = 3;
+
+    fn s16(value: f32) -> i16 {
+        (value * 32768.0).round() as i16
+    }
+
+    fn level(sample: i16) -> f32 {
+        sample as f32 / 32768.0
+    }
+
+    fn mono(value: f32, ssrc: u32) -> RootMixTestSource {
+        RootMixTestSource {
+            channels: 1,
+            left: s16(value),
+            ssrc,
+            elapsed_time_ms: -1,
+            ntp_time_ms: -1,
+            preferred_rate: 48000,
+            ..Default::default()
+        }
+    }
+
+    fn active() -> UniquePtr<RootMixerHarness> {
+        let h = new_root_mixer_harness();
+        h.set_platform_active(true);
+        h
+    }
+
+    /// Past any 20 ms ramp.
+    fn settle(h: &RootMixerHarness, channels: usize) -> RootMixFrame {
+        h.mix(channels);
+        h.mix(channels);
+        h.mix(channels)
+    }
+
+    fn last(frame: &RootMixFrame) -> f32 {
+        level(*frame.data.last().unwrap())
+    }
+
+    fn clip(id: u32, h: &RootMixerHarness, value: f32, samples: usize) {
+        assert!(h.register_effect(id, &vec![s16(value); samples]));
+    }
+
+    #[test]
+    fn root_audio_volume_curve_matches_the_app() {
+        for v in [0.0f32, 0.5, 1.0, 1.5, 2.0] {
+            let expected = if v <= 0.0 { 0.0 } else { (v as f64).powf(2.5) as f32 };
+            assert!((root_audio_volume_to_gain(v) - expected).abs() < 1e-4, "{v}");
+        }
+        assert!((root_audio_volume_to_gain(0.5) - 0.1768).abs() < 1e-3);
+        assert_eq!(root_audio_volume_to_gain(1.0), 1.0);
+        assert!((root_audio_volume_to_gain(2.0) - 5.657).abs() < 1e-2);
+        assert_eq!(root_audio_volume_to_gain(4.0), 10.0);
+        assert_eq!(root_audio_volume_to_gain(-1.0), 0.0);
+        assert_eq!(root_audio_volume_to_gain(f32::NAN), 0.0);
+    }
+
+    #[test]
+    fn root_audio_soft_clip_matches_the_app_knee() {
+        let expected = 0.8 + 0.2 * ((1.5f32 - 0.8) / 0.2).tanh();
+        assert!((root_audio_soft_clip(1.5) - expected).abs() < 1e-5);
+        assert!((root_audio_soft_clip(-1.5) + expected).abs() < 1e-5);
+        let mut previous = root_audio_soft_clip(-5.0);
+        let mut x = -5.0f32;
+        while x <= 5.0 {
+            let y = root_audio_soft_clip(x);
+            assert!(y >= previous - 1e-6 && (-1.0..=1.0).contains(&y), "clip({x}) = {y}");
+            previous = y;
+            x += 0.01;
+        }
+    }
+
+    #[test]
+    fn root_audio_mixer_plays_an_unknown_source_at_unity() {
+        let h = active();
+        h.add_source(&mono(0.5, 7));
+        let frame = h.mix(1);
+        assert_eq!(frame.data, vec![s16(0.5); BLOCK]);
+    }
+
+    #[test]
+    fn root_audio_mixer_tile_volume_follows_the_curve() {
+        let h = active();
+        h.add_source(&mono(0.5, 7));
+        assert!(h.set_source_gain(7, 0.5, false));
+        let expected = 0.5 * root_audio_volume_to_gain(0.5);
+        assert!((last(&settle(&h, 1)) - expected).abs() < 1e-4);
+    }
+
+    #[test]
+    fn root_audio_mixer_master_volume_multiplies_before_the_curve() {
+        let h = active();
+        h.add_source(&mono(0.4, 7));
+        h.set_source_gain(7, 0.5, false);
+        h.set_master_volume(2.0);
+        assert_eq!(settle(&h, 1).data, vec![s16(0.4); BLOCK]);
+    }
+
+    #[test]
+    fn root_audio_mixer_soft_clips_a_boosted_volume_instead_of_hard_clipping() {
+        let h = active();
+        h.add_source(&mono(0.5, 7));
+        h.set_source_gain(7, 2.0, false);
+        let value = last(&settle(&h, 1));
+        assert!(value < 1.0 && value > 0.8, "{value}");
+    }
+
+    #[test]
+    fn root_audio_mixer_volume_touches_only_that_source() {
+        let h = active();
+        h.add_source(&mono(0.3, 1));
+        h.add_source(&mono(0.2, 2));
+        h.set_source_gain(1, 0.0, false);
+        assert_eq!(settle(&h, 1).data, vec![s16(0.2); BLOCK]);
+    }
+
+    #[test]
+    fn root_audio_mixer_deafen_silences_remote_audio_but_not_effects() {
+        let h = active();
+        h.add_source(&mono(0.5, 7));
+        h.set_deafened(true);
+        clip(1, &h, 0.999, BLOCK * 10);
+        assert_eq!(h.play_effect(1, 0.2), QUEUED);
+        assert!((last(&settle(&h, 1)) - 0.2).abs() < 1e-3);
+
+        h.stop_effects();
+        h.set_deafened(false);
+        assert!((last(&settle(&h, 1)) - 0.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn root_audio_mixer_effects_ignore_master_volume() {
+        let h = active();
+        h.set_master_volume(0.0);
+        clip(1, &h, 0.5, BLOCK);
+        assert_eq!(h.play_effect(1, 0.2), QUEUED);
+        let frame = h.mix(1);
+        assert!(!frame.muted);
+        assert!(frame.data.iter().all(|&v| (level(v) - 0.1).abs() < 1e-4));
+        assert!(h.mix(1).data.iter().all(|&v| v == 0));
+        assert_eq!(h.effects_played(), 1);
+    }
+
+    #[test]
+    fn root_audio_mixer_stop_effects_cuts_playing_and_queued_effects() {
+        let h = active();
+        clip(1, &h, 0.999, BLOCK * 10);
+        h.play_effect(1, 0.2);
+        h.mix(1);
+        h.play_effect(1, 0.2);
+        h.stop_effects();
+        assert!(h.mix(1).data.iter().all(|&v| v == 0));
+
+        clip(2, &h, 0.999, BLOCK);
+        h.play_effect(2, 0.2);
+        assert!(h.mix(1).data.iter().all(|&v| (level(v) - 0.2).abs() < 1e-3));
+    }
+
+    #[test]
+    fn root_audio_mixer_paused_source_is_silent() {
+        let h = active();
+        h.add_source(&mono(0.5, 9));
+        h.set_source_gain(9, 1.0, true);
+        assert!(settle(&h, 1).data.iter().all(|&v| v == 0));
+        h.set_source_gain(9, 1.0, false);
+        assert_eq!(settle(&h, 1).data, vec![s16(0.5); BLOCK]);
+    }
+
+    #[test]
+    fn root_audio_mixer_sum_is_soft_clipped() {
+        let h = active();
+        h.add_source(&mono(0.7, 1));
+        h.add_source(&mono(0.7, 2));
+        let sum = 2.0 * level(s16(0.7));
+        let expected = (root_audio_soft_clip(sum) * 32768.0).round() as i16;
+        assert_eq!(h.mix(1).data, vec![expected; BLOCK]);
+    }
+
+    #[test]
+    fn root_audio_stereo_mixer_plays_effects_on_both_channels() {
+        let h = active();
+        clip(1, &h, 0.5, BLOCK);
+        h.play_effect(1, 0.2);
+        let frame = h.mix(2);
+        assert_eq!(frame.num_channels, 2);
+        assert_eq!(frame.data.len(), BLOCK * 2);
+        assert!(frame.data.iter().all(|&v| (level(v) - 0.1).abs() < 1e-4));
+        assert!(h.mix(2).data.iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn root_audio_mixer_ramps_a_gain_change_over_20_ms() {
+        let h = active();
+        h.add_source(&mono(0.5, 7));
+        h.mix(1);
+        h.set_source_gain(7, 0.0, false);
+        let first = h.mix(1);
+        let second = h.mix(1);
+        let ramp: Vec<i16> = first.data.iter().chain(second.data.iter()).copied().collect();
+        assert!(ramp.windows(2).all(|w| w[1] <= w[0]));
+        assert!((level(first.data[BLOCK - 1]) - 0.25).abs() < 1e-3);
+        assert_eq!(second.data[BLOCK - 1], 0);
+        assert!(h.mix(1).data.iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn root_audio_mixer_master_and_deafen_ramp_too() {
+        let h = active();
+        h.add_source(&mono(0.5, 7));
+        h.mix(1);
+        h.set_deafened(true);
+        let frame = h.mix(1);
+        assert!(frame.data[0] > 0 && frame.data[BLOCK - 1] < frame.data[0]);
+        assert!(settle(&h, 1).data.iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn root_audio_mixer_applies_a_gain_set_before_its_source_appears() {
+        let h = active();
+        assert!(h.set_source_gain(42, 0.5, false));
+        h.add_source(&mono(0.5, 42));
+        let expected = 0.5 * root_audio_volume_to_gain(0.5);
+        assert!((level(h.mix(1).data[0]) - expected).abs() < 1e-4);
+    }
+
+    #[test]
+    fn root_audio_mixer_cleared_gain_returns_to_unity() {
+        let h = active();
+        h.add_source(&mono(0.5, 7));
+        h.set_source_gain(7, 0.0, true);
+        settle(&h, 1);
+        h.clear_source_gain(7);
+        assert_eq!(settle(&h, 1).data, vec![s16(0.5); BLOCK]);
+    }
+
+    #[test]
+    fn root_audio_mixer_without_platform_audio_is_unity_and_the_bus_is_idle() {
+        let h = new_root_mixer_harness();
+        h.add_source(&mono(0.5, 7));
+        h.set_source_gain(7, 0.0, true);
+        h.set_deafened(true);
+        h.set_master_volume(0.0);
+        clip(1, &h, 0.5, BLOCK);
+        assert_eq!(h.play_effect(1, 0.2), IDLE);
+        assert_eq!(h.mix(1).data, vec![s16(0.5); BLOCK]);
+        assert_eq!((h.effects_played(), h.effects_dropped()), (0, 1));
+
+        h.set_platform_active(true);
+        assert!(settle(&h, 1).data.iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn root_audio_mixer_effects_queued_before_a_release_never_play() {
+        let h = active();
+        clip(1, &h, 0.5, BLOCK * 4);
+        h.play_effect(1, 0.2);
+        h.mix(1);
+        h.set_platform_active(false);
+        assert!(h.mix(1).muted);
+        h.set_platform_active(true);
+        assert!(h.mix(1).muted);
+    }
+
+    #[test]
+    fn root_audio_mixer_drops_effects_beyond_the_queue() {
+        let h = active();
+        clip(1, &h, 0.01, BLOCK);
+        for _ in 0..32 {
+            assert_eq!(h.play_effect(1, 0.2), QUEUED);
+        }
+        assert_eq!(h.play_effect(1, 0.2), DROPPED);
+        assert_eq!(h.play_effect(99, 0.2), UNKNOWN);
+        assert_eq!((h.effects_played(), h.effects_dropped()), (32, 1));
+        assert!(!h.mix(1).muted);
+        assert_eq!(h.play_effect(1, 0.2), QUEUED);
+    }
+
+    #[test]
+    fn root_audio_mixer_refuses_empty_effect_clips() {
+        let h = active();
+        assert!(!h.register_effect(1, &[]));
+        assert!(h.register_effect(1, &[1, 2, 3]));
+        assert!(h.register_effect(1, &[1, 2, 3]));
+    }
+
+    #[test]
+    fn root_audio_mixer_reset_restores_the_defaults() {
+        let h = active();
+        h.add_source(&mono(0.5, 7));
+        h.set_source_gain(7, 0.2, true);
+        h.set_master_volume(0.1);
+        h.set_deafened(true);
+        clip(1, &h, 0.25, BLOCK * 20);
+        h.play_effect(1, 1.0);
+        settle(&h, 1);
+        h.reset_controls();
+        assert_eq!(settle(&h, 1).data, vec![s16(0.5); BLOCK]);
+    }
+
+    #[test]
+    fn root_audio_mixer_a_non_finite_volume_is_silent() {
+        let h = active();
+        h.add_source(&mono(0.5, 7));
+        h.set_source_gain(7, f32::NAN, false);
+        assert!(settle(&h, 1).data.iter().all(|&v| v == 0));
+        h.set_source_gain(7, f32::INFINITY, false);
+        let value = last(&settle(&h, 1));
+        assert!(value > 0.8 && value < 1.0, "{value}");
     }
 }

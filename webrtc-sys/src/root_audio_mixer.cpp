@@ -32,6 +32,8 @@ namespace {
 constexpr float kSoftClipThreshold = 0.8f;
 constexpr float kSoftClipHeadroom = 1.0f - kSoftClipThreshold;
 constexpr float kS16Scale = 32768.0f;
+constexpr float kInvS16Scale = 1.0f / kS16Scale;
+constexpr float kVolumeExponent = 2.5f;
 
 int64_t NowNs() {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -51,6 +53,12 @@ void UpdateMax(std::atomic<uint64_t>& max, uint64_t value) {
   }
 }
 
+// One source's contribution in int16 units, soft clipped on its own as the
+// app's mixer does with every input.
+float Contribution(float gain, float sample) {
+  return RootSoftClip(gain * sample * kInvS16Scale) * kS16Scale;
+}
+
 }  // namespace
 
 float RootSoftClip(float sample) {
@@ -65,6 +73,20 @@ float RootSoftClip(float sample) {
   return sample >= 0.0f ? clipped : -clipped;
 }
 
+float RootClampVolume(float volume) {
+  if (std::isnan(volume)) {
+    return 0.0f;
+  }
+  return std::min(kRootMaxVolume, std::max(0.0f, volume));
+}
+
+float RootVolumeToGain(float linear_volume) {
+  if (!(linear_volume > 0.0f)) {
+    return 0.0f;
+  }
+  return std::min(std::pow(linear_volume, kVolumeExponent), kRootMaxGain);
+}
+
 RootAudioMixer::RootAudioMixer() = default;
 
 RootAudioMixer::~RootAudioMixer() {
@@ -74,27 +96,30 @@ RootAudioMixer::~RootAudioMixer() {
 }
 
 bool RootAudioMixer::AddSource(Source* source) {
-  const int ssrc = source->Ssrc();
+  const uint32_t ssrc = static_cast<uint32_t>(source->Ssrc());
   auto entry = std::make_unique<Entry>(source, ssrc);
   webrtc::MutexLock lock(&control_mutex_);
+  const auto setting = gain_settings_.find(ssrc);
+  if (setting != gain_settings_.end()) {
+    entry->tile.store(setting->second.tile, std::memory_order_relaxed);
+    entry->paused.store(setting->second.paused, std::memory_order_relaxed);
+  }
   for (size_t i = 0; i < kMaxSources; ++i) {
     if (slots_[i].load(std::memory_order_relaxed) != nullptr) {
       continue;
     }
-    slot_ssrcs_[i].store(static_cast<uint32_t>(ssrc), std::memory_order_relaxed);
+    slot_ssrcs_[i].store(ssrc, std::memory_order_relaxed);
     slots_[i].store(entry.release(), std::memory_order_seq_cst);
     if (i + 1 > slot_limit_.load(std::memory_order_relaxed)) {
       slot_limit_.store(i + 1, std::memory_order_release);
     }
     const uint32_t count =
         source_count_.fetch_add(1, std::memory_order_relaxed) + 1;
-    RTC_LOG(LS_INFO) << "RootAudioMixer: added source ssrc="
-                     << static_cast<uint32_t>(ssrc) << " (" << count
-                     << " sources)";
+    RTC_LOG(LS_INFO) << "RootAudioMixer: added source ssrc=" << ssrc << " ("
+                     << count << " sources)";
     return true;
   }
-  RTC_LOG(LS_ERROR) << "RootAudioMixer: no free slot for source ssrc="
-                    << static_cast<uint32_t>(ssrc);
+  RTC_LOG(LS_ERROR) << "RootAudioMixer: no free slot for source ssrc=" << ssrc;
   return false;
 }
 
@@ -137,36 +162,247 @@ void RootAudioMixer::ResetGapClock() {
   gap_reset_.store(true, std::memory_order_release);
 }
 
+void RootAudioMixer::SetPlatformActive(bool active) {
+  platform_active_.store(active, std::memory_order_release);
+}
+
+bool RootAudioMixer::platform_active() const {
+  return platform_active_.load(std::memory_order_acquire);
+}
+
+void RootAudioMixer::SetMasterVolume(float volume) {
+  master_volume_.store(RootClampVolume(volume), std::memory_order_relaxed);
+}
+
+void RootAudioMixer::SetDeafened(bool deafened) {
+  deafened_.store(deafened, std::memory_order_relaxed);
+}
+
+float RootAudioMixer::master_volume() const {
+  return master_volume_.load(std::memory_order_relaxed);
+}
+
+bool RootAudioMixer::deafened() const {
+  return deafened_.load(std::memory_order_relaxed);
+}
+
+bool RootAudioMixer::SetSourceGain(uint32_t ssrc,
+                                   float tile_volume,
+                                   bool paused) {
+  const float tile = RootClampVolume(tile_volume);
+  webrtc::MutexLock lock(&control_mutex_);
+  auto setting = gain_settings_.find(ssrc);
+  if (setting == gain_settings_.end()) {
+    if (gain_settings_.size() >= kMaxGainSettings) {
+      return false;
+    }
+    setting = gain_settings_.emplace(ssrc, GainSetting{}).first;
+  }
+  setting->second.tile = tile;
+  setting->second.paused = paused;
+  const size_t limit = slot_limit_.load(std::memory_order_relaxed);
+  for (size_t i = 0; i < limit; ++i) {
+    Entry* entry = slots_[i].load(std::memory_order_relaxed);
+    if (entry != nullptr && entry->ssrc == ssrc) {
+      entry->tile.store(tile, std::memory_order_relaxed);
+      entry->paused.store(paused, std::memory_order_relaxed);
+    }
+  }
+  return true;
+}
+
+void RootAudioMixer::ClearSourceGain(uint32_t ssrc) {
+  webrtc::MutexLock lock(&control_mutex_);
+  gain_settings_.erase(ssrc);
+  const size_t limit = slot_limit_.load(std::memory_order_relaxed);
+  for (size_t i = 0; i < limit; ++i) {
+    Entry* entry = slots_[i].load(std::memory_order_relaxed);
+    if (entry != nullptr && entry->ssrc == ssrc) {
+      entry->tile.store(1.0f, std::memory_order_relaxed);
+      entry->paused.store(false, std::memory_order_relaxed);
+    }
+  }
+}
+
+bool RootAudioMixer::RegisterEffectClip(uint32_t id,
+                                        const int16_t* samples,
+                                        size_t count) {
+  if (samples == nullptr || count == 0 || count > kMaxClipSamples) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(effects_mutex_);
+  const auto existing = clips_.find(id);
+  if (existing != clips_.end() &&
+      existing->second->samples.size() == count &&
+      std::equal(samples, samples + count, existing->second->samples.begin())) {
+    return true;
+  }
+  const size_t bytes = count * sizeof(int16_t);
+  if (owned_clip_bytes_ + bytes > kMaxClipBytesTotal) {
+    return false;
+  }
+  auto clip = std::make_unique<Clip>();
+  clip->samples.assign(samples, samples + count);
+  clips_[id] = clip.get();
+  owned_clips_.push_back(std::move(clip));
+  owned_clip_bytes_ += bytes;
+  return true;
+}
+
+RootEffectPlay RootAudioMixer::PlayEffect(uint32_t id, float gain) {
+  if (std::isnan(gain)) {
+    gain = 0.0f;
+  }
+  gain = std::min(kMaxEffectGain, std::max(0.0f, gain));
+  std::lock_guard<std::mutex> lock(effects_mutex_);
+  const auto clip = clips_.find(id);
+  if (clip == clips_.end()) {
+    return RootEffectPlay::kUnknownClip;
+  }
+  if (!platform_active_.load(std::memory_order_acquire)) {
+    effects_dropped_.fetch_add(1, std::memory_order_relaxed);
+    return RootEffectPlay::kIdle;
+  }
+  const uint64_t head = effect_head_.load(std::memory_order_relaxed);
+  const uint64_t tail = effect_tail_.load(std::memory_order_acquire);
+  if (head - tail >= kEffectSlots) {
+    effects_dropped_.fetch_add(1, std::memory_order_relaxed);
+    return RootEffectPlay::kDropped;
+  }
+  effect_ring_[head % kEffectSlots] = EffectRequest{
+      clip->second, gain,
+      effect_generation_.load(std::memory_order_relaxed)};
+  effect_head_.store(head + 1, std::memory_order_release);
+  effects_played_.fetch_add(1, std::memory_order_relaxed);
+  return RootEffectPlay::kQueued;
+}
+
+void RootAudioMixer::StopEffects() {
+  std::lock_guard<std::mutex> lock(effects_mutex_);
+  effect_generation_.fetch_add(1, std::memory_order_release);
+}
+
+void RootAudioMixer::ResetControls() {
+  SetMasterVolume(1.0f);
+  SetDeafened(false);
+  {
+    webrtc::MutexLock lock(&control_mutex_);
+    gain_settings_.clear();
+    const size_t limit = slot_limit_.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < limit; ++i) {
+      Entry* entry = slots_[i].load(std::memory_order_relaxed);
+      if (entry != nullptr) {
+        entry->tile.store(1.0f, std::memory_order_relaxed);
+        entry->paused.store(false, std::memory_order_relaxed);
+      }
+    }
+  }
+  StopEffects();
+}
+
+bool RootAudioMixer::RampGains(Entry& entry, float target) {
+  if (!entry.ramp_started) {
+    entry.ramp_started = true;
+    entry.gain = target;
+    entry.target = target;
+    entry.remaining = 0;
+  } else if (target != entry.target) {
+    entry.target = target;
+    entry.remaining = kRampSamples;
+    entry.step = (target - entry.gain) / static_cast<float>(kRampSamples);
+  }
+  bool audible = false;
+  for (size_t k = 0; k < kSamplesPerChannel; ++k) {
+    if (entry.remaining > 0) {
+      entry.gain += entry.step;
+      if (--entry.remaining == 0) {
+        entry.gain = entry.target;
+      }
+    }
+    gains_[k] = entry.gain;
+    audible |= entry.gain != 0.0f;
+  }
+  return audible;
+}
+
 void RootAudioMixer::Accumulate(const webrtc::AudioFrame& frame,
-                                float gain,
                                 size_t mix_channels) {
   const int16_t* data = frame.data();
   const size_t source_channels = frame.num_channels();
   if (mix_channels == 1) {
     if (source_channels == 1) {
       for (size_t k = 0; k < kSamplesPerChannel; ++k) {
-        accumulator_[k] += gain * data[k];
+        accumulator_[k] += Contribution(gains_[k], data[k]);
       }
     } else {
-      const float half = 0.5f * gain;
       for (size_t k = 0; k < kSamplesPerChannel; ++k) {
-        accumulator_[k] += half * (static_cast<float>(data[2 * k]) +
-                                   static_cast<float>(data[2 * k + 1]));
+        const float average = 0.5f * (static_cast<float>(data[2 * k]) +
+                                      static_cast<float>(data[2 * k + 1]));
+        accumulator_[k] += Contribution(gains_[k], average);
       }
     }
     return;
   }
   if (source_channels == 1) {
     for (size_t k = 0; k < kSamplesPerChannel; ++k) {
-      const float value = gain * data[k];
+      const float value = Contribution(gains_[k], data[k]);
       accumulator_[2 * k] += value;
       accumulator_[2 * k + 1] += value;
     }
   } else {
-    for (size_t k = 0; k < 2 * kSamplesPerChannel; ++k) {
-      accumulator_[k] += gain * data[k];
+    for (size_t k = 0; k < kSamplesPerChannel; ++k) {
+      accumulator_[2 * k] += Contribution(gains_[k], data[2 * k]);
+      accumulator_[2 * k + 1] += Contribution(gains_[k], data[2 * k + 1]);
     }
   }
+}
+
+// Render thread. Takes the queued effects of the current generation, drops
+// voices of an older one, and adds every voice's next 10 ms.
+bool RootAudioMixer::MixEffects(bool active, size_t mix_channels) {
+  const uint64_t generation =
+      effect_generation_.load(std::memory_order_acquire);
+  if (!active || generation != rendered_generation_) {
+    rendered_generation_ = generation;
+    voice_count_ = 0;
+  }
+  uint64_t tail = effect_tail_.load(std::memory_order_relaxed);
+  const uint64_t head = effect_head_.load(std::memory_order_acquire);
+  for (; tail != head; ++tail) {
+    const EffectRequest& request = effect_ring_[tail % kEffectSlots];
+    if (!active || request.generation != generation) {
+      continue;
+    }
+    if (voice_count_ == kMaxVoices) {
+      effects_dropped_.fetch_add(1, std::memory_order_relaxed);
+      continue;
+    }
+    voices_[voice_count_++] = Voice{request.clip, 0, request.gain};
+  }
+  effect_tail_.store(tail, std::memory_order_release);
+
+  bool mixed = false;
+  for (size_t v = 0; v < voice_count_;) {
+    Voice& voice = voices_[v];
+    const std::vector<int16_t>& samples = voice.clip->samples;
+    const size_t count =
+        std::min(kSamplesPerChannel, samples.size() - voice.position);
+    const int16_t* source = samples.data() + voice.position;
+    for (size_t k = 0; k < count; ++k) {
+      const float value = voice.gain * static_cast<float>(source[k]);
+      for (size_t c = 0; c < mix_channels; ++c) {
+        accumulator_[k * mix_channels + c] += value;
+      }
+    }
+    mixed |= count > 0;
+    voice.position += count;
+    if (voice.position >= samples.size()) {
+      voices_[v] = voices_[--voice_count_];
+    } else {
+      ++v;
+    }
+  }
+  return mixed;
 }
 
 void RootAudioMixer::Mix(size_t number_of_channels,
@@ -196,6 +432,10 @@ void RootAudioMixer::Mix(size_t number_of_channels,
   std::fill(accumulator_.begin(),
             accumulator_.begin() + mix_channels * kSamplesPerChannel, 0.0f);
 
+  const bool active = platform_active_.load(std::memory_order_acquire);
+  const float master = master_volume_.load(std::memory_order_relaxed);
+  const bool deafened = deafened_.load(std::memory_order_relaxed);
+
   webrtc::AudioFrame* out = audio_frame_for_mixing;
   bool mixed_any = false;
   uint32_t timestamp = 0;
@@ -209,6 +449,15 @@ void RootAudioMixer::Mix(size_t number_of_channels,
     if (entry == nullptr) {
       continue;
     }
+    float target = 1.0f;
+    if (active) {
+      target = deafened || entry->paused.load(std::memory_order_relaxed)
+                   ? 0.0f
+                   : RootVolumeToGain(
+                         entry->tile.load(std::memory_order_relaxed) * master);
+    }
+    // The ramp moves on with time even for a source that has nothing to play.
+    const bool audible = RampGains(*entry, target);
     const auto info =
         entry->source->GetAudioFrameWithInfo(kSampleRateHz, &entry->frame);
     if (info != Source::AudioFrameInfo::kNormal) {
@@ -220,7 +469,9 @@ void RootAudioMixer::Mix(size_t number_of_channels,
         frame.num_channels() < 1 || frame.num_channels() > 2) {
       continue;
     }
-    Accumulate(frame, entry->gain, mix_channels);
+    if (audible) {
+      Accumulate(frame, mix_channels);
+    }
     if (!mixed_any) {
       timestamp = frame.timestamp_;
       elapsed_time_ms = frame.elapsed_time_ms_;
@@ -237,6 +488,8 @@ void RootAudioMixer::Mix(size_t number_of_channels,
   }
   mix_epoch_.fetch_add(1, std::memory_order_release);
 
+  const bool mixed_effects = MixEffects(active, mix_channels);
+
   out->UpdateFrame(timestamp, nullptr, kSamplesPerChannel, kSampleRateHz,
                    webrtc::AudioFrame::kUndefined,
                    webrtc::AudioFrame::kVadUnknown, out_channels);
@@ -245,17 +498,14 @@ void RootAudioMixer::Mix(size_t number_of_channels,
 
   const uint64_t samples = kSamplesPerChannel * out_channels;
   double sumsq = 0;
-  if (mixed_any) {
+  if (mixed_any || mixed_effects) {
     int16_t* dst = out->mutable_data();
-    // Remote audio takes the master gain (0 when deafened); the effect bus,
-    // which ignores both, joins after it and before the soft clip.
-    const float gain = master_gain_ / kS16Scale;
     for (size_t k = 0; k < kSamplesPerChannel; ++k) {
       for (size_t c = 0; c < out_channels; ++c) {
         int16_t value = 0;
         if (c < mix_channels) {
           value = ToS16(
-              RootSoftClip(accumulator_[k * mix_channels + c] * gain) *
+              RootSoftClip(accumulator_[k * mix_channels + c] * kInvS16Scale) *
               kS16Scale);
         }
         dst[k * out_channels + c] = value;
@@ -279,6 +529,8 @@ RootAudioMixerStats RootAudioMixer::ReadStats() {
   stats.out_samples = out_samples_.load(std::memory_order_relaxed);
   stats.overlapping_mixes =
       overlapping_mixes_.load(std::memory_order_relaxed);
+  stats.effects_played = effects_played_.load(std::memory_order_relaxed);
+  stats.effects_dropped = effects_dropped_.load(std::memory_order_relaxed);
   const size_t limit = slot_limit_.load(std::memory_order_acquire);
   for (size_t i = 0; i < limit; ++i) {
     if (slots_[i].load(std::memory_order_acquire) != nullptr) {
@@ -293,16 +545,23 @@ float root_audio_soft_clip(float sample) {
   return RootSoftClip(sample);
 }
 
-namespace {
+float root_audio_volume_to_gain(float linear_volume) {
+  return RootVolumeToGain(linear_volume);
+}
 
-class TestSource : public webrtc::AudioMixer::Source {
+class RootMixerTestSource : public webrtc::AudioMixer::Source {
  public:
-  TestSource(const RootMixTestSource& spec, RootAudioMixer* mixer)
+  RootMixerTestSource(const RootMixTestSource& spec, RootAudioMixer* mixer)
       : spec_(spec), mixer_(mixer) {}
 
   // Set when this source mixed again from inside the mix (as a second render
   // thread would) and that nested mix came back silent.
   bool nested_mix_silent() const { return nested_mix_silent_; }
+
+  void set_value(int16_t left, int16_t right) {
+    spec_.left = left;
+    spec_.right = right;
+  }
 
   AudioFrameInfo GetAudioFrameWithInfo(int sample_rate_hz,
                                        webrtc::AudioFrame* frame) override {
@@ -342,22 +601,20 @@ class TestSource : public webrtc::AudioMixer::Source {
   int PreferredSampleRate() const override { return spec_.preferred_rate; }
 
  private:
-  const RootMixTestSource spec_;
+  RootMixTestSource spec_;
   RootAudioMixer* const mixer_;
   bool reentered_ = false;
   bool nested_mix_silent_ = false;
 };
-
-}  // namespace
 
 RootMixTestResult root_audio_mixer_run_for_test(
     rust::Slice<const RootMixTestSource> sources,
     rust::Slice<const size_t> remove,
     size_t out_channels) {
   auto mixer = webrtc::make_ref_counted<RootAudioMixer>();
-  std::vector<std::unique_ptr<TestSource>> owned;
+  std::vector<std::unique_ptr<RootMixerTestSource>> owned;
   for (const auto& spec : sources) {
-    owned.push_back(std::make_unique<TestSource>(spec, mixer.get()));
+    owned.push_back(std::make_unique<RootMixerTestSource>(spec, mixer.get()));
     mixer->AddSource(owned.back().get());
   }
   for (size_t index : remove) {
@@ -399,6 +656,106 @@ RootMixTestResult root_audio_mixer_run_for_test(
     mixer->RemoveSource(source.get());
   }
   return result;
+}
+
+RootMixerHarness::RootMixerHarness()
+    : mixer_(webrtc::make_ref_counted<RootAudioMixer>()),
+      sources_(std::make_unique<
+               std::vector<std::unique_ptr<RootMixerTestSource>>>()) {}
+
+RootMixerHarness::~RootMixerHarness() {
+  for (auto& source : *sources_) {
+    if (source) {
+      mixer_->RemoveSource(source.get());
+    }
+  }
+}
+
+size_t RootMixerHarness::add_source(const RootMixTestSource& spec) const {
+  sources_->push_back(std::make_unique<RootMixerTestSource>(spec, mixer_.get()));
+  mixer_->AddSource(sources_->back().get());
+  return sources_->size() - 1;
+}
+
+void RootMixerHarness::remove_source(size_t index) const {
+  if (index < sources_->size() && (*sources_)[index]) {
+    mixer_->RemoveSource((*sources_)[index].get());
+    (*sources_)[index] = nullptr;
+  }
+}
+
+void RootMixerHarness::set_source_value(size_t index,
+                                        int16_t left,
+                                        int16_t right) const {
+  if (index < sources_->size() && (*sources_)[index]) {
+    (*sources_)[index]->set_value(left, right);
+  }
+}
+
+void RootMixerHarness::set_platform_active(bool active) const {
+  mixer_->SetPlatformActive(active);
+}
+
+void RootMixerHarness::set_master_volume(float volume) const {
+  mixer_->SetMasterVolume(volume);
+}
+
+void RootMixerHarness::set_deafened(bool deafened) const {
+  mixer_->SetDeafened(deafened);
+}
+
+bool RootMixerHarness::set_source_gain(uint32_t ssrc,
+                                       float tile_volume,
+                                       bool paused) const {
+  return mixer_->SetSourceGain(ssrc, tile_volume, paused);
+}
+
+void RootMixerHarness::clear_source_gain(uint32_t ssrc) const {
+  mixer_->ClearSourceGain(ssrc);
+}
+
+bool RootMixerHarness::register_effect(
+    uint32_t id,
+    rust::Slice<const int16_t> samples) const {
+  return mixer_->RegisterEffectClip(id, samples.data(), samples.size());
+}
+
+uint8_t RootMixerHarness::play_effect(uint32_t id, float gain) const {
+  return static_cast<uint8_t>(mixer_->PlayEffect(id, gain));
+}
+
+void RootMixerHarness::stop_effects() const {
+  mixer_->StopEffects();
+}
+
+void RootMixerHarness::reset_controls() const {
+  mixer_->ResetControls();
+}
+
+RootMixFrame RootMixerHarness::mix(size_t out_channels) const {
+  webrtc::AudioFrame frame;
+  mixer_->Mix(out_channels, &frame);
+  RootMixFrame result{};
+  result.num_channels = frame.num_channels();
+  result.muted = frame.muted();
+  const int16_t* data = frame.data();
+  for (size_t i = 0; i < frame.samples_per_channel() * frame.num_channels();
+       ++i) {
+    result.data.push_back(data[i]);
+  }
+  return result;
+}
+
+uint64_t RootMixerHarness::effects_played() const {
+  return mixer_->ReadStats().effects_played;
+}
+
+uint64_t RootMixerHarness::effects_dropped() const {
+  return mixer_->ReadStats().effects_dropped;
+}
+
+std::unique_ptr<RootMixerHarness> new_root_mixer_harness() {
+  return std::make_unique<RootMixerHarness>();
 }
 
 }  // namespace livekit_ffi
