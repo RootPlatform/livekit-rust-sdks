@@ -29,9 +29,23 @@ use webrtc_sys::{
 };
 
 pub use webrtc_sys::audio_device_controller::{
+    ffi::RootAudioCaptureFormat as NativeCaptureFormat,
+    ffi::RootAudioControlUpdate as NativeAudioControl,
     ffi::RootAudioNativeStats as NativeAudioStats, ADM_RESULT_DEVICE_NOT_FOUND,
     ADM_RESULT_NOT_ATTEMPTED,
 };
+
+/// What became of an effect played on the native effect bus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectPlay {
+    Queued,
+    /// No clip was registered under that id.
+    UnknownClip,
+    /// The queue of 32 effects waiting for the render thread was full.
+    Dropped,
+    /// No platform audio reference exists, so nothing plays it.
+    Idle,
+}
 
 use crate::{
     audio_source::{native::NativeAudioSource, AudioSourceOptions},
@@ -535,6 +549,48 @@ impl PeerConnectionFactory {
     /// Device and mixer counters; reads atomics only. Max gaps reset on read.
     pub fn root_audio_stats(&self) -> NativeAudioStats {
         self.sys_handle.audio_device().root_audio_stats()
+    }
+
+    /// Live control of the capture gate, input and output volume, deafen and
+    /// the APM's AEC/NS policy. Never blocks on an audio thread.
+    pub fn set_root_audio_control(&self, control: &NativeAudioControl) {
+        self.sys_handle.audio_device().set_root_audio_control(control)
+    }
+
+    /// Tile volume (linear 0..2) and pause of the remote stream with this SSRC;
+    /// false when the mixer's table is full.
+    pub fn set_root_audio_source_gain(&self, ssrc: u32, tile_volume: f32, paused: bool) -> bool {
+        self.sys_handle.audio_device().set_root_audio_source_gain(ssrc, tile_volume, paused)
+    }
+
+    pub fn clear_root_audio_source_gain(&self, ssrc: u32) {
+        self.sys_handle.audio_device().clear_root_audio_source_gain(ssrc)
+    }
+
+    /// Copies a 48 kHz mono clip; false when it is empty or too long.
+    pub fn register_root_audio_effect(&self, id: u32, samples: &[i16]) -> bool {
+        self.sys_handle.audio_device().register_root_audio_effect(id, samples)
+    }
+
+    pub fn play_root_audio_effect(&self, id: u32, gain: f32) -> EffectPlay {
+        match self.sys_handle.audio_device().play_root_audio_effect(id, gain) {
+            0 => EffectPlay::Queued,
+            1 => EffectPlay::UnknownClip,
+            2 => EffectPlay::Dropped,
+            _ => EffectPlay::Idle,
+        }
+    }
+
+    pub fn stop_root_audio_effects(&self) {
+        self.sys_handle.audio_device().stop_root_audio_effects()
+    }
+
+    pub fn root_audio_capture_format(&self) -> NativeCaptureFormat {
+        self.sys_handle.audio_device().root_audio_capture_format()
+    }
+
+    pub fn reset_root_audio(&self) {
+        self.sys_handle.audio_device().reset_root_audio()
     }
 }
 

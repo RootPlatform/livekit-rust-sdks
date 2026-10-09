@@ -98,6 +98,17 @@ impl RemoteAudioTrack {
         super::remote_track::get_stats(&self.inner).await
     }
 
+    /// The SSRC of the RTP stream this track plays, when the remote description
+    /// signals it: the receiver's parameters carry it, and it is the SSRC the
+    /// playout mixer sees for this track's receive stream. `None` before the
+    /// track has a transceiver and for an unsignaled stream (its inbound-rtp
+    /// stats carry the SSRC then). Blocks on libwebrtc's worker thread.
+    pub fn signaled_ssrc(&self) -> Option<u32> {
+        let transceiver = self.inner.info.read().transceiver.clone()?;
+        let parameters = transceiver.receiver().parameters();
+        parameters.encodings.first().filter(|e| e.has_ssrc).map(|e| e.ssrc)
+    }
+
     pub(crate) fn on_muted(&self, f: impl Fn(Track) + Send + 'static) {
         self.inner.events.lock().muted.replace(Box::new(f));
     }

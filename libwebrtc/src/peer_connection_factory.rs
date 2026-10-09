@@ -142,7 +142,8 @@ pub mod native {
     use super::PeerConnectionFactory;
     pub use crate::imp::peer_connection_factory::{
         AudioDeviceOutcome, AudioDeviceRequest, AudioDeviceRequestOutcome, AudioDeviceSelection,
-        NativeAudioStats, ADM_RESULT_DEVICE_NOT_FOUND, ADM_RESULT_NOT_ATTEMPTED,
+        EffectPlay, NativeAudioControl, NativeAudioStats, NativeCaptureFormat,
+        ADM_RESULT_DEVICE_NOT_FOUND, ADM_RESULT_NOT_ATTEMPTED,
     };
     use crate::{
         audio_source::{native::NativeAudioSource, AudioSourceOptions},
@@ -175,6 +176,14 @@ pub mod native {
         fn restart_audio_devices(&self, recording: bool, playout: bool) -> AudioDeviceRequest;
         fn set_audio_playout_hold(&self, hold: bool);
         fn root_audio_stats(&self) -> NativeAudioStats;
+        fn set_root_audio_control(&self, control: &NativeAudioControl);
+        fn set_root_audio_source_gain(&self, ssrc: u32, tile_volume: f32, paused: bool) -> bool;
+        fn clear_root_audio_source_gain(&self, ssrc: u32);
+        fn register_root_audio_effect(&self, id: u32, samples: &[i16]) -> bool;
+        fn play_root_audio_effect(&self, id: u32, gain: f32) -> EffectPlay;
+        fn stop_root_audio_effects(&self);
+        fn root_audio_capture_format(&self) -> NativeCaptureFormat;
+        fn reset_root_audio(&self);
 
         // Device enumeration
         fn playout_devices(&self) -> i16;
@@ -270,6 +279,38 @@ pub mod native {
 
         fn root_audio_stats(&self) -> NativeAudioStats {
             self.handle.root_audio_stats()
+        }
+
+        fn set_root_audio_control(&self, control: &NativeAudioControl) {
+            self.handle.set_root_audio_control(control)
+        }
+
+        fn set_root_audio_source_gain(&self, ssrc: u32, tile_volume: f32, paused: bool) -> bool {
+            self.handle.set_root_audio_source_gain(ssrc, tile_volume, paused)
+        }
+
+        fn clear_root_audio_source_gain(&self, ssrc: u32) {
+            self.handle.clear_root_audio_source_gain(ssrc)
+        }
+
+        fn register_root_audio_effect(&self, id: u32, samples: &[i16]) -> bool {
+            self.handle.register_root_audio_effect(id, samples)
+        }
+
+        fn play_root_audio_effect(&self, id: u32, gain: f32) -> EffectPlay {
+            self.handle.play_root_audio_effect(id, gain)
+        }
+
+        fn stop_root_audio_effects(&self) {
+            self.handle.stop_root_audio_effects()
+        }
+
+        fn root_audio_capture_format(&self) -> NativeCaptureFormat {
+            self.handle.root_audio_capture_format()
+        }
+
+        fn reset_root_audio(&self) {
+            self.handle.reset_root_audio()
         }
 
         fn playout_devices(&self) -> i16 {

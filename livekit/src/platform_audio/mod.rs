@@ -115,7 +115,10 @@ mod rootapp;
 
 pub use error::{AudioError, AudioResult};
 pub use processing::{AudioProcessingOptions, AudioProcessingType};
-pub use rootapp::{AudioDeviceResults, AudioDeviceSelection, RootAudioStats};
+pub use rootapp::{
+    sanitize_volume, AudioDeviceResults, AudioDeviceSelection, CaptureFormat, EffectPlay,
+    PushToTalk, RootAudioControl, RootAudioStats, MAX_VOICE_GAIN_DB, MAX_VOLUME,
+};
 
 // Re-export RtcAudioSource for convenience
 pub use libwebrtc::audio_source::RtcAudioSource;
@@ -1006,6 +1009,61 @@ impl PlatformAudio {
     /// so it is safe to poll; the `*_max_gap_us` fields are reset on read.
     pub fn rootapp_audio_stats(&self) -> RootAudioStats {
         RootAudioStats::from_native(self.handle.runtime.root_audio_stats())
+    }
+
+    /// Applies the set fields of `control` (sanitized first; see
+    /// [`RootAudioControl`]). Stores atomics and returns at once; an AEC or NS
+    /// change reaches the APM from libwebrtc's worker thread, at most once a
+    /// second.
+    pub fn set_rootapp_control(&self, control: &RootAudioControl) {
+        self.handle.runtime.set_root_audio_control(&control.to_native())
+    }
+
+    /// Tile volume (linear 0..2, NaN is 0) and pause of the remote audio stream
+    /// with this SSRC, kept for an SSRC that is not playing yet. Streams without
+    /// one play at tile volume 1. Returns false when the table of gains is full.
+    pub fn set_source_gain(&self, ssrc: u32, tile_volume: f32, paused: bool) -> bool {
+        self.handle.runtime.set_root_audio_source_gain(ssrc, sanitize_volume(tile_volume), paused)
+    }
+
+    /// The SSRC goes back to tile volume 1, not paused.
+    pub fn clear_source_gain(&self, ssrc: u32) {
+        self.handle.runtime.clear_root_audio_source_gain(ssrc)
+    }
+
+    /// Copies a 48 kHz mono clip under `id` for the effect bus. Clips are kept
+    /// for the life of the process's audio engine.
+    pub fn register_effect(&self, id: u32, samples: &[i16]) -> AudioResult<()> {
+        if self.handle.runtime.register_root_audio_effect(id, samples) {
+            Ok(())
+        } else {
+            Err(AudioError::OperationFailed(format!(
+                "effect {id}: {} samples is empty, longer than 60 s or over the clip memory limit",
+                samples.len()
+            )))
+        }
+    }
+
+    /// Plays a registered clip at `gain` (0..2, typically 0.2), mixed after the
+    /// remote audio and ignoring master volume and deafen.
+    pub fn play_effect(&self, id: u32, gain: f32) -> EffectPlay {
+        self.handle.runtime.play_root_audio_effect(id, gain)
+    }
+
+    /// Cuts the playing and queued effects.
+    pub fn stop_effects(&self) {
+        self.handle.runtime.stop_root_audio_effects()
+    }
+
+    /// The capture post-processor's format; atomics only.
+    pub fn capture_format(&self) -> CaptureFormat {
+        self.handle.runtime.root_audio_capture_format().into()
+    }
+
+    /// Controls back to their defaults: gate open, unity volumes, not deafened,
+    /// no per-source gains, effects stopped, AEC/NS following the device track.
+    pub fn reset_rootapp_controls(&self) {
+        self.handle.runtime.reset_root_audio()
     }
 
     // =========================================================================

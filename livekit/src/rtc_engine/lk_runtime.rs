@@ -24,7 +24,8 @@ use thiserror::Error;
 
 #[cfg(not(target_arch = "wasm32"))]
 use libwebrtc::peer_connection_factory::native::{
-    AudioDeviceRequest, AudioDeviceSelection, NativeAudioStats, PeerConnectionFactoryExt,
+    AudioDeviceRequest, AudioDeviceSelection, EffectPlay, NativeAudioControl, NativeAudioStats,
+    NativeCaptureFormat, PeerConnectionFactoryExt,
 };
 
 lazy_static! {
@@ -350,6 +351,51 @@ impl LkRuntime {
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn root_audio_stats(&self) -> NativeAudioStats {
         self.pc_factory.root_audio_stats()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn set_root_audio_control(&self, control: &NativeAudioControl) {
+        self.pc_factory.set_root_audio_control(control)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn set_root_audio_source_gain(
+        &self,
+        ssrc: u32,
+        tile_volume: f32,
+        paused: bool,
+    ) -> bool {
+        self.pc_factory.set_root_audio_source_gain(ssrc, tile_volume, paused)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn clear_root_audio_source_gain(&self, ssrc: u32) {
+        self.pc_factory.clear_root_audio_source_gain(ssrc)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn register_root_audio_effect(&self, id: u32, samples: &[i16]) -> bool {
+        self.pc_factory.register_root_audio_effect(id, samples)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn play_root_audio_effect(&self, id: u32, gain: f32) -> EffectPlay {
+        self.pc_factory.play_root_audio_effect(id, gain)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn stop_root_audio_effects(&self) {
+        self.pc_factory.stop_root_audio_effects()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn root_audio_capture_format(&self) -> NativeCaptureFormat {
+        self.pc_factory.root_audio_capture_format()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn reset_root_audio(&self) {
+        self.pc_factory.reset_root_audio()
     }
 }
 
