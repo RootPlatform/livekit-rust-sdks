@@ -23,7 +23,9 @@ use parking_lot::Mutex;
 use thiserror::Error;
 
 #[cfg(not(target_arch = "wasm32"))]
-use libwebrtc::peer_connection_factory::native::PeerConnectionFactoryExt;
+use libwebrtc::peer_connection_factory::native::{
+    AudioDeviceRequest, AudioDeviceSelection, NativeAudioStats, PeerConnectionFactoryExt,
+};
 
 lazy_static! {
     static ref LK_RUNTIME: Mutex<LkRuntimeState> = Mutex::new(LkRuntimeState::default());
@@ -318,6 +320,36 @@ impl LkRuntime {
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn is_platform_adm_active(&self) -> bool {
         self.pc_factory.is_platform_adm_active()
+    }
+
+    // ===== RootApp native audio =====
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn select_audio_devices(
+        &self,
+        recording: Option<AudioDeviceSelection>,
+        playout: Option<AudioDeviceSelection>,
+    ) -> AudioDeviceRequest {
+        self.pc_factory.select_audio_devices(recording, playout)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn restart_audio_devices(
+        &self,
+        recording: bool,
+        playout: bool,
+    ) -> AudioDeviceRequest {
+        self.pc_factory.restart_audio_devices(recording, playout)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn set_audio_playout_hold(&self, hold: bool) {
+        self.pc_factory.set_audio_playout_hold(hold)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn root_audio_stats(&self) -> NativeAudioStats {
+        self.pc_factory.root_audio_stats()
     }
 }
 

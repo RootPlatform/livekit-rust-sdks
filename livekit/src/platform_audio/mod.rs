@@ -111,14 +111,17 @@
 
 mod error;
 mod processing;
+mod rootapp;
 
 pub use error::{AudioError, AudioResult};
 pub use processing::{AudioProcessingOptions, AudioProcessingType};
+pub use rootapp::{AudioDeviceResults, AudioDeviceSelection, RootAudioStats};
 
 // Re-export RtcAudioSource for convenience
 pub use libwebrtc::audio_source::RtcAudioSource;
 
 use std::fmt;
+use std::future::Future;
 use std::sync::{Arc, Weak};
 
 // =============================================================================
@@ -940,6 +943,57 @@ impl PlatformAudio {
     /// [`start_recording`]: Self::start_recording
     pub fn is_recording_initialized(&self) -> bool {
         self.handle.runtime.recording_is_initialized()
+    }
+
+    // =========================================================================
+    // RootApp native audio
+    // =========================================================================
+
+    /// Selects the device per direction (`None` keeps the current selection).
+    ///
+    /// The selection is stored and applied before every open of that direction,
+    /// so it survives restarts and device-list changes; a running direction moves
+    /// to the new device (stop, select, init, start). A device that is not present
+    /// is never replaced by another one: its direction reports
+    /// [`AudioError::DeviceNotFound`] and stays closed until it shows up.
+    ///
+    /// The request is queued on the native device thread when this is called; the
+    /// returned future only waits for its result and never blocks a thread.
+    pub fn select_devices(
+        &self,
+        recording: Option<AudioDeviceSelection>,
+        playout: Option<AudioDeviceSelection>,
+    ) -> impl Future<Output = AudioDeviceResults> + Send + 'static {
+        let requested = (recording.is_some(), playout.is_some());
+        let request = self.handle.runtime.select_audio_devices(recording, playout);
+        async move { AudioDeviceResults::from_outcome(request.await, requested) }
+    }
+
+    /// Restarts the running directions on their current selection (stop, select,
+    /// init, start), playout even while held. Used to follow a default-device
+    /// change and to recover a device whose IO stopped. Queued like
+    /// [`select_devices`](Self::select_devices).
+    pub fn restart_devices(
+        &self,
+        recording: bool,
+        playout: bool,
+    ) -> impl Future<Output = AudioDeviceResults> + Send + 'static {
+        let request = self.handle.runtime.restart_audio_devices(recording, playout);
+        async move { AudioDeviceResults::from_outcome(request.await, (recording, playout)) }
+    }
+
+    /// Keeps platform playout running while no remote audio is received, so the
+    /// echo canceller keeps a continuous reference and local sounds can play.
+    /// Released automatically when the last `PlatformAudio` is dropped. Returns at
+    /// once; the device follows on the native device thread.
+    pub fn set_playout_hold(&self, hold: bool) {
+        self.handle.runtime.set_audio_playout_hold(hold)
+    }
+
+    /// Device IO and mixer counters of the native audio engine. Reads atomics only,
+    /// so it is safe to poll; the `*_max_gap_us` fields are reset on read.
+    pub fn rootapp_audio_stats(&self) -> RootAudioStats {
+        RootAudioStats::from_native(self.handle.runtime.root_audio_stats())
     }
 
     // =========================================================================

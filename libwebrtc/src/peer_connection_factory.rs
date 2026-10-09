@@ -140,6 +140,10 @@ mod tests {
 
 pub mod native {
     use super::PeerConnectionFactory;
+    pub use crate::imp::peer_connection_factory::{
+        AudioDeviceOutcome, AudioDeviceRequest, AudioDeviceRequestOutcome, AudioDeviceSelection,
+        NativeAudioStats, ADM_RESULT_DEVICE_NOT_FOUND, ADM_RESULT_NOT_ATTEMPTED,
+    };
     use crate::{
         audio_source::{native::NativeAudioSource, AudioSourceOptions},
         audio_track::RtcAudioTrack,
@@ -161,6 +165,16 @@ pub mod native {
             label: &str,
             options: &AudioSourceOptions,
         ) -> Result<RtcAudioTrack, RtcError>;
+
+        // RootApp native audio: device requests run on the native device thread.
+        fn select_audio_devices(
+            &self,
+            recording: Option<AudioDeviceSelection>,
+            playout: Option<AudioDeviceSelection>,
+        ) -> AudioDeviceRequest;
+        fn restart_audio_devices(&self, recording: bool, playout: bool) -> AudioDeviceRequest;
+        fn set_audio_playout_hold(&self, hold: bool);
+        fn root_audio_stats(&self) -> NativeAudioStats;
 
         // Device enumeration
         fn playout_devices(&self) -> i16;
@@ -236,6 +250,26 @@ pub mod native {
             options: &AudioSourceOptions,
         ) -> Result<RtcAudioTrack, RtcError> {
             self.handle.create_device_audio_track(label, options)
+        }
+
+        fn select_audio_devices(
+            &self,
+            recording: Option<AudioDeviceSelection>,
+            playout: Option<AudioDeviceSelection>,
+        ) -> AudioDeviceRequest {
+            self.handle.select_audio_devices(recording, playout)
+        }
+
+        fn restart_audio_devices(&self, recording: bool, playout: bool) -> AudioDeviceRequest {
+            self.handle.restart_audio_devices(recording, playout)
+        }
+
+        fn set_audio_playout_hold(&self, hold: bool) {
+            self.handle.set_audio_playout_hold(hold)
+        }
+
+        fn root_audio_stats(&self) -> NativeAudioStats {
+            self.handle.root_audio_stats()
         }
 
         fn playout_devices(&self) -> i16 {

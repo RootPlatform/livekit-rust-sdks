@@ -12,12 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+};
 
 use cxx::{SharedPtr, UniquePtr};
 use lazy_static::lazy_static;
 use parking_lot::Mutex;
-use webrtc_sys::{peer_connection_factory as sys_pcf, rtc_error as sys_err, webrtc as sys_rtc};
+use tokio::sync::oneshot;
+use webrtc_sys::{
+    audio_device_controller as sys_adc, peer_connection_factory as sys_pcf, rtc_error as sys_err,
+    webrtc as sys_rtc,
+};
+
+pub use webrtc_sys::audio_device_controller::{
+    ffi::RootAudioNativeStats as NativeAudioStats, ADM_RESULT_DEVICE_NOT_FOUND,
+    ADM_RESULT_NOT_ATTEMPTED,
+};
 
 use crate::{
     audio_source::{native::NativeAudioSource, AudioSourceOptions},
@@ -30,6 +44,91 @@ use crate::{
     video_track::RtcVideoTrack,
     MediaType, RtcError, RtcErrorType,
 };
+
+/// Which device a direction of the Platform ADM opens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AudioDeviceSelection {
+    /// The OS default (the console role on Windows, index 0 elsewhere).
+    SystemDefault,
+    /// The ADM GUID (Windows: MMDevice id; macOS: AudioObjectID as a string).
+    Guid(String),
+    /// The ADM device name (Linux, where the ADM leaves GUIDs empty).
+    Name(String),
+}
+
+/// What a device request did for one direction. Results are ADM return codes:
+/// 0 is success, [`ADM_RESULT_NOT_ATTEMPTED`] means no attempt was made (the
+/// direction is not running, or was already running on that device) and
+/// [`ADM_RESULT_DEVICE_NOT_FOUND`] means the selected device is not present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioDeviceOutcome {
+    pub found: bool,
+    pub attempted: bool,
+    pub init_result: i32,
+    pub start_result: i32,
+}
+
+/// Per direction; `None` when the request did not cover it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AudioDeviceRequestOutcome {
+    pub recording: Option<AudioDeviceOutcome>,
+    pub playout: Option<AudioDeviceOutcome>,
+}
+
+impl From<sys_adc::ffi::AudioDeviceRequestOutcome> for AudioDeviceRequestOutcome {
+    fn from(value: sys_adc::ffi::AudioDeviceRequestOutcome) -> Self {
+        let direction = |outcome: sys_adc::ffi::AudioDeviceOutcome| {
+            outcome.requested.then_some(AudioDeviceOutcome {
+                found: outcome.found,
+                attempted: outcome.attempted,
+                init_result: outcome.init_result,
+                start_result: outcome.start_result,
+            })
+        };
+        Self { recording: direction(value.recording), playout: direction(value.playout) }
+    }
+}
+
+fn to_sys_selection(
+    selection: Option<&AudioDeviceSelection>,
+) -> sys_adc::ffi::AudioDeviceSelection {
+    let (kind, id) = match selection {
+        Some(AudioDeviceSelection::Guid(guid)) => {
+            (sys_adc::ffi::AudioDeviceSelectionKind::Guid, guid.clone())
+        }
+        Some(AudioDeviceSelection::Name(name)) => {
+            (sys_adc::ffi::AudioDeviceSelectionKind::Name, name.clone())
+        }
+        Some(AudioDeviceSelection::SystemDefault) | None => {
+            (sys_adc::ffi::AudioDeviceSelectionKind::Default, String::new())
+        }
+    };
+    sys_adc::ffi::AudioDeviceSelection { kind, id, index: 0 }
+}
+
+/// Completes on the native device thread once the request is applied, or with
+/// `None` if the device thread went away first.
+pub struct AudioDeviceRequest {
+    rx: oneshot::Receiver<AudioDeviceRequestOutcome>,
+}
+
+impl AudioDeviceRequest {
+    fn channel() -> (Self, Box<sys_adc::AudioDeviceRequestCallback>) {
+        let (tx, rx) = oneshot::channel();
+        let callback = sys_adc::AudioDeviceRequestCallback::new(move |outcome| {
+            let _ = tx.send(outcome.into());
+        });
+        (Self { rx }, Box::new(callback))
+    }
+}
+
+impl Future for AudioDeviceRequest {
+    type Output = Option<AudioDeviceRequestOutcome>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.rx).poll(cx).map(Result::ok)
+    }
+}
 
 struct LogSinkState {
     sink: Option<UniquePtr<sys_rtc::ffi::LogSink>>,
@@ -395,6 +494,43 @@ impl PeerConnectionFactory {
     /// Returns true if Platform ADM is currently active (ref_count > 0).
     pub fn is_platform_adm_active(&self) -> bool {
         self.sys_handle.audio_device().is_platform_adm_active()
+    }
+
+    // ===== RootApp native audio =====
+
+    /// Stores the device selection per direction (`None` keeps it) and moves a
+    /// running direction to the new device on the native device thread.
+    pub fn select_audio_devices(
+        &self,
+        recording: Option<AudioDeviceSelection>,
+        playout: Option<AudioDeviceSelection>,
+    ) -> AudioDeviceRequest {
+        let (request, callback) = AudioDeviceRequest::channel();
+        self.sys_handle.audio_device().select_devices(
+            &to_sys_selection(recording.as_ref()),
+            recording.is_some(),
+            &to_sys_selection(playout.as_ref()),
+            playout.is_some(),
+            callback,
+        );
+        request
+    }
+
+    /// Stops, re-selects, re-inits and restarts the running directions.
+    pub fn restart_audio_devices(&self, recording: bool, playout: bool) -> AudioDeviceRequest {
+        let (request, callback) = AudioDeviceRequest::channel();
+        self.sys_handle.audio_device().restart_devices(recording, playout, callback);
+        request
+    }
+
+    /// Keeps platform playout running with no receive stream.
+    pub fn set_audio_playout_hold(&self, hold: bool) {
+        self.sys_handle.audio_device().set_playout_hold(hold)
+    }
+
+    /// Device and mixer counters; reads atomics only. Max gaps reset on read.
+    pub fn root_audio_stats(&self) -> NativeAudioStats {
+        self.sys_handle.audio_device().root_audio_stats()
     }
 }
 
