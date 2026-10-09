@@ -171,6 +171,18 @@ void RootAudioMixer::Accumulate(const webrtc::AudioFrame& frame,
 
 void RootAudioMixer::Mix(size_t number_of_channels,
                          webrtc::AudioFrame* audio_frame_for_mixing) {
+  const size_t out_channels =
+      std::clamp<size_t>(number_of_channels, 1, kMaxOutputChannels);
+  // The epoch rule below and the accumulator need a single mixer at a time.
+  if (in_mix_.exchange(true, std::memory_order_acquire)) {
+    overlapping_mixes_.fetch_add(1, std::memory_order_relaxed);
+    audio_frame_for_mixing->UpdateFrame(
+        0, nullptr, kSamplesPerChannel, kSampleRateHz,
+        webrtc::AudioFrame::kUndefined, webrtc::AudioFrame::kVadUnknown,
+        out_channels);
+    return;
+  }
+
   const int64_t now = NowNs();
   if (gap_reset_.exchange(false, std::memory_order_acquire)) {
     last_mix_ns_ = 0;
@@ -180,8 +192,6 @@ void RootAudioMixer::Mix(size_t number_of_channels,
   }
   last_mix_ns_ = now;
 
-  const size_t out_channels =
-      std::clamp<size_t>(number_of_channels, 1, kMaxOutputChannels);
   const size_t mix_channels = out_channels == 1 ? 1 : 2;
   std::fill(accumulator_.begin(),
             accumulator_.begin() + mix_channels * kSamplesPerChannel, 0.0f);
@@ -258,6 +268,7 @@ void RootAudioMixer::Mix(size_t number_of_channels,
                    std::memory_order_relaxed);
   out_samples_.fetch_add(samples, std::memory_order_relaxed);
   mix_calls_.fetch_add(1, std::memory_order_relaxed);
+  in_mix_.store(false, std::memory_order_release);
 }
 
 RootAudioMixerStats RootAudioMixer::ReadStats() {
@@ -266,6 +277,8 @@ RootAudioMixerStats RootAudioMixer::ReadStats() {
   stats.max_gap_us = max_gap_ns_.exchange(0, std::memory_order_relaxed) / 1000;
   stats.out_sumsq = out_sumsq_.load(std::memory_order_relaxed);
   stats.out_samples = out_samples_.load(std::memory_order_relaxed);
+  stats.overlapping_mixes =
+      overlapping_mixes_.load(std::memory_order_relaxed);
   const size_t limit = slot_limit_.load(std::memory_order_acquire);
   for (size_t i = 0; i < limit; ++i) {
     if (slots_[i].load(std::memory_order_acquire) != nullptr) {
@@ -284,10 +297,23 @@ namespace {
 
 class TestSource : public webrtc::AudioMixer::Source {
  public:
-  explicit TestSource(const RootMixTestSource& spec) : spec_(spec) {}
+  TestSource(const RootMixTestSource& spec, RootAudioMixer* mixer)
+      : spec_(spec), mixer_(mixer) {}
+
+  // Set when this source mixed again from inside the mix (as a second render
+  // thread would) and that nested mix came back silent.
+  bool nested_mix_silent() const { return nested_mix_silent_; }
 
   AudioFrameInfo GetAudioFrameWithInfo(int sample_rate_hz,
                                        webrtc::AudioFrame* frame) override {
+    if (spec_.reenter && !reentered_) {
+      reentered_ = true;
+      webrtc::AudioFrame nested;
+      mixer_->Mix(2, &nested);
+      nested_mix_silent_ = nested.muted() &&
+                           nested.sample_rate_hz() == sample_rate_hz &&
+                           nested.num_channels() == 2;
+    }
     const size_t channels = spec_.channels;
     const size_t samples = static_cast<size_t>(sample_rate_hz / 100);
     frame->UpdateFrame(spec_.timestamp, nullptr, samples, sample_rate_hz,
@@ -317,6 +343,9 @@ class TestSource : public webrtc::AudioMixer::Source {
 
  private:
   const RootMixTestSource spec_;
+  RootAudioMixer* const mixer_;
+  bool reentered_ = false;
+  bool nested_mix_silent_ = false;
 };
 
 }  // namespace
@@ -328,7 +357,7 @@ RootMixTestResult root_audio_mixer_run_for_test(
   auto mixer = webrtc::make_ref_counted<RootAudioMixer>();
   std::vector<std::unique_ptr<TestSource>> owned;
   for (const auto& spec : sources) {
-    owned.push_back(std::make_unique<TestSource>(spec));
+    owned.push_back(std::make_unique<TestSource>(spec, mixer.get()));
     mixer->AddSource(owned.back().get());
   }
   for (size_t index : remove) {
@@ -361,6 +390,10 @@ RootMixTestResult root_audio_mixer_run_for_test(
   result.mix_calls = stats.mix_calls;
   result.out_samples = stats.out_samples;
   result.out_sumsq = stats.out_sumsq;
+  result.overlapping_mixes = stats.overlapping_mixes;
+  for (const auto& source : owned) {
+    result.nested_mix_silent |= source->nested_mix_silent();
+  }
 
   for (auto& source : owned) {
     mixer->RemoveSource(source.get());

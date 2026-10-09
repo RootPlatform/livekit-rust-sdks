@@ -29,6 +29,8 @@ pub mod ffi {
         pub elapsed_time_ms: i64,
         pub ntp_time_ms: i64,
         pub preferred_rate: i32,
+        /// Mixes again from inside its first pull, as a second render thread would.
+        pub reenter: bool,
     }
 
     #[derive(Debug, Clone, Default)]
@@ -46,6 +48,8 @@ pub mod ffi {
         pub mix_calls: u64,
         pub out_samples: u64,
         pub out_sumsq: f64,
+        pub overlapping_mixes: u64,
+        pub nested_mix_silent: bool,
     }
 
     unsafe extern "C++" {
@@ -224,5 +228,16 @@ mod tests {
         assert_eq!(result.timestamp, 480);
         assert_eq!(result.elapsed_time_ms, 60);
         assert_eq!(result.ntp_time_ms, 4000);
+    }
+
+    #[test]
+    fn root_audio_mixer_answers_an_overlapping_mix_with_silence() {
+        let reentering = RootMixTestSource { reenter: true, ..mono(1000, 1) };
+        let result = run(&[reentering, mono(2000, 2)], &[], 1);
+        assert!(result.nested_mix_silent);
+        assert_eq!(result.overlapping_mixes, 1);
+        assert_eq!(result.mix_calls, 1);
+        assert_frame(&result, 1, &[3000]);
+        assert_eq!(run(&[mono(1000, 1)], &[], 1).overlapping_mixes, 0);
     }
 }

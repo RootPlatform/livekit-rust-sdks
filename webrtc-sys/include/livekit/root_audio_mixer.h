@@ -46,6 +46,7 @@ struct RootAudioMixerStats {
   std::vector<uint32_t> ssrcs;
   double out_sumsq = 0;
   uint64_t out_samples = 0;
+  uint64_t overlapping_mixes = 0;
 };
 
 // The factory's playout mixer: asks every source for 48 kHz, mixes in float with
@@ -55,6 +56,8 @@ struct RootAudioMixerStats {
 // AddSource/RemoveSource run on the worker while Mix runs on the device's render
 // thread. Mix takes no lock: sources live in a fixed slot array, and
 // RemoveSource only returns once no Mix that may still hold the source runs.
+// One Mix runs at a time; a second one that starts meanwhile (a render thread
+// the ADM failed to stop) returns silence without touching the sources.
 class RootAudioMixer : public webrtc::AudioMixer {
  public:
   static constexpr int kSampleRateHz = 48000;
@@ -99,6 +102,7 @@ class RootAudioMixer : public webrtc::AudioMixer {
   std::atomic<size_t> slot_limit_{0};
   std::atomic<uint64_t> mix_epoch_{0};
   std::atomic<uint32_t> source_count_{0};
+  std::atomic<bool> in_mix_{false};
 
   std::array<float, kSamplesPerChannel * 2> accumulator_{};
   int64_t last_mix_ns_ = 0;
@@ -109,7 +113,10 @@ class RootAudioMixer : public webrtc::AudioMixer {
   std::atomic<uint64_t> max_gap_ns_{0};
   std::atomic<double> out_sumsq_{0.0};
   std::atomic<uint64_t> out_samples_{0};
+  std::atomic<uint64_t> overlapping_mixes_{0};
 };
+
+static_assert(std::atomic<double>::is_always_lock_free);
 
 float root_audio_soft_clip(float sample);
 
