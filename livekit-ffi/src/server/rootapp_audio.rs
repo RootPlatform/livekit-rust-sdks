@@ -67,7 +67,10 @@ pub const CAP_MONITOR: u64 = 1 << 10;
 pub const CAP_APM_DECORATOR: u64 = 1 << 11;
 
 /// What `livekit_ffi_rootapp_audio_caps` reports. The ADM hardening is desktop
-/// only, so mobile builds report nothing.
+/// only, so mobile builds report nothing. The voice chain (DSP) runs wherever
+/// the factory builds its APM (webrtc-sys `kRootDspSupported`); the Effects SDK
+/// slot (DENOISER) only where the SDK's x64/arm64 calling convention holds
+/// (`kRootDenoiserSupported`).
 pub const ROOTAPP_AUDIO_CAPS: u64 = if cfg!(any(target_os = "ios", target_os = "android")) {
     0
 } else {
@@ -79,6 +82,8 @@ pub const ROOTAPP_AUDIO_CAPS: u64 = if cfg!(any(target_os = "ios", target_os = "
         | CAP_TRACK_GAINS
         | CAP_EFFECTS
         | CAP_CONTROL
+        | CAP_DSP
+        | if cfg!(target_pointer_width = "64") { CAP_DENOISER } else { 0 }
         | CAP_APM_DECORATOR
 };
 
@@ -1217,18 +1222,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rootapp_audio_caps_cover_phase_1() {
-        #[cfg(not(any(target_os = "ios", target_os = "android")))]
-        {
-            assert_eq!(ROOTAPP_AUDIO_CAPS, 0b1000_1111_1111);
-            assert_eq!(
-                ROOTAPP_AUDIO_CAPS & (CAP_TRACK_GAINS | CAP_EFFECTS | CAP_CONTROL),
-                CAP_TRACK_GAINS | CAP_EFFECTS | CAP_CONTROL
-            );
-            assert_eq!(ROOTAPP_AUDIO_CAPS & CAP_APM_DECORATOR, CAP_APM_DECORATOR);
+    fn rootapp_audio_caps_cover_phase_2() {
+        let mobile = cfg!(any(target_os = "ios", target_os = "android"));
+        if !mobile {
+            let expected =
+                if cfg!(target_pointer_width = "64") { 0b1011_1111_1111 } else { 0b1001_1111_1111 };
+            assert_eq!(ROOTAPP_AUDIO_CAPS, expected);
+            if cfg!(target_pointer_width = "64") {
+                assert_eq!(ROOTAPP_AUDIO_CAPS, 3071);
+            }
         }
         assert_eq!(crate::cabi::livekit_ffi_rootapp_audio_caps(), ROOTAPP_AUDIO_CAPS);
-        assert_eq!(ROOTAPP_AUDIO_CAPS & (CAP_DSP | CAP_DENOISER | CAP_MONITOR), 0);
+        assert_eq!(ROOTAPP_AUDIO_CAPS & CAP_MONITOR, 0);
+        // Each bit is set exactly where the native side builds what it claims.
+        assert_eq!(
+            ROOTAPP_AUDIO_CAPS & CAP_DSP != 0,
+            webrtc_sys::root_audio_processing::ffi::root_dsp_supported()
+        );
+        assert_eq!(
+            ROOTAPP_AUDIO_CAPS & CAP_DENOISER != 0,
+            !mobile && webrtc_sys::root_denoiser::ffi::root_denoiser_supported()
+        );
+        assert_eq!(
+            ROOTAPP_AUDIO_CAPS & CAP_DENOISER != 0,
+            !crate::cabi::livekit_ffi_rootapp_denoiser_notification_handler().is_null()
+        );
     }
 
     #[test]

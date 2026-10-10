@@ -69,6 +69,16 @@ enum class RootPushToTalk : uint32_t {
 // The app's VoiceGain only boosts, up to 18 dB.
 constexpr float kRootMaxVoiceGainDb = 18.0f;
 
+// The factory builds this APM, and with it the voice chain, on desktop only
+// (the condition of LK_ADM_MOBILE); mobile keeps libwebrtc's APM. The DSP
+// capability bit is set exactly where this holds.
+#if defined(WEBRTC_IOS) || defined(__ANDROID__)
+constexpr bool kRootDspSupported = false;
+#else
+constexpr bool kRootDspSupported = true;
+#endif
+bool root_dsp_supported();
+
 class RootDenoiserSlot;
 class RootFakeFxPipeline;
 

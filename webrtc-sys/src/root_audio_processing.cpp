@@ -90,6 +90,10 @@ webrtc::scoped_refptr<webrtc::AudioProcessing> BuildRootApm(
 
 }  // namespace
 
+bool root_dsp_supported() {
+  return kRootDspSupported;
+}
+
 // =============================================================================
 // RootCaptureState
 // =============================================================================

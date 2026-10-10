@@ -221,6 +221,9 @@ pub mod ffi {
         type RootProcessorHarness;
         type RootApmHarness;
 
+        /// The factory builds the voice chain (desktop): the DSP capability.
+        fn root_dsp_supported() -> bool;
+
         fn new_root_processor_harness() -> UniquePtr<RootProcessorHarness>;
         /// Without a denoiser slot (32-bit and mobile builds).
         fn new_root_processor_harness_without_slot() -> UniquePtr<RootProcessorHarness>;

@@ -349,7 +349,7 @@ RootAudioNativeStats AudioDeviceController::root_audio_stats() const {
     stats.process_rate = format.sample_rate;
     stats.process_channels = format.channels;
     const RootDspStatsSnapshot dsp = capture_->ReadDspStats(true);
-    stats.dsp_available = true;
+    stats.dsp_available = kRootDspSupported;
     stats.processed_frames = dsp.processed_frames;
     stats.stage_samples = dsp.stage_samples;
     stats.apm_out_sumsq = dsp.apm_out_sumsq;
