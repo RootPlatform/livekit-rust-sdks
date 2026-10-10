@@ -634,12 +634,7 @@ mod tests {
         assert_eq!(resolve_audio_device_index_for_test(&selection, &none, &none), NOT_FOUND);
     }
 
-    fn resolve_in(
-        names: &[&str],
-        guids: &[&str],
-        kind: AudioDeviceSelectionKind,
-        id: &str,
-    ) -> i32 {
+    fn resolve_in(names: &[&str], guids: &[&str], kind: AudioDeviceSelectionKind, id: &str) -> i32 {
         let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
         let guids: Vec<String> = guids.iter().map(|s| s.to_string()).collect();
         resolve_audio_device_index_for_test(
@@ -692,7 +687,11 @@ mod tests {
         );
         assert_eq!(resolve_in(&names, &guids, NAME, "Built-in Audio"), NOT_FOUND);
         assert_eq!(resolve_in(&names, &guids, NAME, "built-in audio analog stereo"), NOT_FOUND);
-        assert_eq!(resolve_in(&names, &guids, GUID, ""), NOT_FOUND, "an empty GUID selects nothing");
+        assert_eq!(
+            resolve_in(&names, &guids, GUID, ""),
+            NOT_FOUND,
+            "an empty GUID selects nothing"
+        );
         assert_eq!(
             resolve_in(&names, &guids, NAME, "default: Built-in Audio Analog Stereo"),
             0,
