@@ -606,7 +606,10 @@ fn adm_proxy_controller_hands_pipelines_to_the_slot_and_back() {
     let stats = h.stats();
     assert!(stats.dsp_available && stats.denoiser_available && stats.policy_available);
     assert!(stats.denoiser_installed);
-    assert_eq!((stats.denoiser_rate, stats.denoiser_installs, stats.denoiser_frames), (48_000, 1, 1));
+    assert_eq!(
+        (stats.denoiser_rate, stats.denoiser_installs, stats.denoiser_frames),
+        (48_000, 1, 1)
+    );
     assert_eq!(stats.denoiser_process_us_buckets.len(), 16);
     assert_eq!(stats.denoiser_process_us_buckets.iter().sum::<u64>(), 1);
     assert_eq!(stats.denoiser_frames_until_first_output, 0);
@@ -668,9 +671,11 @@ fn adm_proxy_controller_covers_a_stalled_denoiser_with_webrtc_ns() {
     assert_eq!(h.run_denoiser(48_000), 2);
     h.latch_denoiser_bypass(2);
     wait_until("the fallback", || controller.root_denoiser_state().webrtc_ns_fallback);
+    wait_until("WebRTC NS applied", || h.stats().webrtc_ns_active);
     let stats = h.stats();
     assert!(stats.webrtc_ns_fallback);
     assert_eq!(stats.denoiser_bypass_reason, 2);
+    assert!(stats.policy_available && stats.apm_policy_applies >= 1);
     assert_eq!(h.run_denoiser(48_000), 0, "the stalled pipeline is bypassed");
 
     h.apply_control(&RootAudioControlUpdate {

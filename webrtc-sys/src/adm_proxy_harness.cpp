@@ -298,7 +298,8 @@ AdmProxyHarness::AdmProxyHarness(
     : fake_(webrtc::make_ref_counted<FakePlatformAdm>()),
       mixer_(webrtc::make_ref_counted<RootAudioMixer>()),
       capture_(std::make_shared<RootCaptureState>()),
-      fakes_(std::make_unique<std::vector<std::unique_ptr<RootFakeFxPipeline>>>()),
+      fakes_(std::make_unique<
+             std::vector<std::unique_ptr<RootFakeFxPipeline>>>()),
       transport_(std::make_unique<HarnessTransport>()) {
   fake_->SetDevices(ToStrings(playout_guids), ToStrings(recording_guids));
   if (with_apm) {

@@ -213,10 +213,7 @@ pub struct ReturnedPipelines {
 
 impl From<NativeReturnPipelines> for ReturnedPipelines {
     fn from(value: NativeReturnPipelines) -> Self {
-        Self {
-            pipelines: value.pipelines,
-            error: (!value.error.is_empty()).then_some(value.error),
-        }
+        Self { pipelines: value.pipelines, error: (!value.error.is_empty()).then_some(value.error) }
     }
 }
 
@@ -871,7 +868,10 @@ mod tests {
         };
         let stats = RootAudioStats::from_native(native);
         assert_eq!((stats.denoised_sumsq, stats.gate_in_sumsq), (2.0, 3.0));
-        assert_eq!((stats.gate_in_block_peak_db, stats.threshold, stats.envelope), (-20.0, 0.025, 0.5));
+        assert_eq!(
+            (stats.gate_in_block_peak_db, stats.threshold, stats.envelope),
+            (-20.0, 0.025, 0.5)
+        );
         assert!(stats.gate_speaking && stats.voice_gain_settled);
         assert_eq!((stats.speaking_seq, stats.voice_gain_db, stats.gate_open_frames), (4, 6.0, 7));
         assert_eq!(stats.speaking, Some(true));
@@ -888,7 +888,11 @@ mod tests {
             (100, 1, 2)
         );
         assert_eq!(
-            (stats.denoiser_process_max_us, stats.denoiser_slow_frames, stats.denoiser_bypass_reason),
+            (
+                stats.denoiser_process_max_us,
+                stats.denoiser_slow_frames,
+                stats.denoiser_bypass_reason
+            ),
             (900, 1, 3)
         );
         assert_eq!(stats.denoiser_notifications, 6);
@@ -921,19 +925,11 @@ mod tests {
 
     #[test]
     fn root_audio_denoiser_results_map_empty_errors_to_success() {
-        let ok: DenoiserCompletion = NativeDenoiserCompletion {
-            owner: 1,
-            async_id: 2,
-            error: String::new(),
-        }
-        .into();
+        let ok: DenoiserCompletion =
+            NativeDenoiserCompletion { owner: 1, async_id: 2, error: String::new() }.into();
         assert_eq!(ok, DenoiserCompletion { owner: 1, async_id: 2, error: None });
-        let failed: DenoiserCompletion = NativeDenoiserCompletion {
-            owner: 1,
-            async_id: 3,
-            error: "superseded".into(),
-        }
-        .into();
+        let failed: DenoiserCompletion =
+            NativeDenoiserCompletion { owner: 1, async_id: 3, error: "superseded".into() }.into();
         assert_eq!(failed.error.as_deref(), Some("superseded"));
 
         let all: ReturnedPipelines =

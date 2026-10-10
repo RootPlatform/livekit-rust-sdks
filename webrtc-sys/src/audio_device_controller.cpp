@@ -101,7 +101,9 @@ AudioDeviceController::AudioDeviceController(
   hooks.wanted = [state] {
     return state->denoiser_wanted.load(std::memory_order_relaxed);
   };
-  hooks.process_rate = [state] { return ReadCaptureFormat(*state).sample_rate; };
+  hooks.process_rate = [state] {
+    return ReadCaptureFormat(*state).sample_rate;
+  };
   hooks.set_fallback = [decorator](bool on) {
     if (decorator) {
       decorator->SetFallbackNoiseSuppression(on);
@@ -563,8 +565,8 @@ bool AudioDeviceController::set_root_denoiser(uint64_t owner,
   return true;
 }
 
-RootReturnPipelinesResult AudioDeviceController::return_root_denoiser_pipelines()
-    const {
+RootReturnPipelinesResult
+AudioDeviceController::return_root_denoiser_pipelines() const {
   RootReturnPipelinesResult result{};
   if (!denoiser_) {
     return result;
@@ -583,7 +585,8 @@ AudioDeviceController::take_root_denoiser_completions() const {
   if (!denoiser_) {
     return result;
   }
-  for (const RootDenoiserCompletion& completion : denoiser_->TakeCompletions()) {
+  for (const RootDenoiserCompletion& completion :
+       denoiser_->TakeCompletions()) {
     RootDenoiserCompletionItem item{};
     item.owner = completion.owner;
     item.async_id = completion.async_id;
@@ -600,7 +603,8 @@ AudioDeviceController::take_root_denoiser_returned() const {
     return result;
   }
   for (const RootDenoiserReturned& returned : denoiser_->TakeReturned()) {
-    result.push_back(RootDenoiserReturnedItem{returned.owner, returned.pipeline});
+    result.push_back(
+        RootDenoiserReturnedItem{returned.owner, returned.pipeline});
   }
   return result;
 }

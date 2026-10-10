@@ -117,8 +117,8 @@ pub use error::{AudioError, AudioResult};
 pub use processing::{AudioProcessingOptions, AudioProcessingType};
 pub use rootapp::{
     sanitize_volume, AudioDeviceResults, AudioDeviceSelection, CaptureFormat, DenoiserCompletion,
-    DenoiserState, EffectPlay, PushToTalk, ReturnedPipeline, ReturnedPipelines, RootAudioControl,
-    RootAudioStats, LocalSpeaking, MAX_VOICE_GAIN_DB, MAX_VOLUME,
+    DenoiserState, EffectPlay, LocalSpeaking, PushToTalk, ReturnedPipeline, ReturnedPipelines,
+    RootAudioControl, RootAudioStats, MAX_VOICE_GAIN_DB, MAX_VOLUME,
 };
 
 // Re-export RtcAudioSource for convenience

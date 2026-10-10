@@ -202,7 +202,8 @@ void RootDenoiserSlot::CountProcess(int64_t elapsed_us, size_t samples) {
     ++bucket;
   }
   histogram_[bucket].fetch_add(1, std::memory_order_relaxed);
-  const uint64_t elapsed = static_cast<uint64_t>(std::max<int64_t>(0, elapsed_us));
+  const uint64_t elapsed =
+      static_cast<uint64_t>(std::max<int64_t>(0, elapsed_us));
   uint64_t max = process_max_us_.load(std::memory_order_relaxed);
   while (elapsed > max && !process_max_us_.compare_exchange_weak(
                               max, elapsed, std::memory_order_relaxed)) {
@@ -371,8 +372,9 @@ std::optional<bool> RootNsFallback::Update(int64_t now_ms,
     if (!inactive_since_ms_) {
       inactive_since_ms_ = now_ms;
     }
-    const bool died = installed && (bypass == RootDenoiserBypass::kOutputStalled ||
-                                    bypass == RootDenoiserBypass::kSlow);
+    const bool died =
+        installed && (bypass == RootDenoiserBypass::kOutputStalled ||
+                      bypass == RootDenoiserBypass::kSlow);
     on = on_ || died || now_ms - *inactive_since_ms_ >= grace_ms_;
   } else {
     inactive_since_ms_.reset();
@@ -1116,7 +1118,8 @@ rust::Vec<RootDenoiserTestCompletion> RootDenoiserHarness::take_completions()
 rust::Vec<RootDenoiserTestReturned> RootDenoiserHarness::take_returned() const {
   rust::Vec<RootDenoiserTestReturned> result;
   for (const RootDenoiserReturned& returned : state_->control->TakeReturned()) {
-    result.push_back(RootDenoiserTestReturned{returned.owner, returned.pipeline});
+    result.push_back(
+        RootDenoiserTestReturned{returned.owner, returned.pipeline});
   }
   return result;
 }

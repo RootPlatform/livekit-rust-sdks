@@ -1142,7 +1142,8 @@ void AdmProxy::SetDeviceTrackProcessing(bool echo_cancellation,
                                         std::memory_order_relaxed);
 }
 
-void AdmProxy::SetCaptureState(std::shared_ptr<RootCaptureState> capture_state) {
+void AdmProxy::SetCaptureState(
+    std::shared_ptr<RootCaptureState> capture_state) {
   AdmLock lock(&mutex_);
   capture_state_ = std::move(capture_state);
 }

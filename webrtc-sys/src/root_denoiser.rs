@@ -139,13 +139,7 @@ pub mod ffi {
         fn set_speaking(self: &RootDenoiserHarness, speaking: bool);
         fn set_wanted(self: &RootDenoiserHarness, wanted: bool);
         fn set_process_rate(self: &RootDenoiserHarness, rate: u32);
-        fn request(
-            self: &RootDenoiserHarness,
-            owner: u64,
-            async_id: u64,
-            pipeline: u64,
-            rate: u32,
-        );
+        fn request(self: &RootDenoiserHarness, owner: u64, async_id: u64, pipeline: u64, rate: u32);
         fn wake(self: &RootDenoiserHarness);
         fn return_all(self: &RootDenoiserHarness) -> RootDenoiserTestReturnAll;
         fn reset(self: &RootDenoiserHarness);

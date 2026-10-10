@@ -325,13 +325,15 @@ pub mod ffi {
             sample_rate: u32,
         ) -> bool;
         /// Synchronous: everything native holds, waiting or not yet taken back.
-        fn return_root_denoiser_pipelines(self: &AudioDeviceController)
-            -> RootReturnPipelinesResult;
+        fn return_root_denoiser_pipelines(
+            self: &AudioDeviceController,
+        ) -> RootReturnPipelinesResult;
         fn take_root_denoiser_completions(
             self: &AudioDeviceController,
         ) -> Vec<RootDenoiserCompletionItem>;
-        fn take_root_denoiser_returned(self: &AudioDeviceController)
-            -> Vec<RootDenoiserReturnedItem>;
+        fn take_root_denoiser_returned(
+            self: &AudioDeviceController,
+        ) -> Vec<RootDenoiserReturnedItem>;
         fn root_denoiser_state(self: &AudioDeviceController) -> RootDenoiserStateInfo;
         fn root_audio_speaking(self: &AudioDeviceController) -> RootSpeakingInfo;
 

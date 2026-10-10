@@ -40,8 +40,8 @@ use std::{
 
 use livekit::{
     prelude::*, sanitize_volume, webrtc::stats::RtcStats, AudioDeviceResults, AudioDeviceSelection,
-    CaptureFormat, DenoiserCompletion, DenoiserState, EffectPlay, PlatformAudio, PushToTalk,
-    ReturnedPipeline, RootAudioControl, RootAudioStats, LocalSpeaking,
+    CaptureFormat, DenoiserCompletion, DenoiserState, EffectPlay, LocalSpeaking, PlatformAudio,
+    PushToTalk, ReturnedPipeline, RootAudioControl, RootAudioStats,
 };
 use parking_lot::Mutex;
 use tokio::time::MissedTickBehavior;
@@ -1383,7 +1383,11 @@ mod tests {
 
         sessions.deliver(vec![completion(2, 13, None)], Vec::new());
         sessions.close(2, &sink);
-        assert_eq!(sessions.mail.take(2), (Vec::new(), Vec::new()), "a dropped handle's results go");
+        assert_eq!(
+            sessions.mail.take(2),
+            (Vec::new(), Vec::new()),
+            "a dropped handle's results go"
+        );
         assert_eq!(sessions.mail.take(1), (Vec::new(), Vec::new()));
     }
 
@@ -1476,12 +1480,19 @@ mod tests {
         assert_eq!(events.messages(quiet, Some(stalled), Vec::new(), Vec::new()).len(), 1);
         assert!(events.messages(quiet, None, Vec::new(), Vec::new()).is_empty());
 
-        let messages =
-            events.messages(quiet, Some(stalled), vec![(4, None), (5, Some("x".into()))], vec![7, 8]);
+        let messages = events.messages(
+            quiet,
+            Some(stalled),
+            vec![(4, None), (5, Some("x".into()))],
+            vec![7, 8],
+        );
         assert_eq!(
             messages,
             [
-                Message::DenoiserResult(proto::RootAudioDenoiserResult { async_id: 4, error: None }),
+                Message::DenoiserResult(proto::RootAudioDenoiserResult {
+                    async_id: 4,
+                    error: None
+                }),
                 Message::DenoiserResult(proto::RootAudioDenoiserResult {
                     async_id: 5,
                     error: Some("x".into())
@@ -1584,14 +1595,25 @@ mod tests {
             (Some(25), Some(26), Some(27))
         );
         assert_eq!((p.denoiser_trimmed_samples, p.denoiser_drained_samples), (Some(28), Some(29)));
-        assert_eq!((p.denoiser_frames_until_first_output, p.webrtc_ns_fallback), (Some(30), Some(true)));
         assert_eq!(
-            (p.apm_policy_applies, p.apm_policy_deferred, p.apm_policy_forced, p.apm_policy_pending),
+            (p.denoiser_frames_until_first_output, p.webrtc_ns_fallback),
+            (Some(30), Some(true))
+        );
+        assert_eq!(
+            (
+                p.apm_policy_applies,
+                p.apm_policy_deferred,
+                p.apm_policy_forced,
+                p.apm_policy_pending
+            ),
             (Some(31), Some(32), Some(33), Some(false))
         );
 
         let absent: proto::RootAudioStats = RootAudioStats::default().into();
-        assert_eq!((absent.speaking, absent.denoiser_rate, absent.apm_policy_applies), (None, None, None));
+        assert_eq!(
+            (absent.speaking, absent.denoiser_rate, absent.apm_policy_applies),
+            (None, None, None)
+        );
         assert!(absent.denoiser_process_us_buckets.is_empty());
         assert!(absent.voice_gain_db.is_nan() && absent.gate_in_block_peak_db.is_nan());
     }

@@ -36,8 +36,7 @@ pub use webrtc_sys::audio_device_controller::{
     ffi::RootDenoiserReturnedItem as NativeReturnedPipeline,
     ffi::RootDenoiserStateInfo as NativeDenoiserState,
     ffi::RootReturnPipelinesResult as NativeReturnPipelines,
-    ffi::RootSpeakingInfo as NativeSpeaking, ADM_RESULT_DEVICE_NOT_FOUND,
-    ADM_RESULT_NOT_ATTEMPTED,
+    ffi::RootSpeakingInfo as NativeSpeaking, ADM_RESULT_DEVICE_NOT_FOUND, ADM_RESULT_NOT_ATTEMPTED,
 };
 
 /// What became of an effect played on the native effect bus.
