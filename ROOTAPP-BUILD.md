@@ -1010,7 +1010,10 @@ Portability review of the fork's Phases 0-3 C++ and Rust:
 - The Effects SDK is called through raw vtables (no virtual destructors, `this` first); that holds
   for the Itanium ABI on x86-64 SysV and AArch64 as for MSVC, as the desktop's managed binding
   already relies on.
-- Upstream, not fixable here: AUHAL's stream-format listener reconfigures the render/capture
+- Upstream, not fixable here: `AudioDeviceMac::GetDeviceName` formats the default device's name
+  with `%s` from a 128-byte array CoreAudio may fill without a terminator when the name is that long
+  (a stack over-read when the default device's name has 128 bytes or more; E7 with such a device);
+  AUHAL's stream-format listener reconfigures the render/capture
   converters on a HAL thread without locking against the IO threads (AirPods profile switches); the
   PulseAudio ADM's `RTC_DCHECK(thread_checker_)` calls would fire from the device thread if a
   prebuilt were built with DCHECKs on.
