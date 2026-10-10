@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <thread>
 #include <utility>
 
 #include "api/audio/audio_device.h"
@@ -94,7 +95,8 @@ class AdmLock {
 };
 
 // The PulseAudio ADM enumerates through members its device opens use as well
-// (_deviceIndex, _numPlayDevices, the name pointers), without a lock of its
+// (_deviceIndex, _numPlayDevices, the name pointers; its play and record
+// threads enumerate inside StartPlayout/StartRecording), without a lock of its
 // own: it expects a single thread. On Linux enumeration therefore takes the
 // device mutex. The Windows and macOS ADMs enumerate safely on any thread, so
 // there a device list never waits for a device that is slow to stop.
@@ -103,18 +105,11 @@ constexpr bool kSerializeEnumeration = true;
 #else
 constexpr bool kSerializeEnumeration = false;
 #endif
-
-class EnumerationLock {
- public:
-  explicit EnumerationLock(webrtc::Mutex* mutex) {
-    if (kSerializeEnumeration) {
-      lock_.emplace(mutex);
-    }
-  }
-
- private:
-  std::optional<AdmLock> lock_;
-};
+// A PulseAudio stream start normally takes tens of milliseconds, but waits up
+// to 12 s per direction (kPulseStartTimeoutSec) for a server that does not
+// answer, while an FFI caller (the desktop's NewPlatformAudio, under its
+// engine gate) waits on the enumeration.
+constexpr int64_t kEnumerationWaitMs = 2000;
 
 // ADM names and GUIDs are C strings in fixed buffers, but the macOS ADM
 // copies a device name straight from CoreAudio, unterminated when it fills
@@ -600,6 +595,8 @@ AdmProxy::AdmProxy(
 #if defined(WEBRTC_MAC) && !defined(WEBRTC_IOS)
   uid_translator_ = CoreAudioUidToGuid;
 #endif
+  serialize_enumeration_.store(kSerializeEnumeration);
+  enumeration_wait_ms_.store(kEnumerationWaitMs);
   // Create the synthetic ADM for synthetic mode. SyntheticAudioDevice pumps
   // the WebRTC audio pipeline without platform audio, allowing FFI callbacks
   // to receive decoded remote audio.
@@ -1459,11 +1456,76 @@ bool AdmProxy::Initialized() const {
   return synthetic_init || platform_init;
 }
 
+// On Linux an enumeration takes the device mutex (kSerializeEnumeration),
+// waiting at most kEnumerationWaitMs for a device operation in progress. Past
+// that it reports no devices (count 0, names fail), and further enumerations
+// give up at once for as long again unless the mutex is free, so listing N
+// devices never waits N times.
+class AdmProxy::EnumerationGuard {
+ public:
+  explicit EnumerationGuard(AdmProxy* proxy) : proxy_(proxy) {
+    if (!proxy->serialize_enumeration_.load(std::memory_order_relaxed)) {
+      usable_ = true;
+      return;
+    }
+    locked_ = proxy->LockForEnumeration();
+    usable_ = locked_;
+  }
+  ~EnumerationGuard() {
+    if (locked_) {
+      proxy_->mutex_.Unlock();
+    }
+  }
+
+  EnumerationGuard(const EnumerationGuard&) = delete;
+  EnumerationGuard& operator=(const EnumerationGuard&) = delete;
+
+  bool usable() const { return usable_; }
+
+ private:
+  AdmProxy* const proxy_;
+  bool locked_ = false;
+  bool usable_ = false;
+};
+
+bool AdmProxy::LockForEnumeration() {
+  if (mutex_.TryLock()) {
+    return true;
+  }
+  const int64_t wait_ns =
+      enumeration_wait_ms_.load(std::memory_order_relaxed) * 1'000'000;
+  int64_t now = NowNs();
+  if (now < enumeration_busy_until_ns_.load(std::memory_order_relaxed)) {
+    return false;
+  }
+  const int64_t deadline = now + wait_ns;
+  while (now < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    if (mutex_.TryLock()) {
+      return true;
+    }
+    now = NowNs();
+  }
+  enumeration_busy_until_ns_.store(now + wait_ns, std::memory_order_relaxed);
+  RTC_LOG(LS_WARNING) << "AdmProxy: a device operation held the device for "
+                      << wait_ns / 1'000'000
+                      << " ms; enumeration reports no devices";
+  return false;
+}
+
+void AdmProxy::SetEnumerationLockForTest(bool serialize, int wait_ms) {
+  serialize_enumeration_.store(serialize);
+  enumeration_wait_ms_.store(wait_ms);
+  enumeration_busy_until_ns_.store(0);
+}
+
 // Enumeration goes straight to the Platform ADM, so (except on Linux, see
-// EnumerationLock) a device list is never stuck behind a device being stopped.
+// EnumerationGuard) a device list is never stuck behind a device being
+// stopped.
 int16_t AdmProxy::PlayoutDevices() {
-  EnumerationLock lock(&mutex_);
-  if (webrtc::AudioDeviceModule* platform_adm = platform()) {
+  EnumerationGuard guard(this);
+  webrtc::AudioDeviceModule* platform_adm = platform();
+  if (guard.usable() && platform_adm) {
     return platform_adm->PlayoutDevices();
   }
   // In synthetic mode, return 0 devices (no platform audio)
@@ -1471,8 +1533,9 @@ int16_t AdmProxy::PlayoutDevices() {
 }
 
 int16_t AdmProxy::RecordingDevices() {
-  EnumerationLock lock(&mutex_);
-  if (webrtc::AudioDeviceModule* platform_adm = platform()) {
+  EnumerationGuard guard(this);
+  webrtc::AudioDeviceModule* platform_adm = platform();
+  if (guard.usable() && platform_adm) {
     return platform_adm->RecordingDevices();
   }
   // In synthetic mode, return 0 devices (no platform audio)
@@ -1482,8 +1545,9 @@ int16_t AdmProxy::RecordingDevices() {
 int32_t AdmProxy::PlayoutDeviceName(uint16_t index,
                                     char name[webrtc::kAdmMaxDeviceNameSize],
                                     char guid[webrtc::kAdmMaxGuidSize]) {
-  EnumerationLock lock(&mutex_);
-  if (webrtc::AudioDeviceModule* platform_adm = platform()) {
+  EnumerationGuard guard(this);
+  webrtc::AudioDeviceModule* platform_adm = platform();
+  if (guard.usable() && platform_adm) {
     return platform_adm->PlayoutDeviceName(index, name, guid);
   }
   return -1;
@@ -1492,8 +1556,9 @@ int32_t AdmProxy::PlayoutDeviceName(uint16_t index,
 int32_t AdmProxy::RecordingDeviceName(uint16_t index,
                                       char name[webrtc::kAdmMaxDeviceNameSize],
                                       char guid[webrtc::kAdmMaxGuidSize]) {
-  EnumerationLock lock(&mutex_);
-  if (webrtc::AudioDeviceModule* platform_adm = platform()) {
+  EnumerationGuard guard(this);
+  webrtc::AudioDeviceModule* platform_adm = platform();
+  if (guard.usable() && platform_adm) {
     return platform_adm->RecordingDeviceName(index, name, guid);
   }
   return -1;

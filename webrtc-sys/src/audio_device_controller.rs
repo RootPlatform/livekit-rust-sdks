@@ -441,6 +441,16 @@ pub mod ffi {
         /// UID translation as CoreAudio would answer it now: `uids[i]` is
         /// the device with GUID `guids[i]`; any other UID is no device.
         fn set_uid_map(self: &AdmProxyHarness, uids: &[String], guids: &[String]);
+        /// Enumeration serialized with device operations (as on Linux),
+        /// waiting at most `wait_ms` for one in progress; or never waiting.
+        fn set_enumeration_lock(self: &AdmProxyHarness, serialize: bool, wait_ms: i32);
+        /// The next StartPlayout blocks the device thread (holding the
+        /// device mutex) until released.
+        fn block_next_start_playout(self: &AdmProxyHarness);
+        /// Whether the device thread got there within 5 s.
+        fn start_playout_blocked(self: &AdmProxyHarness) -> bool;
+        /// Releases it `after_ms` from now, from another thread.
+        fn release_start_playout(self: &AdmProxyHarness, after_ms: u32);
         fn fail_next_stop_playout(self: &AdmProxyHarness, result: i32);
         fn fail_next_stop_recording(self: &AdmProxyHarness, result: i32);
         fn set_device_playout_delay(self: &AdmProxyHarness, delay_ms: u16);

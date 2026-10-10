@@ -91,6 +91,18 @@ class FakePlatformAdm
   void SetPlayoutDelay(uint16_t delay_ms) { playout_delay_ms_.store(delay_ms); }
   webrtc::AudioTransport* callback() const { return callback_.load(); }
 
+  // The next StartPlayout blocks (as the PulseAudio ADM waits for its stream)
+  // until released, at most 10 s.
+  void BlockNextStartPlayout() {
+    start_entered_.Reset();
+    start_release_.Reset();
+    block_start_.store(true);
+  }
+  bool WaitStartPlayoutBlocked() {
+    return start_entered_.Wait(webrtc::TimeDelta::Seconds(5));
+  }
+  void ReleaseStartPlayout() { start_release_.Set(); }
+
   int32_t Init() override { return Record("Init"); }
   int32_t Terminate() override { return Record("Terminate"); }
   int32_t RegisterAudioCallback(webrtc::AudioTransport* transport) override {
@@ -150,6 +162,10 @@ class FakePlatformAdm
   }
   int32_t StartPlayout() override {
     Record("StartPlayout");
+    if (block_start_.exchange(false)) {
+      start_entered_.Set();
+      start_release_.Wait(webrtc::TimeDelta::Seconds(10));
+    }
     if (!playout_initialized_.load()) {
       return -1;
     }
@@ -227,6 +243,9 @@ class FakePlatformAdm
   std::atomic<int32_t> next_stop_playout_result_{0};
   std::atomic<int32_t> next_stop_recording_result_{0};
   std::atomic<uint16_t> playout_delay_ms_{0};
+  std::atomic<bool> block_start_{false};
+  webrtc::Event start_entered_;
+  webrtc::Event start_release_;
 };
 
 // libwebrtc's side of the device callbacks. With a re-entry target it calls
@@ -358,6 +377,26 @@ void AdmProxyHarness::set_uid_map(rust::Slice<const rust::String> uids,
         }
         return found->second;
       });
+}
+
+void AdmProxyHarness::set_enumeration_lock(bool serialize,
+                                           int32_t wait_ms) const {
+  proxy_->SetEnumerationLockForTest(serialize, wait_ms);
+}
+
+void AdmProxyHarness::block_next_start_playout() const {
+  fake_->BlockNextStartPlayout();
+}
+
+bool AdmProxyHarness::start_playout_blocked() const {
+  return fake_->WaitStartPlayoutBlocked();
+}
+
+void AdmProxyHarness::release_start_playout(uint32_t after_ms) const {
+  std::thread([fake = fake_, after_ms] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(after_ms));
+    fake->ReleaseStartPlayout();
+  }).detach();
 }
 
 void AdmProxyHarness::fail_next_stop_recording(int32_t result) const {

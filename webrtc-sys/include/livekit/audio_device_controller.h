@@ -234,6 +234,16 @@ class AdmProxyHarness {
   // GUID guids[i]; any other UID is no device.
   void set_uid_map(rust::Slice<const rust::String> uids,
                    rust::Slice<const rust::String> guids) const;
+  // Enumeration serialized with device operations (as on Linux), waiting at
+  // most wait_ms for one in progress; or never waiting.
+  void set_enumeration_lock(bool serialize, int32_t wait_ms) const;
+  // The next StartPlayout blocks the device thread (holding the device
+  // mutex) until released.
+  void block_next_start_playout() const;
+  // Whether the device thread got there within 5 s.
+  bool start_playout_blocked() const;
+  // Releases it after_ms from now, from another thread.
+  void release_start_playout(uint32_t after_ms) const;
   // The next StopPlayout fails with `result` and leaves the device closed, as
   // the Windows ADM does when it gives up joining its render thread.
   void fail_next_stop_playout(int32_t result) const;

@@ -264,6 +264,53 @@ fn adm_proxy_uid_selects_nothing_without_coreaudio() {
     );
 }
 
+/// Linux serializes enumeration with device operations (the PulseAudio ADM
+/// is not thread-safe) but never waits long for one: past the wait it reports
+/// no devices, and the enumerations right after it give up at once.
+#[test]
+fn adm_proxy_serialized_enumeration_waits_for_a_device_operation_but_not_for_long() {
+    let h = platform(&["{a}", "{b}"], &["{mic}"]);
+    h.set_enumeration_lock(true, 200);
+    let c = h.controller();
+    assert_eq!(c.playout_devices(), 2);
+    assert_eq!(c.playout_device_guid(1), "{b}");
+
+    h.block_next_start_playout();
+    h.hold(true);
+    assert!(h.start_playout_blocked(), "the device thread opens playout");
+    let started = Instant::now();
+    assert_eq!(c.playout_devices(), 0, "gave up: no devices");
+    let waited = started.elapsed();
+    assert!(waited >= Duration::from_millis(190) && waited < Duration::from_secs(3), "{waited:?}");
+    let started = Instant::now();
+    assert_eq!(c.recording_devices(), 0);
+    assert_eq!(c.playout_device_name(0), "");
+    assert!(started.elapsed() < Duration::from_millis(150), "the next ones give up at once");
+
+    // Past that window it waits again, and an open that ends in time is
+    // waited for.
+    std::thread::sleep(Duration::from_millis(250));
+    h.release_start_playout(50);
+    assert_eq!(c.playout_devices(), 2, "waited for the open to finish");
+    h.flush();
+    assert!(h.platform_playing());
+
+    // Unserialized (Windows, macOS), enumeration never waits.
+    h.set_enumeration_lock(false, 200);
+    h.hold(false);
+    h.flush();
+    h.block_next_start_playout();
+    h.hold(true);
+    assert!(h.start_playout_blocked());
+    let started = Instant::now();
+    assert_eq!(c.playout_devices(), 2);
+    assert_eq!(c.playout_device_name(1), "Device {b}");
+    assert!(started.elapsed() < Duration::from_millis(150));
+    h.release_start_playout(0);
+    h.flush();
+    assert!(h.platform_playing());
+}
+
 #[test]
 fn adm_proxy_init_alone_opens_nothing() {
     let h = platform(&["{spk}"], &["{mic}"]);

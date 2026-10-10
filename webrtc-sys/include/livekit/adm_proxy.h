@@ -443,6 +443,9 @@ class AdmProxy : public webrtc::AudioDeviceModule {
   bool SyntheticPlayingForTest() const;
   /// Replaces the UID translation (CoreAudio on macOS, none elsewhere).
   void SetUidTranslatorForTest(AdmUidTranslator translator);
+  /// Whether enumeration serializes with device operations (Linux) and how
+  /// long it waits for one in progress.
+  void SetEnumerationLockForTest(bool serialize, int wait_ms);
 
   // ===========================================================================
   // AudioDeviceModule Interface
@@ -587,6 +590,11 @@ class AdmProxy : public webrtc::AudioDeviceModule {
   void ShutdownLocked();
   DesiredState Desired() const;
 
+  class EnumerationGuard;
+  // Takes mutex_ for an enumeration, waiting a bounded time for a device
+  // operation in progress; false when it gave up.
+  bool LockForEnumeration();
+
 #if defined(__ANDROID__)
   bool EnsurePlatformAdmCreated();
 #endif
@@ -604,6 +612,10 @@ class AdmProxy : public webrtc::AudioDeviceModule {
   mutable webrtc::Mutex state_mutex_;
   DesiredState desired_;
   std::atomic<bool> reconcile_posted_{false};
+  // Enumeration and mutex_ (see EnumerationGuard).
+  std::atomic<bool> serialize_enumeration_{false};
+  std::atomic<int64_t> enumeration_wait_ms_{0};
+  std::atomic<int64_t> enumeration_busy_until_ns_{0};
 
   webrtc::scoped_refptr<SyntheticAudioDevice> synthetic_adm_;
   webrtc::scoped_refptr<webrtc::AudioDeviceModule> platform_adm_;
