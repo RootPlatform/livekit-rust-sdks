@@ -25,6 +25,7 @@ use crate::audio_device_controller::{
     ffi::{
         new_adm_proxy_harness, new_adm_proxy_harness_with_apm, AdmProxyHarness, AudioDeviceOutcome,
         AudioDeviceSelection, AudioDeviceSelectionKind, RootAudioControlUpdate,
+        RootDenoiserCompletionItem, RootDenoiserReturnedItem, RootDenoiserStateInfo,
     },
     ADM_RESULT_DEVICE_NOT_FOUND, ADM_RESULT_NOT_ATTEMPTED,
 };
@@ -530,4 +531,152 @@ fn adm_proxy_stats_report_unknown_echo_statistics_without_an_apm() {
     assert!(stats.divergent_filter_fraction.is_nan());
     assert_eq!(stats.aec_delay_ms, -1);
     assert_eq!((stats.processed_frames, stats.effects_played), (0, 0));
+}
+
+#[test]
+fn adm_proxy_moves_the_stream_epoch_before_every_recording_start() {
+    let h = platform(&["{spk}"], &["{mic}"]);
+    assert_eq!(h.control_state().stream_epoch, 0);
+    h.app_recording(true);
+    assert!(calls(&h).contains(&"StartRecording".to_string()));
+    assert_eq!(h.control_state().stream_epoch, 1);
+
+    let outcome = h.restart(true, false);
+    assert!(outcome.recording.attempted);
+    assert_eq!(h.control_state().stream_epoch, 2, "a restart is a new stream");
+
+    h.engine_start_recording();
+    calls(&h);
+    assert_eq!(h.control_state().stream_epoch, 2, "an open device is not started again");
+    h.app_recording(false);
+    h.engine_stop_recording();
+    calls(&h);
+    assert_eq!(h.control_state().stream_epoch, 2);
+    h.app_recording(true);
+    calls(&h);
+    assert_eq!(h.control_state().stream_epoch, 3);
+}
+
+#[test]
+fn adm_proxy_controller_stores_denoiser_wanted_until_a_reset() {
+    let h = harness(&["{spk}"], &["{mic}"]);
+    assert!(h.apply_control(&RootAudioControlUpdate {
+        has_denoiser_wanted: true,
+        denoiser_wanted: true,
+        ..Default::default()
+    }));
+    assert!(h.control_state().denoiser_wanted);
+    let resets = h.control_state().dsp_reset_seq;
+    h.reset_root_audio(false);
+    assert!(!h.control_state().denoiser_wanted);
+    assert_eq!(h.control_state().dsp_reset_seq, resets + 1);
+}
+
+fn denoiser_completions(h: &AdmProxyHarness, count: usize) -> Vec<RootDenoiserCompletionItem> {
+    let all = std::cell::RefCell::new(Vec::new());
+    wait_until("denoiser completions", || {
+        all.borrow_mut().extend(h.controller().take_root_denoiser_completions());
+        all.borrow().len() >= count
+    });
+    all.into_inner()
+}
+
+#[test]
+fn adm_proxy_controller_hands_pipelines_to_the_slot_and_back() {
+    let h = new_adm_proxy_harness_with_apm(&strings(&["{spk}"]), &strings(&["{mic}"]));
+    let controller = h.controller();
+    assert!(controller.root_denoiser_available());
+    let first = h.add_fake_pipeline();
+    assert!(controller.set_root_denoiser(7, 70, first, 48_000));
+    assert_eq!(
+        denoiser_completions(&h, 1),
+        [RootDenoiserCompletionItem { owner: 7, async_id: 70, error: String::new() }]
+    );
+    assert_eq!(
+        controller.root_denoiser_state(),
+        RootDenoiserStateInfo {
+            installed: true,
+            rate: 48_000,
+            bypass_reason: 0,
+            webrtc_ns_fallback: false
+        }
+    );
+    assert_eq!(h.run_denoiser(48_000), 2);
+
+    let stats = h.stats();
+    assert!(stats.dsp_available && stats.denoiser_available && stats.policy_available);
+    assert!(stats.denoiser_installed);
+    assert_eq!((stats.denoiser_rate, stats.denoiser_installs, stats.denoiser_frames), (48_000, 1, 1));
+    assert_eq!(stats.denoiser_process_us_buckets.len(), 16);
+    assert_eq!(stats.denoiser_process_us_buckets.iter().sum::<u64>(), 1);
+    assert_eq!(stats.denoiser_frames_until_first_output, 0);
+    assert_eq!(h.stats().denoiser_process_max_us, 0, "the maximum resets on read");
+
+    let second = h.add_fake_pipeline();
+    controller.set_root_denoiser(8, 80, second, 48_000);
+    denoiser_completions(&h, 1);
+    assert_eq!(
+        controller.take_root_denoiser_returned(),
+        [RootDenoiserReturnedItem { owner: 7, pipeline: first }]
+    );
+
+    h.reset_root_audio(false);
+    assert!(controller.root_denoiser_state().installed, "a session start keeps it");
+    h.reset_root_audio(true);
+    assert!(!controller.root_denoiser_state().installed);
+    assert_eq!(
+        controller.take_root_denoiser_returned(),
+        [RootDenoiserReturnedItem { owner: 8, pipeline: second }],
+        "the last session's end hands it back"
+    );
+}
+
+#[test]
+fn adm_proxy_controller_returns_every_pipeline_at_once() {
+    let h = harness(&["{spk}"], &["{mic}"]);
+    let controller = h.controller();
+    let first = h.add_fake_pipeline();
+    let second = h.add_fake_pipeline();
+    controller.set_root_denoiser(1, 10, first, 48_000);
+    denoiser_completions(&h, 1);
+    controller.set_root_denoiser(1, 11, second, 48_000);
+    denoiser_completions(&h, 1);
+
+    let returned = controller.return_root_denoiser_pipelines();
+    assert!(returned.error.is_empty());
+    let mut pipelines = returned.pipelines;
+    pipelines.sort_unstable();
+    let mut expected = vec![first, second];
+    expected.sort_unstable();
+    assert_eq!(pipelines, expected);
+    assert!(!controller.root_denoiser_state().installed);
+    assert!(controller.take_root_denoiser_returned().is_empty());
+}
+
+#[test]
+fn adm_proxy_controller_covers_a_stalled_denoiser_with_webrtc_ns() {
+    let h = new_adm_proxy_harness_with_apm(&strings(&["{spk}"]), &strings(&["{mic}"]));
+    let controller = h.controller();
+    let pipeline = h.add_fake_pipeline();
+    controller.set_root_denoiser(1, 10, pipeline, 48_000);
+    denoiser_completions(&h, 1);
+    assert!(h.apply_control(&RootAudioControlUpdate {
+        has_denoiser_wanted: true,
+        denoiser_wanted: true,
+        ..Default::default()
+    }));
+    assert_eq!(h.run_denoiser(48_000), 2);
+    h.latch_denoiser_bypass(2);
+    wait_until("the fallback", || controller.root_denoiser_state().webrtc_ns_fallback);
+    let stats = h.stats();
+    assert!(stats.webrtc_ns_fallback);
+    assert_eq!(stats.denoiser_bypass_reason, 2);
+    assert_eq!(h.run_denoiser(48_000), 0, "the stalled pipeline is bypassed");
+
+    h.apply_control(&RootAudioControlUpdate {
+        has_denoiser_wanted: true,
+        denoiser_wanted: false,
+        ..Default::default()
+    });
+    wait_until("the fallback ends", || !controller.root_denoiser_state().webrtc_ns_fallback);
 }

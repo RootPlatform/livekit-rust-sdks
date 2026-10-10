@@ -143,7 +143,9 @@ pub mod native {
     pub use crate::imp::peer_connection_factory::{
         AudioDeviceOutcome, AudioDeviceRequest, AudioDeviceRequestOutcome, AudioDeviceSelection,
         EffectPlay, NativeAudioControl, NativeAudioStats, NativeCaptureFormat,
-        ADM_RESULT_DEVICE_NOT_FOUND, ADM_RESULT_NOT_ATTEMPTED,
+        NativeDenoiserCompletion, NativeDenoiserState, NativeReturnPipelines,
+        NativeReturnedPipeline, NativeSpeaking, ADM_RESULT_DEVICE_NOT_FOUND,
+        ADM_RESULT_NOT_ATTEMPTED,
     };
     use crate::{
         audio_source::{native::NativeAudioSource, AudioSourceOptions},
@@ -185,6 +187,20 @@ pub mod native {
         fn root_audio_capture_format(&self) -> NativeCaptureFormat;
         fn root_audio_sources_added(&self) -> u64;
         fn reset_root_audio(&self, close_gate: bool);
+        // The Effects SDK hand-off and the published speaking flag.
+        fn root_denoiser_available(&self) -> bool;
+        fn set_root_denoiser(
+            &self,
+            owner: u64,
+            async_id: u64,
+            pipeline: u64,
+            sample_rate: u32,
+        ) -> bool;
+        fn return_root_denoiser_pipelines(&self) -> NativeReturnPipelines;
+        fn take_root_denoiser_completions(&self) -> Vec<NativeDenoiserCompletion>;
+        fn take_root_denoiser_returned(&self) -> Vec<NativeReturnedPipeline>;
+        fn root_denoiser_state(&self) -> NativeDenoiserState;
+        fn root_audio_speaking(&self) -> NativeSpeaking;
 
         // Device enumeration
         fn playout_devices(&self) -> i16;
@@ -316,6 +332,40 @@ pub mod native {
 
         fn reset_root_audio(&self, close_gate: bool) {
             self.handle.reset_root_audio(close_gate)
+        }
+
+        fn root_denoiser_available(&self) -> bool {
+            self.handle.root_denoiser_available()
+        }
+
+        fn set_root_denoiser(
+            &self,
+            owner: u64,
+            async_id: u64,
+            pipeline: u64,
+            sample_rate: u32,
+        ) -> bool {
+            self.handle.set_root_denoiser(owner, async_id, pipeline, sample_rate)
+        }
+
+        fn return_root_denoiser_pipelines(&self) -> NativeReturnPipelines {
+            self.handle.return_root_denoiser_pipelines()
+        }
+
+        fn take_root_denoiser_completions(&self) -> Vec<NativeDenoiserCompletion> {
+            self.handle.take_root_denoiser_completions()
+        }
+
+        fn take_root_denoiser_returned(&self) -> Vec<NativeReturnedPipeline> {
+            self.handle.take_root_denoiser_returned()
+        }
+
+        fn root_denoiser_state(&self) -> NativeDenoiserState {
+            self.handle.root_denoiser_state()
+        }
+
+        fn root_audio_speaking(&self) -> NativeSpeaking {
+            self.handle.root_audio_speaking()
         }
 
         fn playout_devices(&self) -> i16 {

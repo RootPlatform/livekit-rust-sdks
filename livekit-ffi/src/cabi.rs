@@ -121,6 +121,19 @@ pub extern "C" fn livekit_ffi_rootapp_audio_caps() -> u64 {
     server::rootapp_audio::ROOTAPP_AUDIO_CAPS
 }
 
+/// The `audio_effects_sdk::INotificationHandler*` the host installs on every
+/// Effects SDK pipeline it hands over (RootAudioSetDenoiserRequest). A static
+/// native object that only counts notifications (RootAudioStats
+/// denoiser_notifications / denoiser_other_notifications), so it outlives any
+/// pipeline; null where the denoiser is not built.
+#[no_mangle]
+pub extern "C" fn livekit_ffi_rootapp_denoiser_notification_handler() -> *mut std::ffi::c_void {
+    if cfg!(any(target_os = "ios", target_os = "android")) {
+        return std::ptr::null_mut();
+    }
+    webrtc_sys::root_denoiser::ffi::root_denoiser_notification_handler() as *mut std::ffi::c_void
+}
+
 /// The MediaFoundation codecs' shared D3D11 device on the adapter `adapter_luid`
 /// names (the default adapter when null), so the host can render or capture on
 /// the device the encoders already use. Returns an HRESULT. On success

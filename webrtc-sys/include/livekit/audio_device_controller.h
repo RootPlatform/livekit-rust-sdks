@@ -17,11 +17,13 @@
 #pragma once
 
 #include <memory>
+#include <vector>
 
 #include "api/scoped_refptr.h"
 #include "livekit/adm_proxy.h"
 #include "livekit/root_audio_mixer.h"
 #include "livekit/root_audio_processing.h"
+#include "livekit/root_denoiser.h"
 #include "rust/cxx.h"
 
 namespace livekit_ffi {
@@ -33,6 +35,11 @@ struct RootAudioNativeStats;
 struct RootAudioControlUpdate;
 struct RootAudioCaptureFormat;
 struct RootControlState;
+struct RootDenoiserCompletionItem;
+struct RootDenoiserReturnedItem;
+struct RootReturnPipelinesResult;
+struct RootDenoiserStateInfo;
+struct RootSpeakingInfo;
 }  // namespace livekit_ffi
 #include "webrtc-sys/src/audio_device_controller.rs.h"
 
@@ -96,8 +103,22 @@ class AudioDeviceController {
   uint64_t root_audio_sources_added() const;
   // Controls back to their defaults (unity volumes, no gains or effects,
   // AEC/NS following the device track), with the capture gate open or closed
-  // (muted, push-to-talk key up).
+  // (muted, push-to-talk key up). Closing it (the last session ended) also
+  // hands back every denoiser pipeline and ends the NS fallback.
   void reset_root_audio(bool close_gate) const;
+
+  // The Effects SDK hand-off (RootDenoiserControl); every call is a no-op
+  // without a slot.
+  bool root_denoiser_available() const;
+  bool set_root_denoiser(uint64_t owner,
+                         uint64_t async_id,
+                         uint64_t pipeline,
+                         uint32_t sample_rate) const;
+  RootReturnPipelinesResult return_root_denoiser_pipelines() const;
+  rust::Vec<RootDenoiserCompletionItem> take_root_denoiser_completions() const;
+  rust::Vec<RootDenoiserReturnedItem> take_root_denoiser_returned() const;
+  RootDenoiserStateInfo root_denoiser_state() const;
+  RootSpeakingInfo root_audio_speaking() const;
 
   // Recording control. On desktop start/stop are the app's own request, apart
   // from libwebrtc's; init does nothing (devices open on start).
@@ -139,6 +160,8 @@ class AudioDeviceController {
   webrtc::scoped_refptr<RootAudioMixer> mixer_;
   webrtc::scoped_refptr<RootApmDecorator> apm_;
   std::shared_ptr<RootCaptureState> capture_;
+  // With the capture state's slot: the rootapp-effects thread.
+  std::unique_ptr<RootDenoiserControl> denoiser_;
 };
 
 int32_t resolve_audio_device_index_for_test(
@@ -225,6 +248,10 @@ class AdmProxyHarness {
   bool apply_control(const RootAudioControlUpdate& control) const;
   void reset_root_audio(bool close_gate) const;
   RootControlState control_state() const;
+  const AudioDeviceController& controller() const;
+  uint64_t add_fake_pipeline() const;
+  uint8_t run_denoiser(uint32_t rate) const;
+  void latch_denoiser_bypass(uint32_t reason) const;
 
  private:
   webrtc::scoped_refptr<FakePlatformAdm> fake_;
@@ -232,6 +259,7 @@ class AdmProxyHarness {
   std::shared_ptr<RootCaptureState> capture_;
   webrtc::scoped_refptr<RootApmDecorator> apm_;
   webrtc::scoped_refptr<AdmProxy> proxy_;
+  std::unique_ptr<std::vector<std::unique_ptr<RootFakeFxPipeline>>> fakes_;
   std::unique_ptr<AudioDeviceController> controller_;
   std::unique_ptr<HarnessTransport> transport_;
 };

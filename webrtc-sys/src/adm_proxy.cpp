@@ -26,6 +26,7 @@
 #include "api/units/time_delta.h"
 #include "livekit/audio_thread.h"
 #include "livekit/root_audio_mixer.h"
+#include "livekit/root_audio_processing.h"
 #include "rtc_base/checks.h"
 #include "rtc_base/event.h"
 #include "rtc_base/logging.h"
@@ -739,6 +740,9 @@ void AdmProxy::ReconcileRecordingLocked(const DesiredState& desired,
 
   if (!platform_adm->Recording()) {
     tap_.ResetCaptureClock();
+    if (capture_state_) {
+      capture_state_->stream_epoch.fetch_add(1, std::memory_order_release);
+    }
     const int32_t result = platform_adm->StartRecording();
     recording_start_result_.store(result, std::memory_order_relaxed);
     if (outcome) {
@@ -1136,6 +1140,11 @@ void AdmProxy::SetDeviceTrackProcessing(bool echo_cancellation,
                                         std::memory_order_relaxed);
   device_track_noise_suppression_.store(noise_suppression,
                                         std::memory_order_relaxed);
+}
+
+void AdmProxy::SetCaptureState(std::shared_ptr<RootCaptureState> capture_state) {
+  AdmLock lock(&mutex_);
+  capture_state_ = std::move(capture_state);
 }
 
 void AdmProxy::FlushDeviceTasksForTest() {

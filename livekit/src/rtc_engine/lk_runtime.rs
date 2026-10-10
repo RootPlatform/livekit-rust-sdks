@@ -25,7 +25,8 @@ use thiserror::Error;
 #[cfg(not(target_arch = "wasm32"))]
 use libwebrtc::peer_connection_factory::native::{
     AudioDeviceRequest, AudioDeviceSelection, EffectPlay, NativeAudioControl, NativeAudioStats,
-    NativeCaptureFormat, PeerConnectionFactoryExt,
+    NativeCaptureFormat, NativeDenoiserCompletion, NativeDenoiserState, NativeReturnPipelines,
+    NativeReturnedPipeline, NativeSpeaking, PeerConnectionFactoryExt,
 };
 
 lazy_static! {
@@ -401,6 +402,47 @@ impl LkRuntime {
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn reset_root_audio(&self, close_gate: bool) {
         self.pc_factory.reset_root_audio(close_gate)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn root_denoiser_available(&self) -> bool {
+        self.pc_factory.root_denoiser_available()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn set_root_denoiser(
+        &self,
+        owner: u64,
+        async_id: u64,
+        pipeline: u64,
+        sample_rate: u32,
+    ) -> bool {
+        self.pc_factory.set_root_denoiser(owner, async_id, pipeline, sample_rate)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn return_root_denoiser_pipelines(&self) -> NativeReturnPipelines {
+        self.pc_factory.return_root_denoiser_pipelines()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn take_root_denoiser_completions(&self) -> Vec<NativeDenoiserCompletion> {
+        self.pc_factory.take_root_denoiser_completions()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn take_root_denoiser_returned(&self) -> Vec<NativeReturnedPipeline> {
+        self.pc_factory.take_root_denoiser_returned()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn root_denoiser_state(&self) -> NativeDenoiserState {
+        self.pc_factory.root_denoiser_state()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn root_audio_speaking(&self) -> NativeSpeaking {
+        self.pc_factory.root_audio_speaking()
     }
 }
 

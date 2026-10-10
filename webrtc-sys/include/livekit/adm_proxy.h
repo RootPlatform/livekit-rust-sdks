@@ -45,6 +45,7 @@ class Thread;
 namespace livekit_ffi {
 
 class RootAudioMixer;
+struct RootCaptureState;
 
 // Last Stop/Init/Start results: 0 is success, other values are ADM errors,
 // except these two, which no ADM returns.
@@ -368,6 +369,11 @@ class AdmProxy : public webrtc::AudioDeviceModule {
   /// What the newest device track asked of the shared APM (reported in stats).
   void SetDeviceTrackProcessing(bool echo_cancellation, bool noise_suppression);
 
+  /// The capture post-processor's state, whose stream epoch moves right before
+  /// every recording start (the DSP chain starts the stream over). Set once,
+  /// before any device opens.
+  void SetCaptureState(std::shared_ptr<RootCaptureState> capture_state);
+
   /// Atomics only; the max gaps are reset on read.
   AdmNativeStats ReadNativeStats();
 
@@ -545,6 +551,8 @@ class AdmProxy : public webrtc::AudioDeviceModule {
   uint64_t playout_opened_restart_gen_ = 0;
   uint64_t recording_opened_selection_gen_ = 0;
   uint64_t recording_opened_restart_gen_ = 0;
+  // Guarded by mutex_.
+  std::shared_ptr<RootCaptureState> capture_state_;
 #if !LK_ADM_MOBILE
   bool delay_refresh_scheduled_ = false;
   bool retry_scheduled_ = false;

@@ -90,7 +90,26 @@ AudioDeviceController::AudioDeviceController(
     : adm_proxy_(std::move(adm_proxy)),
       mixer_(std::move(mixer)),
       apm_(std::move(apm)),
-      capture_(std::move(capture)) {}
+      capture_(std::move(capture)) {
+  if (!capture_ || !capture_->denoiser_slot) {
+    return;
+  }
+  std::shared_ptr<RootCaptureState> state = capture_;
+  webrtc::scoped_refptr<RootApmDecorator> decorator = apm_;
+  RootDenoiserControl::Hooks hooks;
+  hooks.speaking = [state] { return state->ReadSpeaking().speaking; };
+  hooks.wanted = [state] {
+    return state->denoiser_wanted.load(std::memory_order_relaxed);
+  };
+  hooks.process_rate = [state] { return ReadCaptureFormat(*state).sample_rate; };
+  hooks.set_fallback = [decorator](bool on) {
+    if (decorator) {
+      decorator->SetFallbackNoiseSuppression(on);
+    }
+  };
+  denoiser_ = std::make_unique<RootDenoiserControl>(
+      capture_->denoiser_slot, std::move(hooks), RootDenoiserControl::Timing());
+}
 
 int16_t AudioDeviceController::playout_devices() const {
   return adm_proxy_->PlayoutDevices();
@@ -314,16 +333,76 @@ RootAudioNativeStats AudioDeviceController::root_audio_stats() const {
     stats.echo_cancellation_active = apm.echo_cancellation_active;
     stats.webrtc_ns_active = apm.noise_suppression_active;
   }
+  stats.gate_in_block_peak_db = std::numeric_limits<float>::quiet_NaN();
+  stats.voice_gain_db = std::numeric_limits<float>::quiet_NaN();
+  stats.denoiser_frames_until_first_output = -1;
   if (capture_) {
     const RootCaptureFormatSnapshot format = ReadCaptureFormat(*capture_);
     stats.process_rate = format.sample_rate;
     stats.process_channels = format.channels;
-    stats.processed_frames =
-        capture_->processed_frames.load(std::memory_order_relaxed);
-    stats.apm_out_sumsq = capture_->apm_out_sumsq.load(std::memory_order_relaxed);
-    stats.sent_sumsq = capture_->sent_sumsq.load(std::memory_order_relaxed);
-    stats.stage_samples =
-        capture_->stage_samples.load(std::memory_order_relaxed);
+    const RootDspStatsSnapshot dsp = capture_->ReadDspStats(true);
+    stats.dsp_available = true;
+    stats.processed_frames = dsp.processed_frames;
+    stats.stage_samples = dsp.stage_samples;
+    stats.apm_out_sumsq = dsp.apm_out_sumsq;
+    stats.denoised_sumsq = dsp.denoised_sumsq;
+    stats.gate_in_sumsq = dsp.gate_in_sumsq;
+    stats.sent_sumsq = dsp.sent_sumsq;
+    stats.gate_in_block_peak_db = dsp.gate_in_block_peak_db;
+    stats.threshold = dsp.threshold;
+    stats.envelope = dsp.envelope_max;
+    stats.gate_speaking = dsp.gate_speaking;
+    stats.speaking_seq = dsp.speaking_seq;
+    stats.voice_gain_db = dsp.voice_gain_db;
+    stats.voice_gain_settled = dsp.voice_gain_settled;
+    stats.gate_open_frames = dsp.gate_open_frames;
+    stats.speaking = dsp.speaking;
+    stats.gate_input_above_frames = dsp.gate_input_above_frames;
+    stats.startup_hold_frames = dsp.startup_hold_frames;
+    stats.transmit_frames = dsp.transmit_frames;
+    stats.unsupported_frames = dsp.unsupported_frames;
+    stats.non_finite_samples = dsp.non_finite_samples;
+    stats.dsp_resets = dsp.dsp_resets;
+    stats.dsp_flushes = dsp.dsp_flushes;
+    stats.gate_open_delay_us = dsp.gate_open_delay_us;
+    stats.ns_gap_frames = dsp.ns_gap_frames;
+    stats.denoiser_latency_ms = dsp.aligner_latency_ms;
+    stats.denoiser_buffered_samples = dsp.aligner_buffered_samples;
+    stats.denoiser_underruns = dsp.aligner_underruns;
+    stats.denoiser_padded_samples = dsp.aligner_padded_samples;
+    stats.denoiser_trimmed_samples = dsp.aligner_trimmed_samples;
+    stats.denoiser_drained_samples = dsp.aligner_drained_samples;
+  }
+  if (denoiser_) {
+    const RootDenoiserSlotStats slot = capture_->denoiser_slot->ReadStats(true);
+    const RootDenoiserNotificationCounts notifications =
+        root_denoiser_notification_counts();
+    stats.denoiser_available = true;
+    stats.denoiser_installed = slot.installed;
+    stats.denoiser_frames = slot.frames;
+    stats.denoiser_misses = slot.misses;
+    stats.denoiser_empty_outputs = slot.empty_outputs;
+    stats.denoiser_process_max_us = slot.process_max_us;
+    stats.denoiser_slow_frames = slot.slow_frames;
+    stats.denoiser_bypass_reason = static_cast<uint32_t>(slot.bypass);
+    stats.denoiser_notifications = notifications.slow;
+    stats.denoiser_other_notifications = notifications.other;
+    stats.denoiser_rate = slot.rate;
+    stats.denoiser_installs = slot.installs;
+    stats.denoiser_bypassed_frames = slot.bypassed_frames;
+    stats.denoiser_frames_until_first_output = slot.frames_until_first_output;
+    for (uint64_t count : slot.histogram) {
+      stats.denoiser_process_us_buckets.push_back(count);
+    }
+    stats.webrtc_ns_fallback = denoiser_->fallback();
+  }
+  if (apm_) {
+    const RootApmPolicyStats policy = apm_->ReadPolicyStats();
+    stats.policy_available = true;
+    stats.apm_policy_applies = policy.applies;
+    stats.apm_policy_deferred = policy.deferred;
+    stats.apm_policy_forced = policy.forced;
+    stats.apm_policy_pending = policy.pending;
   }
   return stats;
 }
@@ -337,7 +416,8 @@ bool AudioDeviceController::set_root_audio_control(
       control.has_mic_muted || control.has_push_to_talk ||
       control.has_input_volume || control.has_denoise_power ||
       control.has_auto_gain || control.has_gate_threshold ||
-      control.has_auto_sensitivity || control.has_gain_reset_db;
+      control.has_auto_sensitivity || control.has_gain_reset_db ||
+      control.has_denoiser_wanted;
   const bool mixer_fields = control.has_master_volume || control.has_deafened;
   const bool apm_fields =
       control.has_echo_cancellation || control.has_noise_suppression;
@@ -374,6 +454,13 @@ bool AudioDeviceController::set_root_audio_control(
           std::min(kRootMaxVoiceGainDb, std::max(0.0f, control.gain_reset_db)),
           std::memory_order_relaxed);
       capture_->gain_reset_seq.fetch_add(1, std::memory_order_release);
+    }
+    if (control.has_denoiser_wanted) {
+      capture_->denoiser_wanted.store(control.denoiser_wanted,
+                                      std::memory_order_relaxed);
+      if (denoiser_ && control.denoiser_wanted) {
+        denoiser_->Wake();
+      }
     }
   }
   if (mixer_) {
@@ -456,6 +543,89 @@ void AudioDeviceController::reset_root_audio(bool close_gate) const {
   if (apm_) {
     apm_->ResetPolicy();
   }
+  if (denoiser_ && close_gate) {
+    denoiser_->Reset();
+  }
+}
+
+bool AudioDeviceController::root_denoiser_available() const {
+  return denoiser_ != nullptr;
+}
+
+bool AudioDeviceController::set_root_denoiser(uint64_t owner,
+                                              uint64_t async_id,
+                                              uint64_t pipeline,
+                                              uint32_t sample_rate) const {
+  if (!denoiser_) {
+    return false;
+  }
+  denoiser_->Set(owner, async_id, pipeline, sample_rate);
+  return true;
+}
+
+RootReturnPipelinesResult AudioDeviceController::return_root_denoiser_pipelines()
+    const {
+  RootReturnPipelinesResult result{};
+  if (!denoiser_) {
+    return result;
+  }
+  const RootDenoiserReturnAll all = denoiser_->ReturnAll();
+  for (uint64_t pipeline : all.pipelines) {
+    result.pipelines.push_back(pipeline);
+  }
+  result.error = rust::String(all.error);
+  return result;
+}
+
+rust::Vec<RootDenoiserCompletionItem>
+AudioDeviceController::take_root_denoiser_completions() const {
+  rust::Vec<RootDenoiserCompletionItem> result;
+  if (!denoiser_) {
+    return result;
+  }
+  for (const RootDenoiserCompletion& completion : denoiser_->TakeCompletions()) {
+    RootDenoiserCompletionItem item{};
+    item.owner = completion.owner;
+    item.async_id = completion.async_id;
+    item.error = rust::String(completion.error);
+    result.push_back(std::move(item));
+  }
+  return result;
+}
+
+rust::Vec<RootDenoiserReturnedItem>
+AudioDeviceController::take_root_denoiser_returned() const {
+  rust::Vec<RootDenoiserReturnedItem> result;
+  if (!denoiser_) {
+    return result;
+  }
+  for (const RootDenoiserReturned& returned : denoiser_->TakeReturned()) {
+    result.push_back(RootDenoiserReturnedItem{returned.owner, returned.pipeline});
+  }
+  return result;
+}
+
+RootDenoiserStateInfo AudioDeviceController::root_denoiser_state() const {
+  RootDenoiserStateInfo state{};
+  if (!denoiser_) {
+    return state;
+  }
+  const RootDenoiserSlot& slot = *capture_->denoiser_slot;
+  state.installed = slot.installed();
+  state.rate = slot.rate();
+  state.bypass_reason = static_cast<uint32_t>(slot.bypass());
+  state.webrtc_ns_fallback = denoiser_->fallback();
+  return state;
+}
+
+RootSpeakingInfo AudioDeviceController::root_audio_speaking() const {
+  RootSpeakingInfo info{};
+  if (capture_) {
+    const RootSpeakingSnapshot speaking = capture_->ReadSpeaking();
+    info.speaking = speaking.speaking;
+    info.seq = speaking.seq;
+  }
+  return info;
 }
 
 #if LK_ADM_MOBILE

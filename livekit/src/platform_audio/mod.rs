@@ -116,8 +116,9 @@ mod rootapp;
 pub use error::{AudioError, AudioResult};
 pub use processing::{AudioProcessingOptions, AudioProcessingType};
 pub use rootapp::{
-    sanitize_volume, AudioDeviceResults, AudioDeviceSelection, CaptureFormat, EffectPlay,
-    PushToTalk, RootAudioControl, RootAudioStats, MAX_VOICE_GAIN_DB, MAX_VOLUME,
+    sanitize_volume, AudioDeviceResults, AudioDeviceSelection, CaptureFormat, DenoiserCompletion,
+    DenoiserState, EffectPlay, PushToTalk, ReturnedPipeline, ReturnedPipelines, RootAudioControl,
+    RootAudioStats, LocalSpeaking, MAX_VOICE_GAIN_DB, MAX_VOLUME,
 };
 
 // Re-export RtcAudioSource for convenience
@@ -1082,6 +1083,61 @@ impl PlatformAudio {
     /// up) in the same store, so a teardown never passes through an open gate.
     pub fn reset_rootapp_controls(&self, close_gate: bool) {
         self.handle.runtime.reset_root_audio(close_gate)
+    }
+
+    /// The capture processor runs Effects SDK pipelines (desktop, 64-bit).
+    pub fn denoiser_available(&self) -> bool {
+        self.handle.runtime.root_denoiser_available()
+    }
+
+    /// Hands an Effects SDK `IPipeline*` (non-zero) at `sample_rate` to the
+    /// capture processor for `owner`, or removes the installed one (0). An
+    /// install waits for a pause in the user's speech, at most 3 s; a removal
+    /// is immediate. It completes once, through
+    /// [`take_denoiser_completions`](Self::take_denoiser_completions); a
+    /// pipeline native held comes back through
+    /// [`take_returned_pipelines`](Self::take_returned_pipelines). Native
+    /// never releases a pipeline. Fails at once without a slot.
+    pub fn set_denoiser(
+        &self,
+        owner: u64,
+        async_id: u64,
+        pipeline: u64,
+        sample_rate: u32,
+    ) -> AudioResult<()> {
+        if self.handle.runtime.set_root_denoiser(owner, async_id, pipeline, sample_rate) {
+            Ok(())
+        } else {
+            Err(AudioError::OperationFailed("the denoiser is not supported by this build".into()))
+        }
+    }
+
+    /// Takes back every pipeline native holds: the installed one, those
+    /// waiting to be installed (which complete with an error) and those
+    /// returned but not taken yet. Blocks up to 200 ms for the audio thread.
+    pub fn return_denoiser_pipelines(&self) -> ReturnedPipelines {
+        self.handle.runtime.return_root_denoiser_pipelines().into()
+    }
+
+    /// Finished `set_denoiser` requests of every owner since the last take.
+    pub fn take_denoiser_completions(&self) -> Vec<DenoiserCompletion> {
+        self.handle.runtime.take_root_denoiser_completions().into_iter().map(Into::into).collect()
+    }
+
+    /// Pipelines native let go of since the last take, by owner.
+    pub fn take_returned_pipelines(&self) -> Vec<ReturnedPipeline> {
+        self.handle.runtime.take_root_denoiser_returned().into_iter().map(Into::into).collect()
+    }
+
+    /// The Effects SDK slot's state; atomics only.
+    pub fn denoiser_state(&self) -> DenoiserState {
+        self.handle.runtime.root_denoiser_state().into()
+    }
+
+    /// The published speaking flag (noise gate speaking while the transmit
+    /// gate is open); atomics only.
+    pub fn speaking(&self) -> LocalSpeaking {
+        self.handle.runtime.root_audio_speaking().into()
     }
 
     // =========================================================================

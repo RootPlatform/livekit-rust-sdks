@@ -30,7 +30,7 @@
 //! dropped track handles are forgotten.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, LazyLock,
@@ -40,7 +40,8 @@ use std::{
 
 use livekit::{
     prelude::*, sanitize_volume, webrtc::stats::RtcStats, AudioDeviceResults, AudioDeviceSelection,
-    EffectPlay, PlatformAudio, PushToTalk, RootAudioControl, RootAudioStats,
+    CaptureFormat, DenoiserCompletion, DenoiserState, EffectPlay, PlatformAudio, PushToTalk,
+    ReturnedPipeline, RootAudioControl, RootAudioStats, LocalSpeaking,
 };
 use parking_lot::Mutex;
 use tokio::time::MissedTickBehavior;
@@ -98,6 +99,9 @@ const KNOWN_RESOLVE_EVERY_PASSES: u32 = 5;
 const NEW_SOURCE_PASS_DELAY_POLLS: u32 = 5;
 /// The longest effect clip RegisterEffect accepts (60 s at 48 kHz).
 const MAX_EFFECT_SAMPLES: u32 = 48_000 * 60;
+/// The rates the DSP chain runs at.
+const MIN_DENOISER_RATE: u32 = 8_000;
+const MAX_DENOISER_RATE: u32 = 48_000;
 
 /// What a session drives: the handle's PlatformAudio (a recorder in tests).
 trait RootAudioSink {
@@ -127,29 +131,119 @@ fn sink_of(audio: &PlatformAudio) -> &dyn RootAudioSink {
 /// The live sessions of the process. `PlatformAudio::new` reuses the shared
 /// engine, so every handle drives the same controls: they go back to their
 /// defaults only when the first session starts, and the capture gate closes
-/// (with every other control reset) only when the last one ends. Dropping one
-/// handle never changes another's state, and a teardown never opens the gate.
+/// (with every other control reset and every denoiser pipeline handed back)
+/// only when the last one ends. Dropping one handle never changes another's
+/// state, and a teardown never opens the gate.
 #[derive(Default)]
 struct Sessions {
-    live: usize,
+    /// The live handles; the newest is the largest.
+    live: BTreeSet<FfiHandleId>,
     /// SSRCs of remote audio tracks, resolved as they were subscribed.
     subscribed: HashMap<FfiHandleId, u32>,
+    mail: DenoiserMail,
 }
 
 impl Sessions {
-    fn open(&mut self, sink: &dyn RootAudioSink) {
-        self.live += 1;
-        if self.live == 1 {
+    fn open(&mut self, handle: FfiHandleId, sink: &dyn RootAudioSink) {
+        self.live.insert(handle);
+        if self.live.len() == 1 {
             sink.reset_controls(false);
         }
+        self.mail.opened(handle);
     }
 
-    fn close(&mut self, sink: &dyn RootAudioSink) {
-        self.live = self.live.saturating_sub(1);
-        if self.live == 0 {
+    fn close(&mut self, handle: FfiHandleId, sink: &dyn RootAudioSink) {
+        if !self.live.remove(&handle) {
+            return;
+        }
+        if self.live.is_empty() {
             sink.reset_controls(true);
             self.subscribed.clear();
         }
+        self.mail.closed(&self.live, handle);
+    }
+
+    fn deliver(&mut self, completions: Vec<DenoiserCompletion>, returned: Vec<ReturnedPipeline>) {
+        self.mail.deliver(&self.live, completions, returned);
+    }
+}
+
+/// Where SetDenoiser completions and returned pipelines go, each exactly once:
+/// a completion to the handle that asked (dropped once it is gone: native
+/// never held an errored pipeline, and a held one comes back as returned), a
+/// pipeline to the handle whose request installed it while that one lives,
+/// else to the newest live handle, else to the next handle to open (and to a
+/// ReturnPipelines response before that).
+#[derive(Default)]
+struct DenoiserMail {
+    completions: HashMap<FfiHandleId, Vec<(u64, Option<String>)>>,
+    returned: HashMap<FfiHandleId, Vec<u64>>,
+    orphans: Vec<u64>,
+}
+
+impl DenoiserMail {
+    fn deliver(
+        &mut self,
+        live: &BTreeSet<FfiHandleId>,
+        completions: Vec<DenoiserCompletion>,
+        returned: Vec<ReturnedPipeline>,
+    ) {
+        for completion in completions {
+            if live.contains(&completion.owner) {
+                self.completions
+                    .entry(completion.owner)
+                    .or_default()
+                    .push((completion.async_id, completion.error));
+            } else {
+                log::debug!(
+                    "RootAudio: denoiser result {} for dropped handle {}",
+                    completion.async_id,
+                    completion.owner
+                );
+            }
+        }
+        for returned in returned {
+            self.return_to(live, returned.owner, returned.pipeline);
+        }
+    }
+
+    fn return_to(&mut self, live: &BTreeSet<FfiHandleId>, owner: FfiHandleId, pipeline: u64) {
+        let target = if live.contains(&owner) { Some(owner) } else { live.last().copied() };
+        match target {
+            Some(handle) => self.returned.entry(handle).or_default().push(pipeline),
+            None => self.orphans.push(pipeline),
+        }
+    }
+
+    fn opened(&mut self, handle: FfiHandleId) {
+        if !self.orphans.is_empty() {
+            let orphans = std::mem::take(&mut self.orphans);
+            self.returned.entry(handle).or_default().extend(orphans);
+        }
+    }
+
+    fn closed(&mut self, live: &BTreeSet<FfiHandleId>, handle: FfiHandleId) {
+        self.completions.remove(&handle);
+        for pipeline in self.returned.remove(&handle).unwrap_or_default() {
+            self.return_to(live, handle, pipeline);
+        }
+    }
+
+    /// The handle's completions (async id, error) and returned pipelines.
+    fn take(&mut self, handle: FfiHandleId) -> (Vec<(u64, Option<String>)>, Vec<u64>) {
+        (
+            self.completions.remove(&handle).unwrap_or_default(),
+            self.returned.remove(&handle).unwrap_or_default(),
+        )
+    }
+
+    /// Every pipeline not sent yet, for a ReturnPipelines response.
+    fn take_undelivered(&mut self) -> Vec<u64> {
+        let mut pipelines = std::mem::take(&mut self.orphans);
+        for (_, returned) in self.returned.drain() {
+            pipelines.extend(returned);
+        }
+        pipelines
     }
 }
 
@@ -315,6 +409,90 @@ enum Pass {
     NewSource,
 }
 
+/// What the events task reads from native on every poll.
+struct NativePoll {
+    format: CaptureFormat,
+    sources: u64,
+    speaking: LocalSpeaking,
+    /// None without an Effects SDK slot.
+    denoiser: Option<DenoiserState>,
+    completions: Vec<DenoiserCompletion>,
+    returned: Vec<ReturnedPipeline>,
+}
+
+impl NativePoll {
+    fn read(audio: &PlatformAudio) -> Self {
+        let denoiser = audio.denoiser_available();
+        Self {
+            format: audio.capture_format(),
+            sources: audio.mixer_sources_added(),
+            speaking: audio.speaking(),
+            denoiser: denoiser.then(|| audio.denoiser_state()),
+            completions: if denoiser { audio.take_denoiser_completions() } else { Vec::new() },
+            returned: if denoiser { audio.take_returned_pipelines() } else { Vec::new() },
+        }
+    }
+}
+
+/// What one handle was last told: `speaking` is sent when it differs (so a
+/// first poll sends it only when true), `denoiser_state` on the first poll and
+/// on every change; denoiser results and returned pipelines as they arrive.
+#[derive(Default)]
+struct SessionEvents {
+    speaking: bool,
+    denoiser: Option<DenoiserState>,
+}
+
+impl SessionEvents {
+    fn update(
+        &mut self,
+        handle: FfiHandleId,
+        poll: NativePoll,
+    ) -> Vec<proto::root_audio_event::Message> {
+        let (completions, returned) = {
+            let mut sessions = SESSIONS.lock();
+            sessions.deliver(poll.completions, poll.returned);
+            sessions.mail.take(handle)
+        };
+        self.messages(poll.speaking, poll.denoiser, completions, returned)
+    }
+
+    fn messages(
+        &mut self,
+        speaking: LocalSpeaking,
+        denoiser: Option<DenoiserState>,
+        completions: Vec<(u64, Option<String>)>,
+        returned: Vec<u64>,
+    ) -> Vec<proto::root_audio_event::Message> {
+        let mut messages = Vec::new();
+        for (async_id, error) in completions {
+            messages.push(proto::RootAudioDenoiserResult { async_id, error }.into());
+        }
+        if !returned.is_empty() {
+            messages.push(proto::RootAudioPipelinesReturned { pipelines: returned }.into());
+        }
+        if speaking.speaking != self.speaking {
+            self.speaking = speaking.speaking;
+            messages.push(
+                proto::RootAudioSpeaking { speaking: speaking.speaking, seq: speaking.seq }.into(),
+            );
+        }
+        if let Some(state) = denoiser.filter(|state| self.denoiser != Some(*state)) {
+            self.denoiser = Some(state);
+            messages.push(
+                proto::RootAudioDenoiserState {
+                    installed: state.installed,
+                    rate: state.rate,
+                    bypass_reason: state.bypass_reason,
+                    webrtc_ns_fallback: state.webrtc_ns_fallback,
+                }
+                .into(),
+            );
+        }
+        messages
+    }
+}
+
 /// The FFI side of one `PlatformAudio` handle: the track gains it set and the
 /// task that turns native state into `RootAudioEvent`s.
 pub struct RootAudioSession {
@@ -331,7 +509,7 @@ impl RootAudioSession {
         handle: FfiHandleId,
         audio: PlatformAudio,
     ) -> Arc<Self> {
-        SESSIONS.lock().open(&audio);
+        SESSIONS.lock().open(handle, &audio);
         let session = Arc::new(Self {
             handle,
             state: Mutex::new(SessionState {
@@ -358,7 +536,7 @@ impl RootAudioSession {
             state.audio.take()
         };
         if let Some(audio) = audio {
-            SESSIONS.lock().close(&audio);
+            SESSIONS.lock().close(self.handle, &audio);
         }
     }
 
@@ -374,20 +552,19 @@ impl RootAudioSession {
         let mut last_sources = None;
         let mut new_source_pass_at = None;
         let mut polls = 0u32;
+        let mut events = SessionEvents::default();
         loop {
             tokio::select! {
                 _ = &mut dropped => break,
                 _ = interval.tick() => {}
             }
-            let Some((format, sources)) = self
-                .state
-                .lock()
-                .audio
-                .as_ref()
-                .map(|audio| (audio.capture_format(), audio.mixer_sources_added()))
-            else {
+            let Some(poll) = self.state.lock().audio.as_ref().map(NativePoll::read) else {
                 break;
             };
+            let (format, sources) = (poll.format, poll.sources);
+            for message in events.update(self.handle, poll) {
+                send_root_audio_event(server, self.handle, message);
+            }
             if format.seq != last_format_seq {
                 last_format_seq = format.seq;
                 send_root_audio_event(
@@ -524,14 +701,14 @@ pub fn on_track_subscribed(server: &'static FfiServer, handle: FfiHandleId, trac
     let Track::RemoteAudio(track) = track else {
         return;
     };
-    if SESSIONS.lock().live == 0 {
+    if SESSIONS.lock().live.is_empty() {
         return;
     }
     let track = track.clone();
     let task = server.async_runtime.spawn(async move {
         if let Some(ssrc) = resolve_ssrc(track).await {
             let mut sessions = SESSIONS.lock();
-            if sessions.live > 0 {
+            if !sessions.live.is_empty() {
                 sessions.subscribed.insert(handle, ssrc);
             }
         }
@@ -600,6 +777,7 @@ pub fn root_audio_control(control: &proto::RootAudioControl) -> RootAudioControl
         gate_threshold: control.gate_threshold,
         auto_sensitivity: control.auto_sensitivity,
         gain_reset_db: control.gain_reset_db,
+        denoiser_wanted: control.denoiser_wanted,
     }
     .sanitized()
 }
@@ -711,11 +889,12 @@ pub fn on_stats(
 /// Every field is sanitised (finite, clamped; an unknown push-to-talk value
 /// closes the gate). mic_muted, push_to_talk, input_volume, master_volume and
 /// deafened take effect at once; echo_cancellation and
-/// webrtc_noise_suppression within a second (rate-limited APM policy).
-/// denoise_power, auto_gain, gate_threshold, auto_sensitivity and
-/// gain_reset_db are stored for the DSP chain and have no effect yet. A field
-/// this build cannot act on (no capture processor or APM decorator) is
-/// reported as not supported; the others are applied.
+/// webrtc_noise_suppression within a second (rate-limited APM policy, and with
+/// the DSP chain at a pause in speech). denoise_power, auto_gain,
+/// gate_threshold, auto_sensitivity, gain_reset_db and denoiser_wanted are
+/// read by the DSP chain on its next frame. A field this build cannot act on
+/// (no capture processor or APM decorator) is reported as not supported; the
+/// others are applied.
 pub fn on_set_control(
     server: &'static FfiServer,
     req: proto::RootAudioSetControlRequest,
@@ -798,30 +977,85 @@ pub fn on_stop_effects(
     Ok(proto::RootAudioStopEffectsResponse { error: None })
 }
 
+/// Why a SetDenoiser request fails before it is queued: an install needs the
+/// Effects SDK slot, an aligned pointer and a rate the chain runs (8-48 kHz).
+/// A removal without a slot has nothing to remove and succeeds.
+fn denoiser_request_error(available: bool, pipeline: u64, sample_rate: u32) -> Option<String> {
+    if pipeline == 0 {
+        return None;
+    }
+    if !available {
+        return Some(format!("the denoiser is {NOT_SUPPORTED}"));
+    }
+    if pipeline % std::mem::align_of::<usize>() as u64 != 0 {
+        return Some("pipeline pointer is not aligned".into());
+    }
+    if !(MIN_DENOISER_RATE..=MAX_DENOISER_RATE).contains(&sample_rate) {
+        return Some(format!(
+            "pipeline rate {sample_rate} is outside {MIN_DENOISER_RATE}-{MAX_DENOISER_RATE} Hz"
+        ));
+    }
+    None
+}
+
+/// Queues the pipeline for the capture processor (installed at a pause in
+/// speech, at most 3 s later; 0 removes at once). The result arrives as
+/// RootAudioEvent.denoiser_result; an error before queueing is sent at once.
 pub fn on_set_denoiser(
     server: &'static FfiServer,
     req: proto::RootAudioSetDenoiserRequest,
 ) -> FfiResult<proto::RootAudioSetDenoiserResponse> {
+    let audio = platform_audio_from_handle(server, req.platform_audio_handle)?;
     let async_id = server.next_id();
-    let platform_audio_handle = req.platform_audio_handle;
-    server.async_runtime.spawn(async move {
-        send_root_audio_event(
-            server,
-            platform_audio_handle,
-            proto::RootAudioDenoiserResult { async_id, error: Some(NOT_SUPPORTED.into()) }.into(),
-        );
-    });
+    let handle = req.platform_audio_handle;
+    let available = audio.denoiser_available();
+    let mut error = denoiser_request_error(available, req.pipeline_ptr, req.sample_rate);
+    let queued = error.is_none() && available;
+    if queued {
+        if let Err(e) = audio.set_denoiser(handle, async_id, req.pipeline_ptr, req.sample_rate) {
+            error = Some(e.to_string());
+        }
+    }
+    if !queued || error.is_some() {
+        let task = server.async_runtime.spawn(async move {
+            send_root_audio_event(
+                server,
+                handle,
+                proto::RootAudioDenoiserResult { async_id, error }.into(),
+            );
+        });
+        server.watch_panic(task);
+    }
     Ok(proto::RootAudioSetDenoiserResponse { async_id })
 }
 
+/// Synchronous: every pipeline native holds (installed, waiting to be, or
+/// returned and not sent yet). Waiting requests complete with an error
+/// event; the installed pipeline is removed unless the audio thread holds on
+/// for 200 ms (then it stays and `error` says so).
 pub fn on_return_pipelines(
-    _server: &'static FfiServer,
-    _req: proto::RootAudioReturnPipelinesRequest,
+    server: &'static FfiServer,
+    req: proto::RootAudioReturnPipelinesRequest,
 ) -> FfiResult<proto::RootAudioReturnPipelinesResponse> {
-    Ok(proto::RootAudioReturnPipelinesResponse {
-        pipelines: Vec::new(),
-        error: Some(NOT_SUPPORTED.into()),
-    })
+    let audio = platform_audio_from_handle(server, req.platform_audio_handle)?;
+    if !audio.denoiser_available() {
+        return Ok(proto::RootAudioReturnPipelinesResponse { pipelines: Vec::new(), error: None });
+    }
+    let held = audio.return_denoiser_pipelines();
+    let completions = audio.take_denoiser_completions();
+    let returned = audio.take_returned_pipelines();
+    let undelivered = {
+        let mut sessions = SESSIONS.lock();
+        sessions.deliver(completions, returned);
+        sessions.mail.take_undelivered()
+    };
+    let mut pipelines = held.pipelines;
+    for pipeline in undelivered {
+        if !pipelines.contains(&pipeline) {
+            pipelines.push(pipeline);
+        }
+    }
+    Ok(proto::RootAudioReturnPipelinesResponse { pipelines, error: held.error })
 }
 
 pub fn on_set_monitor(
@@ -894,33 +1128,33 @@ impl From<RootAudioStats> for proto::RootAudioStats {
             audio_thread_logs_dropped: Some(stats.audio_thread_logs_dropped),
             overlapping_callbacks: Some(stats.overlapping_callbacks),
             device_stop_failures: Some(stats.device_stop_failures),
-            speaking: None,
-            gate_input_above_frames: None,
-            startup_hold_frames: None,
-            transmit_frames: None,
-            unsupported_frames: None,
-            non_finite_samples: None,
-            dsp_resets: None,
-            dsp_flushes: None,
-            gate_open_delay_us: None,
-            ns_gap_frames: None,
-            denoiser_rate: None,
-            denoiser_installs: None,
-            denoiser_bypassed_frames: None,
-            denoiser_process_us_buckets: Vec::new(),
-            denoiser_other_notifications: None,
-            denoiser_latency_ms: None,
-            denoiser_buffered_samples: None,
-            denoiser_underruns: None,
-            denoiser_padded_samples: None,
-            denoiser_trimmed_samples: None,
-            denoiser_drained_samples: None,
-            denoiser_frames_until_first_output: None,
-            webrtc_ns_fallback: None,
-            apm_policy_applies: None,
-            apm_policy_deferred: None,
-            apm_policy_forced: None,
-            apm_policy_pending: None,
+            speaking: stats.speaking,
+            gate_input_above_frames: stats.gate_input_above_frames,
+            startup_hold_frames: stats.startup_hold_frames,
+            transmit_frames: stats.transmit_frames,
+            unsupported_frames: stats.unsupported_frames,
+            non_finite_samples: stats.non_finite_samples,
+            dsp_resets: stats.dsp_resets,
+            dsp_flushes: stats.dsp_flushes,
+            gate_open_delay_us: stats.gate_open_delay_us,
+            ns_gap_frames: stats.ns_gap_frames,
+            denoiser_rate: stats.denoiser_rate,
+            denoiser_installs: stats.denoiser_installs,
+            denoiser_bypassed_frames: stats.denoiser_bypassed_frames,
+            denoiser_process_us_buckets: stats.denoiser_process_us_buckets,
+            denoiser_other_notifications: stats.denoiser_other_notifications,
+            denoiser_latency_ms: stats.denoiser_latency_ms,
+            denoiser_buffered_samples: stats.denoiser_buffered_samples,
+            denoiser_underruns: stats.denoiser_underruns,
+            denoiser_padded_samples: stats.denoiser_padded_samples,
+            denoiser_trimmed_samples: stats.denoiser_trimmed_samples,
+            denoiser_drained_samples: stats.denoiser_drained_samples,
+            denoiser_frames_until_first_output: stats.denoiser_frames_until_first_output,
+            webrtc_ns_fallback: stats.webrtc_ns_fallback,
+            apm_policy_applies: stats.apm_policy_applies,
+            apm_policy_deferred: stats.apm_policy_deferred,
+            apm_policy_forced: stats.apm_policy_forced,
+            apm_policy_pending: stats.apm_policy_pending,
         }
     }
 }
@@ -942,6 +1176,15 @@ mod tests {
         }
         assert_eq!(crate::cabi::livekit_ffi_rootapp_audio_caps(), ROOTAPP_AUDIO_CAPS);
         assert_eq!(ROOTAPP_AUDIO_CAPS & (CAP_DSP | CAP_DENOISER | CAP_MONITOR), 0);
+    }
+
+    #[test]
+    fn rootapp_audio_denoiser_notification_handler_is_exported_on_64_bit_desktop() {
+        let handler = crate::cabi::livekit_ffi_rootapp_denoiser_notification_handler();
+        let expected = cfg!(target_pointer_width = "64")
+            && !cfg!(any(target_os = "ios", target_os = "android"));
+        assert_eq!(!handler.is_null(), expected);
+        assert_eq!(handler, crate::cabi::livekit_ffi_rootapp_denoiser_notification_handler());
     }
 
     #[test]
@@ -968,8 +1211,9 @@ mod tests {
             gate_threshold: Some(3.0),
             auto_sensitivity: Some(true),
             gain_reset_db: Some(f32::NAN),
-            denoiser_wanted: None,
+            denoiser_wanted: Some(true),
         });
+        assert_eq!(control.denoiser_wanted, Some(true));
         assert_eq!(control.push_to_talk, Some(PushToTalk::Released));
         assert_eq!(control.input_volume, Some(0.0));
         assert_eq!(control.master_volume, Some(2.0));
@@ -1099,18 +1343,257 @@ mod tests {
     fn rootapp_audio_sessions_reset_on_the_first_start_and_close_on_the_last_end() {
         let sink = Recorder::default();
         let mut sessions = Sessions::default();
-        sessions.open(&sink);
+        sessions.open(1, &sink);
         assert_eq!(sink.take(), ["reset closed=false"]);
-        sessions.open(&sink);
+        sessions.open(2, &sink);
         sessions.subscribed.insert(9, 99);
-        sessions.close(&sink);
+        sessions.close(1, &sink);
         assert_eq!(sink.take(), Vec::<String>::new(), "another handle is still live");
         assert_eq!(sessions.subscribed.len(), 1);
-        sessions.close(&sink);
+        sessions.close(1, &sink);
+        assert_eq!(sink.take(), Vec::<String>::new(), "a handle closes once");
+        sessions.close(2, &sink);
         assert_eq!(sink.take(), ["reset closed=true"], "the last end closes the gate");
         assert!(sessions.subscribed.is_empty());
-        sessions.open(&sink);
+        sessions.open(3, &sink);
         assert_eq!(sink.take(), ["reset closed=false"]);
+    }
+
+    fn completion(owner: u64, async_id: u64, error: Option<&str>) -> DenoiserCompletion {
+        DenoiserCompletion { owner, async_id, error: error.map(str::to_string) }
+    }
+
+    fn returned(owner: u64, pipeline: u64) -> ReturnedPipeline {
+        ReturnedPipeline { owner, pipeline }
+    }
+
+    #[test]
+    fn rootapp_audio_denoiser_results_go_to_the_handle_that_asked() {
+        let sink = Recorder::default();
+        let mut sessions = Sessions::default();
+        sessions.open(1, &sink);
+        sessions.open(2, &sink);
+        sessions.deliver(
+            vec![completion(1, 10, None), completion(2, 11, Some("busy")), completion(9, 12, None)],
+            Vec::new(),
+        );
+        assert_eq!(sessions.mail.take(1), (vec![(10, None)], Vec::new()));
+        assert_eq!(sessions.mail.take(2), (vec![(11, Some("busy".to_string()))], Vec::new()));
+        assert_eq!(sessions.mail.take(1), (Vec::new(), Vec::new()), "each once");
+
+        sessions.deliver(vec![completion(2, 13, None)], Vec::new());
+        sessions.close(2, &sink);
+        assert_eq!(sessions.mail.take(2), (Vec::new(), Vec::new()), "a dropped handle's results go");
+        assert_eq!(sessions.mail.take(1), (Vec::new(), Vec::new()));
+    }
+
+    #[test]
+    fn rootapp_audio_returned_pipelines_reach_exactly_one_handle() {
+        let sink = Recorder::default();
+        let mut sessions = Sessions::default();
+        sessions.open(1, &sink);
+        sessions.open(5, &sink);
+        sessions.deliver(Vec::new(), vec![returned(1, 100), returned(7, 101), returned(5, 102)]);
+        assert_eq!(sessions.mail.take(1).1, [100], "to the owner while it lives");
+        assert_eq!(sessions.mail.take(5).1, [101, 102], "else to the newest live handle");
+
+        sessions.deliver(Vec::new(), vec![returned(1, 103)]);
+        sessions.close(1, &sink);
+        assert_eq!(sessions.mail.take(5).1, [103], "a closed handle's pipelines move on");
+
+        sessions.deliver(Vec::new(), vec![returned(5, 104)]);
+        sessions.close(5, &sink);
+        sessions.deliver(Vec::new(), vec![returned(5, 105)]);
+        assert_eq!(sessions.mail.take(5).1, Vec::<u64>::new());
+        sessions.open(6, &sink);
+        assert_eq!(sessions.mail.take(6).1, [104, 105], "kept for the next handle");
+    }
+
+    #[test]
+    fn rootapp_audio_return_pipelines_takes_every_undelivered_pipeline() {
+        let sink = Recorder::default();
+        let mut sessions = Sessions::default();
+        sessions.deliver(Vec::new(), vec![returned(1, 100)]);
+        sessions.open(2, &sink);
+        sessions.open(3, &sink);
+        sessions.deliver(Vec::new(), vec![returned(3, 101), returned(2, 102)]);
+        let mut undelivered = sessions.mail.take_undelivered();
+        undelivered.sort_unstable();
+        assert_eq!(undelivered, [100, 101, 102]);
+        assert_eq!(sessions.mail.take(2).1, Vec::<u64>::new());
+        assert_eq!(sessions.mail.take(3).1, Vec::<u64>::new());
+        assert!(sessions.mail.take_undelivered().is_empty());
+    }
+
+    fn speaking(speaking: bool, seq: u64) -> LocalSpeaking {
+        LocalSpeaking { speaking, seq }
+    }
+
+    fn state(installed: bool, rate: u32, bypass_reason: u32, fallback: bool) -> DenoiserState {
+        DenoiserState { installed, rate, bypass_reason, webrtc_ns_fallback: fallback }
+    }
+
+    #[test]
+    fn rootapp_audio_speaking_is_sent_on_every_change_per_handle() {
+        use proto::root_audio_event::Message;
+        let mut events = SessionEvents::default();
+        assert!(events.messages(speaking(false, 0), None, Vec::new(), Vec::new()).is_empty());
+        assert_eq!(
+            events.messages(speaking(true, 3), None, Vec::new(), Vec::new()),
+            [Message::Speaking(proto::RootAudioSpeaking { speaking: true, seq: 3 })]
+        );
+        assert!(events.messages(speaking(true, 5), None, Vec::new(), Vec::new()).is_empty());
+        assert_eq!(
+            events.messages(speaking(false, 6), None, Vec::new(), Vec::new()),
+            [Message::Speaking(proto::RootAudioSpeaking { speaking: false, seq: 6 })]
+        );
+
+        let mut late = SessionEvents::default();
+        assert_eq!(
+            late.messages(speaking(true, 9), None, Vec::new(), Vec::new()),
+            [Message::Speaking(proto::RootAudioSpeaking { speaking: true, seq: 9 })],
+            "a new handle hears the current value when it is true"
+        );
+    }
+
+    #[test]
+    fn rootapp_audio_denoiser_state_is_sent_first_and_on_change() {
+        use proto::root_audio_event::Message;
+        let mut events = SessionEvents::default();
+        let quiet = speaking(false, 0);
+        let empty = state(false, 0, 0, false);
+        assert_eq!(
+            events.messages(quiet, Some(empty), Vec::new(), Vec::new()),
+            [Message::DenoiserState(proto::RootAudioDenoiserState {
+                installed: false,
+                rate: 0,
+                bypass_reason: 0,
+                webrtc_ns_fallback: false
+            })]
+        );
+        assert!(events.messages(quiet, Some(empty), Vec::new(), Vec::new()).is_empty());
+        let stalled = state(true, 48_000, 2, true);
+        assert_eq!(events.messages(quiet, Some(stalled), Vec::new(), Vec::new()).len(), 1);
+        assert!(events.messages(quiet, None, Vec::new(), Vec::new()).is_empty());
+
+        let messages =
+            events.messages(quiet, Some(stalled), vec![(4, None), (5, Some("x".into()))], vec![7, 8]);
+        assert_eq!(
+            messages,
+            [
+                Message::DenoiserResult(proto::RootAudioDenoiserResult { async_id: 4, error: None }),
+                Message::DenoiserResult(proto::RootAudioDenoiserResult {
+                    async_id: 5,
+                    error: Some("x".into())
+                }),
+                Message::PipelinesReturned(proto::RootAudioPipelinesReturned {
+                    pipelines: vec![7, 8]
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn rootapp_audio_set_denoiser_validates_before_queueing() {
+        let aligned = 0x1000u64;
+        assert_eq!(denoiser_request_error(true, aligned, 48_000), None);
+        assert_eq!(denoiser_request_error(true, aligned, 16_000), None);
+        assert_eq!(denoiser_request_error(true, aligned, 8_000), None);
+        assert!(denoiser_request_error(true, aligned, 7_999).is_some());
+        assert!(denoiser_request_error(true, aligned, 96_000).is_some());
+        assert!(denoiser_request_error(true, aligned + 1, 48_000).is_some());
+        assert!(denoiser_request_error(false, aligned, 48_000).unwrap().contains(NOT_SUPPORTED));
+        assert_eq!(denoiser_request_error(false, 0, 0), None, "nothing to remove is no error");
+        assert_eq!(denoiser_request_error(true, 0, 0), None, "a removal needs no rate");
+    }
+
+    #[test]
+    fn rootapp_audio_phase_2_stats_convert_field_for_field() {
+        let stats = RootAudioStats {
+            denoised_sumsq: 1.5,
+            gate_in_sumsq: 2.5,
+            gate_in_block_peak_db: -12.0,
+            threshold: 0.01,
+            envelope: 0.25,
+            gate_speaking: true,
+            speaking_seq: 4,
+            voice_gain_db: 3.5,
+            voice_gain_settled: true,
+            gate_open_frames: 5,
+            denoiser_installed: true,
+            denoiser_frames: 6,
+            denoiser_misses: 7,
+            denoiser_empty_outputs: 8,
+            denoiser_process_max_us: 9,
+            denoiser_slow_frames: 10,
+            denoiser_bypass_reason: 2,
+            denoiser_notifications: 11,
+            speaking: Some(true),
+            gate_input_above_frames: Some(12),
+            startup_hold_frames: Some(13),
+            transmit_frames: Some(14),
+            unsupported_frames: Some(15),
+            non_finite_samples: Some(16),
+            dsp_resets: Some(17),
+            dsp_flushes: Some(18),
+            gate_open_delay_us: Some(19),
+            ns_gap_frames: Some(20),
+            denoiser_rate: Some(16_000),
+            denoiser_installs: Some(21),
+            denoiser_bypassed_frames: Some(22),
+            denoiser_process_us_buckets: (0..16).collect(),
+            denoiser_other_notifications: Some(23),
+            denoiser_latency_ms: Some(24.5),
+            denoiser_buffered_samples: Some(25),
+            denoiser_underruns: Some(26),
+            denoiser_padded_samples: Some(27),
+            denoiser_trimmed_samples: Some(28),
+            denoiser_drained_samples: Some(29),
+            denoiser_frames_until_first_output: Some(30),
+            webrtc_ns_fallback: Some(true),
+            apm_policy_applies: Some(31),
+            apm_policy_deferred: Some(32),
+            apm_policy_forced: Some(33),
+            apm_policy_pending: Some(false),
+            ..Default::default()
+        };
+        let p: proto::RootAudioStats = stats.into();
+        assert_eq!((p.denoised_sumsq, p.gate_in_sumsq), (1.5, 2.5));
+        assert_eq!((p.gate_in_block_peak_db, p.threshold, p.envelope), (-12.0, 0.01, 0.25));
+        assert!(p.gate_speaking && p.voice_gain_settled && p.denoiser_installed);
+        assert_eq!((p.speaking_seq, p.voice_gain_db, p.gate_open_frames), (4, 3.5, 5));
+        assert_eq!((p.denoiser_frames, p.denoiser_misses, p.denoiser_empty_outputs), (6, 7, 8));
+        assert_eq!((p.denoiser_process_max_us, p.denoiser_slow_frames), (9, 10));
+        assert_eq!((p.denoiser_bypass_reason, p.denoiser_notifications), (2, 11));
+        assert_eq!(p.speaking, Some(true));
+        assert_eq!(
+            (p.gate_input_above_frames, p.startup_hold_frames, p.transmit_frames),
+            (Some(12), Some(13), Some(14))
+        );
+        assert_eq!((p.unsupported_frames, p.non_finite_samples), (Some(15), Some(16)));
+        assert_eq!((p.dsp_resets, p.dsp_flushes), (Some(17), Some(18)));
+        assert_eq!((p.gate_open_delay_us, p.ns_gap_frames), (Some(19), Some(20)));
+        assert_eq!(
+            (p.denoiser_rate, p.denoiser_installs, p.denoiser_bypassed_frames),
+            (Some(16_000), Some(21), Some(22))
+        );
+        assert_eq!(p.denoiser_process_us_buckets, (0..16).collect::<Vec<u64>>());
+        assert_eq!((p.denoiser_other_notifications, p.denoiser_latency_ms), (Some(23), Some(24.5)));
+        assert_eq!(
+            (p.denoiser_buffered_samples, p.denoiser_underruns, p.denoiser_padded_samples),
+            (Some(25), Some(26), Some(27))
+        );
+        assert_eq!((p.denoiser_trimmed_samples, p.denoiser_drained_samples), (Some(28), Some(29)));
+        assert_eq!((p.denoiser_frames_until_first_output, p.webrtc_ns_fallback), (Some(30), Some(true)));
+        assert_eq!(
+            (p.apm_policy_applies, p.apm_policy_deferred, p.apm_policy_forced, p.apm_policy_pending),
+            (Some(31), Some(32), Some(33), Some(false))
+        );
+
+        let absent: proto::RootAudioStats = RootAudioStats::default().into();
+        assert_eq!((absent.speaking, absent.denoiser_rate, absent.apm_policy_applies), (None, None, None));
+        assert!(absent.denoiser_process_us_buckets.is_empty());
+        assert!(absent.voice_gain_db.is_nan() && absent.gate_in_block_peak_db.is_nan());
     }
 
     #[test]

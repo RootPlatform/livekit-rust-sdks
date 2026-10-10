@@ -17,7 +17,8 @@
 
 use libwebrtc::peer_connection_factory::native::{
     AudioDeviceOutcome, AudioDeviceRequestOutcome, NativeAudioControl, NativeAudioStats,
-    NativeCaptureFormat, ADM_RESULT_NOT_ATTEMPTED,
+    NativeCaptureFormat, NativeDenoiserCompletion, NativeDenoiserState, NativeReturnPipelines,
+    NativeReturnedPipeline, NativeSpeaking, ADM_RESULT_NOT_ATTEMPTED,
 };
 pub use libwebrtc::peer_connection_factory::native::{AudioDeviceSelection, EffectPlay};
 
@@ -85,11 +86,14 @@ impl PushToTalk {
 /// only; effects ignore both), and `echo_cancellation` /
 /// `webrtc_noise_suppression` (the APM policy, applied at most once a second
 /// because each toggle re-initializes the echo canceller or the noise
-/// suppressor).
+/// suppressor, and with the DSP chain at a pause in speech, at most 3 s later).
 ///
-/// Stored for the DSP chain of a later build and not effective yet:
-/// `denoise_power`, `auto_gain`, `gate_threshold`, `auto_sensitivity` and the
-/// `gain_reset_db` command.
+/// The DSP chain's settings, read on its next frame: `denoise_power` (the
+/// installed Effects SDK pipeline's power), `auto_gain`, `gate_threshold`,
+/// `auto_sensitivity`, the `gain_reset_db` command and `denoiser_wanted` (the
+/// host's noise suppression mode is the Effects SDK: the startup hold waits
+/// for the denoiser and native WebRTC NS covers a denoiser that stops or does
+/// not arrive). Builds without the chain only store them.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct RootAudioControl {
     pub mic_muted: Option<bool>,
@@ -110,6 +114,7 @@ pub struct RootAudioControl {
     pub auto_sensitivity: Option<bool>,
     /// 0..[`MAX_VOICE_GAIN_DB`].
     pub gain_reset_db: Option<f32>,
+    pub denoiser_wanted: Option<bool>,
 }
 
 impl RootAudioControl {
@@ -157,7 +162,97 @@ impl RootAudioControl {
             auto_sensitivity: c.auto_sensitivity.unwrap_or_default(),
             has_gain_reset_db: c.gain_reset_db.is_some(),
             gain_reset_db: c.gain_reset_db.unwrap_or_default(),
+            has_denoiser_wanted: c.denoiser_wanted.is_some(),
+            denoiser_wanted: c.denoiser_wanted.unwrap_or_default(),
         }
+    }
+}
+
+/// A finished [`set_denoiser`](super::PlatformAudio::set_denoiser) request of
+/// `owner`; `error` is `None` once native holds the pipeline. On an error
+/// native never held it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DenoiserCompletion {
+    pub owner: u64,
+    pub async_id: u64,
+    pub error: Option<String>,
+}
+
+impl From<NativeDenoiserCompletion> for DenoiserCompletion {
+    fn from(value: NativeDenoiserCompletion) -> Self {
+        Self {
+            owner: value.owner,
+            async_id: value.async_id,
+            error: (!value.error.is_empty()).then_some(value.error),
+        }
+    }
+}
+
+/// An Effects SDK pipeline native no longer holds (replaced, removed, or the
+/// last session ended), for the owner whose request installed it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReturnedPipeline {
+    pub owner: u64,
+    pub pipeline: u64,
+}
+
+impl From<NativeReturnedPipeline> for ReturnedPipeline {
+    fn from(value: NativeReturnedPipeline) -> Self {
+        Self { owner: value.owner, pipeline: value.pipeline }
+    }
+}
+
+/// Everything [`return_denoiser_pipelines`](super::PlatformAudio::return_denoiser_pipelines)
+/// took back. `error` says the installed pipeline could not be removed (it
+/// stays installed and is not listed).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReturnedPipelines {
+    pub pipelines: Vec<u64>,
+    pub error: Option<String>,
+}
+
+impl From<NativeReturnPipelines> for ReturnedPipelines {
+    fn from(value: NativeReturnPipelines) -> Self {
+        Self {
+            pipelines: value.pipelines,
+            error: (!value.error.is_empty()).then_some(value.error),
+        }
+    }
+}
+
+/// The Effects SDK slot: the installed pipeline's rate (0 none), why it is
+/// bypassed (0 none, 1 rate mismatch, 2 output stalled, 3 slow), and whether
+/// native WebRTC NS covers it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DenoiserState {
+    pub installed: bool,
+    pub rate: u32,
+    pub bypass_reason: u32,
+    pub webrtc_ns_fallback: bool,
+}
+
+impl From<NativeDenoiserState> for DenoiserState {
+    fn from(value: NativeDenoiserState) -> Self {
+        Self {
+            installed: value.installed,
+            rate: value.rate,
+            bypass_reason: value.bypass_reason,
+            webrtc_ns_fallback: value.webrtc_ns_fallback,
+        }
+    }
+}
+
+/// The local user's published speaking state (the noise gate's speaking while
+/// the transmit gate is open) and how often it changed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LocalSpeaking {
+    pub speaking: bool,
+    pub seq: u64,
+}
+
+impl From<NativeSpeaking> for LocalSpeaking {
+    fn from(value: NativeSpeaking) -> Self {
+        Self { speaking: value.speaking, seq: value.seq }
     }
 }
 
@@ -234,9 +329,10 @@ fn device_result(outcome: AudioDeviceOutcome) -> AudioResult<()> {
 /// `*_max_gap_us` is the maximum since the previous read. Last Init/Start results
 /// are ADM return codes: 0 success, 1 not attempted yet, -10000 selected device
 /// not present, other negative values ADM errors. Fields of stages this build does
-/// not have stay 0, `false`, or NaN for dB values and echo statistics:
-/// `denoised_sumsq`, `gate_in_sumsq` and the gate, speaking, voice gain and
-/// denoiser fields arrive with the DSP chain. `echo_cancellation_active` and
+/// not have stay 0, `false`, or NaN for dB values and echo statistics, and the
+/// optional ones are `None` (no DSP chain, Effects SDK slot or APM decorator).
+/// `gate_in_block_peak_db`, `envelope` and `denoiser_process_max_us` are
+/// maxima since the previous read. `echo_cancellation_active` and
 /// `webrtc_ns_active` are what the APM has applied; the echo statistics are the
 /// APM's (NaN while it has none, and `aec_delay_ms` -1).
 #[derive(Debug, Clone, PartialEq)]
@@ -315,6 +411,39 @@ pub struct RootAudioStats {
     pub audio_thread_logs_dropped: u64,
     pub overlapping_callbacks: u64,
     pub device_stop_failures: u64,
+
+    // DSP chain.
+    pub speaking: Option<bool>,
+    pub gate_input_above_frames: Option<u64>,
+    pub startup_hold_frames: Option<u64>,
+    pub transmit_frames: Option<u64>,
+    pub unsupported_frames: Option<u64>,
+    pub non_finite_samples: Option<u64>,
+    pub dsp_resets: Option<u64>,
+    pub dsp_flushes: Option<u64>,
+    pub gate_open_delay_us: Option<u64>,
+    pub ns_gap_frames: Option<u64>,
+
+    // Denoiser details (Effects SDK slot); the histogram is empty without it.
+    pub denoiser_rate: Option<u32>,
+    pub denoiser_installs: Option<u64>,
+    pub denoiser_bypassed_frames: Option<u64>,
+    pub denoiser_process_us_buckets: Vec<u64>,
+    pub denoiser_other_notifications: Option<u64>,
+    pub denoiser_latency_ms: Option<f32>,
+    pub denoiser_buffered_samples: Option<u32>,
+    pub denoiser_underruns: Option<u64>,
+    pub denoiser_padded_samples: Option<u64>,
+    pub denoiser_trimmed_samples: Option<u64>,
+    pub denoiser_drained_samples: Option<u64>,
+    pub denoiser_frames_until_first_output: Option<i32>,
+    pub webrtc_ns_fallback: Option<bool>,
+
+    // APM policy (APM decorator).
+    pub apm_policy_applies: Option<u64>,
+    pub apm_policy_deferred: Option<u64>,
+    pub apm_policy_forced: Option<u64>,
+    pub apm_policy_pending: Option<bool>,
 }
 
 impl Default for RootAudioStats {
@@ -380,13 +509,93 @@ impl Default for RootAudioStats {
             audio_thread_logs_dropped: 0,
             overlapping_callbacks: 0,
             device_stop_failures: 0,
+            speaking: None,
+            gate_input_above_frames: None,
+            startup_hold_frames: None,
+            transmit_frames: None,
+            unsupported_frames: None,
+            non_finite_samples: None,
+            dsp_resets: None,
+            dsp_flushes: None,
+            gate_open_delay_us: None,
+            ns_gap_frames: None,
+            denoiser_rate: None,
+            denoiser_installs: None,
+            denoiser_bypassed_frames: None,
+            denoiser_process_us_buckets: Vec::new(),
+            denoiser_other_notifications: None,
+            denoiser_latency_ms: None,
+            denoiser_buffered_samples: None,
+            denoiser_underruns: None,
+            denoiser_padded_samples: None,
+            denoiser_trimmed_samples: None,
+            denoiser_drained_samples: None,
+            denoiser_frames_until_first_output: None,
+            webrtc_ns_fallback: None,
+            apm_policy_applies: None,
+            apm_policy_deferred: None,
+            apm_policy_forced: None,
+            apm_policy_pending: None,
         }
     }
 }
 
 impl RootAudioStats {
     pub(crate) fn from_native(native: NativeAudioStats) -> Self {
+        let dsp = native.dsp_available;
+        let denoiser = native.denoiser_available;
+        let policy = native.policy_available;
         Self {
+            denoised_sumsq: native.denoised_sumsq,
+            gate_in_sumsq: native.gate_in_sumsq,
+            gate_in_block_peak_db: native.gate_in_block_peak_db,
+            threshold: native.threshold,
+            envelope: native.envelope,
+            gate_speaking: native.gate_speaking,
+            speaking_seq: native.speaking_seq,
+            voice_gain_db: native.voice_gain_db,
+            voice_gain_settled: native.voice_gain_settled,
+            gate_open_frames: native.gate_open_frames,
+            denoiser_installed: native.denoiser_installed,
+            denoiser_frames: native.denoiser_frames,
+            denoiser_misses: native.denoiser_misses,
+            denoiser_empty_outputs: native.denoiser_empty_outputs,
+            denoiser_process_max_us: native.denoiser_process_max_us,
+            denoiser_slow_frames: native.denoiser_slow_frames,
+            denoiser_bypass_reason: native.denoiser_bypass_reason,
+            denoiser_notifications: native.denoiser_notifications,
+            speaking: dsp.then_some(native.speaking),
+            gate_input_above_frames: dsp.then_some(native.gate_input_above_frames),
+            startup_hold_frames: dsp.then_some(native.startup_hold_frames),
+            transmit_frames: dsp.then_some(native.transmit_frames),
+            unsupported_frames: dsp.then_some(native.unsupported_frames),
+            non_finite_samples: dsp.then_some(native.non_finite_samples),
+            dsp_resets: dsp.then_some(native.dsp_resets),
+            dsp_flushes: dsp.then_some(native.dsp_flushes),
+            gate_open_delay_us: dsp.then_some(native.gate_open_delay_us),
+            ns_gap_frames: dsp.then_some(native.ns_gap_frames),
+            denoiser_rate: denoiser.then_some(native.denoiser_rate),
+            denoiser_installs: denoiser.then_some(native.denoiser_installs),
+            denoiser_bypassed_frames: denoiser.then_some(native.denoiser_bypassed_frames),
+            denoiser_process_us_buckets: if denoiser {
+                native.denoiser_process_us_buckets
+            } else {
+                Vec::new()
+            },
+            denoiser_other_notifications: denoiser.then_some(native.denoiser_other_notifications),
+            denoiser_latency_ms: denoiser.then_some(native.denoiser_latency_ms),
+            denoiser_buffered_samples: denoiser.then_some(native.denoiser_buffered_samples),
+            denoiser_underruns: denoiser.then_some(native.denoiser_underruns),
+            denoiser_padded_samples: denoiser.then_some(native.denoiser_padded_samples),
+            denoiser_trimmed_samples: denoiser.then_some(native.denoiser_trimmed_samples),
+            denoiser_drained_samples: denoiser.then_some(native.denoiser_drained_samples),
+            denoiser_frames_until_first_output: denoiser
+                .then_some(native.denoiser_frames_until_first_output),
+            webrtc_ns_fallback: denoiser.then_some(native.webrtc_ns_fallback),
+            apm_policy_applies: policy.then_some(native.apm_policy_applies),
+            apm_policy_deferred: policy.then_some(native.apm_policy_deferred),
+            apm_policy_forced: policy.then_some(native.apm_policy_forced),
+            apm_policy_pending: policy.then_some(native.apm_policy_pending),
             capture_callbacks: native.capture_callbacks,
             render_callbacks: native.render_callbacks,
             capture_max_gap_us: native.capture_max_gap_us,
@@ -562,6 +771,9 @@ mod tests {
             audio_thread_logs_dropped: 4,
             overlapping_callbacks: 5,
             device_stop_failures: 6,
+            gate_in_block_peak_db: f32::NAN,
+            voice_gain_db: f32::NAN,
+            denoiser_frames_until_first_output: -1,
             ..Default::default()
         };
         let stats = RootAudioStats::from_native(native);
@@ -596,8 +808,140 @@ mod tests {
         assert!(stats.erle_db.is_nan());
         assert_eq!((stats.denoised_sumsq, stats.gate_in_sumsq), (0.0, 0.0));
         assert!(!stats.denoiser_installed && !stats.gate_speaking);
-        assert!(stats.voice_gain_db.is_nan());
+        assert!(stats.voice_gain_db.is_nan() && stats.gate_in_block_peak_db.is_nan());
+        assert_eq!((stats.speaking, stats.ns_gap_frames, stats.dsp_resets), (None, None, None));
+        assert_eq!((stats.denoiser_rate, stats.webrtc_ns_fallback), (None, None));
+        assert!(stats.denoiser_process_us_buckets.is_empty());
+        assert_eq!((stats.apm_policy_applies, stats.apm_policy_pending), (None, None));
         assert_eq!(RootAudioStats::default().aec_delay_ms, -1);
+    }
+
+    #[test]
+    fn root_audio_stats_fill_the_dsp_denoiser_and_policy_fields_they_have() {
+        let native = NativeAudioStats {
+            dsp_available: true,
+            denoiser_available: true,
+            policy_available: true,
+            denoised_sumsq: 2.0,
+            gate_in_sumsq: 3.0,
+            gate_in_block_peak_db: -20.0,
+            threshold: 0.025,
+            envelope: 0.5,
+            gate_speaking: true,
+            speaking_seq: 4,
+            voice_gain_db: 6.0,
+            voice_gain_settled: true,
+            gate_open_frames: 7,
+            speaking: true,
+            gate_input_above_frames: 8,
+            startup_hold_frames: 20,
+            transmit_frames: 9,
+            unsupported_frames: 1,
+            non_finite_samples: 2,
+            dsp_resets: 3,
+            dsp_flushes: 4,
+            gate_open_delay_us: 1500,
+            ns_gap_frames: 5,
+            denoiser_installed: true,
+            denoiser_frames: 100,
+            denoiser_misses: 1,
+            denoiser_empty_outputs: 2,
+            denoiser_process_max_us: 900,
+            denoiser_slow_frames: 1,
+            denoiser_bypass_reason: 3,
+            denoiser_notifications: 6,
+            denoiser_rate: 48_000,
+            denoiser_installs: 2,
+            denoiser_bypassed_frames: 10,
+            denoiser_process_us_buckets: (0..16).collect(),
+            denoiser_other_notifications: 1,
+            denoiser_latency_ms: 10.5,
+            denoiser_buffered_samples: 480,
+            denoiser_underruns: 1,
+            denoiser_padded_samples: 480,
+            denoiser_trimmed_samples: 0,
+            denoiser_drained_samples: 960,
+            denoiser_frames_until_first_output: 3,
+            webrtc_ns_fallback: true,
+            apm_policy_applies: 5,
+            apm_policy_deferred: 2,
+            apm_policy_forced: 1,
+            apm_policy_pending: true,
+            ..Default::default()
+        };
+        let stats = RootAudioStats::from_native(native);
+        assert_eq!((stats.denoised_sumsq, stats.gate_in_sumsq), (2.0, 3.0));
+        assert_eq!((stats.gate_in_block_peak_db, stats.threshold, stats.envelope), (-20.0, 0.025, 0.5));
+        assert!(stats.gate_speaking && stats.voice_gain_settled);
+        assert_eq!((stats.speaking_seq, stats.voice_gain_db, stats.gate_open_frames), (4, 6.0, 7));
+        assert_eq!(stats.speaking, Some(true));
+        assert_eq!(
+            (stats.gate_input_above_frames, stats.startup_hold_frames, stats.transmit_frames),
+            (Some(8), Some(20), Some(9))
+        );
+        assert_eq!((stats.unsupported_frames, stats.non_finite_samples), (Some(1), Some(2)));
+        assert_eq!((stats.dsp_resets, stats.dsp_flushes), (Some(3), Some(4)));
+        assert_eq!((stats.gate_open_delay_us, stats.ns_gap_frames), (Some(1500), Some(5)));
+        assert!(stats.denoiser_installed);
+        assert_eq!(
+            (stats.denoiser_frames, stats.denoiser_misses, stats.denoiser_empty_outputs),
+            (100, 1, 2)
+        );
+        assert_eq!(
+            (stats.denoiser_process_max_us, stats.denoiser_slow_frames, stats.denoiser_bypass_reason),
+            (900, 1, 3)
+        );
+        assert_eq!(stats.denoiser_notifications, 6);
+        assert_eq!(
+            (stats.denoiser_rate, stats.denoiser_installs, stats.denoiser_bypassed_frames),
+            (Some(48_000), Some(2), Some(10))
+        );
+        assert_eq!(stats.denoiser_process_us_buckets, (0..16).collect::<Vec<u64>>());
+        assert_eq!(stats.denoiser_other_notifications, Some(1));
+        assert_eq!(
+            (stats.denoiser_latency_ms, stats.denoiser_buffered_samples, stats.denoiser_underruns),
+            (Some(10.5), Some(480), Some(1))
+        );
+        assert_eq!(
+            (
+                stats.denoiser_padded_samples,
+                stats.denoiser_trimmed_samples,
+                stats.denoiser_drained_samples
+            ),
+            (Some(480), Some(0), Some(960))
+        );
+        assert_eq!(stats.denoiser_frames_until_first_output, Some(3));
+        assert_eq!(stats.webrtc_ns_fallback, Some(true));
+        assert_eq!(
+            (stats.apm_policy_applies, stats.apm_policy_deferred, stats.apm_policy_forced),
+            (Some(5), Some(2), Some(1))
+        );
+        assert_eq!(stats.apm_policy_pending, Some(true));
+    }
+
+    #[test]
+    fn root_audio_denoiser_results_map_empty_errors_to_success() {
+        let ok: DenoiserCompletion = NativeDenoiserCompletion {
+            owner: 1,
+            async_id: 2,
+            error: String::new(),
+        }
+        .into();
+        assert_eq!(ok, DenoiserCompletion { owner: 1, async_id: 2, error: None });
+        let failed: DenoiserCompletion = NativeDenoiserCompletion {
+            owner: 1,
+            async_id: 3,
+            error: "superseded".into(),
+        }
+        .into();
+        assert_eq!(failed.error.as_deref(), Some("superseded"));
+
+        let all: ReturnedPipelines =
+            NativeReturnPipelines { pipelines: vec![5, 6], error: String::new() }.into();
+        assert_eq!(all, ReturnedPipelines { pipelines: vec![5, 6], error: None });
+        let busy: ReturnedPipelines =
+            NativeReturnPipelines { pipelines: vec![], error: "busy".into() }.into();
+        assert_eq!(busy.error.as_deref(), Some("busy"));
     }
 
     #[test]
@@ -640,6 +984,7 @@ mod tests {
             push_to_talk: Some(PushToTalk::Held),
             master_volume: Some(f32::NAN),
             webrtc_noise_suppression: Some(false),
+            denoiser_wanted: Some(true),
             ..Default::default()
         }
         .to_native();
@@ -647,6 +992,7 @@ mod tests {
         assert!(native.has_push_to_talk && native.push_to_talk == 1);
         assert!(native.has_master_volume && native.master_volume == 0.0);
         assert!(native.has_noise_suppression && !native.noise_suppression);
+        assert!(native.has_denoiser_wanted && native.denoiser_wanted);
         assert!(!native.has_input_volume && !native.has_deafened && !native.has_echo_cancellation);
         assert!(!native.has_denoise_power && !native.has_auto_gain && !native.has_gate_threshold);
         assert!(!native.has_auto_sensitivity && !native.has_gain_reset_db);

@@ -31,7 +31,12 @@ use webrtc_sys::{
 pub use webrtc_sys::audio_device_controller::{
     ffi::RootAudioCaptureFormat as NativeCaptureFormat,
     ffi::RootAudioControlUpdate as NativeAudioControl,
-    ffi::RootAudioNativeStats as NativeAudioStats, ADM_RESULT_DEVICE_NOT_FOUND,
+    ffi::RootAudioNativeStats as NativeAudioStats,
+    ffi::RootDenoiserCompletionItem as NativeDenoiserCompletion,
+    ffi::RootDenoiserReturnedItem as NativeReturnedPipeline,
+    ffi::RootDenoiserStateInfo as NativeDenoiserState,
+    ffi::RootReturnPipelinesResult as NativeReturnPipelines,
+    ffi::RootSpeakingInfo as NativeSpeaking, ADM_RESULT_DEVICE_NOT_FOUND,
     ADM_RESULT_NOT_ATTEMPTED,
 };
 
@@ -598,6 +603,47 @@ impl PeerConnectionFactory {
     /// Controls back to their defaults, with the capture gate open or closed.
     pub fn reset_root_audio(&self, close_gate: bool) {
         self.sys_handle.audio_device().reset_root_audio(close_gate)
+    }
+
+    /// The capture processor has an Effects SDK slot (desktop, 64-bit).
+    pub fn root_denoiser_available(&self) -> bool {
+        self.sys_handle.audio_device().root_denoiser_available()
+    }
+
+    /// Queues an Effects SDK pipeline install (`pipeline` non-zero) or removal
+    /// for `owner`; it completes through `take_root_denoiser_completions`.
+    /// False without a slot.
+    pub fn set_root_denoiser(
+        &self,
+        owner: u64,
+        async_id: u64,
+        pipeline: u64,
+        sample_rate: u32,
+    ) -> bool {
+        self.sys_handle.audio_device().set_root_denoiser(owner, async_id, pipeline, sample_rate)
+    }
+
+    /// Takes back every pipeline native holds; waits up to 200 ms for the
+    /// audio thread.
+    pub fn return_root_denoiser_pipelines(&self) -> NativeReturnPipelines {
+        self.sys_handle.audio_device().return_root_denoiser_pipelines()
+    }
+
+    pub fn take_root_denoiser_completions(&self) -> Vec<NativeDenoiserCompletion> {
+        self.sys_handle.audio_device().take_root_denoiser_completions()
+    }
+
+    pub fn take_root_denoiser_returned(&self) -> Vec<NativeReturnedPipeline> {
+        self.sys_handle.audio_device().take_root_denoiser_returned()
+    }
+
+    pub fn root_denoiser_state(&self) -> NativeDenoiserState {
+        self.sys_handle.audio_device().root_denoiser_state()
+    }
+
+    /// The published speaking flag; atomics only.
+    pub fn root_audio_speaking(&self) -> NativeSpeaking {
+        self.sys_handle.audio_device().root_audio_speaking()
     }
 }
 

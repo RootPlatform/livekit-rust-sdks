@@ -298,13 +298,16 @@ AdmProxyHarness::AdmProxyHarness(
     : fake_(webrtc::make_ref_counted<FakePlatformAdm>()),
       mixer_(webrtc::make_ref_counted<RootAudioMixer>()),
       capture_(std::make_shared<RootCaptureState>()),
+      fakes_(std::make_unique<std::vector<std::unique_ptr<RootFakeFxPipeline>>>()),
       transport_(std::make_unique<HarnessTransport>()) {
   fake_->SetDevices(ToStrings(playout_guids), ToStrings(recording_guids));
   if (with_apm) {
     apm_ = NewRootApmOverFakeForTest();
   }
+  capture_->denoiser_slot = std::make_shared<RootDenoiserSlot>();
   proxy_ = webrtc::make_ref_counted<AdmProxy>(webrtc::CreateEnvironment(),
                                               nullptr, mixer_, fake_);
+  proxy_->SetCaptureState(capture_);
   controller_ = std::make_unique<AudioDeviceController>(proxy_, mixer_, apm_,
                                                         capture_);
 }
@@ -312,6 +315,7 @@ AdmProxyHarness::AdmProxyHarness(
 AdmProxyHarness::~AdmProxyHarness() {
   controller_ = nullptr;
   proxy_ = nullptr;
+  fakes_ = nullptr;
 }
 
 rust::Vec<rust::String> AdmProxyHarness::take_calls() const {
@@ -592,7 +596,34 @@ RootControlState AdmProxyHarness::control_state() const {
   state.gain_reset_seq = capture_->gain_reset_seq.load();
   state.master_volume = mixer_->master_volume();
   state.deafened = mixer_->deafened();
+  state.denoiser_wanted = capture_->denoiser_wanted.load();
+  state.stream_epoch = capture_->stream_epoch.load();
+  state.dsp_reset_seq = capture_->dsp_reset_seq.load();
   return state;
+}
+
+const AudioDeviceController& AdmProxyHarness::controller() const {
+  return *controller_;
+}
+
+uint64_t AdmProxyHarness::add_fake_pipeline() const {
+  fakes_->push_back(std::make_unique<RootFakeFxPipeline>(RootFakeFxConfig()));
+  return static_cast<uint64_t>(
+      reinterpret_cast<uintptr_t>(fakes_->back()->pipeline()));
+}
+
+uint8_t AdmProxyHarness::run_denoiser(uint32_t rate) const {
+  const size_t frames = rate / 100;
+  std::vector<float> in(frames, 100.0f);
+  std::vector<float> out(RootDenoiserSlot::kOutputFrames * frames + 1);
+  const RootDenoiseResult result = capture_->denoiser_slot->ProcessAudio(
+      in.data(), frames, static_cast<int>(rate), false, 0.75f, out.data(),
+      RootDenoiserSlot::kOutputFrames * frames);
+  return static_cast<uint8_t>(result.kind);
+}
+
+void AdmProxyHarness::latch_denoiser_bypass(uint32_t reason) const {
+  capture_->denoiser_slot->LatchBypass(static_cast<RootDenoiserBypass>(reason));
 }
 
 std::unique_ptr<AdmProxyHarness> new_adm_proxy_harness(

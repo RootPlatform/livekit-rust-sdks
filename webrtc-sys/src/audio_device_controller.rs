@@ -101,6 +101,57 @@ pub mod ffi {
         pub audio_thread_logs_dropped: u64,
         pub overlapping_callbacks: u64,
         pub device_stop_failures: u64,
+
+        /// The DSP chain, the denoiser slot and the APM decorator exist; the
+        /// fields of the ones that do not stay at their defaults.
+        pub dsp_available: bool,
+        pub denoiser_available: bool,
+        pub policy_available: bool,
+        pub denoised_sumsq: f64,
+        pub gate_in_sumsq: f64,
+        pub gate_in_block_peak_db: f32,
+        pub threshold: f32,
+        pub envelope: f32,
+        pub gate_speaking: bool,
+        pub speaking_seq: u64,
+        pub voice_gain_db: f32,
+        pub voice_gain_settled: bool,
+        pub gate_open_frames: u64,
+        pub speaking: bool,
+        pub gate_input_above_frames: u64,
+        pub startup_hold_frames: u64,
+        pub transmit_frames: u64,
+        pub unsupported_frames: u64,
+        pub non_finite_samples: u64,
+        pub dsp_resets: u64,
+        pub dsp_flushes: u64,
+        pub gate_open_delay_us: u64,
+        pub ns_gap_frames: u64,
+        pub denoiser_installed: bool,
+        pub denoiser_frames: u64,
+        pub denoiser_misses: u64,
+        pub denoiser_empty_outputs: u64,
+        pub denoiser_process_max_us: u64,
+        pub denoiser_slow_frames: u64,
+        pub denoiser_bypass_reason: u32,
+        pub denoiser_notifications: u64,
+        pub denoiser_rate: u32,
+        pub denoiser_installs: u64,
+        pub denoiser_bypassed_frames: u64,
+        pub denoiser_process_us_buckets: Vec<u64>,
+        pub denoiser_other_notifications: u64,
+        pub denoiser_latency_ms: f32,
+        pub denoiser_buffered_samples: u32,
+        pub denoiser_underruns: u64,
+        pub denoiser_padded_samples: u64,
+        pub denoiser_trimmed_samples: u64,
+        pub denoiser_drained_samples: u64,
+        pub denoiser_frames_until_first_output: i32,
+        pub webrtc_ns_fallback: bool,
+        pub apm_policy_applies: u64,
+        pub apm_policy_deferred: u64,
+        pub apm_policy_forced: u64,
+        pub apm_policy_pending: bool,
     }
 
     /// One RootAudioControl; `has_*` marks the fields to change.
@@ -130,6 +181,8 @@ pub mod ffi {
         pub auto_sensitivity: bool,
         pub has_gain_reset_db: bool,
         pub gain_reset_db: f32,
+        pub has_denoiser_wanted: bool,
+        pub denoiser_wanted: bool,
     }
 
     /// The stored controls (tests).
@@ -146,6 +199,9 @@ pub mod ffi {
         pub gain_reset_seq: u64,
         pub master_volume: f32,
         pub deafened: bool,
+        pub denoiser_wanted: bool,
+        pub stream_epoch: u64,
+        pub dsp_reset_seq: u64,
     }
 
     /// What the capture post-processor runs at; `seq` moves on every change.
@@ -154,6 +210,43 @@ pub mod ffi {
         pub seq: u64,
         pub sample_rate: u32,
         pub channels: u32,
+    }
+
+    /// A SetDenoiser request finished (`error` empty on success).
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct RootDenoiserCompletionItem {
+        pub owner: u64,
+        pub async_id: u64,
+        pub error: String,
+    }
+
+    /// A pipeline native no longer holds, for the owner that set it.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct RootDenoiserReturnedItem {
+        pub owner: u64,
+        pub pipeline: u64,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct RootReturnPipelinesResult {
+        pub pipelines: Vec<u64>,
+        /// Empty unless the installed pipeline could not be removed.
+        pub error: String,
+    }
+
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct RootDenoiserStateInfo {
+        pub installed: bool,
+        pub rate: u32,
+        pub bypass_reason: u32,
+        pub webrtc_ns_fallback: bool,
+    }
+
+    /// The published speaking flag and its transition count.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct RootSpeakingInfo {
+        pub speaking: bool,
+        pub seq: u64,
     }
 
     unsafe extern "C++" {
@@ -219,6 +312,28 @@ pub mod ffi {
         fn root_audio_capture_format(self: &AudioDeviceController) -> RootAudioCaptureFormat;
         fn root_audio_sources_added(self: &AudioDeviceController) -> u64;
         fn reset_root_audio(self: &AudioDeviceController, close_gate: bool);
+
+        /// The Effects SDK slot exists (desktop, 64-bit).
+        fn root_denoiser_available(self: &AudioDeviceController) -> bool;
+        /// Queues an install (`pipeline` non-zero) or removal for `owner`;
+        /// false (nothing queued) without a slot.
+        fn set_root_denoiser(
+            self: &AudioDeviceController,
+            owner: u64,
+            async_id: u64,
+            pipeline: u64,
+            sample_rate: u32,
+        ) -> bool;
+        /// Synchronous: everything native holds, waiting or not yet taken back.
+        fn return_root_denoiser_pipelines(self: &AudioDeviceController)
+            -> RootReturnPipelinesResult;
+        fn take_root_denoiser_completions(
+            self: &AudioDeviceController,
+        ) -> Vec<RootDenoiserCompletionItem>;
+        fn take_root_denoiser_returned(self: &AudioDeviceController)
+            -> Vec<RootDenoiserReturnedItem>;
+        fn root_denoiser_state(self: &AudioDeviceController) -> RootDenoiserStateInfo;
+        fn root_audio_speaking(self: &AudioDeviceController) -> RootSpeakingInfo;
 
         fn stop_recording(self: &AudioDeviceController) -> bool;
         fn init_recording(self: &AudioDeviceController) -> bool;
@@ -320,6 +435,14 @@ pub mod ffi {
         fn apply_control(self: &AdmProxyHarness, control: &RootAudioControlUpdate) -> bool;
         fn reset_root_audio(self: &AdmProxyHarness, close_gate: bool);
         fn control_state(self: &AdmProxyHarness) -> RootControlState;
+        /// The controller behind the harness (its capture state has a slot).
+        fn controller(self: &AdmProxyHarness) -> &AudioDeviceController;
+        /// A fake Effects SDK pipeline owned by the harness (scale 1, no delay).
+        fn add_fake_pipeline(self: &AdmProxyHarness) -> u64;
+        /// One 10 ms frame at `rate` through the slot, as the capture
+        /// processor would run it; returns the slot's result kind.
+        fn run_denoiser(self: &AdmProxyHarness, rate: u32) -> u8;
+        fn latch_denoiser_bypass(self: &AdmProxyHarness, reason: u32);
     }
 
     extern "Rust" {

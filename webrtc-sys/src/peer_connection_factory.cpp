@@ -40,6 +40,7 @@
 #include "livekit/peer_connection.h"
 #include "livekit/root_audio_mixer.h"
 #include "livekit/root_audio_processing.h"
+#include "livekit/root_denoiser.h"
 #include "livekit/rtc_error.h"
 #include "livekit/rtp_parameters.h"
 #include "livekit/video_decoder_factory.h"
@@ -191,12 +192,16 @@ PeerConnectionFactory::PeerConnectionFactory(
   // behind a decorator that owns the AGC/HPF/AEC/NS policy. Mobile keeps
   // libwebrtc's own APM and its platform voice processing.
   capture_state_ = std::make_shared<RootCaptureState>();
+  if constexpr (kRootDenoiserSupported) {
+    capture_state_->denoiser_slot = std::make_shared<RootDenoiserSlot>();
+  }
   apm_ = CreateRootAudioProcessing(env_, capture_state_,
                                    rtc_runtime_->worker_thread());
   if (!apm_) {
     RTC_LOG(LS_ERROR) << "Failed to build the RootApp audio processing";
     capture_state_ = nullptr;
   }
+  adm_proxy_->SetCaptureState(capture_state_);
 #endif
   audio_device_ = std::make_shared<AudioDeviceController>(
       adm_proxy_, audio_mixer_, apm_, capture_state_);
