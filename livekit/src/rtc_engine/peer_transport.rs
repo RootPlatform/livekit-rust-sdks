@@ -34,6 +34,17 @@ struct TransportInner {
     single_pc_mode: bool,
     pending_initial_offer: Option<SessionDescription>,
     stereo_track_ids: HashSet<String>,
+    last_offer_sdp: Option<String>,
+    send_codec_pins: HashMap<String, SendCodecPin>,
+}
+
+/// The codec lines the first answer gave an audio send section (by mid), for the track it sends.
+#[derive(Clone, Debug)]
+struct SendCodecPin {
+    track_id: String,
+    formats: Vec<String>,
+    opus_fmtp: Vec<String>,
+    reported: bool,
 }
 
 #[derive(Default)]
@@ -124,6 +135,8 @@ impl PeerTransport {
                 single_pc_mode,
                 pending_initial_offer: None,
                 stereo_track_ids: HashSet::new(),
+                last_offer_sdp: None,
+                send_codec_pins: HashMap::new(),
             })),
             bitrate: Mutex::new(BitratePreferences::default()),
             released_send_mids: Mutex::new(HashSet::new()),
@@ -186,9 +199,15 @@ impl PeerTransport {
         let mut inner = self.inner.lock().await;
 
         if let Some(pending_offer) = inner.pending_initial_offer.take() {
+            inner.last_offer_sdp = Some(pending_offer.to_string());
             self.peer_connection.set_local_description(pending_offer).await?;
         }
 
+        let remote_description = if remote_description.sdp_type() == SdpType::Answer {
+            Self::pin_answer_send_codecs(&mut inner, remote_description)
+        } else {
+            remote_description
+        };
         self.peer_connection.set_remote_description(remote_description).await?;
 
         for ic in inner.pending_candidates.drain(..) {
@@ -552,6 +571,164 @@ impl PeerTransport {
         Self::join_sdp_sections(eol, sections)
     }
 
+    fn pin_answer_send_codecs(
+        inner: &mut TransportInner,
+        answer: SessionDescription,
+    ) -> SessionDescription {
+        let Some(offer_sdp) = inner.last_offer_sdp.as_deref() else {
+            return answer;
+        };
+        let answer_sdp = answer.to_string();
+        let pinned = Self::pin_send_codecs(
+            offer_sdp,
+            &answer_sdp,
+            &inner.stereo_track_ids,
+            &mut inner.send_codec_pins,
+        );
+        if pinned == answer_sdp {
+            return answer;
+        }
+        match SessionDescription::parse(&pinned, answer.sdp_type()) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                log::warn!("Failed to parse send-codec-pinned answer, using original: {e}");
+                answer
+            }
+        }
+    }
+
+    fn m_line_formats(m_line: &str) -> Vec<String> {
+        m_line.split_whitespace().skip(3).map(str::to_string).collect()
+    }
+
+    fn opus_fmtp_lines(section: &[String]) -> Vec<String> {
+        let prefixes: Vec<String> =
+            Self::opus_payload_types(section).iter().map(|pt| format!("a=fmtp:{pt} ")).collect();
+        section
+            .iter()
+            .filter(|line| prefixes.iter().any(|prefix| line.starts_with(prefix)))
+            .cloned()
+            .collect()
+    }
+
+    fn send_codec_pin(section: &[String], track_id: &str) -> SendCodecPin {
+        SendCodecPin {
+            track_id: track_id.to_string(),
+            formats: Self::m_line_formats(&section[0]),
+            opus_fmtp: Self::opus_fmtp_lines(section),
+            reported: false,
+        }
+    }
+
+    /// Gives an answer section the payload order and Opus fmtp lines of `pin`: payload types both
+    /// carry keep the pinned order, any others follow.
+    fn apply_send_codec_pin(section: &mut Vec<String>, pin: &SendCodecPin) {
+        let answered = Self::m_line_formats(&section[0]);
+        let mut formats: Vec<&str> =
+            pin.formats.iter().filter(|pt| answered.contains(pt)).map(String::as_str).collect();
+        formats.extend(answered.iter().filter(|pt| !pin.formats.contains(pt)).map(String::as_str));
+        let head: Vec<&str> = section[0].split_whitespace().take(3).collect();
+        section[0] = format!("{} {}", head.join(" "), formats.join(" "));
+
+        let pts = Self::opus_payload_types(section);
+        let fmtp_prefixes: Vec<String> = pts.iter().map(|pt| format!("a=fmtp:{pt} ")).collect();
+        section.retain(|line| !fmtp_prefixes.iter().any(|prefix| line.starts_with(prefix)));
+        for pt in &pts {
+            let fmtp_prefix = format!("a=fmtp:{pt} ");
+            let rtpmap_prefix = format!("a=rtpmap:{pt} ");
+            let Some(rtpmap) = section.iter().position(|line| line.starts_with(&rtpmap_prefix))
+            else {
+                continue;
+            };
+            let lines = pin.opus_fmtp.iter().filter(|line| line.starts_with(&fmtp_prefix));
+            for (offset, line) in lines.enumerate() {
+                section.insert(rtpmap + 1 + offset, line.clone());
+            }
+        }
+    }
+
+    /// Keeps each audio send section's codec as the first answer set it.
+    ///
+    /// The pinned libwebrtc prebuilt (external_audio_source.patch without its
+    /// StoreEncoderProperties fix) registers an external-source send stream, such as screen-share
+    /// audio, with AudioState when the stream's send codec (format, payload type or RED) changes
+    /// while it sends. With the platform device module recording, the microphone then reaches that
+    /// stream next to the source's own frames: twice the audio rate, garbled at the receiver, and a
+    /// dangling AudioState entry once the track is unpublished. LiveKit server's answers do not
+    /// always give a track the same Opus parameters: it adds `stereo=1;maxaveragebitrate=510000` only
+    /// when it resolves the track for that answer, and with a single peer connection (1.13.7) the
+    /// first answer for a stereo track lacks `maxaveragebitrate` and every later one has it. So later
+    /// answers get the first answer's payload order and Opus fmtp back. A section whose offer no
+    /// longer sends that track drops its pin. A stereo track's first answer gets `stereo=1` when the
+    /// server left it out.
+    fn pin_send_codecs(
+        offer_sdp: &str,
+        answer_sdp: &str,
+        stereo_track_ids: &HashSet<String>,
+        pins: &mut HashMap<String, SendCodecPin>,
+    ) -> String {
+        let (_, offer_sections) = Self::split_sdp_sections(offer_sdp);
+        let sending: HashMap<String, String> = offer_sections
+            .iter()
+            .skip(1)
+            .filter(|s| s.first().is_some_and(|m| m.starts_with("m=audio")))
+            .filter(|s| s.iter().any(|line| line == "a=sendonly" || line == "a=sendrecv"))
+            .filter_map(|s| {
+                let mid = Self::section_attribute(s, "mid")?;
+                let track_id = Self::section_attribute(s, "msid")?.split_whitespace().nth(1)?;
+                Some((mid.to_string(), track_id.to_string()))
+            })
+            .collect();
+        pins.retain(|mid, pin| sending.get(mid) == Some(&pin.track_id));
+
+        let (eol, mut sections) = Self::split_sdp_sections(answer_sdp);
+        let mut changed = false;
+        for section in sections.iter_mut().skip(1) {
+            let Some(mid) = Self::section_attribute(section, "mid").map(str::to_string) else {
+                continue;
+            };
+            let Some(track_id) = sending.get(&mid) else {
+                continue;
+            };
+            let rejected = section[0].split_whitespace().nth(1) == Some("0");
+            if rejected || Self::opus_payload_types(section).is_empty() {
+                continue;
+            }
+            match pins.get_mut(&mid) {
+                None => {
+                    if stereo_track_ids.contains(track_id) {
+                        let before = section.clone();
+                        Self::add_opus_stereo(section);
+                        changed |= *section != before;
+                    }
+                    pins.insert(mid, Self::send_codec_pin(section, track_id));
+                }
+                Some(pin) => {
+                    let before = section.clone();
+                    Self::apply_send_codec_pin(section, pin);
+                    if *section != before {
+                        let level = if pin.reported { log::Level::Debug } else { log::Level::Warn };
+                        pin.reported = true;
+                        log::log!(
+                            level,
+                            "publisher answer changed the send codec of audio mid {mid} (track \
+                             {track_id}): [{}] {}; keeping the first answer's [{}] {}",
+                            Self::m_line_formats(&before[0]).join(" "),
+                            Self::opus_fmtp_lines(&before).join(" | "),
+                            pin.formats.join(" "),
+                            pin.opus_fmtp.join(" | "),
+                        );
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            return answer_sdp.to_string();
+        }
+        Self::join_sdp_sections(eol, sections)
+    }
+
     pub async fn create_and_send_offer(&self, options: OfferOptions) -> EngineResult<()> {
         let mut inner = self.inner.lock().await;
         if options.ice_restart {
@@ -643,6 +820,7 @@ impl PeerTransport {
         }
 
         self.peer_connection.set_local_description(offer.clone()).await?;
+        inner.last_offer_sdp = Some(offer.to_string());
 
         if let Some(handler) = self.on_offer_handler.lock().as_mut() {
             handler(offer);
@@ -654,7 +832,7 @@ impl PeerTransport {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     use libwebrtc::peer_connection::BitrateSettings;
 
@@ -1142,5 +1320,285 @@ a=fmtp:111 minptime=10;useinbandfec=1\n";
             "a=mid:1\na=rtpmap:111 opus/48000/2\na=fmtp:111 minptime=10;useinbandfec=1;stereo=1\n"
         ));
         assert_eq!(PeerTransport::munge_answer_stereo_from_offer(answer, answer), answer);
+    }
+
+    fn audio_sdp(sections: &[(&str, &str, Option<&str>, &str, &str)]) -> String {
+        let mut sdp = "v=0\no=- 0 0 IN IP4 127.0.0.1\ns=-\nt=0 0\n".to_string();
+        for (mid, direction, track_id, formats, opus_fmtp) in sections {
+            sdp.push_str(&format!(
+                "m=audio 9 UDP/TLS/RTP/SAVPF {formats}\na=mid:{mid}\na={direction}\n"
+            ));
+            if let Some(track_id) = track_id {
+                sdp.push_str(&format!("a=msid:- {track_id}\n"));
+            }
+            sdp.push_str(&format!(
+                "a=rtpmap:111 opus/48000/2\na=fmtp:111 {opus_fmtp}\na=rtpmap:63 red/48000/2\n\
+                 a=fmtp:63 111/111\na=rtpmap:9 G722/8000\n"
+            ));
+        }
+        sdp
+    }
+
+    const OFFERED: &str = "minptime=10;useinbandfec=1;stereo=1";
+    const RESOLVED: &str = "minptime=10;useinbandfec=1;stereo=1;maxaveragebitrate=510000";
+    const UNRESOLVED: &str = "minptime=10;useinbandfec=1;stereo=1";
+
+    fn screen_audio_offer() -> String {
+        audio_sdp(&[
+            ("0", "recvonly", None, "111 63 9", OFFERED),
+            ("1", "sendonly", Some("screen-audio"), "111 63 9", OFFERED),
+        ])
+    }
+
+    fn answer(mid1_formats: &str, mid1_fmtp: &str) -> String {
+        audio_sdp(&[
+            ("0", "sendonly", None, "111 63 9", "minptime=10;useinbandfec=1"),
+            ("1", "recvonly", None, mid1_formats, mid1_fmtp),
+        ])
+    }
+
+    #[test]
+    fn later_answers_keep_the_first_answers_opus_fmtp() {
+        let offer = screen_audio_offer();
+        let mut pins = HashMap::new();
+        let first = answer("111 63 9", RESOLVED);
+        assert_eq!(
+            PeerTransport::pin_send_codecs(&offer, &first, &HashSet::new(), &mut pins),
+            first
+        );
+        assert_eq!(pins.keys().collect::<Vec<_>>(), ["1"]);
+
+        let flipped = answer("111 63 9", UNRESOLVED);
+        assert_eq!(
+            PeerTransport::pin_send_codecs(&offer, &flipped, &HashSet::new(), &mut pins),
+            first
+        );
+        assert_eq!(
+            PeerTransport::pin_send_codecs(&offer, &first, &HashSet::new(), &mut pins),
+            first
+        );
+    }
+
+    #[test]
+    fn later_answers_keep_the_first_answers_payload_order() {
+        let offer = screen_audio_offer();
+        let mut pins = HashMap::new();
+        let first = answer("111 63 9", RESOLVED);
+        PeerTransport::pin_send_codecs(&offer, &first, &HashSet::new(), &mut pins);
+
+        let red_first = answer("63 111 9", RESOLVED);
+        assert_eq!(
+            PeerTransport::pin_send_codecs(&offer, &red_first, &HashSet::new(), &mut pins),
+            first
+        );
+
+        let fewer = answer("9 111", UNRESOLVED);
+        assert_eq!(
+            PeerTransport::pin_send_codecs(&offer, &fewer, &HashSet::new(), &mut pins),
+            answer("111 9", RESOLVED)
+        );
+    }
+
+    #[test]
+    fn only_send_sections_are_pinned_and_a_new_track_is_pinned_again() {
+        let offer = screen_audio_offer();
+        let mut pins = HashMap::new();
+        PeerTransport::pin_send_codecs(
+            &offer,
+            &answer("111 63 9", RESOLVED),
+            &HashSet::new(),
+            &mut pins,
+        );
+
+        let other_track = offer.replace("a=msid:- screen-audio", "a=msid:- music");
+        let unresolved = answer("111 63 9", UNRESOLVED);
+        assert_eq!(
+            PeerTransport::pin_send_codecs(&other_track, &unresolved, &HashSet::new(), &mut pins),
+            unresolved
+        );
+        assert_eq!(pins["1"].track_id, "music");
+        assert_eq!(pins["1"].opus_fmtp, [format!("a=fmtp:111 {UNRESOLVED}")]);
+
+        let released = offer.replace("a=msid:- screen-audio\n", "");
+        let resolved = answer("111 63 9", RESOLVED);
+        assert_eq!(
+            PeerTransport::pin_send_codecs(&released, &resolved, &HashSet::new(), &mut pins),
+            resolved
+        );
+        assert!(pins.is_empty());
+
+        let mut recv_only = HashMap::new();
+        let swapped = answer("111 63 9", RESOLVED)
+            .replace("a=mid:0\na=sendonly", "a=mid:0\na=sendonly\na=msid:- remote");
+        PeerTransport::pin_send_codecs(&offer, &swapped, &HashSet::new(), &mut recv_only);
+        assert_eq!(recv_only.keys().collect::<Vec<_>>(), ["1"]);
+    }
+
+    #[test]
+    fn a_stereo_tracks_first_answer_gets_stereo() {
+        let offer = screen_audio_offer();
+        let stereo: HashSet<String> = ["screen-audio".to_string()].into();
+        let mut pins = HashMap::new();
+        let mono = answer("111 63 9", "minptime=10;useinbandfec=1");
+        let out = PeerTransport::pin_send_codecs(&offer, &mono, &stereo, &mut pins);
+        assert_eq!(out, answer("111 63 9", "minptime=10;useinbandfec=1;stereo=1"));
+        assert_eq!(
+            PeerTransport::pin_send_codecs(
+                &offer,
+                &answer("111 63 9", RESOLVED),
+                &stereo,
+                &mut pins
+            ),
+            out
+        );
+
+        let mut mono_pins = HashMap::new();
+        assert_eq!(
+            PeerTransport::pin_send_codecs(&offer, &mono, &HashSet::new(), &mut mono_pins),
+            mono
+        );
+    }
+
+    #[test]
+    fn pinning_keeps_crlf_and_leaves_unchanged_answers_verbatim() {
+        let offer = screen_audio_offer().replace('\n', "\r\n");
+        let first = answer("111 63 9", RESOLVED).replace('\n', "\r\n");
+        let mut pins = HashMap::new();
+        assert_eq!(
+            PeerTransport::pin_send_codecs(&offer, &first, &HashSet::new(), &mut pins),
+            first
+        );
+        let flipped = answer("111 63 9", UNRESOLVED).replace('\n', "\r\n");
+        assert_eq!(
+            PeerTransport::pin_send_codecs(&offer, &flipped, &HashSet::new(), &mut pins),
+            first
+        );
+    }
+
+    /// A real publisher keeps its screen-audio send codec when a later answer changes the Opus
+    /// parameters, as LiveKit's do once the server resolves the track.
+    #[tokio::test]
+    async fn the_send_codec_survives_an_answer_that_changes_opus_parameters() {
+        use std::{
+            sync::{Arc, Mutex},
+            time::{Duration, Instant},
+        };
+
+        use libwebrtc::{
+            audio_source::native::NativeAudioSource,
+            peer_connection_factory::native::PeerConnectionFactoryExt, prelude::*, stats::RtcStats,
+        };
+        use livekit_protocol as proto;
+
+        async fn audio_send_codec(pc: &PeerConnection) -> Option<(String, u32)> {
+            let stats = pc.get_stats().await.unwrap();
+            let codec_id = stats.iter().find_map(|stats| match stats {
+                RtcStats::OutboundRtp(o) if o.stream.kind == "audio" => {
+                    Some(o.stream.codec_id.clone())
+                }
+                _ => None,
+            })?;
+            stats.into_iter().find_map(|stats| match stats {
+                RtcStats::Codec(c) if c.rtc.id == codec_id => {
+                    Some((c.codec.sdp_fmtp_line, c.codec.channels))
+                }
+                _ => None,
+            })
+        }
+
+        async fn negotiate(
+            transport: &PeerTransport,
+            offers: &Mutex<Vec<SessionDescription>>,
+            bob: &PeerConnection,
+            server: impl Fn(String) -> String,
+            pinned: bool,
+        ) {
+            transport.create_and_send_offer(OfferOptions::default()).await.unwrap();
+            let offer = offers.lock().unwrap().pop().unwrap();
+            bob.set_remote_description(offer).await.unwrap();
+            let answer = bob.create_answer(AnswerOptions::default()).await.unwrap();
+            bob.set_local_description(answer.clone()).await.unwrap();
+            let answer =
+                SessionDescription::parse(&server(answer.to_string()), SdpType::Answer).unwrap();
+            if pinned {
+                transport.set_remote_description(answer).await.unwrap();
+            } else {
+                transport.peer_connection().set_remote_description(answer).await.unwrap();
+            }
+        }
+
+        async fn settled_codec(
+            alice: &PeerConnection,
+            previous: Option<&(String, u32)>,
+        ) -> (String, u32) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if let Some(codec) = audio_send_codec(alice).await {
+                    if previous.is_none_or(|p| *p != codec) || Instant::now() > deadline {
+                        return codec;
+                    }
+                }
+                assert!(Instant::now() < deadline, "the audio sender never reported a codec");
+            }
+        }
+
+        let factory = PeerConnectionFactory::default();
+        let alice = factory.create_peer_connection(RtcConfiguration::default()).unwrap();
+        let bob = factory.create_peer_connection(RtcConfiguration::default()).unwrap();
+        for (from, to) in [(alice.clone(), bob.clone()), (bob.clone(), alice.clone())] {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<IceCandidate>();
+            from.on_ice_candidate(Some(Box::new(move |candidate| {
+                let _ = tx.send(candidate);
+            })));
+            tokio::spawn(async move {
+                while let Some(candidate) = rx.recv().await {
+                    let _ = to.add_ice_candidate(candidate).await;
+                }
+            });
+        }
+
+        let transport = PeerTransport::new(alice.clone(), proto::SignalTarget::Publisher, false);
+        let offers = Arc::new(Mutex::new(Vec::new()));
+        let emitted = offers.clone();
+        transport.on_offer(Some(Box::new(move |offer| emitted.lock().unwrap().push(offer))));
+
+        let source = NativeAudioSource::new(AudioSourceOptions::default(), 48_000, 2, 100);
+        let track = factory.create_audio_track("screen-audio", source);
+        transport.add_stereo_track("screen-audio".to_string()).await;
+        alice
+            .add_transceiver(
+                MediaStreamTrack::Audio(track),
+                RtpTransceiverInit {
+                    direction: RtpTransceiverDirection::SendOnly,
+                    stream_ids: Vec::new(),
+                    send_encodings: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        let resolved =
+            |sdp: String| sdp.replace("a=fmtp:111 ", "a=fmtp:111 maxaveragebitrate=510000;");
+        negotiate(&transport, &offers, &bob, |sdp| sdp, true).await;
+        let first = settled_codec(&alice, None).await;
+        assert_eq!(first.1, 2, "{first:?}");
+        assert!(
+            first.0.contains("stereo=1") && !first.0.contains("maxaveragebitrate"),
+            "{first:?}"
+        );
+
+        negotiate(&transport, &offers, &bob, resolved, true).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(audio_send_codec(&alice).await.unwrap(), first);
+        let remote = alice.current_remote_description().unwrap().to_string();
+        assert!(!remote.contains("maxaveragebitrate"), "{remote}");
+
+        // The same answer without the pin does change the send codec, so the check above can fail.
+        negotiate(&transport, &offers, &bob, resolved, false).await;
+        let unpinned = settled_codec(&alice, Some(&first)).await;
+        assert!(unpinned.0.contains("maxaveragebitrate=510000"), "{unpinned:?}");
+
+        alice.close();
+        bob.close();
     }
 }

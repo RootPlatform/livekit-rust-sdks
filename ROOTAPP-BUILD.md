@@ -926,6 +926,21 @@ then: a published audio track's codec options (RED, DTX, stereo) never change in
 fixed at publish; stereo munging is keyed to the track id in every offer), and `RtpSender` refuses
 `set_track` and inactive encodings on audio senders (unpublish and republish instead).
 
+The server's answers change codecs too: LiveKit 1.13.7 with a single peer connection answers a new
+stereo screen-audio section `minptime=10;stereo=1;useinbandfec=1` and every later negotiation (the
+screen video published right after it, any track change) `maxaveragebitrate=510000;...`, because it
+resolves the track only from the second answer on. That format change while sending registers the
+screen-audio stream with AudioState on the platform engine (the live 10/10 symptom: 100 packets/s
+at ~256 kbps against a 128 kbps cap, mic frames interleaved with the screen audio, garbled at the
+receiver). The publisher transport now keeps every audio send section's payload order and Opus fmtp
+as its first answer gave them (`PeerTransport::pin_send_codecs`, a stereo track's first answer gets
+`stereo=1` if the server left it out) and logs the first change it overrides per section. Device-free
+tests:
+`cargo test -p livekit --lib peer_transport` (string cases, plus a loopback pair whose answer gains
+`maxaveragebitrate`: pinned the send codec stays, unpinned it changes). Against a local server
+(`livekit-server --dev --bind 127.0.0.1`): `cargo test -p livekit --features __lk-e2e-test --test
+screen_audio_codec_test -- --nocapture` (fails without the pin).
+
 Tests that need no device: `cargo test -p webrtc-sys --lib -- adm_proxy root_
 device_selection` (AdmProxy over a fake platform ADM that records its calls, the mixer, the capture
 processor, the decorator over a fake and over the real builtin APM, the denoiser slot and its
