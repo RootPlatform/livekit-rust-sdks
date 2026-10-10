@@ -1,11 +1,26 @@
 #![forbid(unsafe_code)]
 
+pub mod aligner;
+pub mod auto_sensitivity;
 mod chain;
 pub mod gain_ramp;
+pub mod noise_gate;
 pub mod sanitize;
 pub mod transmit_gate;
+pub mod voice_gain;
 
-pub use chain::DspChain;
+pub use chain::{DspChain, AUTO_MIN_OPEN_BLOCKS};
+
+/// Managed `Math.Clamp(double, min, max)` without the throw on inverted bounds.
+pub(crate) fn clamp_f64(value: f64, min: f64, max: f64) -> f64 {
+    if value < min {
+        min
+    } else if value > max {
+        max
+    } else {
+        value
+    }
+}
 
 pub const MIN_RATE: u32 = 8_000;
 pub const MAX_RATE: u32 = 48_000;
