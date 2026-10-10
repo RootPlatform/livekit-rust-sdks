@@ -747,16 +747,17 @@ it only changes .NET's own copy, so set the variable before the process starts o
 
 ## Native call audio (`rootapp/native-platform-audio`)
 
-Phases 0-2 of RootApp.Client.Desktop's `docs/native-platform-audio.md`: platform audio
+Phases 0-3 of RootApp.Client.Desktop's `docs/native-platform-audio.md`: platform audio
 (`PlatformAudio`, `AUDIO_SOURCE_PLATFORM`) carries a call, with device IO, mixing, echo cancellation,
-volumes, effects, the mute/push-to-talk gate and (Phase 2) the app's voice chain and the Effects SDK
-denoiser hand-off in native code.
+volumes, effects, the mute/push-to-talk gate, (Phase 2) the app's voice chain and the Effects SDK
+denoiser hand-off, and (Phase 3) the mic test monitor in native code.
 
 `livekit_ffi_rootapp_audio_caps()` is a zero-protobuf export (every target) returning the native audio
 features the build implements: bit 0 SELECT_DEVICES, 1 PLAYOUT_HOLD, 2 STATS, 3 ADM_HARDENED, 4 MIXER,
 5 TRACK_GAINS, 6 EFFECTS, 7 CONTROL, 8 DSP, 9 DENOISER, 10 MONITOR, 11 APM_DECORATOR. This branch
-reports `0b101111111111` (3071: bits 0-9 and 11) on 64-bit desktop, `0b100111111111` (2559, no
-DENOISER) on 32-bit desktop and 0 on mobile; Phase 1 builds reported `0b100011111111` (2303). The
+reports `0b111111111111` (4095: bits 0-11) on 64-bit desktop, `0b110111111111` (3583, no DENOISER)
+on 32-bit desktop and 0 on mobile; Phase 2 builds reported 3071 (no MONITOR) and Phase 1 builds
+`0b100011111111` (2303). The
 `RootAudio*` requests (`rootapp_audio.proto`, oneof cases from 1000) that a build does not implement
 answer "not supported by this build"; an older library rejects them as an empty request, so hosts
 check the export first.
@@ -936,6 +937,84 @@ rootapp-voice-dsp --all-targets -- -D warnings`), `cargo test -p libwebrtc --lib
 `platform_audio`. Run them with `--release`. Every test that creates the platform ADM
 (`test_audio_device_controller_bridge`, `test_new_platform_audio`, the device tests in
 `livekit/tests/platform_audio_test.rs`) runs only with `LK_HW_AUDIO_TESTS=1`.
+
+### Phase 3: mic test monitor, macOS and Linux device ids
+
+Caps: MONITOR (bit 10) wherever DSP is (the monitor is fed by the capture processor);
+`rootapp_audio_caps_cover_phase_3` ties it to `root_dsp_supported()`.
+
+Mic test monitor (`RootAudioSetMonitor`, `PlatformAudio::set_monitor`, stats 102-104):
+
+- `RootAudioMonitor` plays channel 0 of `RootCaptureProcessor`'s output (what a call would send:
+  gate, mute, push-to-talk, voice gain, input volume and the startup hold applied) at unity gain on
+  every playout channel. The transport tap adds it to device render callbacks after libwebrtc's
+  `NeedMorePlayData`, which has already given its mix to the APM as the AEC reference, so the echo
+  canceller never sees it; the synthetic pump never plays it.
+- One producer (capture post-processor) and one consumer (render callback) share 8 preallocated
+  10 ms frames: playback starts with 20 ms queued (older frames skipped), primes again after an
+  underrun, and a capture frame that finds 40 ms queued while playing is dropped. `monitor_frames`
+  counts render frames played in full, `monitor_dropped_frames` underruns plus those drops.
+  Catmull-Rom rate conversion on an integer phase converts the processor's 16/32/48 kHz to any
+  render rate without allocation; equal rates pass samples through with the APM's own int16
+  rounding (bit-exact with what the APM sends).
+- `AdmProxy::SetMonitor` adds a want of its own on both directions (OR-ed in like the hold): the
+  current selection opens on the device thread, `Playing()`/`Recording()` stay libwebrtc's. It is
+  refused while libwebrtc records for a send stream, and libwebrtc's `StartRecording` (a call that
+  publishes the mic) turns it off, keeping the recording device open for the call. The last
+  reference and the last session's reset (`reset_root_audio(true)`) turn it off.
+- Verified in `audio/audio_transport_impl.cc` (m150): with no send stream every capture frame still
+  goes through the APM, at the device rate rounded up to 8/16/32/48 kHz with the device's channels,
+  and is dropped after processing. The post-processor runs at 16/32/48 kHz.
+
+Device ids (all platforms; the macOS and Linux rules come from `audio_device_mac.cc` and
+`audio_device_pulse_linux.cc` at m150):
+
+- GUIDs match exactly: Windows MMDevice ids; macOS AudioObjectIDs as decimal strings, index 0 being
+  the current default under the GUID "default" and the default listed again under its own id. A
+  stale AudioObjectID (replug, coreaudiod restart) is DeviceNotFound, never another device.
+- Names match exactly (Linux: the PulseAudio description; GUIDs are empty there), or by the complete
+  UTF-8 characters an ADM kept of a name it cut to 127 bytes, so the full name and the FFI's lossy
+  copy both match. Of duplicate names the first in the ADM's order wins.
+- ADM name buffers are read up to their size (the macOS ADM copies a CoreAudio name unterminated
+  when it fills the buffer), and names and GUIDs cross the cxx bridge lossily: `rust::String`'s
+  constructor throws on a name cut inside a UTF-8 sequence, which aborted the process.
+- Linux: the PulseAudio ADM enumerates through members its `InitPlayout`/`StartPlayout` also use
+  (`_deviceIndex`, `_numPlayDevices`, the display-name pointers) with no lock of its own, so
+  enumeration from the FFI now takes the device mutex there. Windows and macOS enumeration stays
+  lock-free (their ADMs enumerate safely on any thread).
+
+Portability review of the fork's Phases 0-3 C++ and Rust:
+
+- Platform branches are few: COM and `kDefaultDevice` (Windows), the enumeration lock (Linux), and
+  the mobile branches. Each file includes the standard headers it uses (checked by hand, since
+  libc++ includes less transitively than MSVC's STL). No MSVC-only constructs; `std::atomic<double>` lock-freedom is asserted
+  (true on every 64-bit desktop target; it would fail a 32-bit ARM build).
+- The Effects SDK is called through raw vtables (no virtual destructors, `this` first); that holds
+  for the Itanium ABI on x86-64 SysV and AArch64 as for MSVC, as the desktop's managed binding
+  already relies on.
+- Upstream, not fixable here: AUHAL's stream-format listener reconfigures the render/capture
+  converters on a HAL thread without locking against the IO threads (AirPods profile switches); the
+  PulseAudio ADM's `RTC_DCHECK(thread_checker_)` calls would fire from the device thread if a
+  prebuilt were built with DCHECKs on.
+- Checked here: every audio C++ file compiles syntax-only with clang-cl (`/W4`) under the Linux
+  (`WEBRTC_POSIX`, `WEBRTC_LINUX`) and macOS (`WEBRTC_POSIX`, `WEBRTC_MAC`) defines against the
+  Windows prebuilt's headers, MSVC's STL and stubbed POSIX headers; no warning in our files except
+  the existing unused `AdmProxy::worker_thread_`. Not checked here: AppleClang with Apple's libc++,
+  clang with the hermetic libc++ and a Linux sysroot, linking, and running anything on macOS or Linux.
+
+Still for CI (macOS x64/arm64, Linux x64/arm64): build and link; the device-free suites above plus
+`root_monitor_`; `rootapp-voice-dsp`'s golden vectors (other libm builds may need
+`ROOTAPP_DSP_GOLDEN_LOOSE=1`); `NDEBUG` without `DCHECK_ALWAYS_ON` in the Linux and macOS
+prebuilts' `webrtc.ninja`. Live (desktop gate E7): the monitor on each OS, an AirPods profile switch
+mid-call, PulseAudio and PipeWire-pulse descriptions, duplicate device names.
+
+Tests that need no device: as Phase 2, with `root_monitor` (the ring, priming, underrun and overrun
+counting, 16->48, 48->44.1, 32->48 and 48->16 kHz against an analytic sine, saturation),
+`adm_proxy_monitor_*` (devices opened without claiming them, stop leaves what others keep, refused
+while sending, off when sending starts, needs a reference, follows a selection, teardown),
+`root_voice_monitor_*` (through the real APM: the device plays exactly what the APM sends while the
+APM's reverse stream holds only the remote mix; 16 kHz capture to 48 kHz playout; a call takes over)
+and `device_selection_*` (macOS- and Linux-shaped device lists, cut names).
 
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
