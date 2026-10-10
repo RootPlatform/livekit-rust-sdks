@@ -67,7 +67,8 @@ pub const CAP_MONITOR: u64 = 1 << 10;
 pub const CAP_APM_DECORATOR: u64 = 1 << 11;
 
 /// What `livekit_ffi_rootapp_audio_caps` reports. The ADM hardening is desktop
-/// only, so mobile builds report nothing. The voice chain (DSP) runs wherever
+/// only, so mobile builds report nothing. The voice chain (DSP) and the mic
+/// test monitor (MONITOR, fed by the chain's capture processor) run wherever
 /// the factory builds its APM (webrtc-sys `kRootDspSupported`); the Effects SDK
 /// slot (DENOISER) only where the SDK's x64/arm64 calling convention holds
 /// (`kRootDenoiserSupported`).
@@ -84,6 +85,7 @@ pub const ROOTAPP_AUDIO_CAPS: u64 = if cfg!(any(target_os = "ios", target_os = "
         | CAP_CONTROL
         | CAP_DSP
         | if cfg!(target_pointer_width = "64") { CAP_DENOISER } else { 0 }
+        | CAP_MONITOR
         | CAP_APM_DECORATOR
 };
 
@@ -1133,11 +1135,18 @@ pub fn on_return_pipelines(
     Ok(proto::RootAudioReturnPipelinesResponse { pipelines, error: held.error })
 }
 
+/// The mic test: on, native opens both selected devices for it and plays the
+/// processed capture outside the echo canceller's reference; off, they close
+/// unless a call or the playout hold keeps them. Refused while a call sends
+/// from the platform microphone (a call that starts sending turns it off;
+/// RootAudioStats.monitor_active). Returns at once.
 pub fn on_set_monitor(
-    _server: &'static FfiServer,
-    _req: proto::RootAudioSetMonitorRequest,
+    server: &'static FfiServer,
+    req: proto::RootAudioSetMonitorRequest,
 ) -> FfiResult<proto::RootAudioSetMonitorResponse> {
-    Ok(proto::RootAudioSetMonitorResponse { error: Some(NOT_SUPPORTED.into()) })
+    let audio = platform_audio_from_handle(server, req.platform_audio_handle)?;
+    let error = audio.set_monitor(req.enabled).err().map(|e| e.to_string());
+    Ok(proto::RootAudioSetMonitorResponse { error })
 }
 
 impl From<RootAudioStats> for proto::RootAudioStats {
@@ -1231,9 +1240,9 @@ impl From<RootAudioStats> for proto::RootAudioStats {
             apm_policy_deferred: stats.apm_policy_deferred,
             apm_policy_forced: stats.apm_policy_forced,
             apm_policy_pending: stats.apm_policy_pending,
-            monitor_active: None,
-            monitor_frames: None,
-            monitor_dropped_frames: None,
+            monitor_active: stats.monitor_active,
+            monitor_frames: stats.monitor_frames,
+            monitor_dropped_frames: stats.monitor_dropped_frames,
         }
     }
 }
@@ -1243,21 +1252,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rootapp_audio_caps_cover_phase_2() {
+    fn rootapp_audio_caps_cover_phase_3() {
         let mobile = cfg!(any(target_os = "ios", target_os = "android"));
         if !mobile {
             let expected =
-                if cfg!(target_pointer_width = "64") { 0b1011_1111_1111 } else { 0b1001_1111_1111 };
+                if cfg!(target_pointer_width = "64") { 0b1111_1111_1111 } else { 0b1101_1111_1111 };
             assert_eq!(ROOTAPP_AUDIO_CAPS, expected);
             if cfg!(target_pointer_width = "64") {
-                assert_eq!(ROOTAPP_AUDIO_CAPS, 3071);
+                assert_eq!(ROOTAPP_AUDIO_CAPS, 4095);
             }
         }
         assert_eq!(crate::cabi::livekit_ffi_rootapp_audio_caps(), ROOTAPP_AUDIO_CAPS);
-        assert_eq!(ROOTAPP_AUDIO_CAPS & CAP_MONITOR, 0);
         // Each bit is set exactly where the native side builds what it claims.
         assert_eq!(
             ROOTAPP_AUDIO_CAPS & CAP_DSP != 0,
+            webrtc_sys::root_audio_processing::ffi::root_dsp_supported()
+        );
+        assert_eq!(
+            ROOTAPP_AUDIO_CAPS & CAP_MONITOR != 0,
             webrtc_sys::root_audio_processing::ffi::root_dsp_supported()
         );
         assert_eq!(
@@ -1866,6 +1878,26 @@ mod tests {
         assert_eq!(absent.ns_fallback_pending_frames, None);
         assert!(absent.denoiser_process_us_buckets.is_empty());
         assert!(absent.voice_gain_db.is_nan() && absent.gate_in_block_peak_db.is_nan());
+    }
+
+    #[test]
+    fn rootapp_audio_monitor_stats_convert_and_stay_absent_without_the_monitor() {
+        let stats = RootAudioStats {
+            monitor_active: Some(true),
+            monitor_frames: Some(250),
+            monitor_dropped_frames: Some(2),
+            ..Default::default()
+        };
+        let p: proto::RootAudioStats = stats.into();
+        assert_eq!(
+            (p.monitor_active, p.monitor_frames, p.monitor_dropped_frames),
+            (Some(true), Some(250), Some(2))
+        );
+        let absent: proto::RootAudioStats = RootAudioStats::default().into();
+        assert_eq!(
+            (absent.monitor_active, absent.monitor_frames, absent.monitor_dropped_frames),
+            (None, None, None)
+        );
     }
 
     #[test]
