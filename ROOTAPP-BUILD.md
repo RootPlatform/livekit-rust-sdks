@@ -1038,6 +1038,35 @@ while sending, off when sending starts, needs a reference, follows a selection, 
 APM's reverse stream holds only the remote mix; 16 kHz capture to 48 kHz playout; a call takes over)
 and `device_selection_*` (macOS- and Linux-shaped device lists, cut names).
 
+### First live test fixes (2026-10-10)
+
+- Stereo playout: libwebrtc's `adm_helpers::Init` (engine init, m150 `media/engine/adm_helpers.cc`)
+  calls `InitSpeaker` and `SetStereoPlayout(StereoPlayoutIsAvailable())` once. Under the playout
+  hold the device is already open then, so `AudioDeviceModuleImpl::SetStereoPlayout` refused
+  ("unable to set stereo mode while playing side is initialized") and the Windows ADM's
+  `InitSpeaker` returned -1 while playing ("Unable to access speaker"; it only refreshes the
+  endpoint and takes the session's `ISimpleAudioVolume`, it sets no volume). Windows still played
+  stereo (its ADM prefers 2 channels by default and sets the buffer's channels at every
+  `InitPlayout`), but PulseAudio starts mono (`_playChannels(1)`) and macOS stays mono after a mono
+  device, so remote stereo, screen-share audio and the music bot could play mono there. On desktop
+  `AdmProxy` now keeps libwebrtc's choice (stereo until it says otherwise) and applies it before
+  every playout open; `InitSpeaker`/`InitMicrophone` are no-ops (every open initializes them), and
+  `SetSpeakerVolume`/`SetSpeakerMute` refuse without reaching the ADM (no m150 caller in
+  `media/`, `audio/`, `pc/` or `api/`; the app's volume is the mixer's).
+- Per-source playout levels (`RootAudioStats` 105-106): the mixer counts each source's audio before
+  its gain per slot (a muted frame as silence); `livekit_ffi` names each source's remote track handles
+  from the SSRCs it resolves for track gains and at subscribe. The app shows each person's audio and
+  checks their ring against it on platform calls.
+- The denoiser's slow latch was left as is: in the live test one 1.7 s system burst (capture
+  callbacks bunched too) latched the pipeline and, 0.2 s after its install, the replacement with
+  genuine 5-10 ms calls; the third pipeline ran at 1-1.5 ms at once and the first install's first
+  calls took 1 ms, so the one-call warm-up exemption holds. The app counts such a burst once.
+
+Tests: `adm_proxy_playout_opens_stereo_*`, `adm_proxy_never_touches_the_speaker_*`,
+`adm_proxy_stats_count_mixer_source_levels`, `root_audio_mixer_counts_*`,
+`root_audio_mixer_source_added_again_*`, `root_audio_stats_carry_per_source_levels_*`,
+`rootapp_audio_source_levels_*`.
+
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
 | Commit | Change |
