@@ -185,7 +185,11 @@ message RootAudioReturnPipelinesResponse {
   optional string error = 2;
 }
 
-// Mic test: processed capture played back locally, outside the echo canceller's reference.
+// Mic test (capability MONITOR): enabled opens the selected devices for the app (released again by
+// enabled=false unless a call holds them) and plays the processed capture (what a call would send,
+// following mute, push-to-talk, the gate and the input volume) on the playout device, outside the echo
+// canceller's reference. Refused with an error while a call sends from the platform microphone; a
+// call that starts sending turns the monitor off (RootAudioStats.monitor_active false).
 message RootAudioSetMonitorRequest {
   required uint64 platform_audio_handle = 1;
   required bool enabled = 2;
@@ -368,6 +372,15 @@ message RootAudioStats {
   // NS yet (capability DENOISER; absent without it): the fallback's own way to the APM, part of
   // ns_gap_frames when it happens while denoiser_wanted is set and the transmit gate is open.
   optional uint64 ns_fallback_pending_frames = 101;
+
+  // Mic test monitor (capability MONITOR; absent without it). monitor_active: the monitor is on and
+  // the processed capture is played locally (false after SetMonitor(false), and when native turned it
+  // off because a call started sending). monitor_frames counts 10 ms render frames that played monitor
+  // audio; monitor_dropped_frames counts 10 ms frames lost to the monitor's ring: render frames that
+  // found it empty while it was primed (underrun) and capture frames that found it full (overrun).
+  optional bool monitor_active = 102;
+  optional uint64 monitor_frames = 103;
+  optional uint64 monitor_dropped_frames = 104;
 }
 message RootAudioStatsRequest {
   required uint64 platform_audio_handle = 1;

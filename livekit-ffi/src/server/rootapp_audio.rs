@@ -1231,6 +1231,9 @@ impl From<RootAudioStats> for proto::RootAudioStats {
             apm_policy_deferred: stats.apm_policy_deferred,
             apm_policy_forced: stats.apm_policy_forced,
             apm_policy_pending: stats.apm_policy_pending,
+            monitor_active: None,
+            monitor_frames: None,
+            monitor_dropped_frames: None,
         }
     }
 }
