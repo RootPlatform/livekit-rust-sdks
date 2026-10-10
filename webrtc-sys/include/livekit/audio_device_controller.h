@@ -78,8 +78,10 @@ class AudioDeviceController {
   RootAudioNativeStats root_audio_stats() const;
 
   // Live control of the native audio engine; values arrive sanitised and are
-  // clamped again here. Never blocks on an audio thread or the APM.
-  void set_root_audio_control(const RootAudioControlUpdate& control) const;
+  // clamped again here. Never blocks on an audio thread or the APM. False when
+  // a set field has nothing to act on in this build (no capture processor,
+  // mixer or APM decorator); the other fields are applied.
+  bool set_root_audio_control(const RootAudioControlUpdate& control) const;
   bool set_root_audio_source_gain(uint32_t ssrc,
                                   float tile_volume,
                                   bool paused) const;
@@ -90,9 +92,12 @@ class AudioDeviceController {
   uint8_t play_root_audio_effect(uint32_t id, float gain) const;
   void stop_root_audio_effects() const;
   RootAudioCaptureFormat root_audio_capture_format() const;
-  // Controls back to their defaults (gate open, unity volumes, no gains or
-  // effects, AEC/NS following the device track).
-  void reset_root_audio() const;
+  // Moves whenever the playout mixer gets a new source.
+  uint64_t root_audio_sources_added() const;
+  // Controls back to their defaults (unity volumes, no gains or effects,
+  // AEC/NS following the device track), with the capture gate open or closed
+  // (muted, push-to-talk key up).
+  void reset_root_audio(bool close_gate) const;
 
   // Recording control. On desktop start/stop are the app's own request, apart
   // from libwebrtc's; init does nothing (devices open on start).
@@ -149,8 +154,11 @@ class HarnessTransport;
 // "engine_*" calls are what libwebrtc calls; app_* go through the controller.
 class AdmProxyHarness {
  public:
+  // With `with_apm`, the controller also gets an APM decorator over a fake APM
+  // (NewRootApmOverFakeForTest).
   AdmProxyHarness(rust::Slice<const rust::String> playout_guids,
-                  rust::Slice<const rust::String> recording_guids);
+                  rust::Slice<const rust::String> recording_guids,
+                  bool with_apm);
   ~AdmProxyHarness();
 
   // Calls the fake got since the last take, e.g. "StartPlayout".
@@ -212,22 +220,26 @@ class AdmProxyHarness {
 
   RootAudioNativeStats stats() const;
 
-  // The engine controls behind the controller (no APM in the harness).
+  // The engine controls behind the controller.
   bool mixer_platform_active() const;
-  void apply_control(const RootAudioControlUpdate& control) const;
-  void reset_root_audio() const;
+  bool apply_control(const RootAudioControlUpdate& control) const;
+  void reset_root_audio(bool close_gate) const;
   RootControlState control_state() const;
 
  private:
   webrtc::scoped_refptr<FakePlatformAdm> fake_;
   webrtc::scoped_refptr<RootAudioMixer> mixer_;
   std::shared_ptr<RootCaptureState> capture_;
+  webrtc::scoped_refptr<RootApmDecorator> apm_;
   webrtc::scoped_refptr<AdmProxy> proxy_;
   std::unique_ptr<AudioDeviceController> controller_;
   std::unique_ptr<HarnessTransport> transport_;
 };
 
 std::unique_ptr<AdmProxyHarness> new_adm_proxy_harness(
+    rust::Slice<const rust::String> playout_guids,
+    rust::Slice<const rust::String> recording_guids);
+std::unique_ptr<AdmProxyHarness> new_adm_proxy_harness_with_apm(
     rust::Slice<const rust::String> playout_guids,
     rust::Slice<const rust::String> recording_guids);
 

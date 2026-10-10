@@ -195,7 +195,12 @@ pub mod ffi {
         fn set_playout_hold(self: &AudioDeviceController, hold: bool);
         fn root_audio_stats(self: &AudioDeviceController) -> RootAudioNativeStats;
 
-        fn set_root_audio_control(self: &AudioDeviceController, control: &RootAudioControlUpdate);
+        /// False when a set field has nothing to act on in this build; the
+        /// other fields are applied.
+        fn set_root_audio_control(
+            self: &AudioDeviceController,
+            control: &RootAudioControlUpdate,
+        ) -> bool;
         fn set_root_audio_source_gain(
             self: &AudioDeviceController,
             ssrc: u32,
@@ -203,13 +208,17 @@ pub mod ffi {
             paused: bool,
         ) -> bool;
         fn clear_root_audio_source_gain(self: &AudioDeviceController, ssrc: u32);
-        fn register_root_audio_effect(self: &AudioDeviceController, id: u32, samples: &[i16])
-            -> bool;
+        fn register_root_audio_effect(
+            self: &AudioDeviceController,
+            id: u32,
+            samples: &[i16],
+        ) -> bool;
         /// 0 queued, 1 unknown clip, 2 dropped (queue full), 3 idle (no platform audio).
         fn play_root_audio_effect(self: &AudioDeviceController, id: u32, gain: f32) -> u8;
         fn stop_root_audio_effects(self: &AudioDeviceController);
         fn root_audio_capture_format(self: &AudioDeviceController) -> RootAudioCaptureFormat;
-        fn reset_root_audio(self: &AudioDeviceController);
+        fn root_audio_sources_added(self: &AudioDeviceController) -> u64;
+        fn reset_root_audio(self: &AudioDeviceController, close_gate: bool);
 
         fn stop_recording(self: &AudioDeviceController) -> bool;
         fn init_recording(self: &AudioDeviceController) -> bool;
@@ -247,6 +256,11 @@ pub mod ffi {
 
         // AdmProxy over a fake platform ADM (tests only; opens no device).
         fn new_adm_proxy_harness(
+            playout_guids: &[String],
+            recording_guids: &[String],
+        ) -> UniquePtr<AdmProxyHarness>;
+        /// With an APM decorator over a fake APM behind the controller.
+        fn new_adm_proxy_harness_with_apm(
             playout_guids: &[String],
             recording_guids: &[String],
         ) -> UniquePtr<AdmProxyHarness>;
@@ -303,8 +317,8 @@ pub mod ffi {
         fn lock_on_audio_thread(self: &AdmProxyHarness) -> u64;
         fn stats(self: &AdmProxyHarness) -> RootAudioNativeStats;
         fn mixer_platform_active(self: &AdmProxyHarness) -> bool;
-        fn apply_control(self: &AdmProxyHarness, control: &RootAudioControlUpdate);
-        fn reset_root_audio(self: &AdmProxyHarness);
+        fn apply_control(self: &AdmProxyHarness, control: &RootAudioControlUpdate) -> bool;
+        fn reset_root_audio(self: &AdmProxyHarness, close_gate: bool);
         fn control_state(self: &AdmProxyHarness) -> RootControlState;
     }
 

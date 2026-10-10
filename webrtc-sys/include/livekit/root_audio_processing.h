@@ -64,9 +64,17 @@ constexpr float kRootMaxVoiceGainDb = 18.0f;
 // atomics only. Settings are written by the control side and read once per
 // frame; outputs are written by the audio thread only.
 struct RootCaptureState {
+  // The gate in one word, so an update of both fields is never seen half
+  // done: bit 0 mic muted, bits 1-2 push-to-talk (RootPushToTalk).
+  static constexpr uint32_t kGateMuted = 1;
+  static constexpr uint32_t kGatePushToTalkShift = 1;
+  static constexpr uint32_t kGateClosed =
+      kGateMuted |
+      (static_cast<uint32_t>(RootPushToTalk::kReleased) << kGatePushToTalkShift);
+  static bool GateOpen(uint32_t gate);
+
   // Settings that take effect now.
-  std::atomic<bool> mic_muted{false};
-  std::atomic<uint32_t> push_to_talk{0};
+  std::atomic<uint32_t> gate{0};
   std::atomic<float> input_volume{1.0f};
 
   // Stored for the DSP chain (Phase 2); nothing reads them yet.
@@ -95,8 +103,15 @@ struct RootCaptureState {
   std::atomic<double> sent_sumsq{0.0};
   std::atomic<uint64_t> stage_samples{0};
 
-  // Back to the defaults (gate open, unity input volume); outputs are kept.
-  void ResetControls();
+  bool mic_muted() const;
+  uint32_t push_to_talk() const;
+  // Unset fields keep their value; push-to-talk values past kReleased close
+  // the gate.
+  void SetGate(std::optional<bool> mic_muted,
+               std::optional<uint32_t> push_to_talk);
+  // Back to the defaults (unity input volume), with the gate open or closed
+  // (muted, push-to-talk key up) in the same store; outputs are kept.
+  void ResetControls(bool close_gate);
 };
 
 struct RootCaptureFormatSnapshot {
@@ -112,12 +127,17 @@ RootCaptureFormatSnapshot ReadCaptureFormat(const RootCaptureState& state);
 // The APM's capture post-processor. Its buffer is FloatS16 (+-32768) at the
 // APM's full-band rate (8, 16, 32 or 48 kHz) with the output stream's channel
 // count. It processes channel 0 and copies it to the other channels:
-//   levels -> [Phase 2: Rust DSP chain] -> mute/PTT gate -> input volume (20 ms
-//   ramp) -> levels.
+//   levels -> [Phase 2: Rust DSP chain] -> input volume (20 ms ramp) ->
+//   mute/PTT gate (5 ms fade each way) -> levels.
 // Real-time code: no locks, allocation, logging or APM calls. Initialize runs
 // under both APM locks on up to four threads and only stores the format.
 class RootCaptureProcessor : public webrtc::CustomProcessing {
  public:
+  // The app's gate reaches full gain 4 ms into a push-to-talk press
+  // (NoiseGate: 20 ms attack, full at envelope 0.2); closing fades as long so
+  // the far side hears no click.
+  static constexpr int kGateFadeMs = 5;
+
   explicit RootCaptureProcessor(std::shared_ptr<RootCaptureState> state);
 
   void Initialize(int sample_rate_hz, int num_channels) override;
@@ -129,6 +149,7 @@ class RootCaptureProcessor : public webrtc::CustomProcessing {
  private:
   void ResetDsp();
   void ApplyInputVolume(float* samples, size_t frames);
+  void ApplyGate(float* samples, size_t frames, float target);
 
   const std::shared_ptr<RootCaptureState> state_;
   // Audio thread only.
@@ -140,12 +161,15 @@ class RootCaptureProcessor : public webrtc::CustomProcessing {
   float volume_target_ = 1.0f;
   float volume_step_ = 0.0f;
   size_t volume_remaining_ = 0;
+  float gate_ = 1.0f;
+  float gate_step_ = 1.0f;
 };
 
 struct RootApmStats {
   double erl_db = 0;
   double erle_db = 0;
-  int32_t delay_ms = 0;
+  // -1 while the APM has no estimate.
+  int32_t delay_ms = -1;
   double divergent_filter_fraction = 0;
   bool echo_cancellation_active = false;
   bool noise_suppression_active = false;
@@ -156,7 +180,11 @@ struct RootApmStats {
 //  - ApplyConfig merges our policy into whatever the voice engine asks for
 //    (AGC1 and AGC2 off, high-pass filter on, AEC and NS from the policy when
 //    one is set) and calls the inner ApplyConfig only when the merged config
-//    differs. GetConfig is served from that applied config.
+//    differs. GetConfig serves the engine's own request with only the forced
+//    parts (AGC off, HPF on), so the engine's read-modify-write never copies
+//    the AEC/NS policy into its request and ResetPolicy restores exactly what
+//    it asked for; echo_cancellation_active/noise_suppression_active report
+//    what is applied.
 //  - set_output_will_be_muted and the kCaptureOutputUsed runtime setting are
 //    swallowed, so the capture output is always used and the post-processor
 //    runs every frame; mute and PTT are the post-processor's gate.
@@ -185,7 +213,9 @@ class RootApmDecorator : public webrtc::AudioProcessing {
   // Back to following what the voice engine asks.
   void ResetPolicy();
 
-  // Off the audio threads; APM statistics take the APM's stats lock.
+  // Off the audio threads. GetStatistics takes the APM's stats lock, which the
+  // capture thread holds briefly once per frame (as for libwebrtc's own
+  // getStats); everything else here is atomics.
   RootApmStats ReadStats();
   bool echo_cancellation_active() const;
   bool noise_suppression_active() const;
@@ -244,6 +274,8 @@ class RootApmDecorator : public webrtc::AudioProcessing {
   Config GetConfig() const override;
 
  private:
+  // The parts of the engine's request we always override.
+  static Config Forced(const Config& requested);
   Config MergeLocked(const Config& requested) const;
   void ApplyLocked();
   void SchedulePolicyLocked();
@@ -282,6 +314,11 @@ webrtc::scoped_refptr<RootApmDecorator> CreateRootAudioProcessing(
 bool RootApmConfigsEqual(const webrtc::AudioProcessing::Config& a,
                          const webrtc::AudioProcessing::Config& b);
 
+// Tests only: the decorator over a fake APM that reports fixed echo
+// statistics (ERL 12 dB, ERLE 20 dB, delay 40 ms, divergent fraction 0.25),
+// with policy changes applied inline.
+webrtc::scoped_refptr<RootApmDecorator> NewRootApmOverFakeForTest();
+
 // Runs a RootCaptureProcessor over AudioBuffers (tests only).
 class RootProcessorHarness {
  public:
@@ -291,6 +328,8 @@ class RootProcessorHarness {
   void initialize(int32_t rate, int32_t channels) const;
   void set_mic_muted(bool muted) const;
   void set_push_to_talk(uint32_t state) const;
+  // Both gate fields in one update; -1 keeps a field.
+  void set_gate(int8_t mic_muted, int32_t push_to_talk) const;
   void set_input_volume(float volume) const;
   void reset_controls() const;
   // One frame through Process on a buffer of `rate` / 100 frames and
@@ -323,6 +362,8 @@ class RootApmHarness {
                     bool auto_gain_control,
                     bool gain_controller2,
                     bool high_pass_filter) const;
+  // GetConfig, change the echo canceller only, ApplyConfig.
+  void engine_apply_echo_cancellation(bool echo_cancellation) const;
   void set_output_will_be_muted(bool muted) const;
   bool post_capture_output_used(bool used) const;
   void set_policy(int8_t echo_cancellation, int8_t noise_suppression) const;
@@ -355,5 +396,11 @@ class RootApmHarness {
 };
 
 std::unique_ptr<RootApmHarness> new_root_apm_harness(bool real_apm);
+
+// The engine's ApplyConfig on one thread while another changes the policy
+// (applied inline). True when every config the fake APM got had AGC off and
+// the high-pass filter on, and the last one is the engine's last request with
+// the last policy.
+bool root_apm_decorator_race_for_test(uint32_t iterations);
 
 }  // namespace livekit_ffi

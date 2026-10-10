@@ -35,6 +35,7 @@ namespace livekit_ffi {
 struct RootMixTestSource;
 struct RootMixTestResult;
 struct RootMixFrame;
+struct RootMixStress;
 class RootMixerHarness;
 }  // namespace livekit_ffi
 #include "webrtc-sys/src/root_audio_mixer.rs.h"
@@ -81,6 +82,11 @@ struct RootAudioMixerStats {
 // bus joins after the remote sources, ignoring master volume and deafen, before
 // the final soft clip. Otherwise every gain is unity and the bus is idle.
 //
+// Once the host has set a source gain (since the last ResetControls), a source
+// that has none yet is held at 0 for its first kUnconfiguredHoldMs, so a stream
+// that starts before its gain arrives never plays at the wrong volume; one that
+// gets no gain by then plays at tile volume 1.
+//
 // AddSource/RemoveSource run on the worker while Mix runs on the device's render
 // thread. Mix takes no lock: sources live in a fixed slot array, and
 // RemoveSource only returns once no Mix that may still hold the source runs.
@@ -104,6 +110,10 @@ class RootAudioMixer : public webrtc::AudioMixer {
   static constexpr size_t kMaxClipSamples = static_cast<size_t>(kSampleRateHz) * 60;
   static constexpr size_t kMaxClipBytesTotal = 256u * 1024u * 1024u;
   static constexpr float kMaxEffectGain = 2.0f;
+  static constexpr int64_t kUnconfiguredHoldMs = 500;
+  // An effect that waited this long for the render thread (a stalled or
+  // still-opening device) is dropped instead of played late.
+  static constexpr int64_t kMaxEffectWaitMs = 1000;
 
   RootAudioMixer();
   ~RootAudioMixer() override;
@@ -118,6 +128,7 @@ class RootAudioMixer : public webrtc::AudioMixer {
   void ResetGapClock();
 
   // A platform audio reference exists (AdmProxy's ref count is above zero).
+  // Effects queued before a deactivation never play.
   void SetPlatformActive(bool active);
   bool platform_active() const;
 
@@ -126,10 +137,15 @@ class RootAudioMixer : public webrtc::AudioMixer {
   void SetDeafened(bool deafened);
   float master_volume() const;
   bool deafened() const;
-  // Returns false when the table of gains is full; the source then plays at
-  // the default tile volume (1.0).
+  // Returns false when the table of gains is full; the source then plays as
+  // one without a gain.
   bool SetSourceGain(uint32_t ssrc, float tile_volume, bool paused);
+  // Forgets the SSRC's gain. A stream with that SSRC that is still playing
+  // keeps its last gain; one added later has none.
   void ClearSourceGain(uint32_t ssrc);
+  // Counts every source added, so a poller can tell a new stream (or a
+  // stream's new SSRC) appeared.
+  uint64_t sources_added() const;
 
   // The clip (48 kHz mono int16) is copied and kept until the mixer is
   // destroyed, so the render thread never frees one. Registering an id again
@@ -139,12 +155,17 @@ class RootAudioMixer : public webrtc::AudioMixer {
   // Cuts playing and queued effects.
   void StopEffects();
 
-  // Back to the defaults: master 1, not deafened, no per-source gains, no
-  // effects playing. Registered clips are kept.
+  // Back to the defaults: master 1, not deafened, no per-source gains (and no
+  // hold of sources without one), no effects playing. Registered clips are
+  // kept.
   void ResetControls();
 
   // Atomics only. Max gap is reset on read.
   RootAudioMixerStats ReadStats();
+
+  // Tests only: shorter hold and effect wait, so they run in real time.
+  void SetTimeoutsForTest(int64_t unconfigured_hold_ms,
+                          int64_t max_effect_wait_ms);
 
  private:
   struct GainSetting {
@@ -153,11 +174,16 @@ class RootAudioMixer : public webrtc::AudioMixer {
   };
 
   struct Entry {
-    Entry(Source* source, uint32_t ssrc) : source(source), ssrc(ssrc) {}
+    Entry(Source* source, uint32_t ssrc, int64_t added_ns)
+        : source(source), ssrc(ssrc), added_ns(added_ns) {}
     Source* const source;
     const uint32_t ssrc;
+    const int64_t added_ns;
     std::atomic<float> tile{1.0f};
     std::atomic<bool> paused{false};
+    // Set (release) after tile and paused when the host gave this source a
+    // gain.
+    std::atomic<bool> configured{false};
     // Render thread only.
     bool ramp_started = false;
     float gain = 1.0f;
@@ -175,6 +201,7 @@ class RootAudioMixer : public webrtc::AudioMixer {
     const Clip* clip = nullptr;
     float gain = 0.0f;
     uint64_t generation = 0;
+    int64_t queued_ns = 0;
   };
 
   struct Voice {
@@ -187,7 +214,7 @@ class RootAudioMixer : public webrtc::AudioMixer {
   // `target` as the app's GainRamp does. Returns false when all are 0.
   bool RampGains(Entry& entry, float target);
   void Accumulate(const webrtc::AudioFrame& frame, size_t mix_channels);
-  bool MixEffects(bool active, size_t mix_channels);
+  bool MixEffects(bool active, size_t mix_channels, int64_t now_ns);
   void WaitForMixToRelease();
 
   webrtc::Mutex control_mutex_;
@@ -197,14 +224,20 @@ class RootAudioMixer : public webrtc::AudioMixer {
   std::atomic<size_t> slot_limit_{0};
   std::atomic<uint64_t> mix_epoch_{0};
   std::atomic<uint32_t> source_count_{0};
+  std::atomic<uint64_t> sources_added_{0};
   std::atomic<bool> in_mix_{false};
 
   std::atomic<bool> platform_active_{false};
   std::atomic<float> master_volume_{1.0f};
   std::atomic<bool> deafened_{false};
+  // The host sets source gains, so sources without one are held for a while.
+  std::atomic<bool> gains_used_{false};
+  std::atomic<int64_t> unconfigured_hold_ns_{kUnconfiguredHoldMs * 1000000};
+  std::atomic<int64_t> max_effect_wait_ns_{kMaxEffectWaitMs * 1000000};
 
-  // Effect bus: clips and the producer side of the ring under effects_mutex_;
-  // the render thread only reads the ring and owns the voices.
+  // Effect bus: clips and the producer side of the ring under effects_mutex_
+  // (which also orders PlayEffect against SetPlatformActive); the render
+  // thread only reads the ring and owns the voices.
   std::mutex effects_mutex_;
   std::map<uint32_t, const Clip*> clips_;
   std::vector<std::unique_ptr<Clip>> owned_clips_;
@@ -265,6 +298,9 @@ class RootMixerHarness {
   RootMixFrame mix(size_t out_channels) const;
   uint64_t effects_played() const;
   uint64_t effects_dropped() const;
+  uint64_t sources_added() const;
+  void set_timeouts(int64_t unconfigured_hold_ms,
+                    int64_t max_effect_wait_ms) const;
 
  private:
   webrtc::scoped_refptr<RootAudioMixer> mixer_;
@@ -272,5 +308,9 @@ class RootMixerHarness {
 };
 
 std::unique_ptr<RootMixerHarness> new_root_mixer_harness();
+
+// Mixes `mixes` times while other threads change gains, master, deafen and the
+// platform reference, play and stop effects, and add and remove sources.
+RootMixStress root_audio_mixer_stress_for_test(uint32_t mixes);
 
 }  // namespace livekit_ffi

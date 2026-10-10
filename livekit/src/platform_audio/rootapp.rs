@@ -15,11 +15,11 @@
 //! Types of the RootApp native audio engine (device requests, controls and
 //! stats).
 
-pub use libwebrtc::peer_connection_factory::native::{AudioDeviceSelection, EffectPlay};
 use libwebrtc::peer_connection_factory::native::{
     AudioDeviceOutcome, AudioDeviceRequestOutcome, NativeAudioControl, NativeAudioStats,
     NativeCaptureFormat, ADM_RESULT_NOT_ATTEMPTED,
 };
+pub use libwebrtc::peer_connection_factory::native::{AudioDeviceSelection, EffectPlay};
 
 use super::{AudioError, AudioResult};
 
@@ -78,12 +78,14 @@ impl PushToTalk {
 
 /// Live control of the native audio engine. `None` leaves a setting as it is.
 ///
-/// Take effect now: `mic_muted` and `push_to_talk` (the capture gate zeroes
-/// every frame while muted or the key is up), `input_volume` (after the gate,
-/// 20 ms ramp), `master_volume` and `deafened` (remote audio only; effects
-/// ignore both), and `echo_cancellation` / `webrtc_noise_suppression` (the
-/// APM policy, applied at most once a second because each toggle
-/// re-initializes the echo canceller or the noise suppressor).
+/// Take effect now: `mic_muted` and `push_to_talk` (the capture gate fades
+/// out over 5 ms and zeroes every frame while muted or the key is up, and
+/// fades in over 5 ms; both fields of one control change together),
+/// `input_volume` (20 ms ramp), `master_volume` and `deafened` (remote audio
+/// only; effects ignore both), and `echo_cancellation` /
+/// `webrtc_noise_suppression` (the APM policy, applied at most once a second
+/// because each toggle re-initializes the echo canceller or the noise
+/// suppressor).
 ///
 /// Stored for the DSP chain of a later build and not effective yet:
 /// `denoise_power`, `auto_gain`, `gate_threshold`, `auto_sensitivity` and the
@@ -236,7 +238,7 @@ fn device_result(outcome: AudioDeviceOutcome) -> AudioResult<()> {
 /// `denoised_sumsq`, `gate_in_sumsq` and the gate, speaking, voice gain and
 /// denoiser fields arrive with the DSP chain. `echo_cancellation_active` and
 /// `webrtc_ns_active` are what the APM has applied; the echo statistics are the
-/// APM's (NaN while it has none).
+/// APM's (NaN while it has none, and `aec_delay_ms` -1).
 #[derive(Debug, Clone, PartialEq)]
 pub struct RootAudioStats {
     // Device IO (transport tap on the platform ADM).
@@ -370,7 +372,7 @@ impl Default for RootAudioStats {
             denoiser_notifications: 0,
             erl_db: f64::NAN,
             erle_db: f64::NAN,
-            aec_delay_ms: 0,
+            aec_delay_ms: -1,
             divergent_filter_fraction: f64::NAN,
             echo_cancellation_active: false,
             webrtc_ns_active: false,
@@ -582,13 +584,20 @@ mod tests {
             (3, 4, 5, 6)
         );
         assert_eq!((stats.effects_played, stats.effects_dropped), (7, 8));
-        assert_eq!((stats.processed_frames, stats.process_rate, stats.process_channels), (9, 16_000, 1));
+        assert_eq!(
+            (stats.processed_frames, stats.process_rate, stats.process_channels),
+            (9, 16_000, 1)
+        );
         assert_eq!((stats.apm_out_sumsq, stats.sent_sumsq, stats.stage_samples), (1.5, 0.5, 160));
-        assert_eq!((stats.erl_db, stats.aec_delay_ms, stats.divergent_filter_fraction), (12.0, 40, 0.25));
+        assert_eq!(
+            (stats.erl_db, stats.aec_delay_ms, stats.divergent_filter_fraction),
+            (12.0, 40, 0.25)
+        );
         assert!(stats.erle_db.is_nan());
         assert_eq!((stats.denoised_sumsq, stats.gate_in_sumsq), (0.0, 0.0));
         assert!(!stats.denoiser_installed && !stats.gate_speaking);
         assert!(stats.voice_gain_db.is_nan());
+        assert_eq!(RootAudioStats::default().aec_delay_ms, -1);
     }
 
     #[test]

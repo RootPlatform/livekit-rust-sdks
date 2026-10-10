@@ -53,8 +53,11 @@ pub mod ffi {
         pub swallowed: u64,
         pub aec_active: bool,
         pub ns_active: bool,
-        /// GetConfig serves what the inner APM has.
-        pub served_matches_inner: bool,
+        /// What GetConfig serves the voice engine.
+        pub served_aec: bool,
+        pub served_ns: bool,
+        pub served_agc: bool,
+        pub served_hpf: bool,
     }
 
     unsafe extern "C++" {
@@ -67,6 +70,8 @@ pub mod ffi {
         fn initialize(self: &RootProcessorHarness, rate: i32, channels: i32);
         fn set_mic_muted(self: &RootProcessorHarness, muted: bool);
         fn set_push_to_talk(self: &RootProcessorHarness, state: u32);
+        /// Both gate fields in one update; -1 keeps a field.
+        fn set_gate(self: &RootProcessorHarness, mic_muted: i8, push_to_talk: i32);
         fn set_input_volume(self: &RootProcessorHarness, volume: f32);
         fn reset_controls(self: &RootProcessorHarness);
         fn process(
@@ -88,6 +93,8 @@ pub mod ffi {
             gain_controller2: bool,
             high_pass_filter: bool,
         );
+        /// GetConfig, change the echo canceller only, ApplyConfig.
+        fn engine_apply_echo_cancellation(self: &RootApmHarness, echo_cancellation: bool);
         fn set_output_will_be_muted(self: &RootApmHarness, muted: bool);
         fn post_capture_output_used(self: &RootApmHarness, used: bool) -> bool;
         /// -1 leaves that part of the policy unchanged, 0 off, 1 on.
@@ -97,12 +104,14 @@ pub mod ffi {
         fn run_due_tasks(self: &RootApmHarness) -> u32;
         fn pending_tasks(self: &RootApmHarness) -> u32;
         fn probe(self: &RootApmHarness) -> RootDecoratorProbe;
-        fn process_frame(self: &RootApmHarness, rate: i32, channels: usize, amplitude: i16)
-            -> i16;
+        fn process_frame(self: &RootApmHarness, rate: i32, channels: usize, amplitude: i16) -> i16;
         fn set_mic_muted(self: &RootApmHarness, muted: bool);
         fn processed_frames(self: &RootApmHarness) -> u64;
         fn processor_rate(self: &RootApmHarness) -> u32;
         fn processor_channels(self: &RootApmHarness) -> u32;
+
+        /// The engine's ApplyConfig racing policy changes on another thread.
+        fn root_apm_decorator_race_for_test(iterations: u32) -> bool;
     }
 }
 
@@ -141,13 +150,40 @@ mod processor_tests {
         assert_eq!(run(&h, 48000, 1, 1000.0), vec![1000.0; 480]);
     }
 
+    /// The gate's fade, 5 ms.
+    fn fade(rate: i32) -> usize {
+        (rate / 200) as usize
+    }
+
     #[test]
     fn root_capture_processor_mute_zeroes_the_frame() {
         let h = started(48000, 1);
         h.set_mic_muted(true);
-        assert!(run(&h, 48000, 1, 1000.0).iter().all(|&v| v == 0.0));
+        assert!(run(&h, 48000, 1, 1000.0).iter().all(|&v| v == 0.0), "a new stream starts shut");
         h.set_mic_muted(false);
+        run(&h, 48000, 1, 1000.0);
         assert_eq!(run(&h, 48000, 1, 1000.0), vec![1000.0; 480]);
+    }
+
+    #[test]
+    fn root_capture_processor_gate_fades_over_5_ms_each_way() {
+        for rate in [8000, 16000, 44100, 48000] {
+            let h = started(rate, 1);
+            let f = fade(rate);
+            run(&h, rate, 1, 1000.0);
+            h.set_mic_muted(true);
+            let closing = run(&h, rate, 1, 1000.0);
+            assert!(closing.windows(2).all(|w| w[1] <= w[0]), "{rate}");
+            assert!(closing[0] > 950.0 && closing[f - 2] > 0.0, "{rate}");
+            assert!(closing[f..].iter().all(|&v| v == 0.0), "{rate}");
+            assert!(run(&h, rate, 1, 1000.0).iter().all(|&v| v == 0.0), "{rate}");
+
+            h.set_mic_muted(false);
+            let opening = run(&h, rate, 1, 1000.0);
+            assert!(opening.windows(2).all(|w| w[1] >= w[0]), "{rate}");
+            assert!(opening[0] > 0.0 && opening[0] < 50.0, "{rate}: {}", opening[0]);
+            assert!(opening[f..].iter().all(|&v| v == 1000.0), "{rate}");
+        }
     }
 
     #[test]
@@ -156,12 +192,29 @@ mod processor_tests {
         h.set_push_to_talk(RELEASED);
         assert!(run(&h, 48000, 1, 1000.0).iter().all(|&v| v == 0.0));
         h.set_push_to_talk(HELD);
-        assert_eq!(run(&h, 48000, 1, 1000.0), vec![1000.0; 480]);
+        let pressed = run(&h, 48000, 1, 1000.0);
+        assert!(pressed[0] < 10.0);
+        assert!(pressed[fade(48000)..].iter().all(|&v| v == 1000.0));
         h.set_push_to_talk(VOICE_ACTIVITY);
         assert_eq!(run(&h, 48000, 1, 1000.0), vec![1000.0; 480]);
         h.set_push_to_talk(HELD);
         h.set_mic_muted(true);
+        run(&h, 48000, 1, 1000.0);
         assert!(run(&h, 48000, 1, 1000.0).iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn root_capture_processor_unmute_with_the_key_up_never_opens() {
+        let h = started(48000, 1);
+        h.set_mic_muted(true);
+        run(&h, 48000, 1, 1000.0);
+        h.set_gate(0, RELEASED as i32);
+        assert!(run(&h, 48000, 1, 1000.0).iter().all(|&v| v == 0.0));
+        h.set_gate(-1, 9);
+        assert!(run(&h, 48000, 1, 1000.0).iter().all(|&v| v == 0.0), "unknown values close");
+        h.set_gate(-1, VOICE_ACTIVITY as i32);
+        run(&h, 48000, 1, 1000.0);
+        assert_eq!(run(&h, 48000, 1, 1000.0), vec![1000.0; 480]);
     }
 
     #[test]
@@ -239,11 +292,13 @@ mod processor_tests {
         run(&h, 48000, 1, 100.0);
         h.set_mic_muted(true);
         run(&h, 48000, 1, 100.0);
+        run(&h, 48000, 1, 100.0);
         let stats = h.stats();
-        assert_eq!(stats.processed_frames, 2);
-        assert_eq!(stats.stage_samples, 960);
-        assert_eq!(stats.apm_out_sumsq, 960.0 * 100.0 * 100.0);
-        assert_eq!(stats.sent_sumsq, 480.0 * 100.0 * 100.0);
+        assert_eq!(stats.processed_frames, 3);
+        assert_eq!(stats.stage_samples, 1440);
+        assert_eq!(stats.apm_out_sumsq, 1440.0 * 100.0 * 100.0);
+        let faded = stats.sent_sumsq - 480.0 * 100.0 * 100.0;
+        assert!(faded > 0.0 && faded < 240.0 * 100.0 * 100.0 / 2.0, "{faded}");
     }
 
     #[test]
@@ -285,7 +340,7 @@ mod processor_tests {
 
 #[cfg(test)]
 mod decorator_tests {
-    use super::ffi::{new_root_apm_harness, RootApmHarness};
+    use super::ffi::{new_root_apm_harness, root_apm_decorator_race_for_test, RootApmHarness};
 
     const KEEP: i8 = -1;
 
@@ -307,8 +362,33 @@ mod decorator_tests {
             assert!(probe.inner_hpf);
             assert_eq!((probe.inner_aec, probe.inner_ns), (aec, ns));
             assert_eq!((probe.aec_active, probe.ns_active), (aec, ns));
-            assert!(probe.served_matches_inner);
+            assert_eq!((probe.served_aec, probe.served_ns), (aec, ns));
+            assert!(!probe.served_agc && probe.served_hpf);
         }
+    }
+
+    #[test]
+    fn root_apm_decorator_never_copies_the_policy_into_the_engines_request() {
+        let h = fake();
+        h.engine_apply(true, false, false, false, true);
+        h.set_policy(KEEP, 1);
+        h.run_due_tasks();
+        let probe = h.probe();
+        assert!(probe.inner_ns && !probe.served_ns, "{probe:?}");
+
+        h.engine_apply_echo_cancellation(false);
+        assert!(h.probe().inner_ns);
+        h.advance_clock(1000);
+        h.reset_policy();
+        h.run_due_tasks();
+        let probe = h.probe();
+        assert!(!probe.inner_ns && !probe.ns_active, "the engine never asked for NS");
+        assert!(!probe.inner_aec);
+    }
+
+    #[test]
+    fn root_apm_decorator_survives_engine_applies_racing_policy_changes() {
+        assert!(root_apm_decorator_race_for_test(5000));
     }
 
     #[test]
@@ -344,6 +424,7 @@ mod decorator_tests {
         assert_eq!(h.run_due_tasks(), 1);
         let probe = h.probe();
         assert!(!probe.inner_aec && probe.inner_ns);
+        assert!(probe.served_aec, "the engine keeps seeing its own request");
 
         h.engine_apply(true, false, false, false, true);
         let probe = h.probe();
@@ -420,8 +501,9 @@ mod decorator_tests {
         assert!(h.process_frame(48000, 1, 8000) > 1000);
 
         h.set_mic_muted(true);
-        assert_eq!(h.process_frame(48000, 1, 8000), 0);
-        assert_eq!(h.processed_frames(), 22);
+        h.process_frame(48000, 1, 8000);
+        assert_eq!(h.process_frame(48000, 1, 8000), 0, "after the 5 ms fade");
+        assert_eq!(h.processed_frames(), 23);
     }
 
     #[test]
@@ -441,8 +523,8 @@ mod decorator_tests {
             assert_eq!(h.processor_rate(), processed_rate, "{rate}/{channels}");
             assert!(h.processor_channels() >= 1, "{rate}/{channels}");
             h.set_mic_muted(true);
-            // At 8 kHz the APM processes at 16 kHz, and its resampler's delay line
-            // still holds the last unmuted samples for the first muted frame.
+            // The gate fades over the first 5 ms of the first muted frame (and at
+            // 8 kHz the APM's resampler still holds unmuted samples for it).
             h.process_frame(rate, channels, 8000);
             assert_eq!(h.process_frame(rate, channels, 8000), 0, "{rate}/{channels}");
         }

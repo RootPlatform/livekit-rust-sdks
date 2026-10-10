@@ -293,16 +293,20 @@ class HarnessTransport : public webrtc::AudioTransport {
 
 AdmProxyHarness::AdmProxyHarness(
     rust::Slice<const rust::String> playout_guids,
-    rust::Slice<const rust::String> recording_guids)
+    rust::Slice<const rust::String> recording_guids,
+    bool with_apm)
     : fake_(webrtc::make_ref_counted<FakePlatformAdm>()),
       mixer_(webrtc::make_ref_counted<RootAudioMixer>()),
       capture_(std::make_shared<RootCaptureState>()),
       transport_(std::make_unique<HarnessTransport>()) {
   fake_->SetDevices(ToStrings(playout_guids), ToStrings(recording_guids));
+  if (with_apm) {
+    apm_ = NewRootApmOverFakeForTest();
+  }
   proxy_ = webrtc::make_ref_counted<AdmProxy>(webrtc::CreateEnvironment(),
                                               nullptr, mixer_, fake_);
-  controller_ = std::make_unique<AudioDeviceController>(proxy_, mixer_,
-                                                        nullptr, capture_);
+  controller_ = std::make_unique<AudioDeviceController>(proxy_, mixer_, apm_,
+                                                        capture_);
 }
 
 AdmProxyHarness::~AdmProxyHarness() {
@@ -566,19 +570,19 @@ bool AdmProxyHarness::mixer_platform_active() const {
   return mixer_->platform_active();
 }
 
-void AdmProxyHarness::apply_control(
+bool AdmProxyHarness::apply_control(
     const RootAudioControlUpdate& control) const {
-  controller_->set_root_audio_control(control);
+  return controller_->set_root_audio_control(control);
 }
 
-void AdmProxyHarness::reset_root_audio() const {
-  controller_->reset_root_audio();
+void AdmProxyHarness::reset_root_audio(bool close_gate) const {
+  controller_->reset_root_audio(close_gate);
 }
 
 RootControlState AdmProxyHarness::control_state() const {
   RootControlState state{};
-  state.mic_muted = capture_->mic_muted.load();
-  state.push_to_talk = capture_->push_to_talk.load();
+  state.mic_muted = capture_->mic_muted();
+  state.push_to_talk = capture_->push_to_talk();
   state.input_volume = capture_->input_volume.load();
   state.denoise_power = capture_->denoise_power.load();
   state.auto_gain = capture_->auto_gain.load();
@@ -594,7 +598,15 @@ RootControlState AdmProxyHarness::control_state() const {
 std::unique_ptr<AdmProxyHarness> new_adm_proxy_harness(
     rust::Slice<const rust::String> playout_guids,
     rust::Slice<const rust::String> recording_guids) {
-  return std::make_unique<AdmProxyHarness>(playout_guids, recording_guids);
+  return std::make_unique<AdmProxyHarness>(playout_guids, recording_guids,
+                                           false);
+}
+
+std::unique_ptr<AdmProxyHarness> new_adm_proxy_harness_with_apm(
+    rust::Slice<const rust::String> playout_guids,
+    rust::Slice<const rust::String> recording_guids) {
+  return std::make_unique<AdmProxyHarness>(playout_guids, recording_guids,
+                                           true);
 }
 
 }  // namespace livekit_ffi

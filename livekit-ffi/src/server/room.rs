@@ -1259,6 +1259,7 @@ async fn forward_event(
             };
 
             let track_info = proto::TrackInfo::from(&ffi_track);
+            super::rootapp_audio::on_track_subscribed(server, handle_id, &ffi_track.track);
             server.store_handle(ffi_track.handle, ffi_track);
             inner.track_handle_lookup.lock().insert(track_sid, handle_id);
 

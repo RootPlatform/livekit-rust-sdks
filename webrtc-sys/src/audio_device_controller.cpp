@@ -303,6 +303,7 @@ RootAudioNativeStats AudioDeviceController::root_audio_stats() const {
   const double nan = std::numeric_limits<double>::quiet_NaN();
   stats.erl_db = nan;
   stats.erle_db = nan;
+  stats.aec_delay_ms = -1;
   stats.divergent_filter_fraction = nan;
   if (apm_) {
     const RootApmStats apm = apm_->ReadStats();
@@ -327,20 +328,27 @@ RootAudioNativeStats AudioDeviceController::root_audio_stats() const {
   return stats;
 }
 
-void AudioDeviceController::set_root_audio_control(
+bool AudioDeviceController::set_root_audio_control(
     const RootAudioControlUpdate& control) const {
   auto unit = [](float value) {
     return std::isnan(value) ? 0.0f : std::min(1.0f, std::max(0.0f, value));
   };
+  const bool capture_fields =
+      control.has_mic_muted || control.has_push_to_talk ||
+      control.has_input_volume || control.has_denoise_power ||
+      control.has_auto_gain || control.has_gate_threshold ||
+      control.has_auto_sensitivity || control.has_gain_reset_db;
+  const bool mixer_fields = control.has_master_volume || control.has_deafened;
+  const bool apm_fields =
+      control.has_echo_cancellation || control.has_noise_suppression;
   if (capture_) {
-    if (control.has_mic_muted) {
-      capture_->mic_muted.store(control.mic_muted, std::memory_order_relaxed);
-    }
-    if (control.has_push_to_talk) {
-      capture_->push_to_talk.store(
-          std::min<uint32_t>(control.push_to_talk,
-                             static_cast<uint32_t>(RootPushToTalk::kReleased)),
-          std::memory_order_relaxed);
+    if (control.has_mic_muted || control.has_push_to_talk) {
+      capture_->SetGate(control.has_mic_muted
+                            ? std::optional<bool>(control.mic_muted)
+                            : std::nullopt,
+                        control.has_push_to_talk
+                            ? std::optional<uint32_t>(control.push_to_talk)
+                            : std::nullopt);
     }
     if (control.has_input_volume) {
       capture_->input_volume.store(RootClampVolume(control.input_volume),
@@ -376,7 +384,7 @@ void AudioDeviceController::set_root_audio_control(
       mixer_->SetDeafened(control.deafened);
     }
   }
-  if (apm_ && (control.has_echo_cancellation || control.has_noise_suppression)) {
+  if (apm_ && apm_fields) {
     apm_->SetPolicy(control.has_echo_cancellation
                         ? std::optional<bool>(control.echo_cancellation)
                         : std::nullopt,
@@ -384,6 +392,8 @@ void AudioDeviceController::set_root_audio_control(
                         ? std::optional<bool>(control.noise_suppression)
                         : std::nullopt);
   }
+  return (capture_ || !capture_fields) && (mixer_ || !mixer_fields) &&
+         (apm_ || !apm_fields);
 }
 
 bool AudioDeviceController::set_root_audio_source_gain(uint32_t ssrc,
@@ -431,9 +441,14 @@ RootAudioCaptureFormat AudioDeviceController::root_audio_capture_format()
   return format;
 }
 
-void AudioDeviceController::reset_root_audio() const {
+uint64_t AudioDeviceController::root_audio_sources_added() const {
+  return mixer_ ? mixer_->sources_added() : 0;
+}
+
+// The gate first, in one store, so closing it never passes through open.
+void AudioDeviceController::reset_root_audio(bool close_gate) const {
   if (capture_) {
-    capture_->ResetControls();
+    capture_->ResetControls(close_gate);
   }
   if (mixer_) {
     mixer_->ResetControls();

@@ -354,7 +354,7 @@ impl LkRuntime {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn set_root_audio_control(&self, control: &NativeAudioControl) {
+    pub(crate) fn set_root_audio_control(&self, control: &NativeAudioControl) -> bool {
         self.pc_factory.set_root_audio_control(control)
     }
 
@@ -394,8 +394,13 @@ impl LkRuntime {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn reset_root_audio(&self) {
-        self.pc_factory.reset_root_audio()
+    pub(crate) fn root_audio_sources_added(&self) -> u64 {
+        self.pc_factory.root_audio_sources_added()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn reset_root_audio(&self, close_gate: bool) {
+        self.pc_factory.reset_root_audio(close_gate)
     }
 }
 

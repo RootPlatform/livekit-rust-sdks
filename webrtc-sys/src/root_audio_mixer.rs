@@ -59,6 +59,15 @@ pub mod ffi {
         pub data: Vec<i16>,
     }
 
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct RootMixStress {
+        pub mix_calls: u64,
+        pub overlapping_mixes: u64,
+        /// Mixed frames that were not 10 ms of stereo at 48 kHz.
+        pub bad_frames: u64,
+        pub sources: u32,
+    }
+
     unsafe extern "C++" {
         include!("livekit/root_audio_mixer.h");
 
@@ -93,6 +102,16 @@ pub mod ffi {
         fn mix(self: &RootMixerHarness, out_channels: usize) -> RootMixFrame;
         fn effects_played(self: &RootMixerHarness) -> u64;
         fn effects_dropped(self: &RootMixerHarness) -> u64;
+        fn sources_added(self: &RootMixerHarness) -> u64;
+        fn set_timeouts(
+            self: &RootMixerHarness,
+            unconfigured_hold_ms: i64,
+            max_effect_wait_ms: i64,
+        );
+
+        /// Mixes `mixes` times while other threads change every control and
+        /// add and remove sources.
+        fn root_audio_mixer_stress_for_test(mixes: u32) -> RootMixStress;
     }
 }
 
@@ -278,8 +297,8 @@ mod gain_tests {
     use cxx::UniquePtr;
 
     use super::ffi::{
-        new_root_mixer_harness, root_audio_soft_clip, root_audio_volume_to_gain, RootMixFrame,
-        RootMixTestSource, RootMixerHarness,
+        new_root_mixer_harness, root_audio_mixer_stress_for_test, root_audio_soft_clip,
+        root_audio_volume_to_gain, RootMixFrame, RootMixTestSource, RootMixerHarness,
     };
 
     const BLOCK: usize = 480;
@@ -398,6 +417,7 @@ mod gain_tests {
         let h = active();
         h.add_source(&mono(0.3, 1));
         h.add_source(&mono(0.2, 2));
+        h.set_source_gain(2, 1.0, false);
         h.set_source_gain(1, 0.0, false);
         assert_eq!(settle(&h, 1).data, vec![s16(0.2); BLOCK]);
     }
@@ -512,13 +532,58 @@ mod gain_tests {
     }
 
     #[test]
-    fn root_audio_mixer_cleared_gain_returns_to_unity() {
+    fn root_audio_mixer_cleared_gain_keeps_a_playing_stream_and_is_forgotten() {
         let h = active();
-        h.add_source(&mono(0.5, 7));
+        h.set_timeouts(0, 1000);
+        let source = h.add_source(&mono(0.5, 7));
         h.set_source_gain(7, 0.0, true);
         settle(&h, 1);
         h.clear_source_gain(7);
+        assert!(settle(&h, 1).data.iter().all(|&v| v == 0), "no return to full volume");
+
+        h.remove_source(source);
+        h.add_source(&mono(0.5, 7));
         assert_eq!(settle(&h, 1).data, vec![s16(0.5); BLOCK]);
+    }
+
+    #[test]
+    fn root_audio_mixer_holds_a_new_source_until_its_gain_arrives() {
+        let h = active();
+        h.set_timeouts(300, 1000);
+        h.add_source(&mono(0.25, 1));
+        assert_eq!(h.mix(1).data, vec![s16(0.25); BLOCK], "no gains in use yet");
+
+        assert!(h.set_source_gain(1, 1.0, false));
+        h.add_source(&mono(0.5, 2));
+        assert_eq!(settle(&h, 1).data, vec![s16(0.25); BLOCK], "held");
+        h.set_source_gain(2, 0.5, false);
+        let expected = 0.25 + 0.5 * root_audio_volume_to_gain(0.5);
+        assert!((last(&settle(&h, 1)) - expected).abs() < 1e-3);
+
+        h.add_source(&mono(0.125, 3));
+        assert!((last(&settle(&h, 1)) - expected).abs() < 1e-3, "held");
+        std::thread::sleep(std::time::Duration::from_millis(350));
+        assert!((last(&settle(&h, 1)) - (expected + 0.125)).abs() < 1e-3, "no gain came");
+    }
+
+    #[test]
+    fn root_audio_mixer_holds_nothing_after_a_reset() {
+        let h = active();
+        h.set_source_gain(1, 1.0, false);
+        h.reset_controls();
+        h.add_source(&mono(0.5, 2));
+        assert_eq!(h.mix(1).data, vec![s16(0.5); BLOCK]);
+    }
+
+    #[test]
+    fn root_audio_mixer_counts_added_sources() {
+        let h = active();
+        let first = h.add_source(&mono(0.1, 1));
+        h.add_source(&mono(0.1, 2));
+        h.remove_source(first);
+        assert_eq!(h.sources_added(), 2);
+        h.add_source(&mono(0.1, 1));
+        assert_eq!(h.sources_added(), 3);
     }
 
     #[test]
@@ -547,6 +612,82 @@ mod gain_tests {
         assert!(h.mix(1).muted);
         h.set_platform_active(true);
         assert!(h.mix(1).muted);
+    }
+
+    #[test]
+    fn root_audio_mixer_effects_queued_before_a_release_never_play_without_a_mix_between() {
+        let h = active();
+        clip(1, &h, 0.5, BLOCK * 4);
+        assert_eq!(h.play_effect(1, 0.2), QUEUED);
+        h.set_platform_active(false);
+        h.set_platform_active(true);
+        assert!(h.mix(1).muted);
+        assert_eq!(h.play_effect(1, 0.2), QUEUED);
+        assert!(!h.mix(1).muted);
+    }
+
+    #[test]
+    fn root_audio_mixer_drops_effects_that_waited_too_long() {
+        let h = active();
+        h.set_timeouts(500, 50);
+        clip(1, &h, 0.5, BLOCK);
+        h.play_effect(1, 0.2);
+        h.play_effect(1, 0.2);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(h.mix(1).muted, "a stalled device does not fire them all at once");
+        assert_eq!(h.effects_dropped(), 2);
+        h.play_effect(1, 0.2);
+        assert!(!h.mix(1).muted);
+    }
+
+    #[test]
+    fn root_audio_mixer_effect_ring_wraps() {
+        let h = active();
+        clip(1, &h, 0.5, BLOCK);
+        for round in 0..80 {
+            assert_eq!(h.play_effect(1, 0.2), QUEUED, "round {round}");
+            let frame = h.mix(1);
+            assert!(frame.data.iter().all(|&v| (level(v) - 0.1).abs() < 1e-4), "round {round}");
+        }
+        assert_eq!((h.effects_played(), h.effects_dropped()), (80, 0));
+    }
+
+    #[test]
+    fn root_audio_mixer_re_registering_a_playing_effect_keeps_the_voice() {
+        let h = active();
+        clip(1, &h, 0.5, BLOCK * 3);
+        h.play_effect(1, 0.2);
+        assert!((last(&h.mix(1)) - 0.1).abs() < 1e-4);
+        clip(1, &h, 0.25, BLOCK * 3);
+        h.play_effect(1, 0.2);
+        assert!((last(&h.mix(1)) - 0.15).abs() < 1e-4);
+        assert!((last(&h.mix(1)) - 0.15).abs() < 1e-4);
+        assert!((last(&h.mix(1)) - 0.05).abs() < 1e-4, "the old clip ended");
+    }
+
+    #[test]
+    fn root_audio_mixer_drops_voices_beyond_the_limit() {
+        let h = active();
+        clip(1, &h, 0.001, BLOCK * 10);
+        for _ in 0..32 {
+            assert_eq!(h.play_effect(1, 1.0), QUEUED);
+        }
+        h.mix(1);
+        assert_eq!(h.effects_dropped(), 0);
+        assert_eq!(h.play_effect(1, 1.0), QUEUED);
+        h.mix(1);
+        assert_eq!(h.effects_dropped(), 1);
+        let expected = 32.0 * level(s16(0.001));
+        assert!((last(&h.mix(1)) - expected).abs() < 1e-3);
+    }
+
+    #[test]
+    fn root_audio_mixer_survives_concurrent_control_and_sources() {
+        let stress = root_audio_mixer_stress_for_test(3000);
+        assert_eq!(stress.bad_frames, 0);
+        assert_eq!(stress.mix_calls, 3000);
+        assert_eq!(stress.overlapping_mixes, 0);
+        assert_eq!(stress.sources, 4);
     }
 
     #[test]

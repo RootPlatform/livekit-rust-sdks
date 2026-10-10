@@ -50,10 +50,14 @@ message RootAudioSetPlayoutHoldResponse {
 }
 
 // Live control. Only the fields that are set change. Values are sanitised natively (finite, clamped).
+// The response's error says "not supported by this build" when a set field has nothing to act on
+// (the other fields are applied).
 message RootAudioControl {
-  // Gate: no audio leaves and no speaking is reported while muted.
+  // Gate: no audio leaves and no speaking is reported while muted. The gate fades over 5 ms each
+  // way; mic_muted and push_to_talk of one control change together.
   optional bool mic_muted = 1;
-  // 0 = voice activity, 1 = push-to-talk key held (gate forced open), 2 = key up (gate closed).
+  // 0 = voice activity, 1 = push-to-talk key held (gate forced open), 2 = key up (gate closed);
+  // other values close the gate.
   optional uint32 push_to_talk = 2;
   // Linear input gain after the gate, 0..2.
   optional float input_volume = 3;
@@ -83,7 +87,9 @@ message RootAudioSetControlResponse {
 
 // Per remote track volume: the app's tile volume as a linear slider value / 100 (0..2; screen audio
 // defaults to 0.5), before any curve. Native plays the track at VolumeCurve(tile × master) (v^2.5,
-// capped at 10, 20 ms ramps), 0 while deafened. paused silences a remote screen-audio track.
+// capped at 10, 20 ms ramps), 0 while deafened. paused silences a remote screen-audio track; an
+// absent paused keeps the track's current one. Once gains are in use, a remote stream that starts
+// before its gain arrives is held silent for up to 500 ms, then plays at tile 1.
 message RootAudioTrackGain {
   required uint64 track_handle = 1;
   required float gain = 2;
@@ -94,7 +100,10 @@ message RootAudioSetTrackGainsRequest {
   repeated RootAudioTrackGain gains = 2;
 }
 message RootAudioSetTrackGainsResponse {
+  // A real failure only (the platform audio handle is gone).
   optional string error = 1;
+  // Handles that are not remote audio tracks (dropped already); the other gains were applied.
+  repeated uint64 unknown_track_handles = 2;
 }
 
 // Sound effects mixed into playout (and therefore into the echo canceller's reference).
@@ -215,8 +224,8 @@ message RootAudioStats {
   required uint32 denoiser_bypass_reason = 56;
   required uint64 denoiser_notifications = 57;
 
-  // Echo canceller (APM statistics; NaN when unknown). Until the APM decorator (APM_DECORATOR) the
-  // two flags are what the newest device track asked of the APM.
+  // Echo canceller (APM statistics; NaN when unknown, and aec_delay_ms -1). Until the APM decorator
+  // (APM_DECORATOR) the two flags are what the newest device track asked of the APM.
   required double erl_db = 60;
   required double erle_db = 61;
   required int32 aec_delay_ms = 62;
@@ -244,6 +253,9 @@ message RootAudioSpeaking {
   required bool speaking = 1;
   required uint64 seq = 2;
 }
+// Sent about 100 ms after the handle is created when the capture processor has run before, and on
+// every change. An event sent before the host listens is lost, so a host also reads
+// RootAudioStats.process_rate / process_channels once it does.
 message RootAudioCaptureFormat {
   required uint32 sample_rate = 1;
   required uint32 channels = 2;

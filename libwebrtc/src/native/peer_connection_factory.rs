@@ -552,8 +552,9 @@ impl PeerConnectionFactory {
     }
 
     /// Live control of the capture gate, input and output volume, deafen and
-    /// the APM's AEC/NS policy. Never blocks on an audio thread.
-    pub fn set_root_audio_control(&self, control: &NativeAudioControl) {
+    /// the APM's AEC/NS policy. Never blocks on an audio thread. False when a
+    /// set field has nothing to act on in this build (the others are applied).
+    pub fn set_root_audio_control(&self, control: &NativeAudioControl) -> bool {
         self.sys_handle.audio_device().set_root_audio_control(control)
     }
 
@@ -589,8 +590,14 @@ impl PeerConnectionFactory {
         self.sys_handle.audio_device().root_audio_capture_format()
     }
 
-    pub fn reset_root_audio(&self) {
-        self.sys_handle.audio_device().reset_root_audio()
+    /// Moves whenever the playout mixer gets a new source.
+    pub fn root_audio_sources_added(&self) -> u64 {
+        self.sys_handle.audio_device().root_audio_sources_added()
+    }
+
+    /// Controls back to their defaults, with the capture gate open or closed.
+    pub fn reset_root_audio(&self, close_gate: bool) {
+        self.sys_handle.audio_device().reset_root_audio(close_gate)
     }
 }
 

@@ -23,8 +23,8 @@ use cxx::UniquePtr;
 
 use crate::audio_device_controller::{
     ffi::{
-        new_adm_proxy_harness, AdmProxyHarness, AudioDeviceOutcome, AudioDeviceSelection,
-        AudioDeviceSelectionKind, RootAudioControlUpdate,
+        new_adm_proxy_harness, new_adm_proxy_harness_with_apm, AdmProxyHarness, AudioDeviceOutcome,
+        AudioDeviceSelection, AudioDeviceSelectionKind, RootAudioControlUpdate,
     },
     ADM_RESULT_DEVICE_NOT_FOUND, ADM_RESULT_NOT_ATTEMPTED,
 };
@@ -432,10 +432,94 @@ fn adm_proxy_controller_clamps_what_reaches_the_audio_threads() {
     });
     assert_eq!(h.control_state().gain_reset_seq, 1, "a non-finite command is dropped");
 
-    h.reset_root_audio();
+    h.reset_root_audio(false);
     let state = h.control_state();
     assert!(!state.mic_muted && !state.deafened);
     assert_eq!((state.push_to_talk, state.input_volume, state.master_volume), (0, 1.0, 1.0));
+}
+
+#[test]
+fn adm_proxy_controller_reset_for_teardown_leaves_the_gate_closed() {
+    let h = harness(&["{spk}"], &["{mic}"]);
+    h.apply_control(&RootAudioControlUpdate {
+        has_master_volume: true,
+        master_volume: 0.3,
+        has_deafened: true,
+        deafened: true,
+        ..Default::default()
+    });
+    h.reset_root_audio(true);
+    let state = h.control_state();
+    assert!(state.mic_muted);
+    assert_eq!(state.push_to_talk, 2);
+    assert!(!state.deafened);
+    assert_eq!((state.input_volume, state.master_volume), (1.0, 1.0));
+
+    h.reset_root_audio(false);
+    let state = h.control_state();
+    assert!(!state.mic_muted);
+    assert_eq!(state.push_to_talk, 0);
+}
+
+#[test]
+fn adm_proxy_controller_sets_both_gate_fields_together() {
+    let h = harness(&["{spk}"], &["{mic}"]);
+    h.apply_control(&RootAudioControlUpdate {
+        has_mic_muted: true,
+        mic_muted: true,
+        ..Default::default()
+    });
+    assert!(h.apply_control(&RootAudioControlUpdate {
+        has_mic_muted: true,
+        mic_muted: false,
+        has_push_to_talk: true,
+        push_to_talk: 2,
+        ..Default::default()
+    }));
+    let state = h.control_state();
+    assert!(!state.mic_muted);
+    assert_eq!(state.push_to_talk, 2);
+}
+
+#[test]
+fn adm_proxy_controller_reports_fields_it_cannot_apply() {
+    let h = harness(&["{spk}"], &["{mic}"]);
+    assert!(!h.apply_control(&RootAudioControlUpdate {
+        has_mic_muted: true,
+        mic_muted: true,
+        has_echo_cancellation: true,
+        echo_cancellation: false,
+        ..Default::default()
+    }));
+    assert!(h.control_state().mic_muted, "the other fields are applied");
+    assert!(h.apply_control(&RootAudioControlUpdate {
+        has_deafened: true,
+        deafened: true,
+        ..Default::default()
+    }));
+}
+
+#[test]
+fn adm_proxy_controller_drives_the_apm_policy_and_reads_its_statistics() {
+    let h = new_adm_proxy_harness_with_apm(&strings(&["{spk}"]), &strings(&["{mic}"]));
+    let stats = h.stats();
+    assert_eq!((stats.erl_db, stats.erle_db), (12.0, 20.0));
+    assert_eq!((stats.aec_delay_ms, stats.divergent_filter_fraction), (40, 0.25));
+    assert!(!stats.echo_cancellation_active && !stats.webrtc_ns_active);
+
+    assert!(h.apply_control(&RootAudioControlUpdate {
+        has_echo_cancellation: true,
+        echo_cancellation: true,
+        has_noise_suppression: true,
+        noise_suppression: true,
+        ..Default::default()
+    }));
+    let stats = h.stats();
+    assert!(stats.echo_cancellation_active && stats.webrtc_ns_active);
+
+    h.reset_root_audio(true);
+    let stats = h.stats();
+    assert!(!stats.echo_cancellation_active && !stats.webrtc_ns_active, "the engine's request");
 }
 
 #[test]
@@ -444,5 +528,6 @@ fn adm_proxy_stats_report_unknown_echo_statistics_without_an_apm() {
     let stats = h.stats();
     assert!(stats.erl_db.is_nan() && stats.erle_db.is_nan());
     assert!(stats.divergent_filter_fraction.is_nan());
+    assert_eq!(stats.aec_delay_ms, -1);
     assert_eq!((stats.processed_frames, stats.effects_played), (0, 0));
 }

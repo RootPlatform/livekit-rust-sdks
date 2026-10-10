@@ -176,14 +176,15 @@ pub mod native {
         fn restart_audio_devices(&self, recording: bool, playout: bool) -> AudioDeviceRequest;
         fn set_audio_playout_hold(&self, hold: bool);
         fn root_audio_stats(&self) -> NativeAudioStats;
-        fn set_root_audio_control(&self, control: &NativeAudioControl);
+        fn set_root_audio_control(&self, control: &NativeAudioControl) -> bool;
         fn set_root_audio_source_gain(&self, ssrc: u32, tile_volume: f32, paused: bool) -> bool;
         fn clear_root_audio_source_gain(&self, ssrc: u32);
         fn register_root_audio_effect(&self, id: u32, samples: &[i16]) -> bool;
         fn play_root_audio_effect(&self, id: u32, gain: f32) -> EffectPlay;
         fn stop_root_audio_effects(&self);
         fn root_audio_capture_format(&self) -> NativeCaptureFormat;
-        fn reset_root_audio(&self);
+        fn root_audio_sources_added(&self) -> u64;
+        fn reset_root_audio(&self, close_gate: bool);
 
         // Device enumeration
         fn playout_devices(&self) -> i16;
@@ -281,7 +282,7 @@ pub mod native {
             self.handle.root_audio_stats()
         }
 
-        fn set_root_audio_control(&self, control: &NativeAudioControl) {
+        fn set_root_audio_control(&self, control: &NativeAudioControl) -> bool {
             self.handle.set_root_audio_control(control)
         }
 
@@ -309,8 +310,12 @@ pub mod native {
             self.handle.root_audio_capture_format()
         }
 
-        fn reset_root_audio(&self) {
-            self.handle.reset_root_audio()
+        fn root_audio_sources_added(&self) -> u64 {
+            self.handle.root_audio_sources_added()
+        }
+
+        fn reset_root_audio(&self, close_gate: bool) {
+            self.handle.reset_root_audio(close_gate)
         }
 
         fn playout_devices(&self) -> i16 {

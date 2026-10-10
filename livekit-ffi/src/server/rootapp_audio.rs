@@ -22,23 +22,25 @@
 //! Track gains are keyed by the remote track's FFI handle and applied to the
 //! playout mixer by SSRC: the receiver's signaled SSRC (the SFU signals one per
 //! subscribed track), or the track's inbound-rtp SSRC for an unsignaled stream.
-//! The SSRC is resolved off the caller's thread when a gain arrives for a track
-//! whose SSRC is not known yet, and again every second, so a renegotiated SSRC
-//! moves the gain along; gains of dropped track handles are cleared.
+//! While a session is live, a remote audio track's SSRC is resolved as it is
+//! subscribed, so the host's first gain for it applies inside the request;
+//! otherwise it is resolved off the caller's thread. Unknown SSRCs are
+//! resolved every second, known ones every 5 s and shortly after the mixer
+//! gets a new stream (a renegotiated SSRC), so the gain moves along; gains of
+//! dropped track handles are forgotten.
 
 use std::{
     collections::HashMap,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, LazyLock,
     },
     time::Duration,
 };
 
 use livekit::{
-    prelude::*, sanitize_volume, webrtc::stats::RtcStats, AudioDeviceResults,
-    AudioDeviceSelection, EffectPlay, PlatformAudio, PushToTalk, RootAudioControl,
-    RootAudioStats,
+    prelude::*, sanitize_volume, webrtc::stats::RtcStats, AudioDeviceResults, AudioDeviceSelection,
+    EffectPlay, PlatformAudio, PushToTalk, RootAudioControl, RootAudioStats,
 };
 use parking_lot::Mutex;
 use tokio::time::MissedTickBehavior;
@@ -48,7 +50,7 @@ use super::{
     room::FfiTrack,
     FfiServer,
 };
-use crate::{proto, FfiError, FfiHandleId, FfiResult};
+use crate::{proto, FfiHandleId, FfiResult};
 
 pub const CAP_SELECT_DEVICES: u64 = 1 << 0;
 pub const CAP_PLAYOUT_HOLD: u64 = 1 << 1;
@@ -81,30 +83,236 @@ pub const ROOTAPP_AUDIO_CAPS: u64 = if cfg!(any(target_os = "ios", target_os = "
 
 const NOT_SUPPORTED: &str = "not supported by this build";
 
-/// How often the session task reads the native format atomics.
+/// How often the session task reads the native format and source counters.
 const EVENT_POLL: Duration = Duration::from_millis(10);
-/// Every this many polls the track SSRCs are resolved again (1 s).
+/// The first poll waits this long, so the host listens for the handle's
+/// events before a capture_format event is sent.
+const FIRST_POLL_DELAY: Duration = Duration::from_millis(100);
+/// Every this many polls the session resolves unknown SSRCs (1 s).
 const RESOLVE_EVERY_POLLS: u32 = 100;
-/// A track whose SSRC came from its stats is re-read only every this many passes.
-const STATS_RESOLVE_EVERY_PASSES: u32 = 5;
+/// Known SSRCs are read again every this many passes (5 s), and after the
+/// mixer got a new stream.
+const KNOWN_RESOLVE_EVERY_PASSES: u32 = 5;
+/// A new stream's pass waits this many polls, so the remote description that
+/// added it has updated the receivers' parameters too.
+const NEW_SOURCE_PASS_DELAY_POLLS: u32 = 5;
 /// The longest effect clip RegisterEffect accepts (60 s at 48 kHz).
 const MAX_EFFECT_SAMPLES: u32 = 48_000 * 60;
 
-struct TrackGain {
-    track: RemoteAudioTrack,
+/// What a session drives: the handle's PlatformAudio (a recorder in tests).
+trait RootAudioSink {
+    fn set_source_gain(&self, ssrc: u32, tile: f32, paused: bool) -> bool;
+    fn clear_source_gain(&self, ssrc: u32);
+    fn reset_controls(&self, close_gate: bool);
+}
+
+impl RootAudioSink for PlatformAudio {
+    fn set_source_gain(&self, ssrc: u32, tile: f32, paused: bool) -> bool {
+        PlatformAudio::set_source_gain(self, ssrc, tile, paused)
+    }
+
+    fn clear_source_gain(&self, ssrc: u32) {
+        PlatformAudio::clear_source_gain(self, ssrc)
+    }
+
+    fn reset_controls(&self, close_gate: bool) {
+        self.reset_rootapp_controls(close_gate)
+    }
+}
+
+fn sink_of(audio: &PlatformAudio) -> &dyn RootAudioSink {
+    audio
+}
+
+/// The live sessions of the process. `PlatformAudio::new` reuses the shared
+/// engine, so every handle drives the same controls: they go back to their
+/// defaults only when the first session starts, and the capture gate closes
+/// (with every other control reset) only when the last one ends. Dropping one
+/// handle never changes another's state, and a teardown never opens the gate.
+#[derive(Default)]
+struct Sessions {
+    live: usize,
+    /// SSRCs of remote audio tracks, resolved as they were subscribed.
+    subscribed: HashMap<FfiHandleId, u32>,
+}
+
+impl Sessions {
+    fn open(&mut self, sink: &dyn RootAudioSink) {
+        self.live += 1;
+        if self.live == 1 {
+            sink.reset_controls(false);
+        }
+    }
+
+    fn close(&mut self, sink: &dyn RootAudioSink) {
+        self.live = self.live.saturating_sub(1);
+        if self.live == 0 {
+            sink.reset_controls(true);
+            self.subscribed.clear();
+        }
+    }
+}
+
+static SESSIONS: LazyLock<Mutex<Sessions>> = LazyLock::new(Default::default);
+
+struct TrackGain<T> {
+    track: T,
     tile: f32,
     paused: bool,
     ssrc: Option<u32>,
-    from_stats: bool,
+    resolving: bool,
+    /// Bumped by a resolve request that may see a newer SSRC than the
+    /// resolution running; that resolution is then not applied but run again.
+    generation: u64,
 }
 
-#[derive(Default)]
+/// The tile gains of one session by remote track handle, and the SSRC each
+/// track plays under.
+struct TrackGains<T> {
+    gains: HashMap<FfiHandleId, TrackGain<T>>,
+}
+
+impl<T> Default for TrackGains<T> {
+    fn default() -> Self {
+        Self { gains: HashMap::new() }
+    }
+}
+
+impl<T: Clone> TrackGains<T> {
+    /// Stores a gain (`paused` None keeps the track's) and applies it when the
+    /// SSRC is known, from an earlier resolution or `subscribed_ssrc`. Returns
+    /// whether the handle still has to be resolved.
+    fn set(
+        &mut self,
+        sink: &dyn RootAudioSink,
+        handle: FfiHandleId,
+        track: T,
+        tile: f32,
+        paused: Option<bool>,
+        subscribed_ssrc: Option<u32>,
+    ) -> bool {
+        let gain = self.gains.entry(handle).or_insert_with(|| TrackGain {
+            track,
+            tile: 1.0,
+            paused: false,
+            ssrc: None,
+            resolving: false,
+            generation: 0,
+        });
+        gain.tile = tile;
+        if let Some(paused) = paused {
+            gain.paused = paused;
+        }
+        if gain.ssrc.is_none() {
+            gain.ssrc = subscribed_ssrc;
+        }
+        match gain.ssrc {
+            Some(ssrc) => {
+                apply_gain(sink, ssrc, gain.tile, gain.paused);
+                false
+            }
+            None => true,
+        }
+    }
+
+    /// The track to resolve and the generation to finish with, or None while
+    /// one resolution of the handle runs (with `supersede`, that one then runs
+    /// again instead of being applied).
+    fn begin_resolve(&mut self, handle: FfiHandleId, supersede: bool) -> Option<(T, u64)> {
+        let gain = self.gains.get_mut(&handle)?;
+        if gain.resolving {
+            if supersede {
+                gain.generation = gain.generation.wrapping_add(1);
+            }
+            return None;
+        }
+        gain.resolving = true;
+        Some((gain.track.clone(), gain.generation))
+    }
+
+    /// Ends a resolution. Its SSRC is applied (no sink: the session ended)
+    /// unless a newer request came meanwhile; then true is returned and the
+    /// handle is to be resolved again.
+    fn finish_resolve(
+        &mut self,
+        sink: Option<&dyn RootAudioSink>,
+        handle: FfiHandleId,
+        generation: u64,
+        ssrc: Option<u32>,
+    ) -> bool {
+        let Some(gain) = self.gains.get_mut(&handle) else {
+            return false;
+        };
+        gain.resolving = false;
+        if gain.generation != generation {
+            return true;
+        }
+        let (Some(sink), Some(ssrc)) = (sink, ssrc) else {
+            return false;
+        };
+        let previous = gain.ssrc.replace(ssrc);
+        let (tile, paused) = (gain.tile, gain.paused);
+        if previous != Some(ssrc) {
+            if let Some(previous) = previous {
+                self.clear_if_unused(sink, previous);
+            }
+            apply_gain(sink, ssrc, tile, paused);
+        }
+        false
+    }
+
+    /// Drops a handle's gain. Its SSRC's gain is forgotten once no other
+    /// handle plays under it (a reused transceiver); the stream itself keeps
+    /// its last gain.
+    fn forget(&mut self, sink: Option<&dyn RootAudioSink>, handle: FfiHandleId) {
+        let ssrc = self.gains.remove(&handle).and_then(|gain| gain.ssrc);
+        if let (Some(sink), Some(ssrc)) = (sink, ssrc) {
+            self.clear_if_unused(sink, ssrc);
+        }
+    }
+
+    fn clear_if_unused(&self, sink: &dyn RootAudioSink, ssrc: u32) {
+        if !self.gains.values().any(|gain| gain.ssrc == Some(ssrc)) {
+            sink.clear_source_gain(ssrc);
+        }
+    }
+
+    /// Every handle, and whether its SSRC is known.
+    fn handles(&self) -> Vec<(FfiHandleId, bool)> {
+        self.gains.iter().map(|(handle, gain)| (*handle, gain.ssrc.is_some())).collect()
+    }
+
+    fn clear(&mut self) {
+        self.gains.clear();
+    }
+}
+
+fn apply_gain(sink: &dyn RootAudioSink, ssrc: u32, tile: f32, paused: bool) {
+    if !sink.set_source_gain(ssrc, tile, paused) {
+        log::warn!("RootAudio: the mixer's gain table is full; ssrc {ssrc} has no gain");
+    }
+}
+
 struct SessionState {
     /// None once the handle is dropped, so this session never keeps the ADM
     /// referenced past the host's dispose.
     audio: Option<PlatformAudio>,
-    gains: HashMap<FfiHandleId, TrackGain>,
+    gains: TrackGains<RemoteAudioTrack>,
     resolve_passes: u32,
+}
+
+struct GainRequest {
+    handle: FfiHandleId,
+    track: RemoteAudioTrack,
+    tile: f32,
+    paused: Option<bool>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pass {
+    Periodic,
+    /// The mixer got a new stream: every SSRC is read again.
+    NewSource,
 }
 
 /// The FFI side of one `PlatformAudio` handle: the track gains it set and the
@@ -112,7 +320,7 @@ struct SessionState {
 pub struct RootAudioSession {
     handle: FfiHandleId,
     state: Mutex<SessionState>,
-    resolving: AtomicBool,
+    periodic_pass: AtomicBool,
 }
 
 impl RootAudioSession {
@@ -123,10 +331,15 @@ impl RootAudioSession {
         handle: FfiHandleId,
         audio: PlatformAudio,
     ) -> Arc<Self> {
+        SESSIONS.lock().open(&audio);
         let session = Arc::new(Self {
             handle,
-            state: Mutex::new(SessionState { audio: Some(audio), ..Default::default() }),
-            resolving: AtomicBool::new(false),
+            state: Mutex::new(SessionState {
+                audio: Some(audio),
+                gains: TrackGains::default(),
+                resolve_passes: 0,
+            }),
+            periodic_pass: AtomicBool::new(false),
         });
         let dropped = server.watch_handle_dropped(handle);
         let task = server.async_runtime.spawn(session.clone().run(server, dropped));
@@ -134,14 +347,18 @@ impl RootAudioSession {
         session
     }
 
-    /// The handle was dropped: controls go back to their defaults so the next
-    /// PlatformAudio starts clean, the session lets go of its PlatformAudio,
-    /// and nothing it resolves later is applied.
+    /// The handle was dropped. Runs before its PlatformAudio lets go of the
+    /// device: the last live session closes the capture gate and resets the
+    /// shared controls, any other leaves them to the sessions still live.
+    /// Nothing resolved later is applied.
     pub fn end(&self) {
-        let mut state = self.state.lock();
-        state.gains.clear();
-        if let Some(audio) = state.audio.take() {
-            audio.reset_rootapp_controls();
+        let audio = {
+            let mut state = self.state.lock();
+            state.gains.clear();
+            state.audio.take()
+        };
+        if let Some(audio) = audio {
+            SESSIONS.lock().close(&audio);
         }
     }
 
@@ -150,16 +367,24 @@ impl RootAudioSession {
         server: &'static FfiServer,
         mut dropped: tokio::sync::oneshot::Receiver<()>,
     ) {
-        let mut interval = tokio::time::interval(EVENT_POLL);
+        let mut interval =
+            tokio::time::interval_at(tokio::time::Instant::now() + FIRST_POLL_DELAY, EVENT_POLL);
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut last_format_seq = 0u64;
+        let mut last_sources = None;
+        let mut new_source_pass_at = None;
         let mut polls = 0u32;
         loop {
             tokio::select! {
                 _ = &mut dropped => break,
                 _ = interval.tick() => {}
             }
-            let Some(format) = self.state.lock().audio.as_ref().map(PlatformAudio::capture_format)
+            let Some((format, sources)) = self
+                .state
+                .lock()
+                .audio
+                .as_ref()
+                .map(|audio| (audio.capture_format(), audio.mixer_sources_added()))
             else {
                 break;
             };
@@ -176,55 +401,80 @@ impl RootAudioSession {
                 );
             }
             polls = polls.wrapping_add(1);
-            if polls % RESOLVE_EVERY_POLLS == 0 {
-                self.clone().spawn_resolve_pass(server);
+            if last_sources.is_some_and(|last| last != sources) {
+                new_source_pass_at = Some(polls.wrapping_add(NEW_SOURCE_PASS_DELAY_POLLS));
+            }
+            last_sources = Some(sources);
+            if new_source_pass_at == Some(polls) {
+                new_source_pass_at = None;
+                self.clone().spawn_pass(server, Pass::NewSource);
+            } else if polls % RESOLVE_EVERY_POLLS == 0 {
+                self.clone().spawn_pass(server, Pass::Periodic);
             }
         }
     }
 
-    fn spawn_resolve_pass(self: Arc<Self>, server: &'static FfiServer) {
-        if self.resolving.swap(true, Ordering::AcqRel) {
+    /// One periodic pass at a time; a new stream's pass always runs (handles
+    /// already being resolved are run again rather than resolved twice).
+    fn spawn_pass(self: Arc<Self>, server: &'static FfiServer, pass: Pass) {
+        let periodic = pass == Pass::Periodic;
+        if periodic && self.periodic_pass.swap(true, Ordering::AcqRel) {
             return;
         }
         let task = server.async_runtime.spawn(async move {
-            self.resolve_pass(server).await;
-            self.resolving.store(false, Ordering::Release);
+            self.resolve_pass(server, pass).await;
+            if periodic {
+                self.periodic_pass.store(false, Ordering::Release);
+            }
         });
         server.watch_panic(task);
     }
 
-    /// Drops the gains of track handles that are gone and resolves the others'
-    /// SSRCs again.
-    async fn resolve_pass(&self, server: &'static FfiServer) {
-        let (handles, pass) = {
+    /// Forgets the gains of track handles that are gone and resolves SSRCs:
+    /// unknown ones every pass, known ones every few passes or after a new
+    /// stream appeared.
+    async fn resolve_pass(&self, server: &'static FfiServer, pass: Pass) {
+        let (handles, refresh_known) = {
             let mut state = self.state.lock();
-            state.resolve_passes = state.resolve_passes.wrapping_add(1);
-            let handles: Vec<(FfiHandleId, bool, bool)> = state
-                .gains
-                .iter()
-                .map(|(handle, gain)| (*handle, gain.ssrc.is_some(), gain.from_stats))
-                .collect();
-            (handles, state.resolve_passes)
+            let refresh_known = match pass {
+                Pass::NewSource => true,
+                Pass::Periodic => {
+                    state.resolve_passes = state.resolve_passes.wrapping_add(1);
+                    state.resolve_passes % KNOWN_RESOLVE_EVERY_PASSES == 0
+                }
+            };
+            (state.gains.handles(), refresh_known)
         };
-        let mut live = Vec::new();
-        for (handle, known, from_stats) in handles {
+        let mut to_resolve = Vec::new();
+        for (handle, known) in handles {
             if server.retrieve_handle::<FfiTrack>(handle).is_err() {
                 self.forget(handle);
-            } else if !known || !from_stats || pass % STATS_RESOLVE_EVERY_PASSES == 0 {
-                live.push(handle);
+            } else if !known || refresh_known {
+                to_resolve.push(handle);
             }
         }
-        self.resolve(live).await;
+        if pass == Pass::Periodic {
+            prune_subscribed(server);
+        }
+        self.resolve(to_resolve, pass == Pass::NewSource).await;
     }
 
-    async fn resolve(&self, handles: Vec<FfiHandleId>) {
+    async fn resolve(&self, handles: Vec<FfiHandleId>, supersede: bool) {
         for handle in handles {
-            let track = match self.state.lock().gains.get(&handle) {
-                Some(gain) => gain.track.clone(),
-                None => continue,
-            };
-            if let Some(resolved) = resolve_ssrc(track).await {
-                self.set_ssrc(handle, resolved);
+            let mut supersede = supersede;
+            loop {
+                let Some((track, generation)) =
+                    self.state.lock().gains.begin_resolve(handle, supersede)
+                else {
+                    break;
+                };
+                supersede = false;
+                let ssrc = resolve_ssrc(track).await;
+                let mut state = self.state.lock();
+                let SessionState { audio, gains, .. } = &mut *state;
+                if !gains.finish_resolve(audio.as_ref().map(sink_of), handle, generation, ssrc) {
+                    break;
+                }
             }
         }
     }
@@ -234,104 +484,91 @@ impl RootAudioSession {
             return;
         }
         let session = self.clone();
-        let task = server.async_runtime.spawn(async move { session.resolve(handles).await });
+        let task = server.async_runtime.spawn(async move { session.resolve(handles, false).await });
         server.watch_panic(task);
     }
 
-    fn set_ssrc(&self, handle: FfiHandleId, (ssrc, from_stats): (u32, bool)) {
-        let mut guard = self.state.lock();
-        let state = &mut *guard;
-        let Some(audio) = state.audio.as_ref() else {
-            return;
-        };
-        let Some(gain) = state.gains.get_mut(&handle) else {
-            return;
-        };
-        gain.from_stats = from_stats;
-        let previous = gain.ssrc.replace(ssrc);
-        let (tile, paused) = (gain.tile, gain.paused);
-        if previous == Some(ssrc) {
-            return;
-        }
-        if let Some(previous) = previous {
-            clear_if_unused(audio, &state.gains, previous);
-        }
-        apply_gain(audio, ssrc, tile, paused);
-    }
-
     fn forget(&self, handle: FfiHandleId) {
-        let mut guard = self.state.lock();
-        let state = &mut *guard;
-        let ssrc = state.gains.remove(&handle).and_then(|gain| gain.ssrc);
-        if let (Some(audio), Some(ssrc)) = (state.audio.as_ref(), ssrc) {
-            clear_if_unused(audio, &state.gains, ssrc);
-        }
+        let mut state = self.state.lock();
+        let SessionState { audio, gains, .. } = &mut *state;
+        gains.forget(audio.as_ref().map(sink_of), handle);
     }
 
     /// Stores the gains and applies the ones whose SSRC is known; returns the
     /// handles still to resolve, or Err when the session has ended.
-    fn set_gains(
-        &self,
-        gains: Vec<(FfiHandleId, RemoteAudioTrack, f32, Option<bool>)>,
-    ) -> Result<Vec<FfiHandleId>, ()> {
-        let mut guard = self.state.lock();
-        let state = &mut *guard;
-        let Some(audio) = state.audio.as_ref() else {
+    fn set_gains(&self, requests: Vec<GainRequest>) -> Result<Vec<FfiHandleId>, ()> {
+        let subscribed: Vec<Option<u32>> = {
+            let sessions = SESSIONS.lock();
+            requests.iter().map(|r| sessions.subscribed.get(&r.handle).copied()).collect()
+        };
+        let mut state = self.state.lock();
+        let SessionState { audio, gains, .. } = &mut *state;
+        let Some(audio) = audio.as_ref() else {
             return Err(());
         };
         let mut unresolved = Vec::new();
-        for (handle, track, tile, paused) in gains {
-            let gain = state.gains.entry(handle).or_insert_with(|| TrackGain {
-                track,
-                tile: 1.0,
-                paused: false,
-                ssrc: None,
-                from_stats: false,
-            });
-            gain.tile = tile;
-            if let Some(paused) = paused {
-                gain.paused = paused;
-            }
-            match gain.ssrc {
-                Some(ssrc) => apply_gain(audio, ssrc, gain.tile, gain.paused),
-                None => unresolved.push(handle),
+        for (request, subscribed) in requests.into_iter().zip(subscribed) {
+            let handle = request.handle;
+            if gains.set(audio, handle, request.track, request.tile, request.paused, subscribed) {
+                unresolved.push(handle);
             }
         }
         Ok(unresolved)
     }
 }
 
-fn clear_if_unused(audio: &PlatformAudio, gains: &HashMap<FfiHandleId, TrackGain>, ssrc: u32) {
-    if !gains.values().any(|gain| gain.ssrc == Some(ssrc)) {
-        audio.clear_source_gain(ssrc);
+/// A track was subscribed. While a session is live, a remote audio track's
+/// SSRC is resolved right away, so the host's first gain for it applies inside
+/// its request.
+pub fn on_track_subscribed(server: &'static FfiServer, handle: FfiHandleId, track: &Track) {
+    let Track::RemoteAudio(track) = track else {
+        return;
+    };
+    if SESSIONS.lock().live == 0 {
+        return;
+    }
+    let track = track.clone();
+    let task = server.async_runtime.spawn(async move {
+        if let Some(ssrc) = resolve_ssrc(track).await {
+            let mut sessions = SESSIONS.lock();
+            if sessions.live > 0 {
+                sessions.subscribed.insert(handle, ssrc);
+            }
+        }
+    });
+    server.watch_panic(task);
+}
+
+fn prune_subscribed(server: &'static FfiServer) {
+    let handles: Vec<FfiHandleId> = SESSIONS.lock().subscribed.keys().copied().collect();
+    let gone: Vec<FfiHandleId> = handles
+        .into_iter()
+        .filter(|handle| server.retrieve_handle::<FfiTrack>(*handle).is_err())
+        .collect();
+    if !gone.is_empty() {
+        let mut sessions = SESSIONS.lock();
+        for handle in gone {
+            sessions.subscribed.remove(&handle);
+        }
     }
 }
 
-fn apply_gain(audio: &PlatformAudio, ssrc: u32, tile: f32, paused: bool) {
-    if !audio.set_source_gain(ssrc, tile, paused) {
-        log::warn!("RootAudio: the mixer's gain table is full; ssrc {ssrc} plays at tile 1");
-    }
-}
-
-/// The SSRC of the stream `track` plays, and whether it came from the stats:
-/// the receiver's signaled SSRC first (a hop to libwebrtc's worker thread, off
-/// the async runtime), else the track's inbound-rtp SSRC.
-async fn resolve_ssrc(track: RemoteAudioTrack) -> Option<(u32, bool)> {
+/// The SSRC of the stream `track` plays: the receiver's signaled SSRC first (a
+/// hop to libwebrtc's worker thread, off the async runtime), else the track's
+/// inbound-rtp SSRC.
+async fn resolve_ssrc(track: RemoteAudioTrack) -> Option<u32> {
     let signaled = {
         let track = track.clone();
         tokio::task::spawn_blocking(move || track.signaled_ssrc()).await.ok().flatten()
     };
-    if let Some(ssrc) = signaled {
-        return Some((ssrc, false));
+    if signaled.is_some() {
+        return signaled;
     }
     let stats = track.get_stats().await.ok()?;
-    stats
-        .iter()
-        .find_map(|stats| match stats {
-            RtcStats::InboundRtp(inbound) if inbound.stream.ssrc != 0 => Some(inbound.stream.ssrc),
-            _ => None,
-        })
-        .map(|ssrc| (ssrc, true))
+    stats.iter().find_map(|stats| match stats {
+        RtcStats::InboundRtp(inbound) if inbound.stream.ssrc != 0 => Some(inbound.stream.ssrc),
+        _ => None,
+    })
 }
 
 fn session_from_handle(
@@ -476,42 +713,54 @@ pub fn on_stats(
 /// deafened take effect at once; echo_cancellation and
 /// webrtc_noise_suppression within a second (rate-limited APM policy).
 /// denoise_power, auto_gain, gate_threshold, auto_sensitivity and
-/// gain_reset_db are stored for the DSP chain and have no effect yet.
+/// gain_reset_db are stored for the DSP chain and have no effect yet. A field
+/// this build cannot act on (no capture processor or APM decorator) is
+/// reported as not supported; the others are applied.
 pub fn on_set_control(
     server: &'static FfiServer,
     req: proto::RootAudioSetControlRequest,
 ) -> FfiResult<proto::RootAudioSetControlResponse> {
     let audio = platform_audio_from_handle(server, req.platform_audio_handle)?;
-    audio.set_rootapp_control(&root_audio_control(&req.control));
-    Ok(proto::RootAudioSetControlResponse { error: None })
+    let error = audio
+        .set_rootapp_control(&root_audio_control(&req.control))
+        .err()
+        .map(|_| format!("a control field is {NOT_SUPPORTED}; the other fields are applied"));
+    Ok(proto::RootAudioSetControlResponse { error })
 }
 
 /// Tile volumes (slider / 100, 0..2, NaN is 0) per remote track handle; an
-/// absent `paused` keeps the track's pause. Unknown handles are reported in
-/// the error, the other gains are applied.
+/// absent `paused` keeps the track's pause. Handles that are not remote audio
+/// tracks (a track disposed meanwhile) are listed in `unknown_track_handles`
+/// and are no error; the other gains are applied.
 pub fn on_set_track_gains(
     server: &'static FfiServer,
     req: proto::RootAudioSetTrackGainsRequest,
 ) -> FfiResult<proto::RootAudioSetTrackGainsResponse> {
     let session = session_from_handle(server, req.platform_audio_handle)?;
-    let mut unknown = Vec::new();
-    let mut gains = Vec::with_capacity(req.gains.len());
+    let mut unknown_track_handles = Vec::new();
+    let mut requests = Vec::with_capacity(req.gains.len());
     for gain in &req.gains {
         match remote_audio_track(server, gain.track_handle) {
-            Some(track) => {
-                gains.push((gain.track_handle, track, sanitize_volume(gain.gain), gain.paused))
-            }
-            None => unknown.push(gain.track_handle),
+            Some(track) => requests.push(GainRequest {
+                handle: gain.track_handle,
+                track,
+                tile: sanitize_volume(gain.gain),
+                paused: gain.paused,
+            }),
+            None => unknown_track_handles.push(gain.track_handle),
         }
     }
-    let unresolved = session
-        .set_gains(gains)
-        .map_err(|_| FfiError::InvalidRequest("platform audio handle was dropped".into()))?;
-    session.spawn_resolve(server, unresolved);
-    let error = (!unknown.is_empty()).then(|| {
-        format!("not remote audio track handles: {unknown:?}; the other gains are applied")
-    });
-    Ok(proto::RootAudioSetTrackGainsResponse { error })
+    if !unknown_track_handles.is_empty() {
+        log::debug!("RootAudio: gains for track handles that are gone: {unknown_track_handles:?}");
+    }
+    let error = match session.set_gains(requests) {
+        Ok(unresolved) => {
+            session.spawn_resolve(server, unresolved);
+            None
+        }
+        Err(()) => Some("platform audio handle was dropped".into()),
+    };
+    Ok(proto::RootAudioSetTrackGainsResponse { error, unknown_track_handles })
 }
 
 /// Copies the clip before returning.
@@ -782,5 +1031,156 @@ mod tests {
         assert_eq!(proto.audio_thread_logs_dropped, Some(0));
         assert_eq!(proto.overlapping_callbacks, Some(2));
         assert_eq!(proto.device_stop_failures, Some(0));
+        assert_eq!(proto::RootAudioStats::from(RootAudioStats::default()).aec_delay_ms, -1);
+    }
+
+    /// Records what a session asks of the native engine.
+    #[derive(Default)]
+    struct Recorder {
+        calls: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl Recorder {
+        fn take(&self) -> Vec<String> {
+            std::mem::take(&mut *self.calls.borrow_mut())
+        }
+    }
+
+    impl RootAudioSink for Recorder {
+        fn set_source_gain(&self, ssrc: u32, tile: f32, paused: bool) -> bool {
+            self.calls.borrow_mut().push(format!("set {ssrc} {tile} {paused}"));
+            true
+        }
+
+        fn clear_source_gain(&self, ssrc: u32) {
+            self.calls.borrow_mut().push(format!("clear {ssrc}"));
+        }
+
+        fn reset_controls(&self, close_gate: bool) {
+            self.calls.borrow_mut().push(format!("reset closed={close_gate}"));
+        }
+    }
+
+    /// `handle` resolved to `ssrc` (track `handle`).
+    fn resolved(gains: &mut TrackGains<u64>, sink: &Recorder, handle: u64, ssrc: u32) {
+        let (_, generation) = gains.begin_resolve(handle, false).unwrap();
+        assert!(!gains.finish_resolve(Some(sink), handle, generation, Some(ssrc)));
+    }
+
+    #[test]
+    fn rootapp_audio_sessions_reset_on_the_first_start_and_close_on_the_last_end() {
+        let sink = Recorder::default();
+        let mut sessions = Sessions::default();
+        sessions.open(&sink);
+        assert_eq!(sink.take(), ["reset closed=false"]);
+        sessions.open(&sink);
+        sessions.subscribed.insert(9, 99);
+        sessions.close(&sink);
+        assert_eq!(sink.take(), Vec::<String>::new(), "another handle is still live");
+        assert_eq!(sessions.subscribed.len(), 1);
+        sessions.close(&sink);
+        assert_eq!(sink.take(), ["reset closed=true"], "the last end closes the gate");
+        assert!(sessions.subscribed.is_empty());
+        sessions.open(&sink);
+        assert_eq!(sink.take(), ["reset closed=false"]);
+    }
+
+    #[test]
+    fn rootapp_audio_track_gain_applies_once_its_ssrc_is_resolved() {
+        let sink = Recorder::default();
+        let mut gains = TrackGains::default();
+        assert!(gains.set(&sink, 1, 1, 0.5, Some(true), None));
+        assert_eq!(sink.take(), Vec::<String>::new());
+        resolved(&mut gains, &sink, 1, 100);
+        assert_eq!(sink.take(), ["set 100 0.5 true"]);
+
+        assert!(!gains.set(&sink, 1, 1, 0.75, None, None));
+        assert_eq!(sink.take(), ["set 100 0.75 true"], "an absent paused keeps the pause");
+        assert!(!gains.set(&sink, 1, 1, 0.75, Some(false), None));
+        assert_eq!(sink.take(), ["set 100 0.75 false"]);
+        assert_eq!(gains.handles(), [(1, true)]);
+    }
+
+    #[test]
+    fn rootapp_audio_track_gain_uses_the_ssrc_resolved_at_subscribe() {
+        let sink = Recorder::default();
+        let mut gains = TrackGains::default();
+        assert!(!gains.set(&sink, 1, 1, 1.0, None, Some(55)));
+        assert_eq!(sink.take(), ["set 55 1 false"]);
+        resolved(&mut gains, &sink, 1, 55);
+        assert_eq!(sink.take(), Vec::<String>::new(), "an unchanged SSRC is not set again");
+    }
+
+    #[test]
+    fn rootapp_audio_handles_sharing_an_ssrc_keep_it_until_the_last_is_forgotten() {
+        let sink = Recorder::default();
+        let mut gains = TrackGains::default();
+        gains.set(&sink, 1, 1, 0.0, None, None);
+        gains.set(&sink, 2, 2, 1.0, None, None);
+        resolved(&mut gains, &sink, 1, 100);
+        resolved(&mut gains, &sink, 2, 100);
+        sink.take();
+        gains.forget(Some(&sink), 1);
+        assert_eq!(sink.take(), Vec::<String>::new(), "a reused transceiver keeps its gain");
+        gains.forget(Some(&sink), 2);
+        assert_eq!(sink.take(), ["clear 100"]);
+    }
+
+    #[test]
+    fn rootapp_audio_moved_ssrc_clears_the_old_one_only_when_unused() {
+        let sink = Recorder::default();
+        let mut gains = TrackGains::default();
+        gains.set(&sink, 1, 1, 0.5, None, None);
+        gains.set(&sink, 2, 2, 0.25, None, None);
+        resolved(&mut gains, &sink, 1, 100);
+        resolved(&mut gains, &sink, 2, 100);
+        sink.take();
+
+        resolved(&mut gains, &sink, 1, 200);
+        assert_eq!(sink.take(), ["set 200 0.5 false"], "handle 2 still plays under 100");
+        resolved(&mut gains, &sink, 2, 200);
+        assert_eq!(sink.take(), ["clear 100", "set 200 0.25 false"]);
+    }
+
+    #[test]
+    fn rootapp_audio_resolutions_never_overlap_and_a_superseded_one_is_not_applied() {
+        let sink = Recorder::default();
+        let mut gains = TrackGains::default();
+        gains.set(&sink, 1, 1, 1.0, None, None);
+
+        let (_, first) = gains.begin_resolve(1, false).unwrap();
+        assert!(gains.begin_resolve(1, false).is_none(), "one resolution at a time");
+        assert!(!gains.finish_resolve(Some(&sink), 1, first, Some(100)));
+        assert_eq!(sink.take(), ["set 100 1 false"]);
+
+        let (_, stale) = gains.begin_resolve(1, false).unwrap();
+        assert!(gains.begin_resolve(1, true).is_none());
+        assert!(gains.finish_resolve(Some(&sink), 1, stale, Some(100)), "run again");
+        assert_eq!(sink.take(), Vec::<String>::new());
+        let (_, fresh) = gains.begin_resolve(1, false).unwrap();
+        assert!(!gains.finish_resolve(Some(&sink), 1, fresh, Some(300)));
+        assert_eq!(sink.take(), ["clear 100", "set 300 1 false"]);
+
+        let (_, failed) = gains.begin_resolve(1, false).unwrap();
+        assert!(!gains.finish_resolve(Some(&sink), 1, failed, None));
+        assert_eq!(gains.handles(), [(1, true)], "a failed resolution keeps the SSRC");
+    }
+
+    #[test]
+    fn rootapp_audio_nothing_resolves_into_an_ended_session() {
+        let sink = Recorder::default();
+        let mut gains = TrackGains::default();
+        gains.set(&sink, 1, 1, 1.0, None, None);
+        let (_, generation) = gains.begin_resolve(1, false).unwrap();
+        assert!(!gains.finish_resolve(None, 1, generation, Some(100)));
+        gains.forget(None, 1);
+        assert_eq!(sink.take(), Vec::<String>::new());
+
+        gains.set(&sink, 2, 2, 1.0, None, None);
+        let (_, generation) = gains.begin_resolve(2, false).unwrap();
+        gains.clear();
+        assert!(!gains.finish_resolve(Some(&sink), 2, generation, Some(100)));
+        assert!(gains.begin_resolve(2, false).is_none());
+        assert_eq!(sink.take(), Vec::<String>::new());
     }
 }

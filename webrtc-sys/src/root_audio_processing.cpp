@@ -19,7 +19,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
+#include <thread>
 #include <utility>
 
 #include "api/audio/builtin_audio_processing_builder.h"
@@ -83,10 +85,40 @@ webrtc::scoped_refptr<webrtc::AudioProcessing> BuildRootApm(
 // RootCaptureState
 // =============================================================================
 
-void RootCaptureState::ResetControls() {
-  mic_muted.store(false, std::memory_order_relaxed);
-  push_to_talk.store(static_cast<uint32_t>(RootPushToTalk::kVoiceActivity),
-                     std::memory_order_relaxed);
+bool RootCaptureState::GateOpen(uint32_t gate) {
+  return (gate & kGateMuted) == 0 &&
+         (gate >> kGatePushToTalkShift) !=
+             static_cast<uint32_t>(RootPushToTalk::kReleased);
+}
+
+bool RootCaptureState::mic_muted() const {
+  return (gate.load(std::memory_order_relaxed) & kGateMuted) != 0;
+}
+
+uint32_t RootCaptureState::push_to_talk() const {
+  return gate.load(std::memory_order_relaxed) >> kGatePushToTalkShift;
+}
+
+void RootCaptureState::SetGate(std::optional<bool> muted,
+                               std::optional<uint32_t> push_to_talk) {
+  uint32_t current = gate.load(std::memory_order_relaxed);
+  uint32_t next;
+  do {
+    next = current;
+    if (muted.has_value()) {
+      next = *muted ? (next | kGateMuted) : (next & ~kGateMuted);
+    }
+    if (push_to_talk.has_value()) {
+      const uint32_t state = std::min<uint32_t>(
+          *push_to_talk, static_cast<uint32_t>(RootPushToTalk::kReleased));
+      next = (next & kGateMuted) | (state << kGatePushToTalkShift);
+    }
+  } while (!gate.compare_exchange_weak(current, next,
+                                       std::memory_order_relaxed));
+}
+
+void RootCaptureState::ResetControls(bool close_gate) {
+  gate.store(close_gate ? kGateClosed : 0, std::memory_order_relaxed);
   input_volume.store(1.0f, std::memory_order_relaxed);
   denoise_power.store(0.75f, std::memory_order_relaxed);
   auto_gain.store(true, std::memory_order_relaxed);
@@ -132,6 +164,7 @@ std::string RootCaptureProcessor::ToString() const {
 void RootCaptureProcessor::SetRuntimeSetting(
     webrtc::AudioProcessing::RuntimeSetting /* setting */) {}
 
+// A new stream starts at the current volume and gate, with no ramp.
 void RootCaptureProcessor::ResetDsp() {
   ramp_samples_ = std::max<size_t>(1, static_cast<size_t>(rate_ / 50));
   volume_target_ =
@@ -139,6 +172,12 @@ void RootCaptureProcessor::ResetDsp() {
   volume_ = volume_target_;
   volume_step_ = 0.0f;
   volume_remaining_ = 0;
+  gate_step_ =
+      1.0f / static_cast<float>(std::max(1, rate_ * kGateFadeMs / 1000));
+  gate_ = RootCaptureState::GateOpen(
+              state_->gate.load(std::memory_order_relaxed))
+              ? 1.0f
+              : 0.0f;
 }
 
 // The app's GainRamp: linear over 20 ms toward the newest target.
@@ -160,6 +199,23 @@ void RootCaptureProcessor::ApplyInputVolume(float* samples, size_t frames) {
   }
   for (; i < frames; ++i) {
     samples[i] *= volume_;
+  }
+}
+
+// Linear toward 0 or 1 over kGateFadeMs.
+void RootCaptureProcessor::ApplyGate(float* samples,
+                                     size_t frames,
+                                     float target) {
+  if (gate_ == target) {
+    if (target == 0.0f) {
+      std::fill(samples, samples + frames, 0.0f);
+    }
+    return;
+  }
+  for (size_t i = 0; i < frames; ++i) {
+    gate_ = gate_ < target ? std::min(target, gate_ + gate_step_)
+                           : std::max(target, gate_ - gate_step_);
+    samples[i] *= gate_;
   }
 }
 
@@ -206,18 +262,19 @@ void RootCaptureProcessor::Process(webrtc::AudioBuffer* audio) {
     volume_step_ =
         (target - volume_) / static_cast<float>(ramp_samples_);
   }
-  const bool open =
-      !state_->mic_muted.load(std::memory_order_relaxed) &&
-      state_->push_to_talk.load(std::memory_order_relaxed) !=
-          static_cast<uint32_t>(RootPushToTalk::kReleased);
+  const float gate_target =
+      RootCaptureState::GateOpen(state_->gate.load(std::memory_order_relaxed))
+          ? 1.0f
+          : 0.0f;
   double sent_sumsq = 0;
-  if (open) {
-    ApplyInputVolume(samples, frames);
-    sent_sumsq = SumSquares(samples, frames);
-  } else {
+  if (gate_ == 0.0f && gate_target == 0.0f) {
     std::fill(samples, samples + frames, 0.0f);
     volume_ = volume_target_;
     volume_remaining_ = 0;
+  } else {
+    ApplyInputVolume(samples, frames);
+    ApplyGate(samples, frames, gate_target);
+    sent_sumsq = SumSquares(samples, frames);
   }
   for (size_t c = 1; c < channels; ++c) {
     std::copy(samples, samples + frames, data[c]);
@@ -278,13 +335,19 @@ RootApmDecorator::RootApmDecorator(
 
 RootApmDecorator::~RootApmDecorator() = default;
 
+webrtc::AudioProcessing::Config RootApmDecorator::Forced(
+    const Config& requested) {
+  Config forced = requested;
+  forced.gain_controller1.enabled = false;
+  forced.gain_controller2.enabled = false;
+  forced.gain_controller2.input_volume_controller.enabled = false;
+  forced.high_pass_filter.enabled = true;
+  return forced;
+}
+
 webrtc::AudioProcessing::Config RootApmDecorator::MergeLocked(
     const Config& requested) const {
-  Config merged = requested;
-  merged.gain_controller1.enabled = false;
-  merged.gain_controller2.enabled = false;
-  merged.gain_controller2.input_volume_controller.enabled = false;
-  merged.high_pass_filter.enabled = true;
+  Config merged = Forced(requested);
   if (effective_echo_cancellation_.has_value()) {
     merged.echo_canceller.enabled = *effective_echo_cancellation_;
   }
@@ -374,7 +437,8 @@ RootApmStats RootApmDecorator::ReadStats() {
   result.erl_db = OrNaN(stats.echo_return_loss);
   result.erle_db = OrNaN(stats.echo_return_loss_enhancement);
   result.divergent_filter_fraction = OrNaN(stats.divergent_filter_fraction);
-  result.delay_ms = stats.delay_ms.value_or(stats.delay_median_ms.value_or(0));
+  result.delay_ms =
+      stats.delay_ms.value_or(stats.delay_median_ms.value_or(-1));
   result.echo_cancellation_active = echo_cancellation_active();
   result.noise_suppression_active = noise_suppression_active();
   return result;
@@ -555,7 +619,7 @@ webrtc::AudioProcessingStats RootApmDecorator::GetStatistics(
 
 webrtc::AudioProcessing::Config RootApmDecorator::GetConfig() const {
   webrtc::MutexLock lock(&mutex_);
-  return applied_;
+  return Forced(requested_);
 }
 
 webrtc::scoped_refptr<RootApmDecorator> CreateRootAudioProcessing(
@@ -595,11 +659,20 @@ void RootProcessorHarness::initialize(int32_t rate, int32_t channels) const {
 }
 
 void RootProcessorHarness::set_mic_muted(bool muted) const {
-  state_->mic_muted.store(muted);
+  state_->SetGate(muted, std::nullopt);
 }
 
 void RootProcessorHarness::set_push_to_talk(uint32_t state) const {
-  state_->push_to_talk.store(state);
+  state_->SetGate(std::nullopt, state);
+}
+
+void RootProcessorHarness::set_gate(int8_t mic_muted,
+                                    int32_t push_to_talk) const {
+  state_->SetGate(
+      mic_muted < 0 ? std::nullopt : std::optional<bool>(mic_muted != 0),
+      push_to_talk < 0
+          ? std::nullopt
+          : std::optional<uint32_t>(static_cast<uint32_t>(push_to_talk)));
 }
 
 void RootProcessorHarness::set_input_volume(float volume) const {
@@ -607,7 +680,7 @@ void RootProcessorHarness::set_input_volume(float volume) const {
 }
 
 void RootProcessorHarness::reset_controls() const {
-  state_->ResetControls();
+  state_->ResetControls(false);
 }
 
 RootProcessorFrame RootProcessorHarness::process(
@@ -660,14 +733,22 @@ class FakeApm : public webrtc::AudioProcessing {
  public:
   Config last_config;
   uint64_t applies = 0;
+  // Configs that had AGC on or the high-pass filter off.
+  uint64_t unforced_applies = 0;
   uint64_t mute_calls = 0;
   uint64_t output_used_settings = 0;
+  webrtc::AudioProcessingStats stats;
 
   int Initialize() override { return kNoError; }
   int Initialize(const webrtc::ProcessingConfig&) override { return kNoError; }
   void ApplyConfig(const Config& config) override {
     last_config = config;
     ++applies;
+    if (config.gain_controller1.enabled || config.gain_controller2.enabled ||
+        config.gain_controller2.input_volume_controller.enabled ||
+        !config.high_pass_filter.enabled) {
+      ++unforced_applies;
+    }
   }
   int proc_sample_rate_hz() const override { return 48000; }
   int proc_split_sample_rate_hz() const override { return 16000; }
@@ -734,10 +815,66 @@ class FakeApm : public webrtc::AudioProcessing {
   }
   void AttachAecDump(std::unique_ptr<webrtc::AecDump>) override {}
   void DetachAecDump() override {}
-  webrtc::AudioProcessingStats GetStatistics() override { return {}; }
-  webrtc::AudioProcessingStats GetStatistics(bool) override { return {}; }
+  webrtc::AudioProcessingStats GetStatistics() override { return stats; }
+  webrtc::AudioProcessingStats GetStatistics(bool) override { return stats; }
   Config GetConfig() const override { return last_config; }
 };
+
+webrtc::scoped_refptr<RootApmDecorator> NewRootApmOverFakeForTest() {
+  auto fake = webrtc::make_ref_counted<FakeApm>();
+  fake->stats.echo_return_loss = 12.0;
+  fake->stats.echo_return_loss_enhancement = 20.0;
+  fake->stats.delay_ms = 40;
+  fake->stats.divergent_filter_fraction = 0.25;
+  return webrtc::make_ref_counted<RootApmDecorator>(
+      fake, RootApmDecorator::Scheduler(), RootApmDecorator::Clock());
+}
+
+bool root_apm_decorator_race_for_test(uint32_t iterations) {
+  auto fake = webrtc::make_ref_counted<FakeApm>();
+  auto decorator = webrtc::make_ref_counted<RootApmDecorator>(
+      fake, RootApmDecorator::Scheduler(), RootApmDecorator::Clock());
+  std::thread engine([&] {
+    for (uint32_t i = 0; i < iterations; ++i) {
+      webrtc::AudioProcessing::Config config = decorator->GetConfig();
+      config.echo_canceller.enabled = i % 2 == 0;
+      config.noise_suppression.enabled = i % 3 == 0;
+      config.gain_controller1.enabled = true;
+      config.gain_controller2.enabled = i % 4 == 0;
+      config.high_pass_filter.enabled = false;
+      decorator->ApplyConfig(config);
+    }
+  });
+  std::thread policy([&] {
+    for (uint32_t i = 0; i < iterations; ++i) {
+      if (i % 5 == 4) {
+        decorator->ResetPolicy();
+      } else {
+        decorator->SetPolicy(i % 2 == 0, i % 3 == 0
+                                             ? std::optional<bool>(true)
+                                             : std::nullopt);
+      }
+      decorator->ReadStats();
+    }
+  });
+  engine.join();
+  policy.join();
+
+  decorator->SetPolicy(false, true);
+  webrtc::AudioProcessing::Config config = decorator->GetConfig();
+  config.echo_canceller.enabled = true;
+  config.noise_suppression.enabled = false;
+  decorator->ApplyConfig(config);
+  const webrtc::AudioProcessing::Config served = decorator->GetConfig();
+  const webrtc::AudioProcessing::Config& inner = fake->last_config;
+  return fake->unforced_applies == 0 && !inner.echo_canceller.enabled &&
+         inner.noise_suppression.enabled && served.echo_canceller.enabled &&
+         !served.noise_suppression.enabled &&
+         decorator->echo_cancellation_active() ==
+             inner.echo_canceller.enabled &&
+         decorator->noise_suppression_active() ==
+             inner.noise_suppression.enabled;
+}
 
 RootApmHarness::RootApmHarness(bool real_apm)
     : now_ms_(std::make_shared<int64_t>(100000)),
@@ -778,6 +915,13 @@ void RootApmHarness::engine_apply(bool echo_cancellation,
   config.gain_controller2.enabled = gain_controller2;
   config.gain_controller2.input_volume_controller.enabled = gain_controller2;
   config.high_pass_filter.enabled = high_pass_filter;
+  decorator_->ApplyConfig(config);
+}
+
+void RootApmHarness::engine_apply_echo_cancellation(
+    bool echo_cancellation) const {
+  webrtc::AudioProcessing::Config config = decorator_->GetConfig();
+  config.echo_canceller.enabled = echo_cancellation;
   decorator_->ApplyConfig(config);
 }
 
@@ -852,7 +996,12 @@ RootDecoratorProbe RootApmHarness::probe() const {
   probe.aec_active = decorator_->echo_cancellation_active();
   probe.ns_active = decorator_->noise_suppression_active();
   const webrtc::AudioProcessing::Config served = decorator_->GetConfig();
-  probe.served_matches_inner = RootApmConfigsEqual(served, inner);
+  probe.served_aec = served.echo_canceller.enabled;
+  probe.served_ns = served.noise_suppression.enabled;
+  probe.served_agc = served.gain_controller1.enabled ||
+                     served.gain_controller2.enabled ||
+                     served.gain_controller2.input_volume_controller.enabled;
+  probe.served_hpf = served.high_pass_filter.enabled;
   return probe;
 }
 
@@ -881,7 +1030,7 @@ int16_t RootApmHarness::process_frame(int32_t rate,
 }
 
 void RootApmHarness::set_mic_muted(bool muted) const {
-  capture_->mic_muted.store(muted);
+  capture_->SetGate(muted, std::nullopt);
 }
 
 uint64_t RootApmHarness::processed_frames() const {

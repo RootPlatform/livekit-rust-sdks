@@ -1014,21 +1014,37 @@ impl PlatformAudio {
     /// Applies the set fields of `control` (sanitized first; see
     /// [`RootAudioControl`]). Stores atomics and returns at once; an AEC or NS
     /// change reaches the APM from libwebrtc's worker thread, at most once a
-    /// second.
-    pub fn set_rootapp_control(&self, control: &RootAudioControl) {
-        self.handle.runtime.set_root_audio_control(&control.to_native())
+    /// second. Fails when a set field has nothing to act on in this build (no
+    /// capture processor, as on mobile, or no APM decorator); the other fields
+    /// are applied.
+    pub fn set_rootapp_control(&self, control: &RootAudioControl) -> AudioResult<()> {
+        if self.handle.runtime.set_root_audio_control(&control.to_native()) {
+            Ok(())
+        } else {
+            Err(AudioError::OperationFailed("a control is not supported by this build".into()))
+        }
     }
 
     /// Tile volume (linear 0..2, NaN is 0) and pause of the remote audio stream
-    /// with this SSRC, kept for an SSRC that is not playing yet. Streams without
-    /// one play at tile volume 1. Returns false when the table of gains is full.
+    /// with this SSRC, kept for an SSRC that is not playing yet. Returns false
+    /// when the table of gains is full.
+    ///
+    /// Once a gain was set, a stream that starts without one is held silent for
+    /// up to 500 ms (its gain is on the way), then plays at tile volume 1.
     pub fn set_source_gain(&self, ssrc: u32, tile_volume: f32, paused: bool) -> bool {
         self.handle.runtime.set_root_audio_source_gain(ssrc, sanitize_volume(tile_volume), paused)
     }
 
-    /// The SSRC goes back to tile volume 1, not paused.
+    /// Forgets the SSRC's gain. A stream with it that still plays keeps its last
+    /// gain; one that starts later has none.
     pub fn clear_source_gain(&self, ssrc: u32) {
         self.handle.runtime.clear_root_audio_source_gain(ssrc)
+    }
+
+    /// Counts the remote streams the playout mixer was given; it moves when a
+    /// stream starts, including one whose SSRC changed. Atomics only.
+    pub fn mixer_sources_added(&self) -> u64 {
+        self.handle.runtime.root_audio_sources_added()
     }
 
     /// Copies a 48 kHz mono clip under `id` for the effect bus. Clips are kept
@@ -1060,10 +1076,12 @@ impl PlatformAudio {
         self.handle.runtime.root_audio_capture_format().into()
     }
 
-    /// Controls back to their defaults: gate open, unity volumes, not deafened,
-    /// no per-source gains, effects stopped, AEC/NS following the device track.
-    pub fn reset_rootapp_controls(&self) {
-        self.handle.runtime.reset_root_audio()
+    /// Controls back to their defaults: unity volumes, not deafened, no
+    /// per-source gains, effects stopped, AEC/NS following the device track. The
+    /// capture gate opens, or with `close_gate` closes (muted, push-to-talk key
+    /// up) in the same store, so a teardown never passes through an open gate.
+    pub fn reset_rootapp_controls(&self, close_gate: bool) {
+        self.handle.runtime.reset_root_audio(close_gate)
     }
 
     // =========================================================================
