@@ -1097,7 +1097,10 @@ impl PlatformAudio {
     /// [`take_denoiser_completions`](Self::take_denoiser_completions); a
     /// pipeline native held comes back through
     /// [`take_returned_pipelines`](Self::take_returned_pipelines). Native
-    /// never releases a pipeline. Fails at once without a slot.
+    /// never releases a pipeline. Fails at once without a slot. An install at
+    /// a rate outside 8-48 kHz completes with an error, unless native still
+    /// holds that pipeline (then nothing changes and it completes as a
+    /// success).
     pub fn set_denoiser(
         &self,
         owner: u64,

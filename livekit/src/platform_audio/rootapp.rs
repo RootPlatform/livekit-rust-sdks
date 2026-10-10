@@ -441,6 +441,9 @@ pub struct RootAudioStats {
     pub denoiser_drained_samples: Option<u64>,
     pub denoiser_frames_until_first_output: Option<i32>,
     pub webrtc_ns_fallback: Option<bool>,
+    /// Frames processed while the fallback was decided on but WebRTC NS was
+    /// not applied yet.
+    pub ns_fallback_pending_frames: Option<u64>,
 
     // APM policy (APM decorator).
     pub apm_policy_applies: Option<u64>,
@@ -535,6 +538,7 @@ impl Default for RootAudioStats {
             denoiser_drained_samples: None,
             denoiser_frames_until_first_output: None,
             webrtc_ns_fallback: None,
+            ns_fallback_pending_frames: None,
             apm_policy_applies: None,
             apm_policy_deferred: None,
             apm_policy_forced: None,
@@ -595,6 +599,7 @@ impl RootAudioStats {
             denoiser_frames_until_first_output: denoiser
                 .then_some(native.denoiser_frames_until_first_output),
             webrtc_ns_fallback: denoiser.then_some(native.webrtc_ns_fallback),
+            ns_fallback_pending_frames: denoiser.then_some(native.ns_fallback_pending_frames),
             apm_policy_applies: policy.then_some(native.apm_policy_applies),
             apm_policy_deferred: policy.then_some(native.apm_policy_deferred),
             apm_policy_forced: policy.then_some(native.apm_policy_forced),
@@ -814,6 +819,7 @@ mod tests {
         assert!(stats.voice_gain_db.is_nan() && stats.gate_in_block_peak_db.is_nan());
         assert_eq!((stats.speaking, stats.ns_gap_frames, stats.dsp_resets), (None, None, None));
         assert_eq!((stats.denoiser_rate, stats.webrtc_ns_fallback), (None, None));
+        assert_eq!(stats.ns_fallback_pending_frames, None);
         assert!(stats.denoiser_process_us_buckets.is_empty());
         assert_eq!((stats.apm_policy_applies, stats.apm_policy_pending), (None, None));
         assert_eq!(RootAudioStats::default().aec_delay_ms, -1);
@@ -866,6 +872,7 @@ mod tests {
             denoiser_drained_samples: 960,
             denoiser_frames_until_first_output: 3,
             webrtc_ns_fallback: true,
+            ns_fallback_pending_frames: 11,
             apm_policy_applies: 5,
             apm_policy_deferred: 2,
             apm_policy_forced: 1,
@@ -921,7 +928,10 @@ mod tests {
             (Some(480), Some(0), Some(960))
         );
         assert_eq!(stats.denoiser_frames_until_first_output, Some(3));
-        assert_eq!(stats.webrtc_ns_fallback, Some(true));
+        assert_eq!(
+            (stats.webrtc_ns_fallback, stats.ns_fallback_pending_frames),
+            (Some(true), Some(11))
+        );
         assert_eq!(
             (stats.apm_policy_applies, stats.apm_policy_deferred, stats.apm_policy_forced),
             (Some(5), Some(2), Some(1))

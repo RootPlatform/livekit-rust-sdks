@@ -150,12 +150,15 @@ message RootAudioStopEffectsResponse {
 // A pipeline is installed at a pause in the user's speech (at most 3 s after the request) and
 // replaces the previous one; 0 removes the installed pipeline at once. Completion arrives as
 // RootAudioEvent.denoiser_result with the async_id: on success native owns the pipeline until it
-// comes back in RootAudioEvent.pipelines_returned (removed, replaced, or the last handle dropped).
-// On an error native no longer holds the pipeline, so the app releases it, once: a pipeline whose
-// request failed with "returned before install" is also listed in the ReturnPipelines response,
-// and a pointer named in both is released only once. Handing over a pipeline native still holds
-// (installed, or in an earlier request still waiting) completes as a success and changes nothing;
-// that pipeline comes back once. A pipeline handed over again before it came back is held again.
+// comes back in RootAudioEvent.pipelines_returned (removed, replaced, or the last handle dropped)
+// or in a ReturnPipelines response. On an error native no longer holds the pipeline, so the app
+// releases it, once: the pipeline of an error result not delivered yet (and of one that failed
+// with "returned before install") is also listed in the ReturnPipelines response, and a pointer
+// named in both is released only once. A pipeline is never handed to native twice: results and
+// returns name pipelines, not requests, so a second hand-off of the same pointer could not be told
+// apart from the first (native still answers one for a pipeline it holds with a success that
+// changes nothing, and never names that pipeline for it). sample_rate must be 8-48 kHz; outside
+// that the request fails, unless native still holds the pipeline (a success, nothing changes).
 // A pipeline whose rate is not the processor's is bypassed (RootAudioStats.denoiser_bypass_reason
 // 1) until the processor runs at its rate again or a pipeline at the processor's rate is installed.
 message RootAudioSetDenoiserRequest {
@@ -166,11 +169,14 @@ message RootAudioSetDenoiserRequest {
 message RootAudioSetDenoiserResponse {
   required uint64 async_id = 1;
 }
-// Returns every pipeline native holds, installed or waiting to be (app exit, before the SDK factory's
-// waitUntilAsyncWorkFinished). Synchronous; waits up to 200 ms in all for a change in progress and
-// the audio thread to let go of the installed one (on a timeout it stays installed and error says
-// so). Requests still waiting complete with the error "returned before install". Later SetDenoiser
-// requests work.
+// Returns every pipeline native holds, installed or waiting to be, and every pipeline native let go
+// of that no event has named yet (returned ones, and those of error results not delivered yet) (app
+// exit, before the SDK factory's waitUntilAsyncWorkFinished). Synchronous; waits up to 200 ms in all
+// for a change in progress and the audio thread to let go of the installed one (on a timeout it
+// stays installed and error says so). Requests still waiting complete with the error "returned
+// before install". Without an error, native holds no pipeline handed over before the request, and
+// no later event names one, except for pipelines_returned events already on their way to the app
+// (it ignores names it released). Later SetDenoiser requests work.
 message RootAudioReturnPipelinesRequest {
   required uint64 platform_audio_handle = 1;
 }
@@ -188,10 +194,12 @@ message RootAudioSetMonitorResponse {
   optional string error = 1;
 }
 
-// Counters are cumulative since PlatformAudio creation (the reader takes deltas). Levels are sums of
-// squares in int16 units with their sample counts. Durations are microseconds. The *_max_gap_us and
-// *_max_us fields are the maximum since the previous RootAudioStatsRequest (reset on read: one reader,
-// the app's 100 ms voice sampler).
+// Counters are cumulative for the life of the native audio engine (the factory's ADM, mixer, APM and
+// capture state, shared by every PlatformAudio handle and kept across handles and calls; the reader
+// takes deltas from its own baseline per call). Levels are sums of squares in int16 units with their
+// sample counts. Durations are microseconds. The *_max_gap_us and *_max_us fields are the maximum
+// since the previous RootAudioStatsRequest (reset on read: one reader, the app's 100 ms voice
+// sampler).
 message RootAudioStats {
   // Device IO (AdmProxy transport tap).
   required uint64 capture_callbacks = 1;
@@ -258,10 +266,11 @@ message RootAudioStats {
   // over 5 ms; denoiser_notifications the SDK's slowProcessing notifications through the native
   // handler (process-wide, cumulative). denoiser_bypass_reason: 0 none, 1 rate mismatch (until the
   // processor's rate matches the pipeline again, or a pipeline at its rate is installed), 2 output
-  // stalled (100 empty outputs in a row), 3 slow (3 calls over 5 ms within 60 s, or one over 20 ms
-  // other than the first call after an install or a flush, a warm-up that is still counted); 2 and
-  // 3 last until the pipeline is replaced or removed. A call's time includes the flush and power
-  // change made with it.
+  // stalled (100 empty outputs in a row), 3 slow (3 calls over 5 ms within 60 s, or one over 20 ms,
+  // counting only plain calls: not the first after an install, a flush or a stream restart, nor one
+  // with a power change); 2 and 3 last until the pipeline is replaced or removed. A call's time
+  // includes the flush and power change made with it (denoiser_slow_frames, the maximum and the
+  // histogram count every call).
   required bool denoiser_installed = 50;
   required uint64 denoiser_frames = 51;
   required uint64 denoiser_misses = 52;
@@ -312,7 +321,9 @@ message RootAudioStats {
   // control reaching native to the first frame processed with it open; 0 before any.
   optional uint64 gate_open_delay_us = 82;
   // Frames sent with the transmit gate open while denoiser_wanted was set but neither the denoiser
-  // ran nor WebRTC NS was applied (startup hold excluded): a gap in noise suppression.
+  // ran nor WebRTC NS was applied (startup hold excluded): a gap in noise suppression. This includes
+  // the designed ones: the grace for a missing denoiser (webrtc_ns_fallback) and the fallback's way
+  // to the APM (ns_fallback_pending_frames).
   optional uint64 ns_gap_frames = 83;
 
   // Denoiser details (capability DENOISER; absent without it).
@@ -326,10 +337,12 @@ message RootAudioStats {
   repeated uint64 denoiser_process_us_buckets = 87;
   // Notifications with a code other than slowProcessing.
   optional uint64 denoiser_other_notifications = 88;
-  // The aligner (DenoiseFrameAligner): latency it adds now (inserted minus drained and trimmed since
-  // it last started over: a new pipeline, a flush, a rate change, or the denoiser out of use; the
-  // app's managed denoiser counted from its creation, which only differs after such a restart),
-  // samples it holds, and its cumulative underruns and padded, trimmed and drained samples.
+  // The aligner (DenoiseFrameAligner) on the last frame: the latency it adds (inserted minus drained
+  // and trimmed since it last started over: a new pipeline, a flush or stream restart, a rate change,
+  // a session reset, or the denoiser out of use; the app's managed denoiser counted from its own
+  // creation, which only differs after such a restart) and the samples it holds. Its underruns and
+  // padded, trimmed and drained samples are cumulative for the engine's life like every counter here
+  // (across sessions and restarts).
   optional float denoiser_latency_ms = 89;
   optional uint32 denoiser_buffered_samples = 90;
   optional uint64 denoiser_underruns = 91;
@@ -339,7 +352,8 @@ message RootAudioStats {
   // process() calls of the installed pipeline before its first output (-1 none yet or no pipeline).
   optional int32 denoiser_frames_until_first_output = 95;
   // Native turned WebRTC NS on because denoiser_wanted is set and the denoiser stopped (output
-  // stalled or slow: at once) or is missing, bypassed for its rate or removed for over 1 s.
+  // stalled or slow: at once) or is missing, bypassed for its rate or removed for over 1 s of frames
+  // (not counting the time a handed-over pipeline waits for a pause in speech, at most 3 s).
   optional bool webrtc_ns_fallback = 96;
 
   // APM policy (echo cancellation and WebRTC NS changes): applications that reached the APM, those
@@ -349,6 +363,11 @@ message RootAudioStats {
   optional uint64 apm_policy_deferred = 98;
   optional uint64 apm_policy_forced = 99;
   optional bool apm_policy_pending = 100;
+
+  // Frames processed while native had decided on its WebRTC NS fallback but the APM had not applied
+  // NS yet (capability DENOISER; absent without it): the fallback's own way to the APM, part of
+  // ns_gap_frames when it happens while denoiser_wanted is set and the transmit gate is open.
+  optional uint64 ns_fallback_pending_frames = 101;
 }
 message RootAudioStatsRequest {
   required uint64 platform_audio_handle = 1;
@@ -373,7 +392,8 @@ message RootAudioCaptureFormat {
   required uint32 channels = 2;
 }
 // Pipelines native no longer holds, for the app to release, each sent once: to the handle that set
-// it while that handle lives, else to the newest live handle.
+// it while that handle lives, else to the newest live handle. One sent just before a ReturnPipelines
+// response may also be in it (released once).
 message RootAudioPipelinesReturned {
   repeated uint64 pipelines = 1;
 }

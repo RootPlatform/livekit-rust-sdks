@@ -104,9 +104,6 @@ const KNOWN_RESOLVE_EVERY_PASSES: u32 = 5;
 const NEW_SOURCE_PASS_DELAY_POLLS: u32 = 5;
 /// The longest effect clip RegisterEffect accepts (60 s at 48 kHz).
 const MAX_EFFECT_SAMPLES: u32 = 48_000 * 60;
-/// The rates the DSP chain runs at.
-const MIN_DENOISER_RATE: u32 = 8_000;
-const MAX_DENOISER_RATE: u32 = 48_000;
 
 /// What a session drives: the handle's PlatformAudio (a recorder in tests).
 trait RootAudioSink {
@@ -188,6 +185,12 @@ impl Sessions {
 /// lock only, never under SESSIONS, which every handle's events task takes.
 static LIFECYCLE: Mutex<()> = Mutex::new(());
 
+/// Held from taking native's denoiser completions and returned pipelines
+/// until they are in the mail, so a ReturnPipelines response never misses
+/// what another thread took. Taken before SESSIONS, never while waiting on
+/// the audio thread.
+static DENOISER_TAKE: Mutex<()> = Mutex::new(());
+
 /// A session starts; the first one resets the shared controls.
 fn open_session(sessions: &Mutex<Sessions>, handle: FfiHandleId, sink: &dyn RootAudioSink) {
     let _order = LIFECYCLE.lock();
@@ -206,8 +209,19 @@ fn close_session(sessions: &Mutex<Sessions>, handle: FfiHandleId, sink: &dyn Roo
         return;
     }
     sink.reset_controls(true);
+    let _take = DENOISER_TAKE.lock();
     let (completions, returned) = sink.take_denoiser();
     sessions.lock().deliver(completions, returned);
+}
+
+/// What ReturnPipelines adds to native's own list: everything not sent to a
+/// handle yet, including the pipelines of error results still in the mail.
+fn take_undelivered(sessions: &Mutex<Sessions>, sink: &dyn RootAudioSink) -> Vec<u64> {
+    let _take = DENOISER_TAKE.lock();
+    let (completions, returned) = sink.take_denoiser();
+    let mut sessions = sessions.lock();
+    sessions.deliver(completions, returned);
+    sessions.mail.take_undelivered()
 }
 
 /// The ReturnPipelines response: what native took back, then everything not
@@ -299,11 +313,19 @@ impl DenoiserMail {
         )
     }
 
-    /// Every pipeline not sent yet, for a ReturnPipelines response.
+    /// Every pipeline not sent yet, for a ReturnPipelines response: returned
+    /// ones, orphans, and those of error results still waiting for their
+    /// handle (the result still goes to it, without the pipeline, so a later
+    /// close routes nothing).
     fn take_undelivered(&mut self) -> Vec<u64> {
         let mut pipelines = std::mem::take(&mut self.orphans);
         for (_, returned) in self.returned.drain() {
             pipelines.extend(returned);
+        }
+        for completion in self.completions.values_mut().flatten() {
+            if completion.error.is_some() && completion.pipeline != 0 {
+                pipelines.push(std::mem::take(&mut completion.pipeline));
+            }
         }
         pipelines
     }
@@ -620,11 +642,14 @@ impl RootAudioSession {
                 _ = &mut dropped => break,
                 _ = interval.tick() => {}
             }
+            let take = DENOISER_TAKE.lock();
             let Some(poll) = self.state.lock().audio.as_ref().map(NativePoll::read) else {
                 break;
             };
             let (format, sources) = (poll.format, poll.sources);
-            for message in events.update(self.handle, poll) {
+            let messages = events.update(self.handle, poll);
+            drop(take);
+            for message in messages {
                 send_root_audio_event(server, self.handle, message);
             }
             if format.seq != last_format_seq {
@@ -1040,9 +1065,12 @@ pub fn on_stop_effects(
 }
 
 /// Why a SetDenoiser request fails before it is queued: an install needs the
-/// Effects SDK slot, an aligned pointer and a rate the chain runs (8-48 kHz).
-/// A removal without a slot has nothing to remove and succeeds.
-fn denoiser_request_error(available: bool, pipeline: u64, sample_rate: u32) -> Option<String> {
+/// Effects SDK slot and an aligned pointer (no pipeline native accepted is
+/// misaligned). A removal without a slot has nothing to remove and succeeds.
+/// The rate (8-48 kHz) is checked natively, which first looks whether it
+/// still holds the pipeline: an error then would have the app release a
+/// pipeline native may call.
+fn denoiser_request_error(available: bool, pipeline: u64) -> Option<String> {
     if pipeline == 0 {
         return None;
     }
@@ -1051,11 +1079,6 @@ fn denoiser_request_error(available: bool, pipeline: u64, sample_rate: u32) -> O
     }
     if pipeline % std::mem::align_of::<usize>() as u64 != 0 {
         return Some("pipeline pointer is not aligned".into());
-    }
-    if !(MIN_DENOISER_RATE..=MAX_DENOISER_RATE).contains(&sample_rate) {
-        return Some(format!(
-            "pipeline rate {sample_rate} is outside {MIN_DENOISER_RATE}-{MAX_DENOISER_RATE} Hz"
-        ));
     }
     None
 }
@@ -1071,7 +1094,7 @@ pub fn on_set_denoiser(
     let async_id = server.next_id();
     let handle = req.platform_audio_handle;
     let available = audio.denoiser_available();
-    let mut error = denoiser_request_error(available, req.pipeline_ptr, req.sample_rate);
+    let mut error = denoiser_request_error(available, req.pipeline_ptr);
     let queued = error.is_none() && available;
     if queued {
         if let Err(e) = audio.set_denoiser(handle, async_id, req.pipeline_ptr, req.sample_rate) {
@@ -1105,13 +1128,7 @@ pub fn on_return_pipelines(
         return Ok(proto::RootAudioReturnPipelinesResponse { pipelines: Vec::new(), error: None });
     }
     let held = audio.return_denoiser_pipelines();
-    let completions = audio.take_denoiser_completions();
-    let returned = audio.take_returned_pipelines();
-    let undelivered = {
-        let mut sessions = SESSIONS.lock();
-        sessions.deliver(completions, returned);
-        sessions.mail.take_undelivered()
-    };
+    let undelivered = take_undelivered(&SESSIONS, &audio);
     let pipelines = merge_returned(held.pipelines, undelivered);
     Ok(proto::RootAudioReturnPipelinesResponse { pipelines, error: held.error })
 }
@@ -1209,6 +1226,7 @@ impl From<RootAudioStats> for proto::RootAudioStats {
             denoiser_drained_samples: stats.denoiser_drained_samples,
             denoiser_frames_until_first_output: stats.denoiser_frames_until_first_output,
             webrtc_ns_fallback: stats.webrtc_ns_fallback,
+            ns_fallback_pending_frames: stats.ns_fallback_pending_frames,
             apm_policy_applies: stats.apm_policy_applies,
             apm_policy_deferred: stats.apm_policy_deferred,
             apm_policy_forced: stats.apm_policy_forced,
@@ -1614,6 +1632,51 @@ mod tests {
         assert_eq!(pipelines, [0x10, 0x20, 0x30, 0x40]);
     }
 
+    #[test]
+    fn rootapp_audio_return_pipelines_takes_the_pipeline_of_an_undelivered_error() {
+        let mut sessions = Sessions::default();
+        sessions.open(1);
+        sessions.open(2);
+        sessions.deliver(vec![failed(1, 10, "superseded", 0x100)], Vec::new());
+        assert_eq!(sessions.mail.take_undelivered(), [0x100], "the response lists it");
+        assert_eq!(
+            sessions.mail.take(1),
+            (vec![(10, Some("superseded".to_string()))], Vec::new()),
+            "the handle still hears its result"
+        );
+
+        sessions.deliver(vec![failed(1, 11, "the audio thread did not let go", 0x200)], Vec::new());
+        assert_eq!(sessions.mail.take_undelivered(), [0x200]);
+        sessions.close(1);
+        assert_eq!(sessions.mail.take(2), (Vec::new(), Vec::new()), "closing routes nothing");
+        assert!(sessions.mail.take_undelivered().is_empty(), "nor is it kept as an orphan");
+    }
+
+    #[test]
+    fn rootapp_audio_return_pipelines_waits_for_what_an_events_task_took() {
+        let sessions = Mutex::new(Sessions::default());
+        sessions.lock().open(1);
+        let sink = LifecycleSink {
+            sessions: &sessions,
+            resets: Default::default(),
+            native: Default::default(),
+        };
+        let (taken, taken_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                // An events task between native's take and its delivery.
+                let _take = DENOISER_TAKE.lock();
+                let returned = vec![returned(1, 0x500)];
+                taken.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(50));
+                sessions.lock().deliver(Vec::new(), returned);
+            });
+            taken_rx.recv().unwrap();
+            assert_eq!(take_undelivered(&sessions, &sink), [0x500]);
+        });
+        assert_eq!(sessions.lock().mail.take(1), (Vec::new(), Vec::new()), "sent once");
+    }
+
     fn speaking(speaking: bool, seq: u64) -> LocalSpeaking {
         LocalSpeaking { speaking, seq }
     }
@@ -1692,15 +1755,11 @@ mod tests {
     #[test]
     fn rootapp_audio_set_denoiser_validates_before_queueing() {
         let aligned = 0x1000u64;
-        assert_eq!(denoiser_request_error(true, aligned, 48_000), None);
-        assert_eq!(denoiser_request_error(true, aligned, 16_000), None);
-        assert_eq!(denoiser_request_error(true, aligned, 8_000), None);
-        assert!(denoiser_request_error(true, aligned, 7_999).is_some());
-        assert!(denoiser_request_error(true, aligned, 96_000).is_some());
-        assert!(denoiser_request_error(true, aligned + 1, 48_000).is_some());
-        assert!(denoiser_request_error(false, aligned, 48_000).unwrap().contains(NOT_SUPPORTED));
-        assert_eq!(denoiser_request_error(false, 0, 0), None, "nothing to remove is no error");
-        assert_eq!(denoiser_request_error(true, 0, 0), None, "a removal needs no rate");
+        assert_eq!(denoiser_request_error(true, aligned), None, "the rate is checked natively");
+        assert!(denoiser_request_error(true, aligned + 1).is_some());
+        assert!(denoiser_request_error(false, aligned).unwrap().contains(NOT_SUPPORTED));
+        assert_eq!(denoiser_request_error(false, 0), None, "nothing to remove is no error");
+        assert_eq!(denoiser_request_error(true, 0), None);
     }
 
     #[test]
@@ -1747,6 +1806,7 @@ mod tests {
             denoiser_drained_samples: Some(29),
             denoiser_frames_until_first_output: Some(30),
             webrtc_ns_fallback: Some(true),
+            ns_fallback_pending_frames: Some(34),
             apm_policy_applies: Some(31),
             apm_policy_deferred: Some(32),
             apm_policy_forced: Some(33),
@@ -1793,12 +1853,14 @@ mod tests {
             ),
             (Some(31), Some(32), Some(33), Some(false))
         );
+        assert_eq!(p.ns_fallback_pending_frames, Some(34));
 
         let absent: proto::RootAudioStats = RootAudioStats::default().into();
         assert_eq!(
             (absent.speaking, absent.denoiser_rate, absent.apm_policy_applies),
             (None, None, None)
         );
+        assert_eq!(absent.ns_fallback_pending_frames, None);
         assert!(absent.denoiser_process_us_buckets.is_empty());
         assert!(absent.voice_gain_db.is_nan() && absent.gate_in_block_peak_db.is_nan());
     }
