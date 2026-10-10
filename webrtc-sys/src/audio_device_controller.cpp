@@ -135,31 +135,27 @@ int16_t AudioDeviceController::recording_devices() const {
 
 // Names may be cut inside a UTF-8 sequence, so they are passed on lossily.
 rust::String AudioDeviceController::playout_device_name(uint16_t index) const {
-  char name[webrtc::kAdmMaxDeviceNameSize] = {0};
-  char guid[webrtc::kAdmMaxGuidSize] = {0};
-  adm_proxy_->PlayoutDeviceName(index, name, guid);
-  return rust::String::lossy(AdmDeviceString(name, sizeof(name)));
+  AdmNameBuffers buffers;
+  adm_proxy_->PlayoutDeviceName(index, buffers.name, buffers.guid);
+  return rust::String::lossy(buffers.Name());
 }
 
 rust::String AudioDeviceController::recording_device_name(uint16_t index) const {
-  char name[webrtc::kAdmMaxDeviceNameSize] = {0};
-  char guid[webrtc::kAdmMaxGuidSize] = {0};
-  adm_proxy_->RecordingDeviceName(index, name, guid);
-  return rust::String::lossy(AdmDeviceString(name, sizeof(name)));
+  AdmNameBuffers buffers;
+  adm_proxy_->RecordingDeviceName(index, buffers.name, buffers.guid);
+  return rust::String::lossy(buffers.Name());
 }
 
 rust::String AudioDeviceController::playout_device_guid(uint16_t index) const {
-  char name[webrtc::kAdmMaxDeviceNameSize] = {0};
-  char guid[webrtc::kAdmMaxGuidSize] = {0};
-  adm_proxy_->PlayoutDeviceName(index, name, guid);
-  return rust::String::lossy(AdmDeviceString(guid, sizeof(guid)));
+  AdmNameBuffers buffers;
+  adm_proxy_->PlayoutDeviceName(index, buffers.name, buffers.guid);
+  return rust::String::lossy(buffers.Guid());
 }
 
 rust::String AudioDeviceController::recording_device_guid(uint16_t index) const {
-  char name[webrtc::kAdmMaxDeviceNameSize] = {0};
-  char guid[webrtc::kAdmMaxGuidSize] = {0};
-  adm_proxy_->RecordingDeviceName(index, name, guid);
-  return rust::String::lossy(AdmDeviceString(guid, sizeof(guid)));
+  AdmNameBuffers buffers;
+  adm_proxy_->RecordingDeviceName(index, buffers.name, buffers.guid);
+  return rust::String::lossy(buffers.Guid());
 }
 
 #if LK_ADM_MOBILE

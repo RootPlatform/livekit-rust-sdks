@@ -187,10 +187,10 @@ std::optional<std::string> CoreAudioUidToGuid(const std::string& uid) {
       kAudioHardwarePropertyTranslateUIDToDevice,
       kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
   AudioObjectID device = kAudioObjectUnknown;
-  UInt32 size = sizeof(device);
-  const OSStatus status =
-      AudioObjectGetPropertyData(kAudioObjectSystemObject, &address,
-                                 sizeof(cf_uid), &cf_uid, &size, &device);
+  UInt32 size = static_cast<UInt32>(sizeof(device));
+  const OSStatus status = AudioObjectGetPropertyData(
+      kAudioObjectSystemObject, &address, static_cast<UInt32>(sizeof(cf_uid)),
+      &cf_uid, &size, &device);
   CFRelease(cf_uid);
   if (status != noErr || device == kAudioObjectUnknown) {
     return std::nullopt;
@@ -999,18 +999,18 @@ int AdmProxy::ResolveSelectionLocked(
   return ResolveAdmDeviceIndex(
       *wanted, count,
       [platform_adm, playout](int index, std::string* name, std::string* guid) {
-        char name_buf[webrtc::kAdmMaxDeviceNameSize] = {0};
-        char guid_buf[webrtc::kAdmMaxGuidSize] = {0};
+        AdmNameBuffers buffers;
         const uint16_t device = static_cast<uint16_t>(index);
         const int32_t result =
-            playout
-                ? platform_adm->PlayoutDeviceName(device, name_buf, guid_buf)
-                : platform_adm->RecordingDeviceName(device, name_buf, guid_buf);
+            playout ? platform_adm->PlayoutDeviceName(device, buffers.name,
+                                                      buffers.guid)
+                    : platform_adm->RecordingDeviceName(device, buffers.name,
+                                                        buffers.guid);
         if (result != 0) {
           return false;
         }
-        *name = FromAdmBuffer(name_buf, sizeof(name_buf));
-        *guid = FromAdmBuffer(guid_buf, sizeof(guid_buf));
+        *name = buffers.Name();
+        *guid = buffers.Guid();
         return true;
       });
 #endif

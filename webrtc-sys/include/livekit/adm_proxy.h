@@ -91,6 +91,21 @@ int ResolveAdmDeviceIndex(
 // An ADM name or GUID buffer as a string, also when it is unterminated.
 std::string AdmDeviceString(const char* buffer, size_t size);
 
+// Buffers for an ADM's *DeviceName with a zeroed byte past each: the macOS
+// ADM may fill the name without terminating it, and libwebrtc's ADM wrapper
+// logs it as a C string.
+struct AdmNameBuffers {
+  char name[webrtc::kAdmMaxDeviceNameSize + 1] = {};
+  char guid[webrtc::kAdmMaxGuidSize + 1] = {};
+
+  std::string Name() const {
+    return AdmDeviceString(name, webrtc::kAdmMaxDeviceNameSize);
+  }
+  std::string Guid() const {
+    return AdmDeviceString(guid, webrtc::kAdmMaxGuidSize);
+  }
+};
+
 // A device UID's current ADM GUID, or nullopt when no device has that UID.
 using AdmUidTranslator =
     std::function<std::optional<std::string>(const std::string& uid)>;
