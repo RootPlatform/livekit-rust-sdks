@@ -18,14 +18,30 @@
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
+#include <functional>
 #include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <thread>
+#include <vector>
 
 #include "rust/cxx.h"
 
 namespace livekit_ffi {
 struct RootDenoiserNotificationCounts;
+struct RootFakeFxSpec;
+struct RootFakeFxCounts;
+struct RootDenoiseTestFrame;
+struct RootDenoiserSlotInfo;
+struct RootDenoiserTestCompletion;
+struct RootDenoiserTestReturned;
+struct RootDenoiserTestReturnAll;
+class RootDenoiserHarness;
 }  // namespace livekit_ffi
 #include "webrtc-sys/src/root_denoiser.rs.h"
 
@@ -101,18 +117,19 @@ struct RootDenoiserSlotStats {
 // The Effects SDK pipeline the capture processor runs, shared between the
 // audio thread and the control side by an ownership word (Free, Audio,
 // Control). The audio thread only ever tries to take it and passes the frame
-// dry when it cannot; the control side takes it with bounded 1 ms sleeps. The
-// slot never releases a pipeline: whoever removes one hands it back to the app.
+// dry when it cannot; the control side takes it with 1 ms sleeps for a bounded
+// time. The slot never releases a pipeline: whoever removes one hands it back
+// to the app.
 class RootDenoiserSlot {
  public:
   static constexpr size_t kOutputFrames = 8;
-  static constexpr uint32_t kSlowFrameUs = 5000;
-  static constexpr uint32_t kStalledFrameUs = 20000;
-  static constexpr int kSlowFramesToBypass = 3;
+  static constexpr int64_t kSlowFrameUs = 5000;
+  static constexpr int64_t kStalledFrameUs = 20000;
+  static constexpr size_t kSlowFramesToBypass = 3;
   static constexpr int64_t kSlowWindowUs = 60'000'000;
-  static constexpr int kControlTries = 200;
+  static constexpr int kControlTimeoutMs = 200;
   static constexpr size_t kHistogramBuckets = 16;
-  static constexpr std::array<uint32_t, kHistogramBuckets - 1>
+  static constexpr std::array<int64_t, kHistogramBuckets - 1>
       kHistogramBoundsUs = {50,   100,  150,  200,  300,   400,   500,  750,
                             1000, 1500, 2000, 3000, 5000, 10000, 20000};
 
@@ -124,7 +141,7 @@ class RootDenoiserSlot {
   // Audio thread only. Never blocks, allocates or logs. `in` is the FloatS16
   // frame (frames = rate / 100); `out` receives up to 8 x frames samples.
   // `flush` asks for flush(nullptr, 0) before the next process() (kept until
-  // one runs).
+  // one runs; a new pipeline needs none). `power` is applied when it changed.
   RootDenoiseResult ProcessAudio(const float* in,
                                  size_t frames,
                                  int sample_rate,
@@ -132,18 +149,19 @@ class RootDenoiserSlot {
                                  float power,
                                  float* out,
                                  size_t out_capacity);
-  // Audio thread: bypass the installed pipeline from the next frame on.
+  // Audio thread: bypass the pipeline that last ran from the next frame on
+  // (ignored when it was replaced meanwhile).
   void LatchBypass(RootDenoiserBypass reason);
 
-  // Control side (never the audio thread). Each takes the slot with up to
-  // `tries` 1 ms sleeps and returns false, changing nothing, when the audio
-  // thread did not let go. The pipeline it replaced or removed (may be null)
-  // goes to `previous`.
+  // Control side (never the audio thread). Each takes the slot with 1 ms
+  // sleeps for up to `timeout_ms` and returns false, changing nothing, when
+  // the audio thread did not let go. The pipeline it replaced or removed (may
+  // be null) goes to `previous`.
   bool Install(RootFxPipeline* pipeline,
                uint32_t rate,
-               int tries,
+               int timeout_ms,
                RootFxPipeline** previous);
-  bool Remove(int tries, RootFxPipeline** previous);
+  bool Remove(int timeout_ms, RootFxPipeline** previous);
 
   // Any thread.
   bool installed() const;
@@ -152,17 +170,21 @@ class RootDenoiserSlot {
   // `take_max` resets process_max_us.
   RootDenoiserSlotStats ReadStats(bool take_max);
 
-  // Tests: install or remove at once.
+  // Tests: install or remove at once (the replaced pipeline is dropped).
   bool InstallForTest(void* pipeline, uint32_t rate);
   void* RemoveForTest();
+  // Tests: hold the slot as the audio thread would during process().
+  bool HoldForTest(bool hold);
 
  private:
   static constexpr uint32_t kFree = 0;
   static constexpr uint32_t kAudio = 1;
   static constexpr uint32_t kControl = 2;
 
-  bool AcquireControl(int tries);
-  void ReleaseControl();
+  bool AcquireControl(int timeout_ms);
+  void Publish(RootFxPipeline* pipeline, uint32_t rate);
+  void ApplyPendingBypass();
+  void CountProcess(int64_t elapsed_us, size_t samples);
 
   std::atomic<uint32_t> owner_{kFree};
   // Written only while the control side owns the slot, read only while the
@@ -181,7 +203,9 @@ class RootDenoiserSlot {
   bool flush_pending_ = false;
   float applied_power_ = 0.0f;
   bool first_output_seen_ = false;
-  uint32_t calls_before_output_ = 0;
+  int32_t calls_before_output_ = 0;
+  RootDenoiserBypass pending_bypass_ = RootDenoiserBypass::kNone;
+  uint64_t pending_bypass_generation_ = 0;
   std::array<int64_t, kSlowFramesToBypass> slow_times_us_{};
   size_t slow_count_ = 0;
 
@@ -196,6 +220,141 @@ class RootDenoiserSlot {
   std::array<std::atomic<uint64_t>, kHistogramBuckets> histogram_{};
 };
 
+// Native WebRTC NS covering a denoiser that is wanted but not running: on at
+// once when the installed pipeline was bypassed for a stalled output or slow
+// frames, on after `grace_ms` when none runs for another reason (missing,
+// removed, bypassed for its rate); off once it runs again or is not wanted.
+class RootNsFallback {
+ public:
+  static constexpr int64_t kGraceMs = 1000;
+
+  explicit RootNsFallback(int64_t grace_ms = kGraceMs);
+
+  // The new state when it changes.
+  std::optional<bool> Update(int64_t now_ms,
+                             bool wanted,
+                             bool installed,
+                             RootDenoiserBypass bypass,
+                             uint32_t pipeline_rate,
+                             uint32_t process_rate);
+  bool on() const { return on_; }
+  void Reset();
+
+ private:
+  const int64_t grace_ms_;
+  bool on_ = false;
+  std::optional<int64_t> inactive_since_ms_;
+};
+
+struct RootDenoiserCompletion {
+  uint64_t owner = 0;
+  uint64_t async_id = 0;
+  // Empty on success.
+  std::string error;
+};
+
+struct RootDenoiserReturned {
+  uint64_t owner = 0;
+  uint64_t pipeline = 0;
+};
+
+struct RootDenoiserReturnAll {
+  std::vector<uint64_t> pipelines;
+  // Empty unless the installed pipeline could not be removed.
+  std::string error;
+};
+
+// The control side of the slot: the `rootapp-effects` thread installs and
+// removes pipelines (an install waits for a pause in the user's speech, at
+// most install_wait_ms), runs the WebRTC NS fallback every tick, and keeps the
+// completions and returned pipelines until the FFI layer takes them. Owners
+// are the FFI handles that made the requests.
+class RootDenoiserControl {
+ public:
+  struct Hooks {
+    // The published speaking flag.
+    std::function<bool()> speaking;
+    std::function<bool()> wanted;
+    // The capture processor's rate, 0 before any frame.
+    std::function<uint32_t()> process_rate;
+    // Turns the native WebRTC NS fallback on or off.
+    std::function<void(bool)> set_fallback;
+  };
+  struct Timing {
+    int64_t install_wait_ms = 3000;
+    int64_t fallback_grace_ms = RootNsFallback::kGraceMs;
+    int64_t tick_ms = 10;
+    int control_timeout_ms = RootDenoiserSlot::kControlTimeoutMs;
+  };
+
+  static constexpr char kErrorSuperseded[] =
+      "superseded by a newer denoiser request";
+  static constexpr char kErrorBusy[] = "the audio thread did not let go";
+  static constexpr char kErrorReturned[] = "returned before install";
+  static constexpr char kErrorSessionEnded[] =
+      "the last platform audio handle was dropped before install";
+
+  RootDenoiserControl(std::shared_ptr<RootDenoiserSlot> slot,
+                      Hooks hooks,
+                      Timing timing);
+  ~RootDenoiserControl();
+  RootDenoiserControl(const RootDenoiserControl&) = delete;
+  RootDenoiserControl& operator=(const RootDenoiserControl&) = delete;
+
+  // Queues an install (`pipeline` non-zero) or a removal; completes once.
+  void Set(uint64_t owner, uint64_t async_id, uint64_t pipeline, uint32_t rate);
+  // Something the fallback depends on changed (denoiser_wanted).
+  void Wake();
+  // Every pipeline held, waiting or not yet taken back: the requests still
+  // waiting complete with kErrorReturned and the installed one is removed.
+  RootDenoiserReturnAll ReturnAll();
+  // The last session ended: the installed and waiting pipelines go to the
+  // returned list and the fallback is off.
+  void Reset();
+  std::vector<RootDenoiserCompletion> TakeCompletions();
+  std::vector<RootDenoiserReturned> TakeReturned();
+  bool fallback() const;
+  size_t pending() const;
+
+ private:
+  struct Request {
+    uint64_t seq = 0;
+    uint64_t owner = 0;
+    uint64_t async_id = 0;
+    uint64_t pipeline = 0;
+    uint32_t rate = 0;
+    int64_t since_ms = 0;
+  };
+
+  void Run();
+  void EnsureThreadLocked();
+  // Takes mutex_ again before returning.
+  void CommitLocked(std::unique_lock<std::mutex>& lock, uint64_t seq);
+  bool TickLocked(int64_t now_ms);
+  void CompleteLocked(const Request& request, std::string error);
+  void ReturnLocked(uint64_t owner, RootFxPipeline* pipeline);
+  void DrainRequestsLocked(const char* error, std::vector<uint64_t>* into);
+
+  const std::shared_ptr<RootDenoiserSlot> slot_;
+  const Hooks hooks_;
+  const Timing timing_;
+
+  // Serialises the control side's slot changes; taken before mutex_.
+  std::mutex slot_mutex_;
+  mutable std::mutex mutex_;
+  std::condition_variable wake_;
+  std::deque<Request> queue_;
+  std::optional<Request> waiting_;
+  uint64_t next_seq_ = 0;
+  uint64_t installed_owner_ = 0;
+  std::vector<RootDenoiserCompletion> completions_;
+  std::vector<RootDenoiserReturned> returned_;
+  RootNsFallback fallback_;
+  std::atomic<bool> fallback_on_{false};
+  bool stop_ = false;
+  std::thread thread_;
+};
+
 // The native INotificationHandler the app installs on every pipeline it hands
 // over: static, so a notification that arrives after its pipeline is gone is
 // still safe. It only counts.
@@ -205,6 +364,10 @@ RootDenoiserNotificationCounts root_denoiser_notification_counts();
 // The handler's address as an integer, 0 where the denoiser is not built.
 size_t root_denoiser_notification_handler();
 bool root_denoiser_supported();
+// Tests: one fake INotification per code through the handler's vtable, and a
+// null notification first with `include_null`.
+void root_denoiser_notify_for_test(rust::Slice<const int32_t> codes,
+                                   bool include_null);
 
 // Tests: a C++ object with the SDK's vtable layout. Output = round(scale x
 // input) delayed by delay_samples (a FIFO that starts, and restarts on a flush,
@@ -284,5 +447,72 @@ class RootFakeFxPipeline {
   std::atomic<uint64_t> calls_after_poison_{0};
   std::atomic<uint64_t> releases_{0};
 };
+
+// Tests: a slot with fake pipelines, an optional thread calling ProcessAudio
+// as the capture thread would, and the control side over hooks the test sets.
+class RootDenoiserHarness {
+ public:
+  RootDenoiserHarness(int64_t install_wait_ms, int64_t fallback_grace_ms);
+  ~RootDenoiserHarness();
+
+  size_t add_fake(const RootFakeFxSpec& spec) const;
+  uint64_t fake_pipeline(size_t index) const;
+  RootFakeFxCounts fake_counts(size_t index) const;
+  void poison_fake(size_t index) const;
+  void set_fake_sleep_us(size_t index, uint32_t sleep_us) const;
+  void set_fake_empty(size_t index, bool empty) const;
+
+  bool install_now(size_t index, uint32_t rate) const;
+  uint64_t remove_now() const;
+  // Install with the control side's timeout; returns the replaced pipeline,
+  // or u64::MAX when the audio thread did not let go.
+  uint64_t swap(uint64_t pipeline, uint32_t rate) const;
+  bool hold_slot(bool hold) const;
+  RootDenoiseTestFrame process(uint32_t rate,
+                               rust::Slice<const float> input,
+                               bool flush,
+                               float power,
+                               size_t out_capacity) const;
+  void latch_bypass(uint32_t reason) const;
+  RootDenoiserSlotInfo slot_info(bool take_max) const;
+
+  // A thread calling ProcessAudio back to back on a tone at `rate`.
+  void start_audio(uint32_t rate) const;
+  // Stops it; returns how many frames it ran.
+  uint64_t stop_audio() const;
+
+  void set_speaking(bool speaking) const;
+  void set_wanted(bool wanted) const;
+  void set_process_rate(uint32_t rate) const;
+  void request(uint64_t owner,
+               uint64_t async_id,
+               uint64_t pipeline,
+               uint32_t rate) const;
+  void wake() const;
+  RootDenoiserTestReturnAll return_all() const;
+  void reset() const;
+  rust::Vec<RootDenoiserTestCompletion> take_completions() const;
+  rust::Vec<RootDenoiserTestReturned> take_returned() const;
+  // Every fallback change the control side made since the last take.
+  rust::Vec<uint8_t> take_fallback_changes() const;
+  bool fallback() const;
+  size_t pending() const;
+
+  // The fallback state machine alone: -1 no change, 0 off, 1 on.
+  int8_t fallback_update(int64_t now_ms,
+                         bool wanted,
+                         bool installed,
+                         uint32_t bypass,
+                         uint32_t pipeline_rate,
+                         uint32_t process_rate) const;
+
+ private:
+  struct State;
+  std::unique_ptr<State> state_;
+};
+
+std::unique_ptr<RootDenoiserHarness> new_root_denoiser_harness(
+    int64_t install_wait_ms,
+    int64_t fallback_grace_ms);
 
 }  // namespace livekit_ffi
