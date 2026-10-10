@@ -124,6 +124,21 @@ void RootCaptureState::ResetControls(bool close_gate) {
   auto_gain.store(true, std::memory_order_relaxed);
   gate_threshold.store(0.025f, std::memory_order_relaxed);
   auto_sensitivity.store(true, std::memory_order_relaxed);
+  denoiser_wanted.store(false, std::memory_order_relaxed);
+  dsp_reset_seq.fetch_add(1, std::memory_order_release);
+}
+
+RootDspStatsSnapshot RootCaptureState::ReadDspStats(bool /* take_maxima */) {
+  RootDspStatsSnapshot snapshot;
+  snapshot.processed_frames = processed_frames.load(std::memory_order_relaxed);
+  snapshot.stage_samples = stage_samples.load(std::memory_order_relaxed);
+  snapshot.apm_out_sumsq = apm_out_sumsq.load(std::memory_order_relaxed);
+  snapshot.sent_sumsq = sent_sumsq.load(std::memory_order_relaxed);
+  return snapshot;
+}
+
+RootSpeakingSnapshot RootCaptureState::ReadSpeaking() const {
+  return RootSpeakingSnapshot{};
 }
 
 RootCaptureFormatSnapshot ReadCaptureFormat(const RootCaptureState& state) {
@@ -323,10 +338,12 @@ bool RootApmConfigsEqual(const webrtc::AudioProcessing::Config& a,
 RootApmDecorator::RootApmDecorator(
     webrtc::scoped_refptr<webrtc::AudioProcessing> inner,
     Scheduler scheduler,
-    Clock clock)
+    Clock clock,
+    std::shared_ptr<RootCaptureState> capture_state)
     : inner_(std::move(inner)),
       scheduler_(std::move(scheduler)),
-      clock_(clock ? std::move(clock) : Clock(&SteadyNowMs)) {
+      clock_(clock ? std::move(clock) : Clock(&SteadyNowMs)),
+      capture_(std::move(capture_state)) {
   webrtc::MutexLock lock(&mutex_);
   requested_ = inner_->GetConfig();
   applied_ = requested_;
@@ -429,6 +446,12 @@ void RootApmDecorator::ApplyPolicy() {
   last_policy_apply_ms_ = clock_();
   policy_applied_once_ = true;
   ApplyLocked();
+}
+
+void RootApmDecorator::SetFallbackNoiseSuppression(bool /* on */) {}
+
+RootApmPolicyStats RootApmDecorator::ReadPolicyStats() const {
+  return RootApmPolicyStats{};
 }
 
 RootApmStats RootApmDecorator::ReadStats() {
@@ -627,7 +650,7 @@ webrtc::scoped_refptr<RootApmDecorator> CreateRootAudioProcessing(
     std::shared_ptr<RootCaptureState> capture_state,
     webrtc::TaskQueueBase* policy_queue) {
   webrtc::scoped_refptr<webrtc::AudioProcessing> apm =
-      BuildRootApm(env, std::move(capture_state));
+      BuildRootApm(env, capture_state);
   if (!apm) {
     return nullptr;
   }
@@ -639,9 +662,9 @@ webrtc::scoped_refptr<RootApmDecorator> CreateRootAudioProcessing(
                                     webrtc::TimeDelta::Millis(delay_ms));
     };
   }
-  return webrtc::make_ref_counted<RootApmDecorator>(std::move(apm),
-                                                    std::move(scheduler),
-                                                    RootApmDecorator::Clock());
+  return webrtc::make_ref_counted<RootApmDecorator>(
+      std::move(apm), std::move(scheduler), RootApmDecorator::Clock(),
+      std::move(capture_state));
 }
 
 // =============================================================================

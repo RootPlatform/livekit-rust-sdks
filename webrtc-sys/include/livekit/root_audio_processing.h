@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -60,6 +61,50 @@ enum class RootPushToTalk : uint32_t {
 // The app's VoiceGain only boosts, up to 18 dB.
 constexpr float kRootMaxVoiceGainDb = 18.0f;
 
+class RootDenoiserSlot;
+
+struct RootDspStatsSnapshot {
+  // Consistent with each other (seqlock).
+  uint64_t processed_frames = 0;
+  uint64_t stage_samples = 0;
+  double apm_out_sumsq = 0;
+  double denoised_sumsq = 0;
+  double gate_in_sumsq = 0;
+  double sent_sumsq = 0;
+
+  uint64_t gate_open_frames = 0;
+  uint64_t gate_input_above_frames = 0;
+  uint64_t startup_hold_frames = 0;
+  uint64_t transmit_frames = 0;
+  uint64_t unsupported_frames = 0;
+  uint64_t non_finite_samples = 0;
+  uint64_t dsp_resets = 0;
+  uint64_t dsp_flushes = 0;
+  uint64_t ns_gap_frames = 0;
+  uint64_t speaking_seq = 0;
+  uint64_t gate_open_delay_us = 0;
+  float threshold = 0;
+  float voice_gain_db = std::numeric_limits<float>::quiet_NaN();
+  bool voice_gain_settled = false;
+  bool gate_speaking = false;
+  bool speaking = false;
+  // Maxima since the last take; NaN when no frame ran since.
+  float gate_in_block_peak_db = std::numeric_limits<float>::quiet_NaN();
+  float envelope_max = 0;
+  bool aligner_primed = false;
+  uint32_t aligner_buffered_samples = 0;
+  uint64_t aligner_underruns = 0;
+  uint64_t aligner_padded_samples = 0;
+  uint64_t aligner_trimmed_samples = 0;
+  uint64_t aligner_drained_samples = 0;
+  float aligner_latency_ms = 0;
+};
+
+struct RootSpeakingSnapshot {
+  bool speaking = false;
+  uint64_t seq = 0;
+};
+
 // Shared by the capture post-processor (audio thread) and the control side:
 // atomics only. Settings are written by the control side and read once per
 // frame; outputs are written by the audio thread only.
@@ -77,14 +122,23 @@ struct RootCaptureState {
   std::atomic<uint32_t> gate{0};
   std::atomic<float> input_volume{1.0f};
 
-  // Stored for the DSP chain (Phase 2); nothing reads them yet.
+  // The DSP chain's settings, read once per frame.
   std::atomic<float> denoise_power{0.75f};
   std::atomic<bool> auto_gain{true};
   std::atomic<float> gate_threshold{0.025f};
   std::atomic<bool> auto_sensitivity{true};
+  std::atomic<bool> denoiser_wanted{false};
   // Command: the payload is stored before the sequence number is bumped.
   std::atomic<float> gain_reset_db{0.0f};
   std::atomic<uint64_t> gain_reset_seq{0};
+  // Commands: a session start (bumped by ResetControls) and a recording
+  // (re)start (bumped before each StartRecording).
+  std::atomic<uint64_t> dsp_reset_seq{0};
+  std::atomic<uint64_t> stream_epoch{0};
+  // What the APM decorator has applied.
+  std::atomic<bool> webrtc_ns_applied{false};
+  // Set once before the APM is built; may be null.
+  std::shared_ptr<RootDenoiserSlot> denoiser_slot;
 
   // From CustomProcessing::Initialize to Process.
   std::atomic<int> init_rate{0};
@@ -110,8 +164,14 @@ struct RootCaptureState {
   void SetGate(std::optional<bool> mic_muted,
                std::optional<uint32_t> push_to_talk);
   // Back to the defaults (unity input volume), with the gate open or closed
-  // (muted, push-to-talk key up) in the same store; outputs are kept.
+  // (muted, push-to-talk key up) in the same store, and the DSP chain reset;
+  // outputs are kept.
   void ResetControls(bool close_gate);
+
+  // Any thread but the audio thread. take_maxima resets the block peak and
+  // envelope maxima.
+  RootDspStatsSnapshot ReadDspStats(bool take_maxima);
+  RootSpeakingSnapshot ReadSpeaking() const;
 };
 
 struct RootCaptureFormatSnapshot {
@@ -175,6 +235,14 @@ struct RootApmStats {
   bool noise_suppression_active = false;
 };
 
+struct RootApmPolicyStats {
+  uint64_t applies = 0;
+  uint64_t deferred = 0;
+  uint64_t forced = 0;
+  bool pending = false;
+  bool fallback_ns = false;
+};
+
 // Wraps the factory's APM. Forwards every AudioProcessing call, with three
 // exceptions:
 //  - ApplyConfig merges our policy into whatever the voice engine asks for
@@ -201,10 +269,13 @@ class RootApmDecorator : public webrtc::AudioProcessing {
   using Scheduler =
       std::function<void(int64_t delay_ms, absl::AnyInvocable<void() &&>)>;
 
-  // Without a scheduler policy changes are applied inline.
+  // Without a scheduler policy changes are applied inline. The capture state
+  // (may be null) gives the published speaking flag and receives what NS is
+  // applied.
   RootApmDecorator(webrtc::scoped_refptr<webrtc::AudioProcessing> inner,
                    Scheduler scheduler,
-                   Clock clock);
+                   Clock clock,
+                   std::shared_ptr<RootCaptureState> capture_state = nullptr);
   ~RootApmDecorator() override;
 
   // Unset values leave that part of the policy as it is.
@@ -212,6 +283,9 @@ class RootApmDecorator : public webrtc::AudioProcessing {
                  std::optional<bool> noise_suppression);
   // Back to following what the voice engine asks.
   void ResetPolicy();
+  // The native denoiser fallback: on forces WebRTC NS on.
+  void SetFallbackNoiseSuppression(bool on);
+  RootApmPolicyStats ReadPolicyStats() const;
 
   // Off the audio threads. GetStatistics takes the APM's stats lock, which the
   // capture thread holds briefly once per frame (as for libwebrtc's own
@@ -284,6 +358,7 @@ class RootApmDecorator : public webrtc::AudioProcessing {
   const webrtc::scoped_refptr<webrtc::AudioProcessing> inner_;
   const Scheduler scheduler_;
   const Clock clock_;
+  const std::shared_ptr<RootCaptureState> capture_;
 
   mutable webrtc::Mutex mutex_;
   Config requested_;

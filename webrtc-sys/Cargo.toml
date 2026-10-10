@@ -13,6 +13,7 @@ default = []
 [dependencies]
 cxx = "1.0"
 log = { workspace = true }
+rootapp-voice-dsp = { path = "../rootapp-voice-dsp" }
 
 [build-dependencies]
 webrtc-sys-build = { workspace = true }
