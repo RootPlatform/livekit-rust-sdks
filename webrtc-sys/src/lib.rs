@@ -36,6 +36,7 @@ pub mod peer_connection_factory;
 pub mod prohibit_libsrtp_initialization;
 pub mod root_audio_mixer;
 pub mod root_audio_processing;
+pub mod root_denoiser;
 
 #[cfg(test)]
 mod adm_proxy_tests;

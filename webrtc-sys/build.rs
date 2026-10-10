@@ -57,6 +57,7 @@ fn main() {
         "src/audio_mixer.rs",
         "src/root_audio_mixer.rs",
         "src/root_audio_processing.rs",
+        "src/root_denoiser.rs",
         "src/packet_trailer.rs",
     ];
 
@@ -96,6 +97,7 @@ fn main() {
         "src/audio_thread.cpp",
         "src/root_audio_mixer.cpp",
         "src/root_audio_processing.cpp",
+        "src/root_denoiser.cpp",
         "src/audio_resampler.cpp",
         "src/frame_cryptor.cpp",
         "src/global_task_queue.cpp",
