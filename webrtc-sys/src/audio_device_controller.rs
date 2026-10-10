@@ -346,7 +346,7 @@ pub mod ffi {
         fn reset_root_audio(self: &AudioDeviceController, close_gate: bool);
         /// The mic test monitor: 0 applied, 1 not supported by this build, 2
         /// refused while a call sends from the platform microphone, 3 no
-        /// platform audio reference.
+        /// platform audio reference, 4 no platform device module.
         fn set_root_audio_monitor(self: &AudioDeviceController, enabled: bool) -> u8;
 
         /// The Effects SDK slot exists (desktop, 64-bit).
@@ -432,6 +432,8 @@ pub mod ffi {
             playout_guids: &[String],
             recording_guids: &[String],
         ) -> UniquePtr<AdmProxyHarness>;
+        /// With no platform ADM (one that failed to initialize).
+        fn new_adm_proxy_harness_without_platform_adm() -> UniquePtr<AdmProxyHarness>;
         fn take_calls(self: &AdmProxyHarness) -> Vec<String>;
         fn set_devices(
             self: &AdmProxyHarness,

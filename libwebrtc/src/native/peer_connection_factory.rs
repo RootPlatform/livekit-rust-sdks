@@ -61,6 +61,8 @@ pub enum MonitorResult {
     Sending,
     /// No platform audio reference exists.
     NotAcquired,
+    /// The platform audio device module could not be created or initialized.
+    NoDevice,
 }
 
 use crate::{
@@ -629,6 +631,7 @@ impl PeerConnectionFactory {
             0 => MonitorResult::Applied,
             2 => MonitorResult::Sending,
             3 => MonitorResult::NotAcquired,
+            4 => MonitorResult::NoDevice,
             _ => MonitorResult::NotSupported,
         }
     }

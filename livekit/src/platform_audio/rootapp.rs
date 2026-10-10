@@ -35,6 +35,8 @@ pub enum MonitorError {
     Sending,
     /// The platform audio device module is not acquired.
     NotAcquired,
+    /// The platform audio device module could not be created or initialized.
+    NoDevice,
 }
 
 impl fmt::Display for MonitorError {
@@ -43,6 +45,7 @@ impl fmt::Display for MonitorError {
             Self::NotSupported => "not supported by this build",
             Self::Sending => "refused: a call is sending from the platform microphone",
             Self::NotAcquired => "platform audio is not acquired",
+            Self::NoDevice => "platform audio has no device module",
         })
     }
 }
@@ -55,6 +58,7 @@ pub(crate) fn monitor_result(result: MonitorResult) -> Result<(), MonitorError> 
         MonitorResult::NotSupported => Err(MonitorError::NotSupported),
         MonitorResult::Sending => Err(MonitorError::Sending),
         MonitorResult::NotAcquired => Err(MonitorError::NotAcquired),
+        MonitorResult::NoDevice => Err(MonitorError::NoDevice),
     }
 }
 
@@ -1018,6 +1022,10 @@ mod tests {
         assert_eq!(monitor_result(MonitorResult::Applied), Ok(()));
         assert_eq!(monitor_result(MonitorResult::Sending), Err(MonitorError::Sending));
         assert_eq!(monitor_result(MonitorResult::NotAcquired), Err(MonitorError::NotAcquired));
+        assert_eq!(
+            monitor_result(MonitorResult::NoDevice).unwrap_err().to_string(),
+            "platform audio has no device module"
+        );
         assert_eq!(
             monitor_result(MonitorResult::NotSupported).unwrap_err().to_string(),
             "not supported by this build"

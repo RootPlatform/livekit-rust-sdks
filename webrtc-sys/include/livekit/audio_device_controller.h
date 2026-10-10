@@ -119,7 +119,7 @@ class AudioDeviceController {
   void reset_root_audio(bool close_gate) const;
   // The mic test monitor (AdmProxy::SetMonitor): 0 applied, 1 not supported
   // by this build, 2 refused while a call sends from the platform microphone,
-  // 3 no platform audio reference.
+  // 3 no platform audio reference, 4 no platform device module.
   uint8_t set_root_audio_monitor(bool enabled) const;
 
   // The Effects SDK hand-off (RootDenoiserControl); every call is a no-op
@@ -220,10 +220,12 @@ class HarnessTransport;
 class AdmProxyHarness {
  public:
   // With `with_apm`, the controller also gets an APM decorator over a fake APM
-  // (NewRootApmOverFakeForTest).
+  // (NewRootApmOverFakeForTest). Without `with_platform` the proxy has no
+  // platform ADM (one that failed to initialize).
   AdmProxyHarness(rust::Slice<const rust::String> playout_guids,
                   rust::Slice<const rust::String> recording_guids,
-                  bool with_apm);
+                  bool with_apm,
+                  bool with_platform = true);
   ~AdmProxyHarness();
 
   // Calls the fake got since the last take, e.g. "StartPlayout".
@@ -337,6 +339,7 @@ std::unique_ptr<AdmProxyHarness> new_adm_proxy_harness(
 std::unique_ptr<AdmProxyHarness> new_adm_proxy_harness_with_apm(
     rust::Slice<const rust::String> playout_guids,
     rust::Slice<const rust::String> recording_guids);
+std::unique_ptr<AdmProxyHarness> new_adm_proxy_harness_without_platform_adm();
 
 class HarnessApmTransport;
 

@@ -1330,7 +1330,10 @@ AdmMonitorResult AdmProxy::SetMonitor(bool enabled) {
     if (enabled && desired_.engine_recording) {
       return AdmMonitorResult::kSending;
     }
-    if (enabled && (desired_.ref_count <= 0 || platform() == nullptr)) {
+    if (enabled && platform() == nullptr) {
+      return AdmMonitorResult::kNoDevice;
+    }
+    if (enabled && desired_.ref_count <= 0) {
       return AdmMonitorResult::kNotAcquired;
     }
     if (desired_.monitor == enabled && monitor->enabled() == enabled) {

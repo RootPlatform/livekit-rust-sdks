@@ -321,7 +321,8 @@ class HarnessTransport : public webrtc::AudioTransport {
 AdmProxyHarness::AdmProxyHarness(
     rust::Slice<const rust::String> playout_guids,
     rust::Slice<const rust::String> recording_guids,
-    bool with_apm)
+    bool with_apm,
+    bool with_platform)
     : fake_(webrtc::make_ref_counted<FakePlatformAdm>()),
       mixer_(webrtc::make_ref_counted<RootAudioMixer>()),
       capture_(std::make_shared<RootCaptureState>()),
@@ -334,8 +335,10 @@ AdmProxyHarness::AdmProxyHarness(
   }
   capture_->denoiser_slot = std::make_shared<RootDenoiserSlot>();
   capture_->monitor = std::make_shared<RootAudioMonitor>();
-  proxy_ = webrtc::make_ref_counted<AdmProxy>(webrtc::CreateEnvironment(),
-                                              nullptr, mixer_, fake_);
+  proxy_ = webrtc::make_ref_counted<AdmProxy>(
+      webrtc::CreateEnvironment(), nullptr, mixer_,
+      with_platform ? webrtc::scoped_refptr<webrtc::AudioDeviceModule>(fake_)
+                    : nullptr);
   proxy_->SetCaptureState(capture_);
   controller_ = std::make_unique<AudioDeviceController>(proxy_, mixer_, apm_,
                                                         capture_);
@@ -749,6 +752,12 @@ std::unique_ptr<AdmProxyHarness> new_adm_proxy_harness_with_apm(
     rust::Slice<const rust::String> recording_guids) {
   return std::make_unique<AdmProxyHarness>(playout_guids, recording_guids,
                                            true);
+}
+
+std::unique_ptr<AdmProxyHarness> new_adm_proxy_harness_without_platform_adm() {
+  return std::make_unique<AdmProxyHarness>(
+      rust::Slice<const rust::String>(), rust::Slice<const rust::String>(),
+      false, false);
 }
 
 // The voice engine's capture path in miniature (AudioTransportImpl): each

@@ -337,6 +337,8 @@ enum class AdmMonitorResult : uint8_t {
   // libwebrtc records for a send stream (a call publishes the microphone).
   kSending = 2,
   kNotAcquired = 3,
+  // No platform ADM: it could not be created or initialized.
+  kNoDevice = 4,
 };
 
 /// ADM Proxy that manages synthetic and platform audio modes.

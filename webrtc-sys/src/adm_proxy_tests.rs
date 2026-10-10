@@ -23,7 +23,8 @@ use cxx::UniquePtr;
 
 use crate::audio_device_controller::{
     ffi::{
-        new_adm_proxy_harness, new_adm_proxy_harness_with_apm, AdmProxyHarness, AudioDeviceOutcome,
+        new_adm_proxy_harness, new_adm_proxy_harness_with_apm,
+        new_adm_proxy_harness_without_platform_adm, AdmProxyHarness, AudioDeviceOutcome,
         AudioDeviceSelection, AudioDeviceSelectionKind, RootAudioControlUpdate,
         RootDenoiserCompletionItem, RootDenoiserReturnedItem, RootDenoiserStateInfo,
     },
@@ -901,6 +902,7 @@ fn adm_proxy_controller_hands_the_fallback_over_to_the_hosts_ns_without_a_gap() 
 const MONITOR_APPLIED: u8 = 0;
 const MONITOR_SENDING: u8 = 2;
 const MONITOR_NOT_ACQUIRED: u8 = 3;
+const MONITOR_NO_DEVICE: u8 = 4;
 
 fn both_open() -> Vec<String> {
     vec![
@@ -1005,6 +1007,15 @@ fn adm_proxy_monitor_needs_a_reference_and_ends_with_the_last_one() {
     assert!(!h.stats().monitor_active);
     h.acquire();
     assert_eq!(calls(&h), Vec::<String>::new(), "the next reference does not reopen them");
+}
+
+#[test]
+fn adm_proxy_monitor_without_a_device_module_says_so() {
+    let h = new_adm_proxy_harness_without_platform_adm();
+    h.acquire();
+    assert_eq!(h.monitor(true), MONITOR_NO_DEVICE);
+    assert!(!h.stats().monitor_active);
+    assert_eq!(h.monitor(false), MONITOR_APPLIED);
 }
 
 #[test]
