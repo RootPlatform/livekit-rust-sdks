@@ -1115,3 +1115,54 @@ fn adm_proxy_controller_reset_for_teardown_stops_the_monitor() {
     assert_eq!(calls(&h), ["StopPlayout", "StopRecording"]);
     assert!(!h.stats().monitor_active);
 }
+
+/// The live test's engine init under the playout hold: libwebrtc's
+/// adm_helpers::Init found playout open ("Unable to access speaker", "unable to
+/// set stereo mode while playing side is initialized"). The hold now opens
+/// playout stereo, engine init succeeds without reaching the device, and the
+/// choice applies at the next open.
+#[test]
+fn adm_proxy_playout_opens_stereo_and_takes_libwebrtcs_channels_at_the_next_open() {
+    let h = platform(&["{spk}"], &["{mic}"]);
+    h.hold(true);
+    calls(&h);
+    assert_eq!(h.take_channel_calls(), ["SetStereoPlayout(on)", "InitPlayout stereo"]);
+    assert!(h.platform_playing());
+
+    assert_eq!(h.engine_adm_init(), [0, 0, 0, 0]);
+    assert!(h.engine_stereo_playout());
+    assert_eq!(h.take_channel_calls(), Vec::<String>::new(), "nothing reaches the open device");
+
+    assert_eq!(h.engine_set_stereo_playout(false), 0);
+    assert!(!h.engine_stereo_playout());
+    h.flush();
+    assert_eq!(h.take_channel_calls(), Vec::<String>::new(), "the running device keeps stereo");
+    h.restart(false, true);
+    assert_eq!(h.take_channel_calls(), ["SetStereoPlayout(off)", "InitPlayout mono"]);
+
+    h.engine_set_stereo_playout(true);
+    h.hold(false);
+    calls(&h);
+    h.engine_start_playout();
+    calls(&h);
+    assert_eq!(h.take_channel_calls(), ["SetStereoPlayout(on)", "InitPlayout stereo"]);
+}
+
+/// The speaker's volume and mute are the session or endpoint volume: the
+/// proxy never sets them, and engine init's speaker and microphone access
+/// never reaches the device.
+#[test]
+fn adm_proxy_never_touches_the_speaker_volume_or_mute() {
+    let h = platform(&["{spk}"], &["{mic}"]);
+    h.hold(true);
+    h.app_recording(true);
+    calls(&h);
+    h.take_channel_calls();
+
+    assert_eq!(h.engine_set_speaker_volume(255), -1);
+    assert_eq!(h.engine_set_speaker_mute(true), -1);
+    assert_eq!(h.engine_adm_init(), [0, 0, 0, 0]);
+    h.flush();
+    assert_eq!(h.take_channel_calls(), Vec::<String>::new());
+    assert_eq!(calls(&h), Vec::<String>::new());
+}

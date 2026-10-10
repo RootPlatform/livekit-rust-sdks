@@ -230,6 +230,9 @@ class AdmProxyHarness {
 
   // Calls the fake got since the last take, e.g. "StartPlayout".
   rust::Vec<rust::String> take_calls() const;
+  // Its channel, speaker and microphone calls since the last take, and the
+  // channels of every InitPlayout ("InitPlayout stereo"), kept apart.
+  rust::Vec<rust::String> take_channel_calls() const;
   void set_devices(rust::Slice<const rust::String> playout_guids,
                    rust::Slice<const rust::String> recording_guids) const;
   // UID translation as CoreAudio would answer it: uids[i] is the device with
@@ -273,6 +276,13 @@ class AdmProxyHarness {
   void engine_stop_recording() const;
   int32_t engine_init_playout() const;
   int32_t engine_init_recording() const;
+  // libwebrtc's adm_helpers::Init on the proxy (speaker, stereo playout,
+  // microphone): each call's result, in that order.
+  rust::Vec<int32_t> engine_adm_init() const;
+  bool engine_stereo_playout() const;
+  int32_t engine_set_stereo_playout(bool enable) const;
+  int32_t engine_set_speaker_volume(uint32_t volume) const;
+  int32_t engine_set_speaker_mute(bool mute) const;
   void register_transport() const;
   void terminate() const;
   AudioDeviceRequestOutcome select(const AudioDeviceSelection& recording,

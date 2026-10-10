@@ -821,6 +821,13 @@ void AdmProxy::ReconcilePlayoutLocked(const DesiredState& desired,
     playout_opened_selection_gen_ = desired.playout_selection_gen;
     playout_opened_restart_gen_ = desired.playout_restart_gen;
     int32_t result = ApplySelectionLocked(true, desired.playout_selection);
+#if !LK_ADM_MOBILE
+    if (result == 0 &&
+        platform_adm->SetStereoPlayout(
+            stereo_playout_.load(std::memory_order_acquire)) != 0) {
+      RTC_LOG(LS_WARNING) << "AdmProxy: SetStereoPlayout refused";
+    }
+#endif
     if (result == 0) {
       result = platform_adm->InitPlayout();
     }
@@ -1710,11 +1717,16 @@ bool AdmProxy::Recording() const {
          device_recording_.load(std::memory_order_acquire);
 }
 
+// On desktop the device thread's every InitPlayout/InitRecording initializes
+// the speaker or microphone itself; forwarding libwebrtc's own call at engine
+// init only fails while the hold or the mic test runs the device.
 int32_t AdmProxy::InitSpeaker() {
+#if LK_ADM_MOBILE
   AdmLock lock(&mutex_);
   if (webrtc::AudioDeviceModule* platform_adm = platform()) {
     return platform_adm->InitSpeaker();
   }
+#endif
   return 0;
 }
 
@@ -1727,10 +1739,12 @@ bool AdmProxy::SpeakerIsInitialized() const {
 }
 
 int32_t AdmProxy::InitMicrophone() {
+#if LK_ADM_MOBILE
   AdmLock lock(&mutex_);
   if (webrtc::AudioDeviceModule* platform_adm = platform()) {
     return platform_adm->InitMicrophone();
   }
+#endif
   return 0;
 }
 
@@ -1742,20 +1756,26 @@ bool AdmProxy::MicrophoneIsInitialized() const {
   return false;
 }
 
+// On desktop the app's output volume is the mixer's; the ADM's speaker volume
+// and mute are the session or endpoint volume, which the proxy never changes.
 int32_t AdmProxy::SpeakerVolumeIsAvailable(bool* available) {
+#if LK_ADM_MOBILE
   AdmLock lock(&mutex_);
   if (webrtc::AudioDeviceModule* platform_adm = platform()) {
     return platform_adm->SpeakerVolumeIsAvailable(available);
   }
+#endif
   *available = false;
   return 0;
 }
 
-int32_t AdmProxy::SetSpeakerVolume(uint32_t volume) {
+int32_t AdmProxy::SetSpeakerVolume([[maybe_unused]] uint32_t volume) {
+#if LK_ADM_MOBILE
   AdmLock lock(&mutex_);
   if (webrtc::AudioDeviceModule* platform_adm = platform()) {
     return platform_adm->SetSpeakerVolume(volume);
   }
+#endif
   return -1;
 }
 
@@ -1825,19 +1845,23 @@ int32_t AdmProxy::MinMicrophoneVolume(uint32_t* minVolume) const {
 }
 
 int32_t AdmProxy::SpeakerMuteIsAvailable(bool* available) {
+#if LK_ADM_MOBILE
   AdmLock lock(&mutex_);
   if (webrtc::AudioDeviceModule* platform_adm = platform()) {
     return platform_adm->SpeakerMuteIsAvailable(available);
   }
+#endif
   *available = false;
   return 0;
 }
 
-int32_t AdmProxy::SetSpeakerMute(bool enable) {
+int32_t AdmProxy::SetSpeakerMute([[maybe_unused]] bool enable) {
+#if LK_ADM_MOBILE
   AdmLock lock(&mutex_);
   if (webrtc::AudioDeviceModule* platform_adm = platform()) {
     return platform_adm->SetSpeakerMute(enable);
   }
+#endif
   return -1;
 }
 
@@ -1894,20 +1918,32 @@ int32_t AdmProxy::StereoPlayoutIsAvailable(bool* available) const {
   return 0;
 }
 
+// libwebrtc sets its playout channels once, at engine init, when the playout
+// hold may already have opened the device (the ADM refuses a change then). On
+// desktop the wish is kept and applied before every playout open instead,
+// stereo until libwebrtc says otherwise.
 int32_t AdmProxy::SetStereoPlayout(bool enable) {
+#if LK_ADM_MOBILE
   AdmLock lock(&mutex_);
   if (webrtc::AudioDeviceModule* platform_adm = platform()) {
     return platform_adm->SetStereoPlayout(enable);
   }
+#else
+  stereo_playout_.store(enable, std::memory_order_release);
+#endif
   return 0;
 }
 
 int32_t AdmProxy::StereoPlayout(bool* enabled) const {
+#if LK_ADM_MOBILE
   AdmLock lock(&mutex_);
   if (webrtc::AudioDeviceModule* platform_adm = platform()) {
     return platform_adm->StereoPlayout(enabled);
   }
   *enabled = true;
+#else
+  *enabled = stereo_playout_.load(std::memory_order_acquire);
+#endif
   return 0;
 }
 

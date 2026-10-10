@@ -75,6 +75,11 @@ class FakePlatformAdm
     return std::exchange(calls_, {});
   }
 
+  std::vector<std::string> TakeChannelCalls() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return std::exchange(channel_calls_, {});
+  }
+
   void SetDevices(std::vector<std::string> playout,
                   std::vector<std::string> recording) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -155,7 +160,54 @@ class FakePlatformAdm
 
   int32_t InitPlayout() override {
     playout_initialized_.store(true);
+    RecordChannel(stereo_playout_.load() ? "InitPlayout stereo"
+                                         : "InitPlayout mono",
+                  0);
     return Record("InitPlayout");
+  }
+
+  // As AudioDeviceModuleImpl: no channel change while playout is initialized.
+  // Mono until set, as the PulseAudio ADM starts.
+  int32_t SetStereoPlayout(bool enable) override {
+    const std::string call = std::string("SetStereoPlayout(") + OnOff(enable) +
+                             ")";
+    if (playout_initialized_.load()) {
+      return RecordChannel(call + " refused", -1);
+    }
+    stereo_playout_.store(enable);
+    return RecordChannel(call, 0);
+  }
+  int32_t StereoPlayoutIsAvailable(bool* available) const override {
+    *available = true;
+    return 0;
+  }
+  int32_t StereoPlayout(bool* enabled) const override {
+    *enabled = stereo_playout_.load();
+    return 0;
+  }
+  // As the Windows ADM: no speaker or microphone (re)initialization while
+  // that direction runs.
+  int32_t InitSpeaker() override {
+    return RecordChannel("InitSpeaker", playing_.load() ? -1 : 0);
+  }
+  int32_t InitMicrophone() override {
+    return RecordChannel("InitMicrophone", recording_.load() ? -1 : 0);
+  }
+  int32_t SpeakerVolumeIsAvailable(bool* available) override {
+    *available = true;
+    return 0;
+  }
+  int32_t SetSpeakerVolume(uint32_t volume) override {
+    return RecordChannel("SetSpeakerVolume(" + std::to_string(volume) + ")",
+                         0);
+  }
+  int32_t SpeakerMuteIsAvailable(bool* available) override {
+    *available = true;
+    return 0;
+  }
+  int32_t SetSpeakerMute(bool enable) override {
+    return RecordChannel(std::string("SetSpeakerMute(") + OnOff(enable) + ")",
+                         0);
   }
   bool PlayoutIsInitialized() const override {
     return playout_initialized_.load();
@@ -231,8 +283,16 @@ class FakePlatformAdm
     return 0;
   }
 
+  int32_t RecordChannel(std::string call, int32_t result) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    channel_calls_.push_back(std::move(call));
+    return result;
+  }
+
   std::mutex mutex_;
   std::vector<std::string> calls_;
+  std::vector<std::string> channel_calls_;
+  std::atomic<bool> stereo_playout_{false};
   std::vector<std::string> playout_guids_;
   std::vector<std::string> recording_guids_;
   std::atomic<webrtc::AudioTransport*> callback_{nullptr};
@@ -353,6 +413,14 @@ AdmProxyHarness::~AdmProxyHarness() {
 rust::Vec<rust::String> AdmProxyHarness::take_calls() const {
   rust::Vec<rust::String> calls;
   for (const std::string& call : fake_->TakeCalls()) {
+    calls.push_back(rust::String(call));
+  }
+  return calls;
+}
+
+rust::Vec<rust::String> AdmProxyHarness::take_channel_calls() const {
+  rust::Vec<rust::String> calls;
+  for (const std::string& call : fake_->TakeChannelCalls()) {
     calls.push_back(rust::String(call));
   }
   return calls;
@@ -503,6 +571,34 @@ int32_t AdmProxyHarness::engine_init_playout() const {
 
 int32_t AdmProxyHarness::engine_init_recording() const {
   return proxy_->InitRecording();
+}
+
+rust::Vec<int32_t> AdmProxyHarness::engine_adm_init() const {
+  rust::Vec<int32_t> results;
+  results.push_back(proxy_->InitSpeaker());
+  bool available = false;
+  results.push_back(proxy_->StereoPlayoutIsAvailable(&available));
+  results.push_back(proxy_->SetStereoPlayout(available));
+  results.push_back(proxy_->InitMicrophone());
+  return results;
+}
+
+bool AdmProxyHarness::engine_stereo_playout() const {
+  bool enabled = false;
+  proxy_->StereoPlayout(&enabled);
+  return enabled;
+}
+
+int32_t AdmProxyHarness::engine_set_stereo_playout(bool enable) const {
+  return proxy_->SetStereoPlayout(enable);
+}
+
+int32_t AdmProxyHarness::engine_set_speaker_volume(uint32_t volume) const {
+  return proxy_->SetSpeakerVolume(volume);
+}
+
+int32_t AdmProxyHarness::engine_set_speaker_mute(bool mute) const {
+  return proxy_->SetSpeakerMute(mute);
 }
 
 void AdmProxyHarness::register_transport() const {

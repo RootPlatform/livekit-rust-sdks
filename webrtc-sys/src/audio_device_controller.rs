@@ -435,6 +435,9 @@ pub mod ffi {
         /// With no platform ADM (one that failed to initialize).
         fn new_adm_proxy_harness_without_platform_adm() -> UniquePtr<AdmProxyHarness>;
         fn take_calls(self: &AdmProxyHarness) -> Vec<String>;
+        /// The fake's channel, speaker and microphone calls and the channels of
+        /// every InitPlayout ("InitPlayout stereo"), kept apart from take_calls.
+        fn take_channel_calls(self: &AdmProxyHarness) -> Vec<String>;
         fn set_devices(
             self: &AdmProxyHarness,
             playout_guids: &[String],
@@ -477,6 +480,14 @@ pub mod ffi {
         fn engine_stop_recording(self: &AdmProxyHarness);
         fn engine_init_playout(self: &AdmProxyHarness) -> i32;
         fn engine_init_recording(self: &AdmProxyHarness) -> i32;
+        /// libwebrtc's adm_helpers::Init on the proxy: the results of
+        /// InitSpeaker, StereoPlayoutIsAvailable, SetStereoPlayout and
+        /// InitMicrophone.
+        fn engine_adm_init(self: &AdmProxyHarness) -> Vec<i32>;
+        fn engine_stereo_playout(self: &AdmProxyHarness) -> bool;
+        fn engine_set_stereo_playout(self: &AdmProxyHarness, enable: bool) -> i32;
+        fn engine_set_speaker_volume(self: &AdmProxyHarness, volume: u32) -> i32;
+        fn engine_set_speaker_mute(self: &AdmProxyHarness, mute: bool) -> i32;
         fn register_transport(self: &AdmProxyHarness);
         fn terminate(self: &AdmProxyHarness);
         fn select(

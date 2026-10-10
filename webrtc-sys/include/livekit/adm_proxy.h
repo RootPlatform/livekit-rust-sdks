@@ -361,8 +361,11 @@ enum class AdmMonitorResult : uint8_t {
 /// open.
 ///
 /// On desktop the OS effects (Windows' voice capture DMO) are off and refused,
-/// mute never stops recording or touches the endpoint mute, and recording only
-/// opens for a device track (`InitRecording` alone opens nothing). A device
+/// mute never stops recording or touches the endpoint mute, the speaker's
+/// volume and mute are never set, and recording only opens for a device track
+/// (`InitRecording` alone opens nothing). libwebrtc's stereo playout choice is
+/// kept and applied before every playout open (stereo until it says
+/// otherwise), since the hold can open playout before libwebrtc makes it. A device
 /// that fails to stop (the Windows ADM gives up joining its thread after 2 s)
 /// gets no second puller in that pass; the direction is retried a second later.
 class AdmProxy : public webrtc::AudioDeviceModule {
@@ -658,6 +661,8 @@ class AdmProxy : public webrtc::AudioDeviceModule {
   std::atomic<uint64_t> device_stop_failures_{0};
   std::atomic<bool> device_track_echo_cancellation_{false};
   std::atomic<bool> device_track_noise_suppression_{false};
+  // Desktop: libwebrtc's SetStereoPlayout, applied before every playout open.
+  std::atomic<bool> stereo_playout_{true};
 };
 
 }  // namespace livekit_ffi
