@@ -783,7 +783,9 @@ What changes for every user of the library on Windows, macOS and Linux, the mana
   concurrent `RootAudioMixer::Mix`.
 - On desktop the device track uses software AEC and NS as asked, AGC off and the high-pass filter
   (mobile keeps its platform voice processing and AGC); external (`NativeAudioSource`) tracks set no
-  processing options and never initialize the mic.
+  processing options and never initialize the mic. From Phase 1 the factory's APM decorator also
+  ignores a device track's `auto_gain_control=true` and `highpass_filter=false`: AGC1 and AGC2 stay
+  off and the high-pass filter stays on for every desktop user.
 - `RootAudioMixer` replaces `AudioMixerImpl`: fixed 48 kHz, no limiter, float mix, soft clip.
 - A transport tap counts the platform ADM's callbacks (`RootAudioStats`; `GetStats` only while
   platform audio is in use). In every build, locks taken and libwebrtc log lines raised (and
@@ -795,31 +797,49 @@ Phase 1 (desktop; mobile keeps libwebrtc's APM and reports no capability):
 - `RootAudioMixer` plays each remote stream at `VolumeCurve(tile x master)` (v^2.5 capped at 10, the
   app's curve) with 20 ms linear ramps, 0 while deafened or paused, soft clips each stream and the
   sum, and mixes the effect bus after the remote streams, ignoring master and deafen. Gains are keyed
-  by `Source::Ssrc()` and kept for streams that have not started. While no `PlatformAudio` holds the
-  ADM every gain is unity and the effect bus is idle, so managed calls are unaffected.
+  by `Source::Ssrc()` and kept for streams that have not started. Once a gain was set, a stream that
+  starts without one is held at 0 for up to 500 ms (its gain is on the way), then plays at tile 1;
+  a forgotten SSRC leaves a stream that still plays at its last gain. While no `PlatformAudio` holds
+  the ADM every gain is unity and the effect bus is idle, so managed calls are unaffected.
 - Effects: `RegisterEffect` copies a 48 kHz mono int16 clip, kept for the factory's lifetime;
   `PlayEffect` queues it in a 32-slot ring (a full ring drops and counts it); `StopEffects` cuts
-  playing and queued effects.
+  playing and queued effects, and so does the last `PlatformAudio` reference going away. An effect
+  that waited over 1 s for the render thread (a stalled or still-opening device) is dropped and
+  counted instead of played late.
 - The factory's APM is built here: libwebrtc's builtin APM with `RootCaptureProcessor` as its
   capture post-processor, wrapped in `RootApmDecorator`. The decorator forwards every
   `AudioProcessing` call; its `ApplyConfig` keeps AGC1 and AGC2 off and the high-pass filter on and
   takes AEC and NS from `RootAudioSetControl` once set (applied from the worker thread, at most once
-  a second), and it swallows `set_output_will_be_muted` and the `kCaptureOutputUsed` setting, so the
-  post-processor runs on every frame. `GetConfig` serves the applied config.
-- `RootCaptureProcessor` gates the mic (muted or push-to-talk key up zeroes the frame), applies the
-  input volume with a 20 ms ramp and counts levels, at whatever rate and channel count the APM hands
-  it (8 kHz streams are processed at 16 kHz). Its format changes reach the host as
-  `RootAudioEvent.capture_format`, from a task that reads atomics every 10 ms.
+  a second; not yet deferred to a speech pause), and it swallows `set_output_will_be_muted` and the
+  `kCaptureOutputUsed` setting, so the post-processor runs on every frame. `GetConfig` serves the
+  voice engine's own request with only AGC off and the high-pass filter on, so the engine's
+  read-modify-write never copies the AEC/NS policy into it.
+- `RootCaptureProcessor` gates the mic (muted or push-to-talk key up), with a 5 ms fade each way and
+  both gate fields in one atomic word, applies the input volume with a 20 ms ramp and counts levels,
+  at whatever rate and channel count the APM hands it (8 kHz streams are processed at 16 kHz). Its
+  format reaches the host as `RootAudioEvent.capture_format` from a task that reads atomics every
+  10 ms, starting 100 ms after the handle is created (`RootAudioStats.process_rate` has it too).
 - Track gains (`RootAudioSetTrackGains`) are keyed by the remote track's FFI handle and mapped to the
   stream's SSRC: the receiver's signaled SSRC (the receive stream's `remote_ssrc`), else the track's
-  inbound-rtp SSRC. The mapping is resolved off the caller's thread and again every second; gains of
-  dropped track handles are cleared. Dropping the `PlatformAudio` handle resets every control.
+  inbound-rtp SSRC. While a session is live a remote audio track's SSRC is resolved as it is
+  subscribed, so the first gain applies inside its request; otherwise off the caller's thread, one
+  resolution per track at a time. Unknown SSRCs are resolved again every second, known ones every
+  5 s and 50 ms after the mixer gets a new stream (a renegotiated SSRC). Gains of dropped track
+  handles are forgotten; handles that are not remote audio tracks come back in
+  `unknown_track_handles`, not as an error.
+- The `PlatformAudio` handles of a process share one engine. Its controls go back to their defaults
+  (gate open) when the first handle's session starts; when the last one is dropped the gate closes
+  (muted, push-to-talk key up) and gains, effects and the AEC/NS policy reset, before the handle
+  lets go of the device. Dropping one of several handles changes nothing.
 - `RootAudioSetControl` fields `denoise_power`, `auto_gain`, `gate_threshold`, `auto_sensitivity`
-  and `gain_reset_db` are stored for the DSP chain and have no effect yet.
+  and `gain_reset_db` are stored for the DSP chain and have no effect yet. A field the build cannot
+  act on (no capture processor or decorator, e.g. when the APM failed to build) is answered "not
+  supported by this build"; the other fields are applied.
 
 `echo_cancellation_active` and `webrtc_ns_active` report the decorator's applied config; ERL, ERLE,
 the echo delay and the divergent filter fraction come from the APM's statistics (NaN while it has
-none).
+none, the delay -1). Reading them takes the APM's statistics lock, which the capture thread holds
+briefly once per frame (as libwebrtc's own getStats does); the rest of `RootAudioStats` is atomics.
 
 Known limit (libwebrtc prebuilt): `external_audio_source.patch` as built into the pinned prebuilt
 never clears `sending_` in `Stop()`, and `StoreEncoderProperties` still registers a sending external
@@ -861,7 +881,7 @@ livekit-ffi --lib rootapp_audio`. Every test that creates the platform ADM
 | `rootapp/fx3` | MF encoder upload ring never blocks in `Map` (fence-gated slots, grows to 5, then a fence wait outside the device lock); `D3D11GpuFence` in `mf_gpu_fence.h` with a WARP test; MF decoder teardown on the deferred release thread; a release run needs all six RIDs and refuses a tag, or a draft, that points at another commit |
 | `rootapp/fx4-tokio` | FFI tokio runtime capped at 8 workers, `LK_FFI_WORKER_THREADS` override (see Tokio runtime size). Later: simulcast encodings lowest-first, periodic ALR probing, start bitrate through `SetBitrate` once per PeerConnection with a max that follows the published video (see Start bitrate), MF sessions counted until their delayed release with the D3D11 device kept alive that long, unpublished senders' streams left out of offers (see Unpublish and the publisher SDP), libwebrtc log levels and `LK_FFI_LOG_LEVEL` (see Logging), each video codec listed once by the codec factories |
 | `rootapp/fx4-dev` | Windows exports `livekit_ffi_d3d11_acquire_shared_device` / `_release_shared_device`, so the desktop's screen capture runs on the codecs' shared D3D11 device; the shared device is created without the driver's internal threading optimizations (`LK_MF_D3D11_DRIVER_THREADING=on` restores them). See "Sharing the D3D11 device with the host" |
-| `rootapp/native-platform-audio` | Native call audio, Phase 0: `rootapp_audio.proto`, `AdmProxy` on a device thread with stored selection, playout hold, restart and a transport tap, `RootAudioMixer`, explicit device-track options, external sources off the APM and mic, `livekit_ffi_rootapp_audio_caps`. Review fixes: one mix and one render/capture callback at a time, no second puller after a failed device stop, the app's start/stop apart from libwebrtc's, real-time rule counters in every build, AdmProxy tests over a fake platform ADM. Phase 1: mixer gains, ramps and effect bus, `RootApmDecorator` and `RootCaptureProcessor` (mute/PTT gate, input volume, levels, capture format events), track gains by SSRC, `RootAudioSetControl`, caps `0b100011111111`. See "Native call audio" |
+| `rootapp/native-platform-audio` | Native call audio, Phase 0: `rootapp_audio.proto`, `AdmProxy` on a device thread with stored selection, playout hold, restart and a transport tap, `RootAudioMixer`, explicit device-track options, external sources off the APM and mic, `livekit_ffi_rootapp_audio_caps`. Review fixes: one mix and one render/capture callback at a time, no second puller after a failed device stop, the app's start/stop apart from libwebrtc's, real-time rule counters in every build, AdmProxy tests over a fake platform ADM. Phase 1: mixer gains, ramps and effect bus, `RootApmDecorator` and `RootCaptureProcessor` (mute/PTT gate, input volume, levels, capture format events), track gains by SSRC, `RootAudioSetControl`, caps `0b100011111111`. Phase 1 review fixes: shared controls reset only by the first session and closed by the last, new streams held until their gain arrives, SSRCs resolved at subscribe, gate fades and one gate word, stale effects dropped, `unknown_track_handles`. See "Native call audio" |
 
 `rootapp/fx-session` adds: unpublishing a video track releases its encoder (see above);
 received I420 frames whose planes are already packed are handed to the FFI handle without a
