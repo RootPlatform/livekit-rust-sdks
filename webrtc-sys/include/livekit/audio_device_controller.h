@@ -198,6 +198,8 @@ class AdmProxyHarness {
   // The next StopPlayout fails with `result` and leaves the device closed, as
   // the Windows ADM does when it gives up joining its render thread.
   void fail_next_stop_playout(int32_t result) const;
+  // The same for StopRecording.
+  void fail_next_stop_recording(int32_t result) const;
   void set_device_playout_delay(uint16_t delay_ms) const;
 
   void acquire() const;

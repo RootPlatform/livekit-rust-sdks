@@ -144,10 +144,11 @@ class RootDenoiserSlot {
   // `flush` asks for flush(nullptr, 0) before the next process() (kept until
   // one runs; a new pipeline needs none). `power` is applied when it changed.
   // A rate-mismatch bypass ends, with a flush, once the frames fit again.
-  // Flush, power and process are timed together; kSlowFramesToBypass calls
-  // over kSlowFrameUs within kSlowWindowUs, or one over kStalledFrameUs,
-  // latch kSlow, except that the first call after an install or a flush (a
-  // warm-up) never latches on its own.
+  // Flush, power and process are timed together (slow_frames, the maximum
+  // and the histogram); kSlowFramesToBypass plain calls over kSlowFrameUs
+  // within kSlowWindowUs, or one over kStalledFrameUs, latch kSlow. A plain
+  // call is one with no flush, power change or (re)start: those pay one-off
+  // costs that say nothing about the SDK keeping up.
   RootDenoiseResult ProcessAudio(const float* in,
                                  size_t frames,
                                  int sample_rate,
@@ -231,7 +232,9 @@ class RootDenoiserSlot {
 // frames, on after `grace_ms` of frames when none runs for another reason
 // (missing, removed, bypassed for its rate); off once it runs again or is not
 // wanted. The grace only counts while frames flow (processed_frames moved in
-// the last kFlowingMs) and starts over with each new stream.
+// the last kFlowingMs) and no install is on its way (`arriving`: a request
+// still waiting for a pause in speech, within its install wait), and starts
+// over with each new stream.
 class RootNsFallback {
  public:
   static constexpr int64_t kGraceMs = 1000;
@@ -247,7 +250,8 @@ class RootNsFallback {
                              uint32_t pipeline_rate,
                              uint32_t process_rate,
                              uint64_t processed_frames,
-                             uint64_t stream_epoch);
+                             uint64_t stream_epoch,
+                             bool arriving);
   bool on() const { return on_; }
   void Reset();
 
@@ -285,7 +289,9 @@ struct RootDenoiserReturnAll {
 // removes pipelines (an install waits for a pause in the user's speech, at
 // most install_wait_ms), runs the WebRTC NS fallback every tick, and keeps the
 // completions and returned pipelines until the FFI layer takes them. Owners
-// are the FFI handles that made the requests.
+// are the FFI handles that made the requests. The fallback is decided under
+// mutex_ and applied (set_fallback, which can wait for an APM
+// re-initialisation and a capture frame) outside it, latest decision last.
 //
 // A pipeline is named in an error completion, the returned list or a
 // ReturnAll result only once native holds it nowhere (installed, being
@@ -304,7 +310,9 @@ class RootDenoiserControl {
     // the missing-denoiser grace only counts while frames flow.
     std::function<uint64_t()> processed_frames;
     std::function<uint64_t()> stream_epoch;
-    // Turns the native WebRTC NS fallback on or off.
+    // The fallback was decided on or off (called under mutex_: never blocks).
+    std::function<void(bool)> fallback_decided;
+    // Turns the native WebRTC NS fallback on or off (never under mutex_).
     std::function<void(bool)> set_fallback;
   };
   struct Timing {
@@ -320,6 +328,9 @@ class RootDenoiserControl {
   static constexpr char kErrorReturned[] = "returned before install";
   static constexpr char kErrorSessionEnded[] =
       "the last platform audio handle was dropped before install";
+  // The rates the voice chain runs at.
+  static constexpr uint32_t kMinRate = 8000;
+  static constexpr uint32_t kMaxRate = 48000;
 
   RootDenoiserControl(std::shared_ptr<RootDenoiserSlot> slot,
                       Hooks hooks,
@@ -329,7 +340,10 @@ class RootDenoiserControl {
   RootDenoiserControl& operator=(const RootDenoiserControl&) = delete;
 
   // Queues an install (`pipeline` non-zero) or a removal; completes once. A
-  // pipeline returned but not taken back yet is held again.
+  // pipeline returned but not taken back yet is held again. An install at a
+  // rate outside kMinRate..kMaxRate fails at once, unless native still holds
+  // that pipeline (or has it on the returned list): then nothing changes and
+  // it completes as a success.
   void Set(uint64_t owner, uint64_t async_id, uint64_t pipeline, uint32_t rate);
   // Something the fallback depends on changed (denoiser_wanted).
   void Wake();
@@ -360,7 +374,14 @@ class RootDenoiserControl {
   void EnsureThreadLocked();
   // Takes mutex_ again before returning.
   void CommitLocked(std::unique_lock<std::mutex>& lock, uint64_t seq);
-  bool TickLocked(int64_t now_ms);
+  // Whether the thread keeps ticking; `changed` when the fallback decision
+  // changed (apply it after unlocking).
+  bool TickLocked(int64_t now_ms, bool* changed);
+  // An install request waits for a pause in speech, within its install wait.
+  bool ArrivingLocked(int64_t now_ms) const;
+  void DecideFallbackLocked(bool on);
+  // Without mutex_: hands the latest decision to set_fallback.
+  void ApplyFallback();
   // Native holds `pipeline` (installed, being installed, waiting or queued).
   bool HeldLocked(uint64_t pipeline) const;
   void CompleteLocked(const Request& request,
@@ -393,7 +414,11 @@ class RootDenoiserControl {
   std::vector<RootDenoiserCompletion> completions_;
   std::vector<RootDenoiserReturned> returned_;
   RootNsFallback fallback_;
+  // The decision (written under mutex_).
   std::atomic<bool> fallback_on_{false};
+  // Serialises set_fallback calls; what was last handed to it.
+  std::mutex fallback_mutex_;
+  bool fallback_applied_ = false;
   bool stop_ = false;
   std::thread thread_;
 };
@@ -547,6 +572,10 @@ class RootDenoiserHarness {
   // Every fallback change the control side made since the last take.
   rust::Vec<uint8_t> take_fallback_changes() const;
   bool fallback() const;
+  // What the fallback_decided hook last stored.
+  bool fallback_decided() const;
+  // While set, set_fallback waits (an APM re-initialisation that hangs).
+  void block_fallback(bool block) const;
   size_t pending() const;
 
   // The fallback state machine alone: -1 no change, 0 off, 1 on.
@@ -557,7 +586,8 @@ class RootDenoiserHarness {
                          uint32_t pipeline_rate,
                          uint32_t process_rate,
                          uint64_t processed_frames,
-                         uint64_t stream_epoch) const;
+                         uint64_t stream_epoch,
+                         bool arriving) const;
 
  private:
   struct State;

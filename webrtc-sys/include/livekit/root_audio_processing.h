@@ -100,6 +100,7 @@ struct RootDspStatsSnapshot {
   uint64_t dsp_resets = 0;
   uint64_t dsp_flushes = 0;
   uint64_t ns_gap_frames = 0;
+  uint64_t ns_fallback_pending_frames = 0;
   uint64_t speaking_seq = 0;
   uint64_t gate_open_delay_us = 0;
   float threshold = 0;
@@ -154,8 +155,10 @@ struct RootCaptureState {
   // (re)start (bumped before each StartRecording).
   std::atomic<uint64_t> dsp_reset_seq{0};
   std::atomic<uint64_t> stream_epoch{0};
-  // What the APM decorator has applied.
+  // What the APM decorator has applied, and what the denoiser control decided
+  // for its WebRTC NS fallback (applied a little later, by the decorator).
   std::atomic<bool> webrtc_ns_applied{false};
+  std::atomic<bool> ns_fallback_decided{false};
   // Set once before the APM is built; may be null.
   std::shared_ptr<RootDenoiserSlot> denoiser_slot;
 
@@ -190,6 +193,7 @@ struct RootCaptureState {
   std::atomic<uint64_t> dsp_resets{0};
   std::atomic<uint64_t> dsp_flushes{0};
   std::atomic<uint64_t> ns_gap_frames{0};
+  std::atomic<uint64_t> ns_fallback_pending_frames{0};
   std::atomic<float> threshold{0.0f};
   std::atomic<float> voice_gain_db{0.0f};
   std::atomic<bool> voice_gain_settled{false};
@@ -216,6 +220,11 @@ struct RootCaptureState {
   // first frame processed open turns it into gate_open_delay_us.
   std::atomic<int64_t> gate_open_stamp_us{0};
   std::atomic<uint64_t> gate_open_delay_us{0};
+  // When the last frame was processed (steady clock, µs; 0 before any).
+  std::atomic<int64_t> last_frame_us{0};
+
+  // Frames stopped this long ago leave nobody speaking.
+  static constexpr int64_t kStaleSpeakingUs = 300'000;
 
   bool mic_muted() const;
   uint32_t push_to_talk() const;
@@ -231,6 +240,9 @@ struct RootCaptureState {
   // Not speaking, unless the audio thread says otherwise on a later frame:
   // for when frames stop (a session ends, recording stops).
   void ClearSpeaking();
+  // Control side: ClearSpeaking once no frame came for kStaleSpeakingUs
+  // (frames that stopped without a successful stop: a device that died).
+  void ClearStaleSpeaking();
 
   // Any thread but the audio thread. take_maxima resets the block peak and
   // envelope maxima.
@@ -238,7 +250,8 @@ struct RootCaptureState {
   RootSpeakingSnapshot ReadSpeaking() const;
   // Speaking and heard: a change that would be audible mid-word (a pipeline
   // swap, an AEC/NS re-init) waits for this to clear. Inside the startup hold
-  // nothing is heard, also with push-to-talk held.
+  // nothing is heard, also with push-to-talk held, and with no frame for
+  // kStaleSpeakingUs nobody is.
   bool AudiblySpeaking() const;
 };
 
@@ -515,6 +528,7 @@ class RootProcessorHarness {
   void set_denoiser_wanted(bool wanted) const;
   void set_denoise_power(float power) const;
   void set_webrtc_ns_applied(bool applied) const;
+  void set_ns_fallback_decided(bool on) const;
   void bump_stream_epoch() const;
   void gain_reset(float db) const;
   // One frame through Process on a buffer of `rate` / 100 frames and
@@ -537,8 +551,9 @@ class RootProcessorHarness {
   // Holds the slot as the audio thread would mid-process (the next frame
   // misses).
   bool hold_denoiser_slot(bool hold) const;
-  // Stores the speaking flag as the audio thread publishes it.
+  // Stores the speaking flag as the audio thread publishes it on a frame now.
   void set_published_speaking(bool speaking) const;
+  void clear_stale_speaking() const;
   int64_t gate_open_stamp_us() const;
   bool audibly_speaking() const;
 

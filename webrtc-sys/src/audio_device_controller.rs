@@ -127,6 +127,7 @@ pub mod ffi {
         pub dsp_flushes: u64,
         pub gate_open_delay_us: u64,
         pub ns_gap_frames: u64,
+        pub ns_fallback_pending_frames: u64,
         pub denoiser_installed: bool,
         pub denoiser_frames: u64,
         pub denoiser_misses: u64,
@@ -401,6 +402,7 @@ pub mod ffi {
             recording_guids: &[String],
         );
         fn fail_next_stop_playout(self: &AdmProxyHarness, result: i32);
+        fn fail_next_stop_recording(self: &AdmProxyHarness, result: i32);
         fn set_device_playout_delay(self: &AdmProxyHarness, delay_ms: u16);
         fn acquire(self: &AdmProxyHarness);
         fn release(self: &AdmProxyHarness);
@@ -458,7 +460,8 @@ pub mod ffi {
         /// processor would run it; returns the slot's result kind.
         fn run_denoiser(self: &AdmProxyHarness, rate: u32) -> u8;
         fn latch_denoiser_bypass(self: &AdmProxyHarness, reason: u32);
-        /// Stores the speaking flag as the capture processor publishes it.
+        /// Stores the speaking flag as the capture processor publishes it on
+        /// a frame now.
         fn set_speaking(self: &AdmProxyHarness, speaking: bool);
 
         /// The voice path end to end over one capture state, wired as the

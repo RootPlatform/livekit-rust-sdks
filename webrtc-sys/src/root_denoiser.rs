@@ -157,6 +157,10 @@ pub mod ffi {
         fn take_returned(self: &RootDenoiserHarness) -> Vec<RootDenoiserTestReturned>;
         fn take_fallback_changes(self: &RootDenoiserHarness) -> Vec<u8>;
         fn fallback(self: &RootDenoiserHarness) -> bool;
+        /// What the control last decided through the fallback_decided hook.
+        fn fallback_decided(self: &RootDenoiserHarness) -> bool;
+        /// While set, set_fallback waits (an APM re-initialisation that hangs).
+        fn block_fallback(self: &RootDenoiserHarness, block: bool);
         fn pending(self: &RootDenoiserHarness) -> usize;
         /// The fallback state machine alone: -1 no change, 0 off, 1 on.
         fn fallback_update(
@@ -169,6 +173,7 @@ pub mod ffi {
             process_rate: u32,
             processed_frames: u64,
             stream_epoch: u64,
+            arriving: bool,
         ) -> i8;
     }
 }
@@ -331,8 +336,8 @@ mod tests {
 
     #[test]
     fn root_denoiser_slow_frames_latch_a_bypass() {
-        // The fake spins for 6 ms; a call preempted past 20 ms latches on its
-        // own, so that run is tried again.
+        // The fake spins for 6 ms; a plain call preempted past 20 ms latches
+        // on its own, so that run is tried again.
         let mut attempts = 0;
         let h = loop {
             attempts += 1;
@@ -340,15 +345,15 @@ mod tests {
             let a = h.add_fake(&RootFakeFxSpec { sleep_us: 6_000, ..fake(1.0) });
             h.install_now(a, 48_000);
             let mut preempted = false;
-            for call in 0..3 {
+            for call in 0..4 {
                 assert_eq!(run(&h, 48_000, 1.0).kind, RAN);
                 let info = h.slot_info(true);
-                preempted = info.process_max_us > 20_000;
+                preempted = call > 0 && info.process_max_us > 20_000;
                 if preempted {
                     break;
                 }
-                if call < 2 {
-                    assert_eq!(info.bypass, 0, "two slow calls are not enough");
+                if call < 3 {
+                    assert_eq!(info.bypass, 0, "a warm-up and two slow calls are not enough");
                 }
             }
             if !preempted {
@@ -357,9 +362,9 @@ mod tests {
             assert!(attempts < 5, "every run had a call preempted past 20 ms");
         };
         let info = h.slot_info(false);
-        assert_eq!((info.slow_frames, info.bypass), (3, SLOW));
+        assert_eq!((info.slow_frames, info.bypass), (4, SLOW), "every slow call is counted");
         assert_eq!(run(&h, 48_000, 1.0).kind, NOT_IN_USE);
-        assert_eq!(info.histogram[13..].iter().sum::<u64>(), 3, "{:?}", info.histogram);
+        assert_eq!(info.histogram[13..].iter().sum::<u64>(), 4, "{:?}", info.histogram);
 
         let b = h.add_fake(&RootFakeFxSpec { sleep_us: 25_000, ..fake(1.0) });
         h.install_now(b, 48_000);
@@ -367,30 +372,52 @@ mod tests {
         let warm_up = h.slot_info(true);
         assert_eq!(warm_up.bypass, 0, "the first call after an install is a warm-up");
         assert!(warm_up.process_max_us >= 25_000, "still measured: {}", warm_up.process_max_us);
-        assert_eq!((warm_up.slow_frames, warm_up.histogram[15]), (4, 1));
+        assert_eq!((warm_up.slow_frames, warm_up.histogram[15]), (5, 1));
         assert_eq!(run(&h, 48_000, 1.0).kind, RAN);
         assert_eq!(h.slot_info(false).bypass, SLOW, "one later call over 20 ms");
         assert!(h.slot_info(true).process_max_us >= 20_000);
         assert_eq!(h.slot_info(true).process_max_us, 0, "the maximum resets on read");
     }
 
+    /// Stream restarts, device flaps and power changes in a minute never
+    /// bypass a denoiser that keeps up with plain frames.
     #[test]
-    fn root_denoiser_a_warm_up_after_a_flush_latches_nothing_on_its_own() {
-        let h = harness();
-        let a = h.add_fake(&fake(1.0));
-        h.install_now(a, 48_000);
-        run(&h, 48_000, 1.0);
-        h.set_fake_sleep_us(a, 25_000);
-        let flushed = h.process(48_000, &frame(48_000, 1.0), true, 0.5, 3840);
-        assert!(flushed.restart);
-        let info = h.slot_info(false);
-        assert_eq!((info.bypass, info.slow_frames), (0, 1));
-        assert!(info.process_max_us >= 50_000, "flush and process: {}", info.process_max_us);
+    fn root_denoiser_warm_ups_flushes_and_power_changes_never_count_toward_the_slow_latch() {
+        // A plain call preempted past 20 ms latches on its own, so that run is
+        // tried again.
+        let plain = |h: &RootDenoiserHarness| {
+            assert_eq!(h.process(48_000, &frame(48_000, 1.0), false, 0.8, 3840).kind, RAN);
+            h.slot_info(true).process_max_us <= 20_000
+        };
+        for attempt in 1.. {
+            let h = harness();
+            let a = h.add_fake(&fake(1.0));
+            h.install_now(a, 48_000);
+            run(&h, 48_000, 1.0);
+            h.set_fake_sleep_us(a, 25_000);
+            for _ in 0..3 {
+                let flushed = h.process(48_000, &frame(48_000, 1.0), true, 0.5, 3840);
+                assert!(flushed.restart);
+            }
+            let info = h.slot_info(true);
+            assert_eq!((info.bypass, info.slow_frames), (0, 3), "three slow flushes: counted only");
+            assert!(info.process_max_us >= 50_000, "flush and process: {}", info.process_max_us);
 
-        h.set_fake_sleep_us(a, 6_000);
-        run(&h, 48_000, 1.0);
-        assert_eq!(run(&h, 48_000, 1.0).kind, RAN);
-        assert_eq!(h.slot_info(false).bypass, SLOW, "the warm-up still counts toward three");
+            h.set_fake_sleep_us(a, 6_000);
+            for power in [0.6, 0.7, 0.8] {
+                assert_eq!(h.process(48_000, &frame(48_000, 1.0), false, power, 3840).kind, RAN);
+            }
+            let info = h.slot_info(true);
+            assert_eq!((info.bypass, info.slow_frames), (0, 6), "power changes neither");
+            if !(plain(&h) && plain(&h)) {
+                assert!(attempt < 5, "every run had a plain call preempted past 20 ms");
+                continue;
+            }
+            assert_eq!(h.slot_info(false).bypass, 0, "two plain slow calls");
+            plain(&h);
+            assert_eq!(h.slot_info(false).bypass, SLOW, "the third plain one latches");
+            break;
+        }
     }
 
     #[test]
@@ -510,7 +537,17 @@ mod tests {
         process_rate: u32,
     ) -> i8 {
         let frames = now_ms as u64 + 1;
-        h.fallback_update(now_ms, wanted, installed, bypass, pipeline_rate, process_rate, frames, 0)
+        h.fallback_update(
+            now_ms,
+            wanted,
+            installed,
+            bypass,
+            pipeline_rate,
+            process_rate,
+            frames,
+            0,
+            false,
+        )
     }
 
     #[test]
@@ -522,9 +559,9 @@ mod tests {
         assert_eq!(update(&h, 30, true, true, 0, 48_000, 48_000), 0, "a new one runs");
         assert_eq!(update(&h, 40, true, true, SLOW, 48_000, 48_000), 1);
         assert_eq!(update(&h, 50, false, true, SLOW, 48_000, 48_000), 0, "not wanted");
-        assert_eq!(h.fallback_update(60, true, true, SLOW, 48_000, 48_000, 50, 0), 1);
+        assert_eq!(h.fallback_update(60, true, true, SLOW, 48_000, 48_000, 50, 0, false), 1);
         assert_eq!(
-            h.fallback_update(5000, true, false, 0, 0, 48_000, 50, 0),
+            h.fallback_update(5000, true, false, 0, 0, 48_000, 50, 0, false),
             -1,
             "on stays on while no frames flow"
         );
@@ -562,37 +599,57 @@ mod tests {
     fn root_denoiser_fallback_grace_counts_only_while_frames_flow() {
         let h = harness();
         assert_eq!(
-            h.fallback_update(0, true, false, 0, 0, 0, 0, 0),
+            h.fallback_update(0, true, false, 0, 0, 0, 0, 0, false),
             -1,
             "wanted at the first control send"
         );
-        assert_eq!(h.fallback_update(5000, true, false, 0, 0, 0, 0, 0), -1, "no frames, no grace");
-        assert_eq!(h.fallback_update(6000, true, false, 0, 0, 48_000, 1, 1), -1, "recording");
-        assert_eq!(h.fallback_update(6500, true, false, 0, 0, 48_000, 50, 1), -1);
-        assert_eq!(h.fallback_update(6999, true, false, 0, 0, 48_000, 99, 1), -1);
-        assert_eq!(h.fallback_update(7000, true, false, 0, 0, 48_000, 100, 1), 1, "1 s of frames");
+        assert_eq!(
+            h.fallback_update(5000, true, false, 0, 0, 0, 0, 0, false),
+            -1,
+            "no frames, no grace"
+        );
+        assert_eq!(
+            h.fallback_update(6000, true, false, 0, 0, 48_000, 1, 1, false),
+            -1,
+            "recording"
+        );
+        assert_eq!(h.fallback_update(6500, true, false, 0, 0, 48_000, 50, 1, false), -1);
+        assert_eq!(h.fallback_update(6999, true, false, 0, 0, 48_000, 99, 1, false), -1);
+        assert_eq!(
+            h.fallback_update(7000, true, false, 0, 0, 48_000, 100, 1, false),
+            1,
+            "1 s of frames"
+        );
     }
 
     #[test]
     fn root_denoiser_fallback_grace_starts_over_when_frames_stop_or_a_stream_starts() {
         let h = harness();
-        assert_eq!(h.fallback_update(0, true, false, 0, 0, 48_000, 1, 0), -1);
-        assert_eq!(h.fallback_update(600, true, false, 0, 0, 48_000, 60, 0), -1);
+        assert_eq!(h.fallback_update(0, true, false, 0, 0, 48_000, 1, 0, false), -1);
+        assert_eq!(h.fallback_update(600, true, false, 0, 0, 48_000, 60, 0, false), -1);
         assert_eq!(
-            h.fallback_update(800, true, false, 0, 0, 48_000, 60, 0),
+            h.fallback_update(800, true, false, 0, 0, 48_000, 60, 0, false),
             -1,
             "200 ms, no frame"
         );
-        assert_eq!(h.fallback_update(900, true, false, 0, 0, 48_000, 61, 0), -1, "frames again");
-        assert_eq!(h.fallback_update(1899, true, false, 0, 0, 48_000, 160, 0), -1);
-        assert_eq!(h.fallback_update(1900, true, false, 0, 0, 48_000, 161, 0), 1);
+        assert_eq!(
+            h.fallback_update(900, true, false, 0, 0, 48_000, 61, 0, false),
+            -1,
+            "frames again"
+        );
+        assert_eq!(h.fallback_update(1899, true, false, 0, 0, 48_000, 160, 0, false), -1);
+        assert_eq!(h.fallback_update(1900, true, false, 0, 0, 48_000, 161, 0, false), 1);
 
         let h = harness();
-        assert_eq!(h.fallback_update(0, true, false, 0, 0, 48_000, 1, 0), -1);
-        assert_eq!(h.fallback_update(900, true, false, 0, 0, 48_000, 90, 0), -1);
-        assert_eq!(h.fallback_update(910, true, false, 0, 0, 48_000, 91, 1), -1, "a new stream");
-        assert_eq!(h.fallback_update(1909, true, false, 0, 0, 48_000, 190, 1), -1);
-        assert_eq!(h.fallback_update(1910, true, false, 0, 0, 48_000, 191, 1), 1);
+        assert_eq!(h.fallback_update(0, true, false, 0, 0, 48_000, 1, 0, false), -1);
+        assert_eq!(h.fallback_update(900, true, false, 0, 0, 48_000, 90, 0, false), -1);
+        assert_eq!(
+            h.fallback_update(910, true, false, 0, 0, 48_000, 91, 1, false),
+            -1,
+            "a new stream"
+        );
+        assert_eq!(h.fallback_update(1909, true, false, 0, 0, 48_000, 190, 1, false), -1);
+        assert_eq!(h.fallback_update(1910, true, false, 0, 0, 48_000, 191, 1, false), 1);
     }
 
     #[test]
@@ -739,17 +796,20 @@ mod tests {
         let b = h.add_fake(&fake(1.0));
         h.request(1, 10, h.fake_pipeline(a), 48_000);
         completions(&h, 1);
+        run(&h, 48_000, 1.0);
         h.set_speaking(true);
         h.request(2, 11, h.fake_pipeline(b), 48_000);
         wait_until("b waiting", || h.pending() == 1);
         h.set_wanted(true);
-        h.set_process_rate(16_000);
+        h.set_process_rate(48_000);
+        h.latch_bypass(OUTPUT_STALLED);
         h.wake();
         wait_until("fallback", || h.fallback());
+        assert_eq!(fallback_changes(&h, 1), vec![1], "a dead denoiser: b on its way or not");
 
         h.set_wanted(false);
         h.reset();
-        assert!(!h.fallback());
+        assert!(!h.fallback() && !h.fallback_decided());
         let mut returned = h.take_returned();
         returned.sort_by_key(|r| r.owner);
         assert_eq!(
@@ -764,7 +824,7 @@ mod tests {
         assert!(!done[0].error.is_empty());
         assert_eq!(done[0].pipeline, 0, "it is on the returned list");
         assert!(!h.slot_info(false).installed);
-        assert_eq!(h.take_fallback_changes(), vec![1, 0]);
+        assert_eq!(h.take_fallback_changes(), vec![0], "applied before reset returns");
     }
 
     #[test]
@@ -973,13 +1033,14 @@ mod tests {
         h.wake();
         wait_until("fallback after the grace", || h.fallback());
         assert!(started.elapsed() >= Duration::from_millis(95));
-        assert_eq!(h.take_fallback_changes(), vec![1]);
+        assert_eq!(fallback_changes(&h, 1), vec![1]);
+        assert!(h.fallback_decided());
 
         let a = h.add_fake(&fake(1.0));
         h.request(1, 10, h.fake_pipeline(a), 48_000);
         completions(&h, 1);
         wait_until("the denoiser runs", || !h.fallback());
-        assert_eq!(h.take_fallback_changes(), vec![0]);
+        assert_eq!(fallback_changes(&h, 1), vec![0]);
 
         run(&h, 48_000, 1.0);
         let latched = Instant::now();
@@ -989,6 +1050,153 @@ mod tests {
 
         h.set_wanted(false);
         wait_until("fallback off", || !h.fallback());
-        assert_eq!(h.take_fallback_changes(), vec![1, 0]);
+        assert_eq!(fallback_changes(&h, 2), vec![1, 0]);
+    }
+
+    /// The fallback changes set_fallback was handed, once `count` arrived.
+    fn fallback_changes(h: &RootDenoiserHarness, count: usize) -> Vec<u8> {
+        let mut all = Vec::new();
+        wait_until("fallback changes", || {
+            all.extend(h.take_fallback_changes());
+            all.len() >= count
+        });
+        all
+    }
+
+    #[test]
+    fn root_denoiser_fallback_grace_waits_for_an_install_on_its_way() {
+        let h = harness();
+        let arriving = |now_ms: i64, arriving: bool| {
+            h.fallback_update(now_ms, true, false, 0, 0, 48_000, now_ms as u64 + 1, 0, arriving)
+        };
+        assert_eq!(arriving(0, true), -1);
+        assert_eq!(arriving(2999, true), -1, "no grace while the install waits");
+        assert_eq!(arriving(3000, false), -1, "it starts once nothing is on its way");
+        assert_eq!(arriving(3999, false), -1);
+        assert_eq!(arriving(4000, false), 1);
+        assert_eq!(arriving(4010, true), -1, "on stays on until a denoiser runs");
+
+        let h = harness();
+        let dead = |now_ms: i64, bypass: u32| {
+            h.fallback_update(
+                now_ms,
+                true,
+                true,
+                bypass,
+                48_000,
+                48_000,
+                now_ms as u64 + 1,
+                0,
+                true,
+            )
+        };
+        assert_eq!(dead(0, 0), -1);
+        assert_eq!(dead(10, OUTPUT_STALLED), 1, "a dead denoiser never waits");
+        assert_eq!(dead(20, 0), 0);
+        assert_eq!(dead(30, SLOW), 1);
+        let h = harness();
+        assert_eq!(
+            h.fallback_update(0, true, true, RATE_MISMATCH, 16_000, 48_000, 1, 0, true),
+            -1,
+            "a pipeline at the new rate on its way"
+        );
+        assert_eq!(
+            h.fallback_update(1500, true, true, RATE_MISMATCH, 16_000, 48_000, 150, 0, true),
+            -1
+        );
+    }
+
+    /// A pipeline handed over while the user talks waits for a pause, up to
+    /// the install wait; the missing-denoiser grace does not run out meanwhile,
+    /// so WebRTC NS is not turned on just before the pipeline lands.
+    #[test]
+    fn root_denoiser_effects_thread_holds_the_grace_while_an_install_waits_for_a_pause() {
+        let h = new_root_denoiser_harness(600, 100);
+        h.set_process_rate(48_000);
+        h.set_wanted(true);
+        h.set_speaking(true);
+        let a = h.add_fake(&fake(1.0));
+        h.request(1, 10, h.fake_pipeline(a), 48_000);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!h.fallback(), "three graces long, the install still waiting");
+        assert_eq!(h.pending(), 1);
+        h.set_speaking(false);
+        assert_eq!(completions(&h, 1), vec![ok(1, 10)]);
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!h.fallback());
+        assert!(h.take_fallback_changes().is_empty(), "WebRTC NS never toggled");
+
+        let b = h.add_fake(&fake(1.0));
+        h.set_speaking(true);
+        assert!(h.hold_slot(true));
+        h.request(1, 11, h.fake_pipeline(b), 16_000);
+        h.set_process_rate(16_000);
+        let started = Instant::now();
+        let failed = completions(&h, 1);
+        assert!(failed[0].error.contains("did not let go"), "{:?}", failed[0]);
+        assert!(started.elapsed() >= Duration::from_millis(550), "it waited the install wait");
+        h.hold_slot(false);
+        wait_until("fallback once nothing is on its way", || h.fallback());
+        assert_eq!(fallback_changes(&h, 1), vec![1]);
+    }
+
+    #[test]
+    fn root_denoiser_a_rate_the_chain_never_runs_fails_unless_native_holds_the_pipeline() {
+        let h = harness();
+        let a = h.add_fake(&fake(1.0));
+        let b = h.add_fake(&fake(1.0));
+        let (pa, pb) = (h.fake_pipeline(a), h.fake_pipeline(b));
+        h.request(1, 10, pa, 7_999);
+        let failed = completions(&h, 1);
+        assert!(failed[0].error.contains("outside 8000-48000 Hz"), "{:?}", failed[0]);
+        assert_eq!(failed[0].pipeline, pa, "never held: the app releases it");
+        assert_eq!(h.pending(), 0);
+
+        h.request(1, 11, pa, 48_000);
+        completions(&h, 1);
+        h.request(2, 12, pa, 96_000);
+        assert_eq!(completions(&h, 1), vec![ok(2, 12)], "installed: nothing changes");
+        assert!(h.slot_info(false).installed && h.slot_info(false).rate == 48_000);
+
+        h.request(1, 13, pb, 48_000);
+        completions(&h, 1);
+        h.request(1, 14, pa, 0);
+        assert_eq!(completions(&h, 1), vec![ok(1, 14)], "returned, not taken back yet");
+        assert_eq!(
+            h.take_returned(),
+            vec![RootDenoiserTestReturned { owner: 1, pipeline: pa }],
+            "it still comes back"
+        );
+    }
+
+    /// set_fallback can wait on an APM re-initialisation (and a capture frame
+    /// with the SDK in it); requests and the FFI's takes never wait for it.
+    #[test]
+    fn root_denoiser_applying_the_fallback_blocks_no_request() {
+        struct Unblock<'a>(&'a RootDenoiserHarness);
+        impl Drop for Unblock<'_> {
+            fn drop(&mut self) {
+                self.0.block_fallback(false);
+            }
+        }
+        let h = new_root_denoiser_harness(3000, 50);
+        let _unblock = Unblock(&h);
+        h.set_process_rate(48_000);
+        h.block_fallback(true);
+        h.set_wanted(true);
+        h.wake();
+        wait_until("decided", || h.fallback() && h.fallback_decided());
+        std::thread::sleep(Duration::from_millis(20));
+        let started = Instant::now();
+        let a = h.add_fake(&fake(1.0));
+        h.request(1, 10, h.fake_pipeline(a), 48_000);
+        assert!(h.take_completions().is_empty());
+        let _ = h.pending();
+        assert!(started.elapsed() < Duration::from_millis(50), "{:?}", started.elapsed());
+        assert!(h.take_fallback_changes().is_empty(), "still being applied");
+        h.block_fallback(false);
+        completions(&h, 1);
+        wait_until("the denoiser runs", || !h.fallback());
+        assert_eq!(fallback_changes(&h, 2), vec![1, 0], "applied in the order decided");
     }
 }

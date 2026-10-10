@@ -157,9 +157,11 @@ RootDenoiseResult RootDenoiserSlot::ProcessAudio(const float* in,
   }
   const float wanted_power =
       std::isnan(power) ? 0.0f : std::min(1.0f, std::max(0.0f, power));
+  bool power_changed = false;
   if (!(wanted_power == applied_power_)) {
     pipeline->vtbl->set_noise_suppression_power(pipeline, wanted_power);
     applied_power_ = wanted_power;
+    power_changed = true;
   }
 
   const uint32_t capacity = static_cast<uint32_t>(kOutputFrames * frames);
@@ -180,11 +182,13 @@ RootDenoiseResult RootDenoiserSlot::ProcessAudio(const float* in,
   }
   if (elapsed_us > kSlowFrameUs) {
     slow_frames_.fetch_add(1, std::memory_order_relaxed);
+  }
+  // A (re)start, flush or power change pays one-off costs: measured and
+  // counted above like any other call, but only plain calls latch.
+  if (elapsed_us > kSlowFrameUs && !restart && !power_changed) {
     slow_times_us_[slow_count_ % kSlowFramesToBypass] = end_us;
     ++slow_count_;
-    // The first call after an install or a flush may pay a one-off warm-up:
-    // measured and counted like any other, but alone it latches nothing.
-    bool latch = elapsed_us > kStalledFrameUs && !restart;
+    bool latch = elapsed_us > kStalledFrameUs;
     if (slow_count_ >= kSlowFramesToBypass &&
         end_us - slow_times_us_[slow_count_ % kSlowFramesToBypass] <=
             kSlowWindowUs) {
@@ -380,7 +384,8 @@ std::optional<bool> RootNsFallback::Update(int64_t now_ms,
                                            uint32_t pipeline_rate,
                                            uint32_t process_rate,
                                            uint64_t processed_frames,
-                                           uint64_t stream_epoch) {
+                                           uint64_t stream_epoch,
+                                           bool arriving) {
   if (processed_frames != frames_) {
     frames_ = processed_frames;
     frames_moved_ms_ = now_ms;
@@ -395,7 +400,10 @@ std::optional<bool> RootNsFallback::Update(int64_t now_ms,
                       (process_rate == 0 || pipeline_rate == process_rate);
   bool on = false;
   if (wanted && !active) {
-    if (!flowing) {
+    // A pipeline waiting for a pause in speech lands within its install wait;
+    // turning NS on (an AEC re-init) just before it would cost a second
+    // re-init when it lands.
+    if (!flowing || arriving) {
       inactive_since_ms_.reset();
     } else if (!inactive_since_ms_) {
       inactive_since_ms_ = now_ms;
@@ -457,13 +465,6 @@ void RootDenoiserControl::Set(uint64_t owner,
                               uint32_t rate) {
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (pipeline != 0) {
-      returned_.erase(std::remove_if(returned_.begin(), returned_.end(),
-                                     [pipeline](const RootDenoiserReturned& r) {
-                                       return r.pipeline == pipeline;
-                                     }),
-                      returned_.end());
-    }
     Request request;
     request.seq = ++next_seq_;
     request.owner = owner;
@@ -471,6 +472,28 @@ void RootDenoiserControl::Set(uint64_t owner,
     request.pipeline = pipeline;
     request.rate = rate;
     request.since_ms = NowMs();
+    const auto on_returned_list = [pipeline](const RootDenoiserReturned& r) {
+      return r.pipeline == pipeline;
+    };
+    if (pipeline != 0 && (rate < kMinRate || rate > kMaxRate)) {
+      // An error has the app release the pipeline, so one native still holds
+      // (or has yet to hand back) stays as it is and this changes nothing.
+      if (HeldLocked(pipeline) ||
+          std::any_of(returned_.begin(), returned_.end(), on_returned_list)) {
+        CompleteLocked(request, std::string(), 0);
+      } else {
+        CompleteLocked(request,
+                       "pipeline rate " + std::to_string(rate) +
+                           " is outside 8000-48000 Hz",
+                       pipeline);
+      }
+      return;
+    }
+    if (pipeline != 0) {
+      returned_.erase(
+          std::remove_if(returned_.begin(), returned_.end(), on_returned_list),
+          returned_.end());
+    }
     queue_.push_back(request);
     EnsureThreadLocked();
   }
@@ -512,7 +535,15 @@ void RootDenoiserControl::Run() {
         continue;
       }
     }
-    const bool ticking = TickLocked(now_ms);
+    bool changed = false;
+    const bool ticking = TickLocked(now_ms, &changed);
+    if (changed) {
+      lock.unlock();
+      ApplyFallback();
+      lock.lock();
+      // A request or a stop may have come meanwhile.
+      continue;
+    }
     if (stop_) {
       break;
     }
@@ -561,24 +592,52 @@ void RootDenoiserControl::CommitLocked(std::unique_lock<std::mutex>& lock,
   CompleteLocked(request, std::string(), 0);
 }
 
-bool RootDenoiserControl::TickLocked(int64_t now_ms) {
+bool RootDenoiserControl::TickLocked(int64_t now_ms, bool* changed) {
   const bool wanted = hooks_.wanted && hooks_.wanted();
   const bool installed = slot_->installed();
   const uint32_t process_rate = hooks_.process_rate ? hooks_.process_rate() : 0;
   const uint64_t frames =
       hooks_.processed_frames ? hooks_.processed_frames() : 0;
   const uint64_t epoch = hooks_.stream_epoch ? hooks_.stream_epoch() : 0;
-  const std::optional<bool> change =
-      fallback_.Update(now_ms, wanted, installed, slot_->bypass(),
-                       slot_->rate(), process_rate, frames, epoch);
+  const std::optional<bool> change = fallback_.Update(
+      now_ms, wanted, installed, slot_->bypass(), slot_->rate(), process_rate,
+      frames, epoch, ArrivingLocked(now_ms));
+  *changed = change.has_value();
   if (change) {
-    fallback_on_.store(*change, std::memory_order_relaxed);
-    if (hooks_.set_fallback) {
-      hooks_.set_fallback(*change);
-    }
+    DecideFallbackLocked(*change);
   }
   return wanted || installed || !queue_.empty() || waiting_.has_value() ||
          fallback_.on();
+}
+
+bool RootDenoiserControl::ArrivingLocked(int64_t now_ms) const {
+  const auto arriving = [this, now_ms](const Request& request) {
+    return request.pipeline != 0 &&
+           now_ms - request.since_ms < timing_.install_wait_ms;
+  };
+  return (waiting_ && arriving(*waiting_)) ||
+         std::any_of(queue_.begin(), queue_.end(), arriving);
+}
+
+void RootDenoiserControl::DecideFallbackLocked(bool on) {
+  fallback_on_.store(on, std::memory_order_relaxed);
+  if (hooks_.fallback_decided) {
+    hooks_.fallback_decided(on);
+  }
+}
+
+void RootDenoiserControl::ApplyFallback() {
+  // Whoever applies last reads the latest decision, so the APM ends where
+  // the decisions did whatever order the deciding threads get here in.
+  std::lock_guard<std::mutex> lock(fallback_mutex_);
+  const bool on = fallback_on_.load(std::memory_order_relaxed);
+  if (on == fallback_applied_) {
+    return;
+  }
+  fallback_applied_ = on;
+  if (hooks_.set_fallback) {
+    hooks_.set_fallback(on);
+  }
 }
 
 bool RootDenoiserControl::HeldLocked(uint64_t pipeline) const {
@@ -733,13 +792,10 @@ void RootDenoiserControl::Reset() {
       installed_owner_ = 0;
       ReturnLocked(owner, previous);
     }
-    const bool was_on = fallback_.on();
     fallback_.Reset();
-    fallback_on_.store(false, std::memory_order_relaxed);
-    if (was_on && hooks_.set_fallback) {
-      hooks_.set_fallback(false);
-    }
+    DecideFallbackLocked(false);
   }
+  ApplyFallback();
   wake_.notify_all();
 }
 
@@ -1009,6 +1065,8 @@ struct RootDenoiserHarness::State {
   std::atomic<bool> frames_flowing{true};
   std::atomic<uint64_t> frames{0};
   std::atomic<uint64_t> epoch{0};
+  std::atomic<bool> block_fallback{false};
+  std::atomic<bool> fallback_decided{false};
   std::mutex changes_mutex;
   std::vector<uint8_t> changes;
   RootNsFallback fallback;
@@ -1042,7 +1100,14 @@ RootDenoiserHarness::RootDenoiserHarness(int64_t install_wait_ms,
   hooks.stream_epoch = [state] {
     return state->epoch.load(std::memory_order_relaxed);
   };
+  hooks.fallback_decided = [state](bool on) {
+    state->fallback_decided.store(on, std::memory_order_relaxed);
+  };
   hooks.set_fallback = [state](bool on) {
+    // As the decorator waiting for an APM re-initialisation.
+    while (state->block_fallback.load(std::memory_order_relaxed)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
     std::lock_guard<std::mutex> lock(state->changes_mutex);
     state->changes.push_back(on ? 1 : 0);
   };
@@ -1295,6 +1360,14 @@ bool RootDenoiserHarness::fallback() const {
   return state_->control->fallback();
 }
 
+bool RootDenoiserHarness::fallback_decided() const {
+  return state_->fallback_decided.load(std::memory_order_relaxed);
+}
+
+void RootDenoiserHarness::block_fallback(bool block) const {
+  state_->block_fallback.store(block, std::memory_order_relaxed);
+}
+
 size_t RootDenoiserHarness::pending() const {
   return state_->control->pending();
 }
@@ -1306,10 +1379,11 @@ int8_t RootDenoiserHarness::fallback_update(int64_t now_ms,
                                             uint32_t pipeline_rate,
                                             uint32_t process_rate,
                                             uint64_t processed_frames,
-                                            uint64_t stream_epoch) const {
+                                            uint64_t stream_epoch,
+                                            bool arriving) const {
   const std::optional<bool> change = state_->fallback.Update(
       now_ms, wanted, installed, static_cast<RootDenoiserBypass>(bypass),
-      pipeline_rate, process_rate, processed_frames, stream_epoch);
+      pipeline_rate, process_rate, processed_frames, stream_epoch, arriving);
   if (!change) {
     return -1;
   }

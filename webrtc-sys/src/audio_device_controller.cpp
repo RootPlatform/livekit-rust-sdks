@@ -110,6 +110,9 @@ AudioDeviceController::AudioDeviceController(
   hooks.stream_epoch = [state] {
     return state->stream_epoch.load(std::memory_order_relaxed);
   };
+  hooks.fallback_decided = [state](bool on) {
+    state->ns_fallback_decided.store(on, std::memory_order_relaxed);
+  };
   hooks.set_fallback = [decorator](bool on) {
     if (decorator) {
       decorator->SetFallbackNoiseSuppression(on);
@@ -348,6 +351,7 @@ RootAudioNativeStats AudioDeviceController::root_audio_stats() const {
     const RootCaptureFormatSnapshot format = ReadCaptureFormat(*capture_);
     stats.process_rate = format.sample_rate;
     stats.process_channels = format.channels;
+    capture_->ClearStaleSpeaking();
     const RootDspStatsSnapshot dsp = capture_->ReadDspStats(true);
     stats.dsp_available = kRootDspSupported;
     stats.processed_frames = dsp.processed_frames;
@@ -374,6 +378,7 @@ RootAudioNativeStats AudioDeviceController::root_audio_stats() const {
     stats.dsp_flushes = dsp.dsp_flushes;
     stats.gate_open_delay_us = dsp.gate_open_delay_us;
     stats.ns_gap_frames = dsp.ns_gap_frames;
+    stats.ns_fallback_pending_frames = dsp.ns_fallback_pending_frames;
     stats.denoiser_latency_ms = dsp.aligner_latency_ms;
     stats.denoiser_buffered_samples = dsp.aligner_buffered_samples;
     stats.denoiser_underruns = dsp.aligner_underruns;
@@ -463,10 +468,9 @@ bool AudioDeviceController::set_root_audio_control(
           std::memory_order_relaxed);
       capture_->gain_reset_seq.fetch_add(1, std::memory_order_release);
     }
-    if (control.has_denoiser_wanted) {
-      capture_->denoiser_wanted.store(control.denoiser_wanted,
-                                      std::memory_order_relaxed);
-      if (denoiser_ && control.denoiser_wanted) {
+    if (control.has_denoiser_wanted && control.denoiser_wanted) {
+      capture_->denoiser_wanted.store(true, std::memory_order_relaxed);
+      if (denoiser_) {
         denoiser_->Wake();
       }
     }
@@ -486,6 +490,12 @@ bool AudioDeviceController::set_root_audio_control(
                     control.has_noise_suppression
                         ? std::optional<bool>(control.noise_suppression)
                         : std::nullopt);
+  }
+  // A falling denoiser_wanted lands after the policy sent with it: the
+  // effects thread may drop the fallback at once, and NS then has to be
+  // what the host now asks for, not its previous value.
+  if (capture_ && control.has_denoiser_wanted && !control.denoiser_wanted) {
+    capture_->denoiser_wanted.store(false, std::memory_order_relaxed);
   }
   return (capture_ || !capture_fields) && (mixer_ || !mixer_fields) &&
          (apm_ || !apm_fields);
@@ -632,6 +642,9 @@ RootDenoiserStateInfo AudioDeviceController::root_denoiser_state() const {
 RootSpeakingInfo AudioDeviceController::root_audio_speaking() const {
   RootSpeakingInfo info{};
   if (capture_) {
+    // Polled every 10 ms while a session lives: frames that stopped without
+    // a stop never leave the ring lit.
+    capture_->ClearStaleSpeaking();
     const RootSpeakingSnapshot speaking = capture_->ReadSpeaking();
     info.speaking = speaking.speaking;
     info.seq = speaking.seq;

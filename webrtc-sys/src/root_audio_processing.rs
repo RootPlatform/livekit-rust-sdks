@@ -171,6 +171,7 @@ pub mod ffi {
         pub dsp_resets: u64,
         pub dsp_flushes: u64,
         pub ns_gap_frames: u64,
+        pub ns_fallback_pending_frames: u64,
         pub speaking_seq: u64,
         pub gate_open_delay_us: u64,
         pub threshold: f32,
@@ -243,6 +244,8 @@ pub mod ffi {
         fn set_denoiser_wanted(self: &RootProcessorHarness, wanted: bool);
         fn set_denoise_power(self: &RootProcessorHarness, power: f32);
         fn set_webrtc_ns_applied(self: &RootProcessorHarness, applied: bool);
+        /// As the denoiser control does when it decides the NS fallback.
+        fn set_ns_fallback_decided(self: &RootProcessorHarness, on: bool);
         /// As AdmProxy does before each StartRecording.
         fn bump_stream_epoch(self: &RootProcessorHarness);
         /// As the controller does: payload, then the sequence number.
@@ -270,8 +273,11 @@ pub mod ffi {
         fn fake_denoiser(self: &RootProcessorHarness) -> RootFakeDenoiserProbe;
         /// Holds the slot as the audio thread would mid-process.
         fn hold_denoiser_slot(self: &RootProcessorHarness, hold: bool) -> bool;
-        /// Stores the speaking flag as the processor publishes it.
+        /// Stores the speaking flag as the processor publishes it, as of a
+        /// frame now.
         fn set_published_speaking(self: &RootProcessorHarness, speaking: bool);
+        /// The control side's check for frames that stopped with speaking set.
+        fn clear_stale_speaking(self: &RootProcessorHarness);
         fn gate_open_stamp_us(self: &RootProcessorHarness) -> i64;
         /// Speaking and outside the startup hold.
         fn audibly_speaking(self: &RootProcessorHarness) -> bool;
@@ -311,7 +317,8 @@ pub mod ffi {
         fn processor_channels(self: &RootApmHarness) -> u32;
         /// The capture state's published speaking flag.
         fn speaking(self: &RootApmHarness) -> bool;
-        /// Overrides the published speaking flag the decorator waits on.
+        /// Overrides the published speaking flag the decorator waits on, as of
+        /// a frame now.
         fn set_speaking(self: &RootApmHarness, speaking: bool);
         fn set_fallback_ns(self: &RootApmHarness, on: bool);
         fn policy(self: &RootApmHarness) -> RootPolicyProbe;
@@ -1124,6 +1131,48 @@ mod processor_tests {
         assert_eq!(dsp.published_seq, seq + 1);
         h.reset_controls();
         assert_eq!(h.dsp(false).published_seq, seq + 1, "already clear: no transition");
+    }
+
+    #[test]
+    fn root_capture_processor_speaking_goes_stale_when_frames_stop() {
+        let h = started(48000, 1);
+        h.set_published_speaking(true);
+        assert!(h.audibly_speaking());
+        h.clear_stale_speaking();
+        assert!(h.dsp(false).published_speaking, "a frame just now");
+        std::thread::sleep(std::time::Duration::from_millis(320));
+        assert!(!h.audibly_speaking(), "no frame for 300 ms: nobody is heard");
+        assert!(h.dsp(false).published_speaking, "published until the control side clears it");
+        let seq = h.dsp(false).published_seq;
+        h.clear_stale_speaking();
+        let dsp = h.dsp(false);
+        assert!(!dsp.published_speaking);
+        assert_eq!(dsp.published_seq, seq + 1);
+    }
+
+    #[test]
+    fn root_capture_processor_counts_frames_the_ns_fallback_waits_for_the_apm() {
+        let h = pass_through(48000, 1);
+        for _ in 0..3 {
+            run(&h, 48000, 1, 1000.0);
+        }
+        assert_eq!(h.dsp(false).ns_fallback_pending_frames, 0);
+        h.set_ns_fallback_decided(true);
+        h.set_mic_muted(true);
+        run(&h, 48000, 1, 1000.0);
+        run(&h, 48000, 1, 1000.0);
+        assert_eq!(
+            h.dsp(false).ns_fallback_pending_frames,
+            2,
+            "decided, not applied, muted or not"
+        );
+        h.set_webrtc_ns_applied(true);
+        run(&h, 48000, 1, 1000.0);
+        assert_eq!(h.dsp(false).ns_fallback_pending_frames, 2, "applied");
+        h.set_ns_fallback_decided(false);
+        h.set_webrtc_ns_applied(false);
+        run(&h, 48000, 1, 1000.0);
+        assert_eq!(h.dsp(false).ns_fallback_pending_frames, 2, "not decided");
     }
 
     #[test]

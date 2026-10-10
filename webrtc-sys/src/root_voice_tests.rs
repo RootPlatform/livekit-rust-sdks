@@ -170,6 +170,18 @@ fn speak_until_speaking(h: &RootVoiceHarness, signal: &mut Signal) -> usize {
     panic!("speech was never published as speaking");
 }
 
+/// Frames of speech in real time (one every few ms, as a device delivers
+/// them) for `duration`; the user talks throughout.
+fn keep_talking(h: &RootVoiceHarness, signal: &mut Signal, duration: Duration) {
+    let rate = signal.rate as i32;
+    let until = Instant::now() + duration;
+    while Instant::now() < until {
+        h.capture(rate, 1, &signal.speech(3000.0));
+        assert!(speaking(h.controller()), "talking throughout");
+        std::thread::sleep(Duration::from_millis(8));
+    }
+}
+
 /// Quiet until speaking is released; returns how many frames that took.
 fn quiet_until_released(h: &RootVoiceHarness, signal: &mut Signal) -> usize {
     let rate = signal.rate as i32;
@@ -369,6 +381,7 @@ fn root_voice_a_stalled_denoiser_gets_webrtc_ns_at_once_through_the_worker() {
         let stats = c.root_audio_stats();
         stats.apm_policy_applies == 1 && !stats.apm_policy_pending
     });
+    let aec_applied = Instant::now();
     let mut signal = Signal::new(48_000);
     speak_until_speaking(&h, &mut signal);
     let before = c.root_audio_stats();
@@ -405,7 +418,12 @@ fn root_voice_a_stalled_denoiser_gets_webrtc_ns_at_once_through_the_worker() {
     h.hold_worker(false);
     wait_until("WebRTC NS applied", || h.webrtc_ns_applied());
     let waited = released.elapsed();
-    assert!(waited < Duration::from_millis(500), "no rate limit, no pause: {waited:?}");
+    assert!(waited < Duration::from_millis(500), "no pause: {waited:?}");
+    let since_aec = aec_applied.elapsed();
+    assert!(
+        since_aec < Duration::from_secs(1),
+        "inside the AEC change's 1 s window: {since_aec:?}"
+    );
     let stats = c.root_audio_stats();
     assert!(stats.webrtc_ns_active && stats.webrtc_ns_fallback);
     assert_eq!(stats.denoiser_bypass_reason, 2);
@@ -439,9 +457,10 @@ fn root_voice_an_install_asked_while_speaking_lands_at_the_next_pause() {
     let pipeline = h.add_fake_pipeline(0.5, 0);
     let asked = Instant::now();
     assert!(c.set_root_denoiser(3, 30, pipeline, 48_000));
-    std::thread::sleep(Duration::from_millis(300));
+    keep_talking(&h, &mut signal, Duration::from_millis(300));
     assert!(!c.root_denoiser_state().installed, "not mid-word");
     assert!(c.take_root_denoiser_completions().is_empty());
+    assert!(!c.root_denoiser_state().webrtc_ns_fallback, "no grace while it is on its way");
 
     quiet_until_released(&h, &mut signal);
     let paused = Instant::now();
@@ -472,15 +491,143 @@ fn root_voice_an_install_lands_at_the_3_s_limit_while_the_user_keeps_talking() {
     let pipeline = h.add_fake_pipeline(0.5, 0);
     let asked = Instant::now();
     assert!(c.set_root_denoiser(1, 11, pipeline, 48_000));
-    // No frame clears the published flag: the user is still talking.
-    wait_until("the install", || c.root_denoiser_state().installed);
+    // Frames keep coming and the user keeps talking.
+    while !c.root_denoiser_state().installed {
+        h.capture(48_000, 1, &signal.speech(3000.0));
+        assert!(speaking(c), "talking throughout");
+        assert!(asked.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(8));
+    }
     let waited = asked.elapsed();
     assert!(
         waited >= Duration::from_millis(2_900) && waited < Duration::from_millis(4_000),
         "{waited:?}"
     );
-    assert!(speaking(c));
     assert_eq!(completions(c, 1), [ok(1, 11)]);
+}
+
+/// Frames that stop mid-word without a stop (a device that died) leave
+/// nobody speaking: an install waits for no pause that will never come.
+#[test]
+fn root_voice_an_install_does_not_wait_for_a_speaker_whose_frames_stopped() {
+    if !root_denoiser_supported() {
+        return;
+    }
+    let h = started();
+    let c = h.controller();
+    let mut signal = Signal::new(48_000);
+    speak_until_speaking(&h, &mut signal);
+    let pipeline = h.add_fake_pipeline(0.5, 0);
+    let asked = Instant::now();
+    assert!(c.set_root_denoiser(1, 12, pipeline, 48_000));
+    wait_until("the install", || c.root_denoiser_state().installed);
+    let waited = asked.elapsed();
+    assert!(waited < Duration::from_millis(1_000), "{waited:?}");
+    assert!(!speaking(c), "the poll cleared the stale flag");
+    assert_eq!(completions(c, 1), [ok(1, 12)]);
+}
+
+/// A host AEC change while the user talks, with frames flowing in real time,
+/// lands at the next pause.
+#[test]
+fn root_voice_a_host_aec_change_waits_for_a_pause_while_frames_flow() {
+    let h = started();
+    let c = h.controller();
+    let mut signal = Signal::new(48_000);
+    speak_until_speaking(&h, &mut signal);
+    control(
+        &h,
+        RootAudioControlUpdate {
+            has_echo_cancellation: true,
+            echo_cancellation: false,
+            ..Default::default()
+        },
+    );
+    keep_talking(&h, &mut signal, Duration::from_millis(600));
+    let waiting = c.root_audio_stats();
+    assert!(waiting.apm_policy_pending, "deferred while talking");
+    assert_eq!(waiting.apm_policy_applies, 0);
+
+    quiet_until_released(&h, &mut signal);
+    let paused = Instant::now();
+    while c.root_audio_stats().apm_policy_pending {
+        h.capture(48_000, 1, &signal.quiet());
+        assert!(paused.elapsed() < Duration::from_millis(500), "at the pause");
+        std::thread::sleep(Duration::from_millis(8));
+    }
+    let stats = c.root_audio_stats();
+    assert!(!stats.echo_cancellation_active);
+    assert_eq!(
+        (stats.apm_policy_applies, stats.apm_policy_deferred, stats.apm_policy_forced),
+        (1, 1, 0)
+    );
+}
+
+/// A mid-call switch to a 16 kHz headset with the Effects SDK at 48 kHz: the
+/// stream holds while no denoiser runs at the new rate, WebRTC NS covers it
+/// after the grace, the host's 16 kHz pipeline takes over, and NS goes off
+/// again only at a pause in speech.
+#[test]
+fn root_voice_a_rate_change_mid_call_is_covered_until_a_pipeline_at_the_new_rate_runs() {
+    if !root_denoiser_supported() {
+        return;
+    }
+    let h = started();
+    let c = h.controller();
+    denoiser_wanted(&h, true);
+    let old = install(&h, 48_000, 0.5);
+    let mut signal = Signal::new(48_000);
+    for _ in 0..HOLD_FRAMES + 10 {
+        h.capture(48_000, 1, &signal.speech(3000.0));
+    }
+    assert!(speaking(c));
+    let ran = h.fake_counts(old).process_calls;
+    assert_eq!(ran, HOLD_FRAMES as u64 + 10);
+
+    let mut signal = Signal::new(16_000);
+    let switched = Instant::now();
+    let mut frames = 0;
+    while !h.webrtc_ns_applied() {
+        let out = h.capture(16_000, 1, &signal.speech(3000.0));
+        frames += 1;
+        if frames <= 100 {
+            assert!(silent(&out), "{frames}: held, nothing denoises it yet");
+        }
+        assert!(switched.elapsed() < Duration::from_secs(4));
+        std::thread::sleep(Duration::from_millis(8));
+    }
+    let covered = switched.elapsed();
+    assert!(covered >= Duration::from_millis(950), "after the 1 s grace: {covered:?}");
+    let state = c.root_denoiser_state();
+    assert!(state.webrtc_ns_fallback && state.installed);
+    assert_eq!((state.rate, state.bypass_reason), (48_000, 1));
+    assert_eq!(h.fake_counts(old).process_calls, ran, "bypassed for its rate");
+
+    quiet_until_released(&h, &mut signal);
+    let new = h.add_fake_pipeline(0.5, 0);
+    assert!(c.set_root_denoiser(1, 20, new, 16_000));
+    assert_eq!(completions(c, 1), [ok(1, 20)], "between words: at once");
+    let returned = c.take_root_denoiser_returned();
+    assert!(returned.iter().any(|r| r.pipeline == old), "{returned:?}");
+
+    let before = c.root_audio_stats();
+    speak_until_speaking(&h, &mut signal);
+    keep_talking(&h, &mut signal, Duration::from_millis(1_500));
+    assert!(!c.root_denoiser_state().webrtc_ns_fallback, "the 16 kHz pipeline runs");
+    assert!(h.webrtc_ns_applied(), "NS stays on while the user talks");
+    assert!(c.root_audio_stats().apm_policy_pending);
+    quiet_until_released(&h, &mut signal);
+    let paused = Instant::now();
+    while h.webrtc_ns_applied() {
+        h.capture(16_000, 1, &signal.quiet());
+        assert!(paused.elapsed() < Duration::from_millis(500), "at the pause");
+        std::thread::sleep(Duration::from_millis(8));
+    }
+    let after = c.root_audio_stats();
+    assert_eq!(after.apm_policy_deferred, before.apm_policy_deferred + 1);
+    assert_eq!(after.apm_policy_forced, before.apm_policy_forced);
+    assert_eq!(after.denoiser_rate, 16_000);
+    assert!(h.fake_counts(new).process_calls > 100);
 }
 
 #[test]

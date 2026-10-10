@@ -579,6 +579,26 @@ fn adm_proxy_clears_the_speaking_flag_when_recording_stops() {
 }
 
 #[test]
+fn adm_proxy_clears_the_speaking_flag_after_a_failed_stop_and_when_frames_stop() {
+    let h = platform(&["{spk}"], &["{mic}"]);
+    h.app_recording(true);
+    calls(&h);
+    h.set_speaking(true);
+    h.fail_next_stop_recording(-1);
+    h.app_recording(false);
+    assert!(calls(&h).contains(&"StopRecording".to_string()));
+    assert_eq!(h.stats().device_stop_failures, 1);
+    assert!(!h.controller().root_audio_speaking().speaking, "a failed stop clears it too");
+
+    h.set_speaking(true);
+    assert!(h.controller().root_audio_speaking().speaking, "a frame just now");
+    std::thread::sleep(Duration::from_millis(320));
+    let stale = h.controller().root_audio_speaking();
+    assert!(!stale.speaking, "no frame for 300 ms: a device that died mid-word");
+    assert!(!h.stats().speaking);
+}
+
+#[test]
 fn adm_proxy_controller_stores_denoiser_wanted_until_a_reset() {
     let h = harness(&["{spk}"], &["{mic}"]);
     assert!(h.apply_control(&RootAudioControlUpdate {
@@ -705,4 +725,41 @@ fn adm_proxy_controller_covers_a_stalled_denoiser_with_webrtc_ns() {
         ..Default::default()
     });
     wait_until("the fallback ends", || !controller.root_denoiser_state().webrtc_ns_fallback);
+}
+
+/// The host leaves the Effects SDK for WebRTC NS in one control: the policy
+/// lands before denoiser_wanted falls, so the fallback hands NS over without
+/// turning it off in between.
+#[test]
+fn adm_proxy_controller_hands_the_fallback_over_to_the_hosts_ns_without_a_gap() {
+    let h = new_adm_proxy_harness_with_apm(&strings(&["{spk}"]), &strings(&["{mic}"]));
+    let controller = h.controller();
+    let pipeline = h.add_fake_pipeline();
+    controller.set_root_denoiser(1, 10, pipeline, 48_000);
+    denoiser_completions(&h, 1);
+    assert!(h.apply_control(&RootAudioControlUpdate {
+        has_denoiser_wanted: true,
+        denoiser_wanted: true,
+        ..Default::default()
+    }));
+    assert_eq!(h.run_denoiser(48_000), 2);
+    h.latch_denoiser_bypass(2);
+    wait_until("WebRTC NS applied", || h.stats().webrtc_ns_active);
+    std::thread::sleep(Duration::from_millis(1100));
+
+    assert!(h.apply_control(&RootAudioControlUpdate {
+        has_denoiser_wanted: true,
+        denoiser_wanted: false,
+        has_noise_suppression: true,
+        noise_suppression: true,
+        ..Default::default()
+    }));
+    let until = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < until {
+        assert!(h.stats().webrtc_ns_active, "NS never goes off between the two");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(!controller.root_denoiser_state().webrtc_ns_fallback);
+    let stats = h.stats();
+    assert!(stats.webrtc_ns_active && !stats.apm_policy_pending);
 }

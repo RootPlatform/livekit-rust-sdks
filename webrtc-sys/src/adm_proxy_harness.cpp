@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -80,6 +81,9 @@ class FakePlatformAdm
     recording_guids_ = std::move(recording);
   }
 
+  void FailNextStopRecording(int32_t result) {
+    next_stop_recording_result_.store(result);
+  }
   void FailNextStopPlayout(int32_t result) {
     next_stop_playout_result_.store(result);
   }
@@ -176,9 +180,9 @@ class FakePlatformAdm
   }
   int32_t StopRecording() override {
     Record("StopRecording");
-    recording_initialized_.store(false);
+    const bool open = recording_initialized_.exchange(false);
     recording_.store(false);
-    return 0;
+    return open ? next_stop_recording_result_.exchange(0) : 0;
   }
   bool Recording() const override { return recording_.load(); }
 
@@ -220,6 +224,7 @@ class FakePlatformAdm
   std::atomic<bool> recording_initialized_{false};
   std::atomic<bool> recording_{false};
   std::atomic<int32_t> next_stop_playout_result_{0};
+  std::atomic<int32_t> next_stop_recording_result_{0};
   std::atomic<uint16_t> playout_delay_ms_{0};
 };
 
@@ -333,6 +338,10 @@ void AdmProxyHarness::set_devices(
     rust::Slice<const rust::String> playout_guids,
     rust::Slice<const rust::String> recording_guids) const {
   fake_->SetDevices(ToStrings(playout_guids), ToStrings(recording_guids));
+}
+
+void AdmProxyHarness::fail_next_stop_recording(int32_t result) const {
+  fake_->FailNextStopRecording(result);
 }
 
 void AdmProxyHarness::fail_next_stop_playout(int32_t result) const {
@@ -631,6 +640,10 @@ void AdmProxyHarness::latch_denoiser_bypass(uint32_t reason) const {
 
 void AdmProxyHarness::set_speaking(bool speaking) const {
   const uint64_t transitions = capture_->ReadSpeaking().seq + 1;
+  capture_->last_frame_us.store(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
   capture_->speaking_word.store((transitions << 1) | (speaking ? 1u : 0u),
                                 std::memory_order_release);
 }

@@ -157,8 +157,18 @@ void RootCaptureState::ClearSpeaking() {
   }
 }
 
+void RootCaptureState::ClearStaleSpeaking() {
+  if (ReadSpeaking().speaking &&
+      SteadyNowUs() - last_frame_us.load(std::memory_order_relaxed) >=
+          kStaleSpeakingUs) {
+    ClearSpeaking();
+  }
+}
+
 bool RootCaptureState::AudiblySpeaking() const {
-  return ReadSpeaking().speaking && !holding.load(std::memory_order_relaxed);
+  return ReadSpeaking().speaking && !holding.load(std::memory_order_relaxed) &&
+         SteadyNowUs() - last_frame_us.load(std::memory_order_relaxed) <
+             kStaleSpeakingUs;
 }
 
 RootDspStatsSnapshot RootCaptureState::ReadDspStats(bool take_maxima) {
@@ -187,6 +197,7 @@ RootDspStatsSnapshot RootCaptureState::ReadDspStats(bool take_maxima) {
   s.dsp_resets = dsp_resets.load(kRelaxed);
   s.dsp_flushes = dsp_flushes.load(kRelaxed);
   s.ns_gap_frames = ns_gap_frames.load(kRelaxed);
+  s.ns_fallback_pending_frames = ns_fallback_pending_frames.load(kRelaxed);
   const RootSpeakingSnapshot published = ReadSpeaking();
   s.speaking = published.speaking;
   s.speaking_seq = published.seq;
@@ -387,9 +398,12 @@ void RootCaptureProcessor::Publish(const RootDspOutputs& outputs,
   CountIf(state.unsupported_frames, !supported);
   CountIf(state.dsp_resets, outputs.reset);
   CountIf(state.dsp_flushes, outputs.flushed);
+  const bool ns_applied = state.webrtc_ns_applied.load(kRelaxed);
   CountIf(state.ns_gap_frames,
           outputs.transmit_open && denoiser_wanted && !held && !ran &&
-              !state.webrtc_ns_applied.load(kRelaxed));
+              !ns_applied);
+  CountIf(state.ns_fallback_pending_frames,
+          !ns_applied && state.ns_fallback_decided.load(kRelaxed));
   if (outputs.non_finite_samples > 0) {
     state.non_finite_samples.fetch_add(outputs.non_finite_samples, kRelaxed);
   }
@@ -413,6 +427,10 @@ void RootCaptureProcessor::Publish(const RootDspOutputs& outputs,
                                       kRelaxed);
   state.aligner_latency_ms.store(outputs.aligner_latency_ms, kRelaxed);
 
+  // Before the speaking flag, so a stale check never sees a fresh flag with
+  // the previous frame's time.
+  const int64_t now_us = SteadyNowUs();
+  state.last_frame_us.store(now_us, kRelaxed);
   state.holding.store(held, kRelaxed);
   // Against the stored flag, which ClearSpeaking may have changed; a clear
   // that lands in between wins and this value goes out on the next frame.
@@ -427,7 +445,7 @@ void RootCaptureProcessor::Publish(const RootDspOutputs& outputs,
     if (stamp != 0 &&
         state.gate_open_stamp_us.compare_exchange_strong(stamp, 0, kRelaxed)) {
       state.gate_open_delay_us.store(
-          static_cast<uint64_t>(std::max<int64_t>(0, SteadyNowUs() - stamp)),
+          static_cast<uint64_t>(std::max<int64_t>(0, now_us - stamp)),
           kRelaxed);
     }
   }
@@ -973,6 +991,10 @@ void RootProcessorHarness::set_webrtc_ns_applied(bool applied) const {
   state_->webrtc_ns_applied.store(applied);
 }
 
+void RootProcessorHarness::set_ns_fallback_decided(bool on) const {
+  state_->ns_fallback_decided.store(on);
+}
+
 void RootProcessorHarness::bump_stream_epoch() const {
   state_->stream_epoch.fetch_add(1, std::memory_order_release);
 }
@@ -1042,6 +1064,7 @@ RootProcessorDsp RootProcessorHarness::dsp(bool take_maxima) const {
   dsp.dsp_resets = s.dsp_resets;
   dsp.dsp_flushes = s.dsp_flushes;
   dsp.ns_gap_frames = s.ns_gap_frames;
+  dsp.ns_fallback_pending_frames = s.ns_fallback_pending_frames;
   dsp.speaking_seq = s.speaking_seq;
   dsp.gate_open_delay_us = s.gate_open_delay_us;
   dsp.threshold = s.threshold;
@@ -1109,8 +1132,13 @@ bool RootProcessorHarness::hold_denoiser_slot(bool hold) const {
 
 void RootProcessorHarness::set_published_speaking(bool speaking) const {
   const uint64_t transitions = state_->ReadSpeaking().seq + 1;
+  state_->last_frame_us.store(SteadyNowUs());
   state_->speaking_word.store((transitions << 1) | (speaking ? 1u : 0u),
                               std::memory_order_release);
+}
+
+void RootProcessorHarness::clear_stale_speaking() const {
+  state_->ClearStaleSpeaking();
 }
 
 int64_t RootProcessorHarness::gate_open_stamp_us() const {
@@ -1479,6 +1507,7 @@ bool RootApmHarness::speaking() const {
 
 void RootApmHarness::set_speaking(bool speaking) const {
   const uint64_t transitions = capture_->ReadSpeaking().seq + 1;
+  capture_->last_frame_us.store(SteadyNowUs());
   capture_->speaking_word.store((transitions << 1) | (speaking ? 1u : 0u));
 }
 
