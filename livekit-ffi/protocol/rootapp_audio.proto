@@ -190,10 +190,11 @@ message RootAudioReturnPipelinesResponse {
 }
 
 // Mic test (capability MONITOR): enabled opens the selected devices for the app (released again by
-// enabled=false unless a call holds them) and plays the processed capture (what a call would send,
-// following mute, push-to-talk, the gate and the input volume) on the playout device, outside the echo
-// canceller's reference. Refused with an error while a call sends from the platform microphone; a
-// call that starts sending turns the monitor off (RootAudioStats.monitor_active false).
+// enabled=false unless a call holds them) and plays the processed capture (what a call would send:
+// a multi-channel mic averaged to mono, following mute, push-to-talk, the gate and the input volume)
+// on the playout device, outside the echo canceller's reference. Refused with an error while a call
+// sends from the platform microphone; a call that starts sending turns the monitor off
+// (RootAudioStats.monitor_active false).
 message RootAudioSetMonitorRequest {
   required uint64 platform_audio_handle = 1;
   required bool enabled = 2;
@@ -381,7 +382,9 @@ message RootAudioStats {
   // the processed capture is played locally (false after SetMonitor(false), and when native turned it
   // off because a call started sending). monitor_frames counts 10 ms render frames that played monitor
   // audio; monitor_dropped_frames counts 10 ms frames lost to the monitor's ring: render frames that
-  // found it empty while it was primed (underrun) and capture frames that found it full (overrun).
+  // ran out of audio while playing (underruns), frames skipped to bring a latency that grew back down,
+  // and capture frames that found the ring full while the render side ran. Priming and frames that went
+  // stale across a device stop or start or a render stall are not counted.
   optional bool monitor_active = 102;
   optional uint64 monitor_frames = 103;
   optional uint64 monitor_dropped_frames = 104;
