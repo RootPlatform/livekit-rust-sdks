@@ -150,9 +150,14 @@ message RootAudioStopEffectsResponse {
 // A pipeline is installed at a pause in the user's speech (at most 3 s after the request) and
 // replaces the previous one; 0 removes the installed pipeline at once. Completion arrives as
 // RootAudioEvent.denoiser_result with the async_id: on success native owns the pipeline until it
-// comes back in RootAudioEvent.pipelines_returned (removed, replaced, or the last handle dropped);
-// on an error native never held it and the app releases it. A pipeline whose rate is not the
-// processor's is bypassed (RootAudioStats.denoiser_bypass_reason 1) until a matching one arrives.
+// comes back in RootAudioEvent.pipelines_returned (removed, replaced, or the last handle dropped).
+// On an error native no longer holds the pipeline, so the app releases it, once: a pipeline whose
+// request failed with "returned before install" is also listed in the ReturnPipelines response,
+// and a pointer named in both is released only once. Handing over a pipeline native still holds
+// (installed, or in an earlier request still waiting) completes as a success and changes nothing;
+// that pipeline comes back once. A pipeline handed over again before it came back is held again.
+// A pipeline whose rate is not the processor's is bypassed (RootAudioStats.denoiser_bypass_reason
+// 1) until the processor runs at its rate again or a pipeline at the processor's rate is installed.
 message RootAudioSetDenoiserRequest {
   required uint64 platform_audio_handle = 1;
   required uint64 pipeline_ptr = 2;
@@ -162,8 +167,10 @@ message RootAudioSetDenoiserResponse {
   required uint64 async_id = 1;
 }
 // Returns every pipeline native holds, installed or waiting to be (app exit, before the SDK factory's
-// waitUntilAsyncWorkFinished). Synchronous; waits up to 200 ms for the audio thread to let go of the
-// installed one (on a timeout it stays installed and error says so). Later SetDenoiser requests work.
+// waitUntilAsyncWorkFinished). Synchronous; waits up to 200 ms in all for a change in progress and
+// the audio thread to let go of the installed one (on a timeout it stays installed and error says
+// so). Requests still waiting complete with the error "returned before install". Later SetDenoiser
+// requests work.
 message RootAudioReturnPipelinesRequest {
   required uint64 platform_audio_handle = 1;
 }
@@ -249,10 +256,12 @@ message RootAudioStats {
   // Denoiser (capability DENOISER). denoiser_frames counts process() calls; denoiser_misses frames
   // the slot was busy (installing or removing) and passed dry; denoiser_slow_frames process() calls
   // over 5 ms; denoiser_notifications the SDK's slowProcessing notifications through the native
-  // handler (process-wide, cumulative). denoiser_bypass_reason: 0 none, 1 rate mismatch (until a
-  // pipeline at the processor's rate is installed), 2 output stalled (100 empty outputs in a row),
-  // 3 slow (3 calls over 5 ms within 60 s, or one over 20 ms); 2 and 3 last until the pipeline is
-  // replaced or removed.
+  // handler (process-wide, cumulative). denoiser_bypass_reason: 0 none, 1 rate mismatch (until the
+  // processor's rate matches the pipeline again, or a pipeline at its rate is installed), 2 output
+  // stalled (100 empty outputs in a row), 3 slow (3 calls over 5 ms within 60 s, or one over 20 ms
+  // other than the first call after an install or a flush, a warm-up that is still counted); 2 and
+  // 3 last until the pipeline is replaced or removed. A call's time includes the flush and power
+  // change made with it.
   required bool denoiser_installed = 50;
   required uint64 denoiser_frames = 51;
   required uint64 denoiser_misses = 52;
@@ -317,7 +326,9 @@ message RootAudioStats {
   repeated uint64 denoiser_process_us_buckets = 87;
   // Notifications with a code other than slowProcessing.
   optional uint64 denoiser_other_notifications = 88;
-  // The aligner (DenoiseFrameAligner): latency it added (inserted minus drained and trimmed),
+  // The aligner (DenoiseFrameAligner): latency it adds now (inserted minus drained and trimmed since
+  // it last started over: a new pipeline, a flush, a rate change, or the denoiser out of use; the
+  // app's managed denoiser counted from its creation, which only differs after such a restart),
   // samples it holds, and its cumulative underruns and padded, trimmed and drained samples.
   optional float denoiser_latency_ms = 89;
   optional uint32 denoiser_buffered_samples = 90;
