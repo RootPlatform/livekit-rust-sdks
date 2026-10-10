@@ -627,6 +627,12 @@ void AdmProxyHarness::latch_denoiser_bypass(uint32_t reason) const {
   capture_->denoiser_slot->LatchBypass(static_cast<RootDenoiserBypass>(reason));
 }
 
+void AdmProxyHarness::set_speaking(bool speaking) const {
+  const uint64_t transitions = capture_->ReadSpeaking().seq + 1;
+  capture_->speaking_word.store((transitions << 1) | (speaking ? 1u : 0u),
+                                std::memory_order_release);
+}
+
 std::unique_ptr<AdmProxyHarness> new_adm_proxy_harness(
     rust::Slice<const rust::String> playout_guids,
     rust::Slice<const rust::String> recording_guids) {

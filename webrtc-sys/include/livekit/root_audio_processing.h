@@ -185,8 +185,12 @@ struct RootCaptureState {
   std::atomic<bool> voice_gain_settled{false};
   std::atomic<bool> gate_speaking{false};
   // The published speaking flag and its transition count in one word:
-  // seq << 1 | speaking.
+  // seq << 1 | speaking. Two writers, both by compare-and-swap: the audio
+  // thread publishes what the chain says, the control side clears it when no
+  // frame will (ClearSpeaking).
   std::atomic<uint64_t> speaking_word{0};
+  // The startup hold zeroed the last frame (nothing the user says is heard).
+  std::atomic<bool> holding{false};
   // Maxima since the last ReadDspStats(true); NaN: no frame since.
   std::atomic<float> gate_in_block_peak_db_max{
       std::numeric_limits<float>::quiet_NaN()};
@@ -211,13 +215,21 @@ struct RootCaptureState {
                std::optional<uint32_t> push_to_talk);
   // Back to the defaults (unity input volume), with the gate open or closed
   // (muted, push-to-talk key up) in the same store, and the DSP chain reset;
-  // outputs are kept.
+  // outputs are kept, except that speaking clears and a pending gate-open
+  // stamp is dropped.
   void ResetControls(bool close_gate);
+  // Not speaking, unless the audio thread says otherwise on a later frame:
+  // for when frames stop (a session ends, recording stops).
+  void ClearSpeaking();
 
   // Any thread but the audio thread. take_maxima resets the block peak and
   // envelope maxima.
   RootDspStatsSnapshot ReadDspStats(bool take_maxima);
   RootSpeakingSnapshot ReadSpeaking() const;
+  // Speaking and heard: a change that would be audible mid-word (a pipeline
+  // swap, an AEC/NS re-init) waits for this to clear. Inside the startup hold
+  // nothing is heard, also with push-to-talk held.
+  bool AudiblySpeaking() const;
 };
 
 struct RootCaptureFormatSnapshot {
@@ -269,7 +281,9 @@ class RootCaptureProcessor : public webrtc::CustomProcessing {
   uint64_t seen_stream_epoch_ = 0;
   uint64_t seen_gain_reset_seq_ = 0;
   bool stalled_ = false;
-  bool published_speaking_ = false;
+  // The pipeline was not fed while the denoiser was not wanted: flush it
+  // before it runs again.
+  bool denoiser_flush_owed_ = false;
   std::array<float, kDenoiseOutputFrames * kMaxRate / 100> denoise_out_{};
 };
 
@@ -313,8 +327,9 @@ struct RootApmPolicyStats {
 class RootApmDecorator : public webrtc::AudioProcessing {
  public:
   static constexpr int64_t kMinPolicyIntervalMs = 1000;
-  // A policy change waits for the published speaking flag to clear, polling
-  // every kSpeechPausePollMs, at most kSpeechPauseMaxMs after it was asked.
+  // A policy change waits for the capture state's AudiblySpeaking to clear,
+  // polling every kSpeechPausePollMs, at most kSpeechPauseMaxMs after it was
+  // asked.
   static constexpr int64_t kSpeechPauseMaxMs = 3000;
   static constexpr int64_t kSpeechPausePollMs = 50;
 
@@ -338,6 +353,7 @@ class RootApmDecorator : public webrtc::AudioProcessing {
   void ResetPolicy();
   // The native denoiser fallback: on forces WebRTC NS on.
   void SetFallbackNoiseSuppression(bool on);
+  // Atomics only: never waits on an APM re-initialisation.
   RootApmPolicyStats ReadPolicyStats() const;
 
   // Off the audio threads. GetStatistics takes the APM's stats lock, which the
@@ -412,7 +428,10 @@ class RootApmDecorator : public webrtc::AudioProcessing {
   void SchedulePolicyLocked();
   void PostPolicyLocked(int64_t delay_ms);
   void ApplyPolicy(uint64_t generation);
+  void ApplyPolicyLocked(uint64_t generation);
   void ApplyPolicyNowLocked(int64_t now_ms, bool forced);
+  // Copies the policy stats to the atomics ReadPolicyStats reads.
+  void PublishPolicyStatsLocked();
 
   const webrtc::scoped_refptr<webrtc::AudioProcessing> inner_;
   const Scheduler scheduler_;
@@ -443,6 +462,11 @@ class RootApmDecorator : public webrtc::AudioProcessing {
   std::atomic<bool> noise_suppression_active_{false};
   std::atomic<uint64_t> inner_applies_{0};
   std::atomic<uint64_t> swallowed_mutes_{0};
+  std::atomic<uint64_t> stats_applies_{0};
+  std::atomic<uint64_t> stats_deferred_{0};
+  std::atomic<uint64_t> stats_forced_{0};
+  std::atomic<bool> stats_pending_{false};
+  std::atomic<bool> stats_fallback_ns_{false};
 };
 
 // The factory's APM: libwebrtc's builtin APM with RootCaptureProcessor as its
@@ -465,7 +489,7 @@ webrtc::scoped_refptr<RootApmDecorator> NewRootApmOverFakeForTest();
 // Runs a RootCaptureProcessor over AudioBuffers (tests only).
 class RootProcessorHarness {
  public:
-  RootProcessorHarness();
+  explicit RootProcessorHarness(bool with_slot);
   ~RootProcessorHarness();
 
   void initialize(int32_t rate, int32_t channels) const;
@@ -500,6 +524,13 @@ class RootProcessorHarness {
                              uint32_t empty_count) const;
   bool remove_fake_denoiser() const;
   RootFakeDenoiserProbe fake_denoiser() const;
+  // Holds the slot as the audio thread would mid-process (the next frame
+  // misses).
+  bool hold_denoiser_slot(bool hold) const;
+  // Stores the speaking flag as the audio thread publishes it.
+  void set_published_speaking(bool speaking) const;
+  int64_t gate_open_stamp_us() const;
+  bool audibly_speaking() const;
 
  private:
   std::shared_ptr<RootCaptureState> state_;
@@ -509,6 +540,8 @@ class RootProcessorHarness {
 };
 
 std::unique_ptr<RootProcessorHarness> new_root_processor_harness();
+// Without a denoiser slot (32-bit and mobile builds).
+std::unique_ptr<RootProcessorHarness> new_root_processor_harness_without_slot();
 
 class FakeApm;
 
@@ -572,5 +605,9 @@ std::unique_ptr<RootApmHarness> new_root_apm_harness(bool real_apm);
 // the high-pass filter on, and the last one is the engine's last request with
 // the last policy.
 bool root_apm_decorator_race_for_test(uint32_t iterations);
+
+// A policy stats read while another thread's policy change sits in the inner
+// ApplyConfig (the decorator's mutex held) returns at once.
+bool root_apm_policy_stats_never_wait_for_an_apply_for_test();
 
 }  // namespace livekit_ffi

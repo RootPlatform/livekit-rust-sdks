@@ -600,6 +600,10 @@ bool AdmProxy::StopDeviceLocked(bool playout, AdmDirectionOutcome* outcome) {
     outcome->stop_result = result;
   }
   if (result == 0) {
+    if (!playout && capture_state_) {
+      // No frame clears it now.
+      capture_state_->ClearSpeaking();
+    }
     return true;
   }
   device_stop_failures_.fetch_add(1, std::memory_order_relaxed);
@@ -920,7 +924,9 @@ void AdmProxy::ShutdownLocked() {
   // device threads, so stop them first.
   if (webrtc::AudioDeviceModule* platform_adm = platform()) {
     platform_adm->StopPlayout();
-    platform_adm->StopRecording();
+    if (platform_adm->StopRecording() == 0 && capture_state_) {
+      capture_state_->ClearSpeaking();
+    }
     platform_adm->RegisterAudioCallback(nullptr);
     platform_adm->Terminate();
   }

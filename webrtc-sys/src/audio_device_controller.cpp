@@ -97,7 +97,7 @@ AudioDeviceController::AudioDeviceController(
   std::shared_ptr<RootCaptureState> state = capture_;
   webrtc::scoped_refptr<RootApmDecorator> decorator = apm_;
   RootDenoiserControl::Hooks hooks;
-  hooks.speaking = [state] { return state->ReadSpeaking().speaking; };
+  hooks.speaking = [state] { return state->AudiblySpeaking(); };
   hooks.wanted = [state] {
     return state->denoiser_wanted.load(std::memory_order_relaxed);
   };

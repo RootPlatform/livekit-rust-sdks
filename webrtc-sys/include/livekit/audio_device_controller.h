@@ -252,6 +252,8 @@ class AdmProxyHarness {
   uint64_t add_fake_pipeline() const;
   uint8_t run_denoiser(uint32_t rate) const;
   void latch_denoiser_bypass(uint32_t reason) const;
+  // Stores the speaking flag as the capture processor publishes it.
+  void set_speaking(bool speaking) const;
 
  private:
   webrtc::scoped_refptr<FakePlatformAdm> fake_;

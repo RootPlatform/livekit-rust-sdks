@@ -200,6 +200,8 @@ pub mod ffi {
         pub installed: bool,
         /// RootDenoiserBypass.
         pub bypass: u32,
+        /// Frames the slot was busy for.
+        pub misses: u64,
     }
 
     #[derive(Debug, Clone, Copy, Default)]
@@ -220,6 +222,8 @@ pub mod ffi {
         type RootApmHarness;
 
         fn new_root_processor_harness() -> UniquePtr<RootProcessorHarness>;
+        /// Without a denoiser slot (32-bit and mobile builds).
+        fn new_root_processor_harness_without_slot() -> UniquePtr<RootProcessorHarness>;
         fn initialize(self: &RootProcessorHarness, rate: i32, channels: i32);
         fn set_mic_muted(self: &RootProcessorHarness, muted: bool);
         fn set_push_to_talk(self: &RootProcessorHarness, state: u32);
@@ -261,6 +265,13 @@ pub mod ffi {
         ) -> bool;
         fn remove_fake_denoiser(self: &RootProcessorHarness) -> bool;
         fn fake_denoiser(self: &RootProcessorHarness) -> RootFakeDenoiserProbe;
+        /// Holds the slot as the audio thread would mid-process.
+        fn hold_denoiser_slot(self: &RootProcessorHarness, hold: bool) -> bool;
+        /// Stores the speaking flag as the processor publishes it.
+        fn set_published_speaking(self: &RootProcessorHarness, speaking: bool);
+        fn gate_open_stamp_us(self: &RootProcessorHarness) -> i64;
+        /// Speaking and outside the startup hold.
+        fn audibly_speaking(self: &RootProcessorHarness) -> bool;
 
         /// The decorator over a recording fake APM, or over the real builtin APM
         /// with the capture processor.
@@ -304,6 +315,9 @@ pub mod ffi {
 
         /// The engine's ApplyConfig racing policy changes on another thread.
         fn root_apm_decorator_race_for_test(iterations: u32) -> bool;
+        /// A policy stats read during another thread's inner ApplyConfig
+        /// returns at once.
+        fn root_apm_policy_stats_never_wait_for_an_apply_for_test() -> bool;
     }
 }
 
@@ -407,7 +421,9 @@ impl RootDspChain {
 
 #[cfg(test)]
 mod processor_tests {
-    use super::ffi::{new_root_processor_harness, RootProcessorHarness};
+    use super::ffi::{
+        new_root_processor_harness, new_root_processor_harness_without_slot, RootProcessorHarness,
+    };
 
     const VOICE_ACTIVITY: u32 = 0;
     const HELD: u32 = 1;
@@ -975,6 +991,184 @@ mod processor_tests {
     }
 
     #[test]
+    fn root_capture_processor_passes_a_missed_frame_dry_and_counts_the_gap() {
+        let h = pass_through(48000, 1);
+        h.set_denoiser_wanted(true);
+        assert!(h.install_fake_denoiser(48000, 0.5, 0, 0, 0, 0));
+        for _ in 0..WARM_FRAMES {
+            run(&h, 48000, 1, 1000.0);
+        }
+        assert_eq!(run(&h, 48000, 1, 1000.0), vec![500.0; 480]);
+        let before = h.dsp(false);
+        assert!(h.hold_denoiser_slot(true));
+        let missed = run(&h, 48000, 1, 1000.0);
+        assert!(h.hold_denoiser_slot(false));
+        assert_eq!(missed, vec![1000.0; 480], "dry, neither held nor silent");
+        let fake = h.fake_denoiser();
+        assert_eq!((fake.misses, fake.process_calls), (1, WARM_FRAMES as u64 + 1));
+        let dsp = h.dsp(false);
+        assert_eq!(dsp.ns_gap_frames - before.ns_gap_frames, 1, "nothing denoised it");
+        assert_eq!(dsp.startup_hold_frames, before.startup_hold_frames);
+        assert_eq!(run(&h, 48000, 1, 1000.0), vec![500.0; 480], "the aligner carries on");
+    }
+
+    #[test]
+    fn root_capture_processor_restarts_on_a_pipeline_replaced_mid_stream() {
+        let h = pass_through(48000, 1);
+        h.set_denoiser_wanted(true);
+        assert!(h.install_fake_denoiser(48000, 0.5, 240, 0, 0, 0));
+        for _ in 0..WARM_FRAMES + 3 {
+            run(&h, 48000, 1, 1000.0);
+        }
+        assert_eq!(run(&h, 48000, 1, 1000.0), vec![500.0; 480]);
+        let before = h.dsp(false);
+        assert!(h.install_fake_denoiser(48000, 0.25, 0, 0, 0, 0));
+        let replaced = run(&h, 48000, 1, 1000.0);
+        assert!(replaced.iter().all(|&v| v == 250.0 || v == 0.0), "nothing of the old one");
+        assert_eq!(run(&h, 48000, 1, 1000.0), vec![250.0; 480]);
+        let fake = h.fake_denoiser();
+        assert_eq!((fake.process_calls, fake.flush_calls, fake.power_sets), (2, 0, 1));
+        let dsp = h.dsp(false);
+        assert_eq!(dsp.dsp_flushes, before.dsp_flushes, "a replacement is no stream flush");
+        assert_eq!(dsp.ns_gap_frames, before.ns_gap_frames);
+    }
+
+    #[test]
+    fn root_capture_processor_a_rate_change_bypasses_the_pipeline_until_the_rate_is_back() {
+        let h = pass_through(48000, 1);
+        h.set_denoiser_wanted(true);
+        assert!(h.install_fake_denoiser(48000, 0.5, 0, 0, 0, 0));
+        for _ in 0..WARM_FRAMES {
+            run(&h, 48000, 1, 1000.0);
+        }
+        let before = h.dsp(false);
+
+        h.initialize(16000, 1);
+        let mut first_audible = None;
+        for i in 0..110 {
+            if !silent(&run(&h, 16000, 1, 1000.0)) && first_audible.is_none() {
+                first_audible = Some(i);
+            }
+        }
+        let first = first_audible.expect("dry audio after the hold");
+        assert!((HOLD_FRAMES..=101).contains(&first), "{first}");
+        let fake = h.fake_denoiser();
+        assert_eq!((fake.bypass, fake.process_calls), (1, WARM_FRAMES as u64));
+        let dsp = h.dsp(false);
+        assert_eq!(dsp.dsp_flushes - before.dsp_flushes, 1, "the rate change");
+        assert!(dsp.ns_gap_frames - before.ns_gap_frames >= 9, "dry after the hold: a gap");
+        assert_eq!(run(&h, 16000, 1, 1000.0), vec![1000.0; 160]);
+
+        h.initialize(48000, 1);
+        for _ in 0..HOLD_FRAMES {
+            assert!(silent(&run(&h, 48000, 1, 1000.0)));
+        }
+        let fake = h.fake_denoiser();
+        assert_eq!(fake.bypass, 0, "the rate is back");
+        assert_eq!(fake.flush_calls, 1, "it starts over");
+        run(&h, 48000, 1, 1000.0);
+        run(&h, 48000, 1, 1000.0);
+        assert_eq!(run(&h, 48000, 1, 1000.0), vec![500.0; 480]);
+    }
+
+    #[test]
+    fn root_capture_processor_runs_the_denoiser_only_while_wanted() {
+        let h = pass_through(48000, 1);
+        assert!(h.install_fake_denoiser(48000, 0.5, 0, 0, 0, 0));
+        let mut out = Vec::new();
+        for _ in 0..WARM_FRAMES {
+            out = run(&h, 48000, 1, 1000.0);
+        }
+        assert_eq!(h.fake_denoiser().process_calls, 0, "not wanted: never fed");
+        assert_eq!(out, vec![1000.0; 480], "dry, and no 100-frame wait for it");
+
+        h.set_denoiser_wanted(true);
+        run(&h, 48000, 1, 1000.0);
+        assert_eq!(h.fake_denoiser().process_calls, 1);
+        assert_eq!(run(&h, 48000, 1, 1000.0), vec![500.0; 480]);
+        h.set_denoiser_wanted(false);
+        assert_eq!(run(&h, 48000, 1, 1000.0), vec![1000.0; 480]);
+        assert_eq!(h.fake_denoiser().process_calls, 2);
+        h.set_denoiser_wanted(true);
+        run(&h, 48000, 1, 1000.0);
+        let fake = h.fake_denoiser();
+        assert_eq!((fake.process_calls, fake.flush_calls), (3, 1), "it missed frames: flushed");
+    }
+
+    #[test]
+    fn root_capture_processor_without_a_slot_never_waits_for_a_denoiser() {
+        let h = new_root_processor_harness_without_slot();
+        h.initialize(48000, 1);
+        h.set_dsp(false, false, 0.0);
+        h.set_denoiser_wanted(true);
+        let mut out = Vec::new();
+        for _ in 0..WARM_FRAMES {
+            out = run(&h, 48000, 1, 1000.0);
+        }
+        assert_eq!(out, vec![1000.0; 480]);
+        let dsp = h.dsp(false);
+        assert_eq!((dsp.startup_hold_frames, dsp.ns_gap_frames), (HOLD_FRAMES as u64, 0));
+    }
+
+    #[test]
+    fn root_capture_processor_a_reset_clears_a_stale_speaking_flag() {
+        let h = started(48000, 1);
+        h.set_published_speaking(true);
+        let seq = h.dsp(false).published_seq;
+        h.reset_controls();
+        let dsp = h.dsp(false);
+        assert!(!dsp.published_speaking && !dsp.speaking, "cleared without a frame");
+        assert_eq!(dsp.published_seq, seq + 1);
+        h.reset_controls();
+        assert_eq!(h.dsp(false).published_seq, seq + 1, "already clear: no transition");
+    }
+
+    #[test]
+    fn root_capture_processor_publishes_against_the_stored_flag() {
+        let h = pass_through(48000, 1);
+        h.set_published_speaking(true);
+        let seq = h.dsp(false).published_seq;
+        run(&h, 48000, 1, 0.0);
+        let dsp = h.dsp(false);
+        assert!(!dsp.published_speaking, "silence clears whatever another writer left");
+        assert_eq!(dsp.published_seq, seq + 1);
+        run(&h, 48000, 1, 0.0);
+        assert_eq!(h.dsp(false).published_seq, seq + 1);
+    }
+
+    #[test]
+    fn root_capture_processor_reset_forgets_a_push_to_talk_press_no_frame_saw() {
+        let h = started(48000, 1);
+        h.set_push_to_talk(RELEASED);
+        h.set_push_to_talk(HELD);
+        assert_ne!(h.gate_open_stamp_us(), 0);
+        h.reset_controls();
+        assert_eq!(h.gate_open_stamp_us(), 0);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        h.set_dsp(false, false, 0.0);
+        for _ in 0..WARM_FRAMES {
+            run(&h, 48000, 1, 1000.0);
+        }
+        assert_eq!(h.dsp(false).gate_open_delay_us, 0, "no delay from the last session");
+    }
+
+    #[test]
+    fn root_capture_processor_is_not_audibly_speaking_inside_the_startup_hold() {
+        let h = started(48000, 1);
+        h.set_push_to_talk(HELD);
+        let mut position = 0;
+        for _ in 0..5 {
+            run_input(&h, 48000, 1, &tone(48000, 3000.0, &mut position));
+        }
+        assert_eq!(h.dsp(false).startup_hold_frames, 5);
+        assert!(!h.audibly_speaking(), "nothing is heard inside the hold");
+        for _ in 0..30 {
+            run_input(&h, 48000, 1, &tone(48000, 3000.0, &mut position));
+        }
+        assert!(h.dsp(false).published_speaking && h.audibly_speaking());
+    }
+
+    #[test]
     fn root_capture_processor_reset_opens_the_gate() {
         let h = started(48000, 1);
         h.set_mic_muted(true);
@@ -991,7 +1185,10 @@ mod processor_tests {
 
 #[cfg(test)]
 mod decorator_tests {
-    use super::ffi::{new_root_apm_harness, root_apm_decorator_race_for_test, RootApmHarness};
+    use super::ffi::{
+        new_root_apm_harness, root_apm_decorator_race_for_test,
+        root_apm_policy_stats_never_wait_for_an_apply_for_test, RootApmHarness,
+    };
 
     const KEEP: i8 = -1;
 
@@ -1040,6 +1237,11 @@ mod decorator_tests {
     #[test]
     fn root_apm_decorator_survives_engine_applies_racing_policy_changes() {
         assert!(root_apm_decorator_race_for_test(5000));
+    }
+
+    #[test]
+    fn root_apm_decorator_policy_stats_never_wait_for_an_apm_reinit() {
+        assert!(root_apm_policy_stats_never_wait_for_an_apply_for_test());
     }
 
     #[test]

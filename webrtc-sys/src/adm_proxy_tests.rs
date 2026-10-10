@@ -558,6 +558,27 @@ fn adm_proxy_moves_the_stream_epoch_before_every_recording_start() {
 }
 
 #[test]
+fn adm_proxy_clears_the_speaking_flag_when_recording_stops() {
+    let h = platform(&["{spk}"], &["{mic}"]);
+    h.app_recording(true);
+    assert!(calls(&h).contains(&"StartRecording".to_string()));
+    h.set_speaking(true);
+    let speaking = h.controller().root_audio_speaking();
+    assert!(speaking.speaking);
+
+    h.app_recording(false);
+    assert!(calls(&h).contains(&"StopRecording".to_string()));
+    let stopped = h.controller().root_audio_speaking();
+    assert!(!stopped.speaking, "no frame will clear it");
+    assert_eq!(stopped.seq, speaking.seq + 1);
+
+    h.set_speaking(true);
+    h.reset_root_audio(true);
+    assert!(!h.controller().root_audio_speaking().speaking, "nor after the last session");
+    assert!(!h.stats().speaking);
+}
+
+#[test]
 fn adm_proxy_controller_stores_denoiser_wanted_until_a_reset() {
     let h = harness(&["{spk}"], &["{mic}"]);
     assert!(h.apply_control(&RootAudioControlUpdate {

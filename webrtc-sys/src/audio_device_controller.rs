@@ -448,6 +448,8 @@ pub mod ffi {
         /// processor would run it; returns the slot's result kind.
         fn run_denoiser(self: &AdmProxyHarness, rate: u32) -> u8;
         fn latch_denoiser_bypass(self: &AdmProxyHarness, reason: u32);
+        /// Stores the speaking flag as the capture processor publishes it.
+        fn set_speaking(self: &AdmProxyHarness, speaking: bool);
     }
 
     extern "Rust" {
