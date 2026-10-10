@@ -393,7 +393,8 @@ message RootAudioCaptureFormat {
 }
 // Pipelines native no longer holds, for the app to release, each sent once: to the handle that set
 // it while that handle lives, else to the newest live handle. One sent just before a ReturnPipelines
-// response may also be in it (released once).
+// response can reach the app after it (the response does not list it, and the app released it as
+// still out): the app ignores a name it already released or never sent.
 message RootAudioPipelinesReturned {
   repeated uint64 pipelines = 1;
 }
