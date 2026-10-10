@@ -27,6 +27,7 @@
 #include "api/units/time_delta.h"
 #include "livekit/audio_thread.h"
 #include "livekit/root_audio_mixer.h"
+#include "livekit/root_audio_monitor.h"
 #include "livekit/root_audio_processing.h"
 #include "rtc_base/checks.h"
 #include "rtc_base/event.h"
@@ -234,6 +235,10 @@ void AdmTransportTap::set_transport(webrtc::AudioTransport* transport) {
   transport_.store(transport, std::memory_order_release);
 }
 
+void AdmTransportTap::set_monitor(RootAudioMonitor* monitor) {
+  monitor_.store(monitor, std::memory_order_release);
+}
+
 void AdmTransportTap::Count(Direction& direction,
                             size_t frames,
                             uint32_t sample_rate,
@@ -377,6 +382,13 @@ int32_t AdmTransportTap::Render(bool count,
     result = transport->NeedMorePlayData(
         samples_per_channel, bytes_per_frame, channels, sample_rate,
         audio_samples, samples_out, elapsed_time_ms, ntp_time_ms);
+  }
+  // After the AEC reference was taken, and only into what a device plays.
+  RootAudioMonitor* monitor = monitor_.load(std::memory_order_acquire);
+  if (count && monitor != nullptr && audio_samples != nullptr &&
+      bytes_per_frame == channels * sizeof(int16_t)) {
+    monitor->MixInto(static_cast<int16_t*>(audio_samples), samples_per_channel,
+                     channels, sample_rate);
   }
   render_busy_.store(false, std::memory_order_release);
   return result;
@@ -702,8 +714,8 @@ void AdmProxy::ReconcilePlayoutLocked(const DesiredState& desired,
   const bool platform_mode =
       platform_adm && desired.ref_count > 0 && desired.playout_enabled;
   const bool want_platform =
-      platform_mode &&
-      (desired.engine_playout || desired.hold || desired.app_playout);
+      platform_mode && (desired.engine_playout || desired.hold ||
+                        desired.app_playout || desired.monitor);
 
   if (platform_adm &&
       (platform_adm->Playing() || platform_adm->PlayoutIsInitialized())) {
@@ -782,8 +794,9 @@ void AdmProxy::ReconcileRecordingLocked(const DesiredState& desired,
   if (!platform_adm) {
     return;
   }
-  const bool want = desired.ref_count > 0 && desired.recording_enabled &&
-                    (desired.engine_recording || desired.app_recording);
+  const bool want =
+      desired.ref_count > 0 && desired.recording_enabled &&
+      (desired.engine_recording || desired.app_recording || desired.monitor);
 
   if (platform_adm->Recording() || platform_adm->RecordingIsInitialized()) {
     const bool stale =
@@ -1097,6 +1110,11 @@ void AdmProxy::ReleasePlatformAdm() {
       desired_.hold = false;
       desired_.app_playout = false;
       desired_.app_recording = false;
+      desired_.monitor = false;
+      if (RootAudioMonitor* monitor =
+              monitor_.load(std::memory_order_acquire)) {
+        monitor->SetEnabled(false);
+      }
       if (mixer_) {
         mixer_->SetPlatformActive(false);
       }
@@ -1215,6 +1233,29 @@ void AdmProxy::SetAppRecording(bool start) {
   RequestReconcile();
 }
 
+AdmMonitorResult AdmProxy::SetMonitor(bool enabled) {
+  RootAudioMonitor* monitor = monitor_.load(std::memory_order_acquire);
+  {
+    AdmLock lock(&state_mutex_);
+    if (monitor == nullptr) {
+      return enabled ? AdmMonitorResult::kNotSupported : AdmMonitorResult::kOk;
+    }
+    if (enabled && desired_.engine_recording) {
+      return AdmMonitorResult::kSending;
+    }
+    if (enabled && (desired_.ref_count <= 0 || platform() == nullptr)) {
+      return AdmMonitorResult::kNotAcquired;
+    }
+    if (desired_.monitor == enabled && monitor->enabled() == enabled) {
+      return AdmMonitorResult::kOk;
+    }
+    desired_.monitor = enabled;
+    monitor->SetEnabled(enabled);
+  }
+  RequestReconcile();
+  return AdmMonitorResult::kOk;
+}
+
 void AdmProxy::SetDeviceTrackProcessing(bool echo_cancellation,
                                         bool noise_suppression) {
   device_track_echo_cancellation_.store(echo_cancellation,
@@ -1227,6 +1268,10 @@ void AdmProxy::SetCaptureState(
     std::shared_ptr<RootCaptureState> capture_state) {
   AdmLock lock(&mutex_);
   capture_state_ = std::move(capture_state);
+  RootAudioMonitor* monitor =
+      capture_state_ ? capture_state_->monitor.get() : nullptr;
+  monitor_.store(monitor, std::memory_order_release);
+  tap_.set_monitor(monitor);
 }
 
 void AdmProxy::FlushDeviceTasksForTest() {
@@ -1466,11 +1511,19 @@ bool AdmProxy::Playing() const {
          device_playing_.load(std::memory_order_acquire);
 }
 
+// A send stream takes the microphone over from a mic test.
 int32_t AdmProxy::StartRecording() {
   {
     AdmLock lock(&state_mutex_);
     desired_.engine_recording = true;
     engine_recording_.store(true, std::memory_order_release);
+    if (desired_.monitor) {
+      desired_.monitor = false;
+      if (RootAudioMonitor* monitor =
+              monitor_.load(std::memory_order_acquire)) {
+        monitor->SetEnabled(false);
+      }
+    }
   }
   RequestReconcile();
   return 0;

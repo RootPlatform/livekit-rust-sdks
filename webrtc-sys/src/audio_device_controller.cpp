@@ -418,6 +418,13 @@ RootAudioNativeStats AudioDeviceController::root_audio_stats() const {
     stats.apm_policy_forced = policy.forced;
     stats.apm_policy_pending = policy.pending;
   }
+  if (capture_ && capture_->monitor) {
+    const RootAudioMonitorStats monitor = capture_->monitor->Read();
+    stats.monitor_available = true;
+    stats.monitor_active = monitor.active;
+    stats.monitor_frames = monitor.frames;
+    stats.monitor_dropped_frames = monitor.dropped_frames;
+  }
   return stats;
 }
 
@@ -556,6 +563,9 @@ void AudioDeviceController::reset_root_audio(bool close_gate) const {
   if (capture_) {
     capture_->ResetControls(close_gate);
   }
+  if (close_gate) {
+    adm_proxy_->SetMonitor(false);
+  }
   if (mixer_) {
     mixer_->ResetControls();
   }
@@ -565,6 +575,10 @@ void AudioDeviceController::reset_root_audio(bool close_gate) const {
   if (denoiser_ && close_gate) {
     denoiser_->Reset();
   }
+}
+
+uint8_t AudioDeviceController::set_root_audio_monitor(bool enabled) const {
+  return static_cast<uint8_t>(adm_proxy_->SetMonitor(enabled));
 }
 
 bool AudioDeviceController::root_denoiser_available() const {

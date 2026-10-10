@@ -153,6 +153,20 @@ pub mod ffi {
         pub apm_policy_deferred: u64,
         pub apm_policy_forced: u64,
         pub apm_policy_pending: bool,
+
+        /// The mic test monitor exists (the capture processor does).
+        pub monitor_available: bool,
+        pub monitor_active: bool,
+        pub monitor_frames: u64,
+        pub monitor_dropped_frames: u64,
+    }
+
+    /// A RootAudioMonitor's counters (tests).
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct RootMonitorStats {
+        pub active: bool,
+        pub frames: u64,
+        pub dropped_frames: u64,
     }
 
     /// One RootAudioControl; `has_*` marks the fields to change.
@@ -269,6 +283,7 @@ pub mod ffi {
         type AudioDeviceController;
         type AdmProxyHarness;
         type RootVoiceHarness;
+        type RootMonitorHarness;
         type PeerConnectionFactory = crate::peer_connection_factory::ffi::PeerConnectionFactory;
 
         fn audio_device(self: &PeerConnectionFactory) -> SharedPtr<AudioDeviceController>;
@@ -326,6 +341,10 @@ pub mod ffi {
         fn root_audio_capture_format(self: &AudioDeviceController) -> RootAudioCaptureFormat;
         fn root_audio_sources_added(self: &AudioDeviceController) -> u64;
         fn reset_root_audio(self: &AudioDeviceController, close_gate: bool);
+        /// The mic test monitor: 0 applied, 1 not supported by this build, 2
+        /// refused while a call sends from the platform microphone, 3 no
+        /// platform audio reference.
+        fn set_root_audio_monitor(self: &AudioDeviceController, enabled: bool) -> u8;
 
         /// The Effects SDK slot exists (desktop, 64-bit).
         fn root_denoiser_available(self: &AudioDeviceController) -> bool;
@@ -388,6 +407,16 @@ pub mod ffi {
         /// these raw bytes.
         fn adm_name_matches_for_test(device: &[u8], wanted: &str) -> bool;
 
+        /// A RootAudioMonitor driven as its capture and render threads would.
+        fn new_root_monitor_harness() -> UniquePtr<RootMonitorHarness>;
+        fn set_enabled(self: &RootMonitorHarness, enabled: bool);
+        /// One capture frame of FloatS16 samples at `rate`.
+        fn push(self: &RootMonitorHarness, rate: i32, samples: &[f32]);
+        /// One render callback of rate / 100 frames over `base`; returns what
+        /// the device plays.
+        fn mix(self: &RootMonitorHarness, rate: u32, channels: usize, base: &[i16]) -> Vec<i16>;
+        fn stats(self: &RootMonitorHarness) -> RootMonitorStats;
+
         // AdmProxy over a fake platform ADM (tests only; opens no device).
         fn new_adm_proxy_harness(
             playout_guids: &[String],
@@ -414,6 +443,8 @@ pub mod ffi {
         fn held(self: &AdmProxyHarness) -> bool;
         fn app_playout(self: &AdmProxyHarness, start: bool);
         fn app_recording(self: &AdmProxyHarness, start: bool);
+        /// The controller's set_root_audio_monitor.
+        fn monitor(self: &AdmProxyHarness, enabled: bool) -> u8;
         fn engine_start_playout(self: &AdmProxyHarness);
         fn engine_stop_playout(self: &AdmProxyHarness);
         fn engine_start_recording(self: &AdmProxyHarness);
@@ -476,10 +507,25 @@ pub mod ffi {
         fn controller(self: &RootVoiceHarness) -> &AudioDeviceController;
         /// The app starts or stops recording (a start bumps the stream epoch).
         fn recording(self: &RootVoiceHarness, start: bool);
+        /// libwebrtc starts or stops recording for a send stream.
+        fn engine_recording(self: &RootVoiceHarness, start: bool);
+        /// The controller's set_root_audio_monitor, applied on the device
+        /// thread before it returns.
+        fn monitor(self: &RootVoiceHarness, enabled: bool) -> u8;
+        fn platform_playing(self: &RootVoiceHarness) -> bool;
+        fn platform_recording(self: &RootVoiceHarness) -> bool;
         fn stream_epoch(self: &RootVoiceHarness) -> u64;
         /// One 10 ms frame of interleaved channels from the device, through
         /// AdmProxy and the APM on a device thread; returns what is sent.
         fn capture(self: &RootVoiceHarness, rate: i32, channels: usize, input: &[i16]) -> Vec<i16>;
+        /// libwebrtc's render side plays `level` everywhere and hands that
+        /// frame to the APM as its reverse stream (the AEC reference).
+        fn set_remote_level(self: &RootVoiceHarness, level: i16);
+        /// One 10 ms render callback from the device thread; returns what the
+        /// device plays.
+        fn render(self: &RootVoiceHarness, rate: i32, channels: usize) -> Vec<i16>;
+        /// The last frame the APM got as its reverse stream.
+        fn reverse_input(self: &RootVoiceHarness) -> Vec<i16>;
         /// A fake Effects SDK pipeline (output round(scale x input) delayed
         /// by delay_samples) owned by the harness.
         fn add_fake_pipeline(self: &RootVoiceHarness, scale: f32, delay_samples: u32) -> u64;

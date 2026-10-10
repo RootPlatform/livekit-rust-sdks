@@ -22,6 +22,7 @@
 #include "api/scoped_refptr.h"
 #include "livekit/adm_proxy.h"
 #include "livekit/root_audio_mixer.h"
+#include "livekit/root_audio_monitor.h"
 #include "livekit/root_audio_processing.h"
 #include "livekit/root_denoiser.h"
 #include "rust/cxx.h"
@@ -35,6 +36,8 @@ namespace livekit_ffi {
 class AudioDeviceController;
 class AdmProxyHarness;
 class RootVoiceHarness;
+class RootMonitorHarness;
+struct RootMonitorStats;
 struct RootVoiceFakeCounts;
 struct AudioDeviceSelection;
 struct AudioDeviceRequestOutcome;
@@ -111,8 +114,13 @@ class AudioDeviceController {
   // Controls back to their defaults (unity volumes, no gains or effects,
   // AEC/NS following the device track), with the capture gate open or closed
   // (muted, push-to-talk key up). Closing it (the last session ended) also
-  // hands back every denoiser pipeline and ends the NS fallback.
+  // hands back every denoiser pipeline, ends the NS fallback and stops the
+  // mic test monitor.
   void reset_root_audio(bool close_gate) const;
+  // The mic test monitor (AdmProxy::SetMonitor): 0 applied, 1 not supported
+  // by this build, 2 refused while a call sends from the platform microphone,
+  // 3 no platform audio reference.
+  uint8_t set_root_audio_monitor(bool enabled) const;
 
   // The Effects SDK hand-off (RootDenoiserControl); every call is a no-op
   // without a slot.
@@ -180,6 +188,28 @@ int32_t resolve_audio_device_index_for_test(
 bool adm_name_matches_for_test(rust::Slice<const uint8_t> device,
                                rust::Str wanted);
 
+// A RootAudioMonitor driven as its capture and render threads would (tests).
+class RootMonitorHarness {
+ public:
+  RootMonitorHarness();
+  ~RootMonitorHarness();
+
+  void set_enabled(bool enabled) const;
+  // One capture frame: rate / 100 samples of FloatS16.
+  void push(int32_t rate, rust::Slice<const float> samples) const;
+  // One render callback of rate / 100 frames over `base` (interleaved,
+  // zero-padded); returns the buffer the device would play.
+  rust::Vec<int16_t> mix(uint32_t rate,
+                         size_t channels,
+                         rust::Slice<const int16_t> base) const;
+  RootMonitorStats stats() const;
+
+ private:
+  std::unique_ptr<RootAudioMonitor> monitor_;
+};
+
+std::unique_ptr<RootMonitorHarness> new_root_monitor_harness();
+
 class FakePlatformAdm;
 class HarnessTransport;
 
@@ -213,6 +243,8 @@ class AdmProxyHarness {
   bool held() const;
   void app_playout(bool start) const;
   void app_recording(bool start) const;
+  // The controller's set_root_audio_monitor.
+  uint8_t monitor(bool enabled) const;
   void engine_start_playout() const;
   void engine_stop_playout() const;
   void engine_start_recording() const;
@@ -303,12 +335,26 @@ class RootVoiceHarness {
   const AudioDeviceController& controller() const;
   // The app starts or stops recording (a start bumps the stream epoch).
   void recording(bool start) const;
+  // libwebrtc starts or stops recording for a send stream.
+  void engine_recording(bool start) const;
+  // The controller's set_root_audio_monitor; returns once the device thread
+  // applied it.
+  uint8_t monitor(bool enabled) const;
+  bool platform_playing() const;
+  bool platform_recording() const;
   uint64_t stream_epoch() const;
   // One 10 ms frame of interleaved int16 channels from the device; returns
   // what the APM sends.
   rust::Vec<int16_t> capture(int32_t rate,
                              size_t channels,
                              rust::Slice<const int16_t> input) const;
+  // libwebrtc's render side plays `level` on every sample and hands that
+  // frame to the APM as the echo canceller's reference.
+  void set_remote_level(int16_t level) const;
+  // One 10 ms render callback from the device; returns what it plays.
+  rust::Vec<int16_t> render(int32_t rate, size_t channels) const;
+  // The last frame the APM got as its reverse stream (the AEC reference).
+  rust::Vec<int16_t> reverse_input() const;
   // A fake Effects SDK pipeline owned by the harness: output round(scale x
   // input) delayed by delay_samples.
   uint64_t add_fake_pipeline(float scale, uint32_t delay_samples) const;

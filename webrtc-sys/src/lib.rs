@@ -41,6 +41,8 @@ pub mod root_denoiser;
 #[cfg(test)]
 mod adm_proxy_tests;
 #[cfg(all(test, not(any(target_os = "ios", target_os = "android"))))]
+mod root_monitor_tests;
+#[cfg(all(test, not(any(target_os = "ios", target_os = "android"))))]
 mod root_voice_tests;
 pub mod rtc_error;
 pub mod rtp_parameters;

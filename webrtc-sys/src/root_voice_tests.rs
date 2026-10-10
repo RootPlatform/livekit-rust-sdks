@@ -846,3 +846,141 @@ fn root_voice_stats_agree_with_what_the_chain_sent() {
         assert!(s1.denoiser_available && !s1.webrtc_ns_fallback);
     }
 }
+
+const MONITOR_APPLIED: u8 = 0;
+const MONITOR_SENDING: u8 = 2;
+/// What libwebrtc's render side plays (and gives the APM as its reference).
+const REMOTE: i16 = 1000;
+
+fn without_remote(played: &[i16]) -> Vec<i16> {
+    played.iter().map(|&s| s - REMOTE).collect()
+}
+
+#[test]
+fn root_voice_monitor_plays_what_a_call_would_send_outside_the_aec_reference() {
+    let h = new_root_voice_harness();
+    let c = h.controller();
+    assert!(!h.platform_playing() && !h.platform_recording());
+    assert_eq!(h.monitor(true), MONITOR_APPLIED);
+    assert!(h.platform_playing() && h.platform_recording(), "both devices open for it");
+    h.set_remote_level(REMOTE);
+
+    let mut signal = Signal::new(48_000);
+    let mut sent_before: Option<Vec<i16>> = None;
+    let mut heard = 0usize;
+    for frame in 0..60 {
+        let sent = h.capture(48_000, 1, &signal.speech(3000.0));
+        let played = h.render(48_000, 2);
+        assert!(
+            h.reverse_input().iter().all(|&s| s == REMOTE),
+            "frame {frame}: the echo canceller's reference is the remote mix alone"
+        );
+        let left: Vec<i16> = played.iter().step_by(2).copied().collect();
+        let right: Vec<i16> = played.iter().skip(1).step_by(2).copied().collect();
+        assert_eq!(left, right, "frame {frame}");
+        match &sent_before {
+            None => assert!(silent(&without_remote(&left)), "20 ms are queued before it plays"),
+            Some(sent) => assert_eq!(&without_remote(&left), sent, "frame {frame}"),
+        }
+        if sumsq(&sent) > 0.0 {
+            heard += 1;
+        }
+        sent_before = Some(sent);
+    }
+    assert!(heard >= 30, "{heard} frames carried the voice");
+
+    let stats = c.root_audio_stats();
+    assert!(stats.monitor_available && stats.monitor_active);
+    assert_eq!((stats.monitor_frames, stats.monitor_dropped_frames), (59, 0));
+    assert_eq!(stats.startup_hold_frames, HOLD_FRAMES as u64, "processed as in a call");
+
+    // Muted, what a call would send is silence, and so is the monitor.
+    control(
+        &h,
+        RootAudioControlUpdate { has_mic_muted: true, mic_muted: true, ..Default::default() },
+    );
+    for _ in 0..3 {
+        h.capture(48_000, 1, &signal.speech(3000.0));
+        h.render(48_000, 1);
+    }
+    for _ in 0..10 {
+        assert!(silent(&h.capture(48_000, 1, &signal.speech(3000.0))));
+        assert!(silent(&without_remote(&h.render(48_000, 1))));
+    }
+
+    assert_eq!(h.monitor(false), MONITOR_APPLIED);
+    assert!(!h.platform_playing() && !h.platform_recording());
+    assert!(!c.root_audio_stats().monitor_active);
+}
+
+#[test]
+fn root_voice_monitor_converts_16_khz_capture_to_48_khz_playout() {
+    let h = new_root_voice_harness();
+    control(
+        &h,
+        RootAudioControlUpdate {
+            has_auto_gain: true,
+            auto_gain: false,
+            has_auto_sensitivity: true,
+            auto_sensitivity: false,
+            has_gate_threshold: true,
+            gate_threshold: 0.0,
+            ..Default::default()
+        },
+    );
+    assert_eq!(h.monitor(true), MONITOR_APPLIED);
+    let mut signal = Signal::new(16_000);
+    let mut sent_energy = 0.0;
+    let mut played_energy = 0.0;
+    let mut played_all = Vec::new();
+    for frame in 0..80 {
+        let sent = h.capture(16_000, 1, &signal.tone(4000.0));
+        let played = h.render(48_000, 1);
+        assert_eq!(played.len(), 480);
+        if frame >= 40 {
+            sent_energy += sumsq(&sent) / sent.len() as f64;
+            played_energy += sumsq(&played) / played.len() as f64;
+            played_all.extend(played);
+        }
+    }
+    assert!(sent_energy > 0.0);
+    let ratio_db = 10.0 * (played_energy / sent_energy).log10();
+    assert!(ratio_db.abs() < 0.5, "played {ratio_db:.2} dB from what was sent");
+    // 1 kHz for 400 ms: 800 sign changes.
+    let crossings = played_all.windows(2).filter(|w| (w[0] < 0) != (w[1] < 0)).count();
+    assert!((797..=803).contains(&crossings), "{crossings} sign changes in 400 ms");
+    let stats = h.controller().root_audio_stats();
+    assert_eq!(stats.process_rate, 16_000);
+    assert_eq!(stats.monitor_dropped_frames, 0);
+}
+
+#[test]
+fn root_voice_monitor_gives_way_to_a_call_that_sends() {
+    let h = new_root_voice_harness();
+    let c = h.controller();
+    h.engine_recording(true);
+    assert_eq!(h.monitor(true), MONITOR_SENDING);
+    assert!(!h.platform_playing(), "a refused monitor opens nothing");
+    h.engine_recording(false);
+    assert!(!h.platform_recording());
+
+    assert_eq!(h.monitor(true), MONITOR_APPLIED);
+    let mut signal = Signal::new(48_000);
+    for _ in 0..30 {
+        h.capture(48_000, 1, &signal.speech(3000.0));
+        h.render(48_000, 1);
+    }
+    assert!(c.root_audio_stats().monitor_frames > 0);
+
+    h.engine_recording(true);
+    let stats = c.root_audio_stats();
+    assert!(!stats.monitor_active, "native turned the monitor off");
+    assert!(h.platform_recording(), "the call keeps the microphone");
+    assert!(!h.platform_playing(), "nothing else wanted playout");
+    let frames = stats.monitor_frames;
+    h.capture(48_000, 1, &signal.speech(3000.0));
+    h.capture(48_000, 1, &signal.speech(3000.0));
+    assert!(silent(&h.render(48_000, 1)));
+    assert_eq!(c.root_audio_stats().monitor_frames, frames);
+    assert_eq!(h.monitor(true), MONITOR_SENDING);
+}

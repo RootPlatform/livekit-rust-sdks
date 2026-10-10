@@ -79,6 +79,7 @@ constexpr bool kRootDspSupported = true;
 #endif
 bool root_dsp_supported();
 
+class RootAudioMonitor;
 class RootDenoiserSlot;
 class RootFakeFxPipeline;
 
@@ -161,6 +162,9 @@ struct RootCaptureState {
   std::atomic<bool> ns_fallback_decided{false};
   // Set once before the APM is built; may be null.
   std::shared_ptr<RootDenoiserSlot> denoiser_slot;
+  // The mic test monitor, fed every processed frame while it is enabled. Set
+  // once before the APM is built; may be null.
+  std::shared_ptr<RootAudioMonitor> monitor;
 
   // From CustomProcessing::Initialize to Process.
   std::atomic<int> init_rate{0};

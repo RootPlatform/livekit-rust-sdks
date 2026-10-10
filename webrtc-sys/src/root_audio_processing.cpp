@@ -30,6 +30,7 @@
 #include "api/make_ref_counted.h"
 #include "api/task_queue/task_queue_base.h"
 #include "api/units/time_delta.h"
+#include "livekit/root_audio_monitor.h"
 #include "livekit/root_denoiser.h"
 #include "modules/audio_processing/audio_buffer.h"
 #include "modules/audio_processing/include/aec_dump.h"
@@ -362,6 +363,9 @@ void RootCaptureProcessor::Process(webrtc::AudioBuffer* audio) {
     std::copy(samples, samples + frames, data[c]);
   }
   Publish(outputs, frames, settings.denoiser_wanted);
+  if (RootAudioMonitor* monitor = state.monitor.get()) {
+    monitor->Push(samples, frames, rate);
+  }
 }
 
 void RootCaptureProcessor::Publish(const RootDspOutputs& outputs,

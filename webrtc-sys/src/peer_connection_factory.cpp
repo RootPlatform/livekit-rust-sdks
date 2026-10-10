@@ -39,6 +39,7 @@
 #include "livekit/audio_track.h"
 #include "livekit/peer_connection.h"
 #include "livekit/root_audio_mixer.h"
+#include "livekit/root_audio_monitor.h"
 #include "livekit/root_audio_processing.h"
 #include "livekit/root_denoiser.h"
 #include "livekit/rtc_error.h"
@@ -195,6 +196,7 @@ PeerConnectionFactory::PeerConnectionFactory(
   if constexpr (kRootDenoiserSupported) {
     capture_state_->denoiser_slot = std::make_shared<RootDenoiserSlot>();
   }
+  capture_state_->monitor = std::make_shared<RootAudioMonitor>();
   apm_ = CreateRootAudioProcessing(env_, capture_state_,
                                    rtc_runtime_->worker_thread());
   if (!apm_) {

@@ -313,6 +313,7 @@ AdmProxyHarness::AdmProxyHarness(
     apm_ = NewRootApmOverFakeForTest();
   }
   capture_->denoiser_slot = std::make_shared<RootDenoiserSlot>();
+  capture_->monitor = std::make_shared<RootAudioMonitor>();
   proxy_ = webrtc::make_ref_counted<AdmProxy>(webrtc::CreateEnvironment(),
                                               nullptr, mixer_, fake_);
   proxy_->SetCaptureState(capture_);
@@ -387,6 +388,10 @@ void AdmProxyHarness::app_recording(bool start) const {
   } else {
     controller_->stop_recording();
   }
+}
+
+uint8_t AdmProxyHarness::monitor(bool enabled) const {
+  return controller_->set_root_audio_monitor(enabled);
 }
 
 void AdmProxyHarness::engine_start_playout() const {
@@ -698,18 +703,36 @@ class HarnessApmTransport : public webrtc::AudioTransport {
     return 0;
   }
 
+  void SetRemoteLevel(int16_t level) { remote_level_.store(level); }
+
+  std::vector<int16_t> ReverseInput() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return reverse_input_;
+  }
+
+  // As AudioTransportImpl: the mix goes to the APM as its reverse stream, then
+  // to the device.
   int32_t NeedMorePlayData(size_t samples_per_channel,
                            size_t bytes_per_frame,
                            size_t channels,
-                           uint32_t /* sample_rate */,
+                           uint32_t sample_rate,
                            void* audio_samples,
                            size_t& samples_out,
                            int64_t* elapsed_time_ms,
                            int64_t* ntp_time_ms) override {
-    std::memset(audio_samples, 0, samples_per_channel * bytes_per_frame);
+    std::vector<int16_t> mix(samples_per_channel * channels,
+                             remote_level_.load());
+    std::vector<int16_t> processed(mix.size());
+    const webrtc::StreamConfig config(static_cast<int>(sample_rate), channels);
+    apm_->ProcessReverseStream(mix.data(), config, config, processed.data());
+    std::memcpy(audio_samples, mix.data(),
+                std::min(mix.size() * sizeof(int16_t),
+                         samples_per_channel * bytes_per_frame));
     samples_out = samples_per_channel * channels;
     *elapsed_time_ms = -1;
     *ntp_time_ms = -1;
+    std::lock_guard<std::mutex> lock(mutex_);
+    reverse_input_ = std::move(mix);
     return 0;
   }
 
@@ -723,8 +746,10 @@ class HarnessApmTransport : public webrtc::AudioTransport {
 
  private:
   const webrtc::scoped_refptr<webrtc::AudioProcessing> apm_;
+  std::atomic<int16_t> remote_level_{0};
   std::mutex mutex_;
   std::vector<int16_t> output_;
+  std::vector<int16_t> reverse_input_;
 };
 
 RootVoiceHarness::RootVoiceHarness()
@@ -739,6 +764,7 @@ RootVoiceHarness::RootVoiceHarness()
   if constexpr (kRootDenoiserSupported) {
     capture_->denoiser_slot = std::make_shared<RootDenoiserSlot>();
   }
+  capture_->monitor = std::make_shared<RootAudioMonitor>();
   apm_ = CreateRootAudioProcessing(webrtc::CreateEnvironment(), capture_,
                                    worker_.get());
   transport_ = std::make_unique<HarnessApmTransport>(apm_);
@@ -780,8 +806,67 @@ void RootVoiceHarness::recording(bool start) const {
   proxy_->FlushDeviceTasksForTest();
 }
 
+void RootVoiceHarness::engine_recording(bool start) const {
+  if (start) {
+    proxy_->StartRecording();
+  } else {
+    proxy_->StopRecording();
+  }
+  proxy_->FlushDeviceTasksForTest();
+}
+
+uint8_t RootVoiceHarness::monitor(bool enabled) const {
+  const uint8_t result = controller_->set_root_audio_monitor(enabled);
+  proxy_->FlushDeviceTasksForTest();
+  return result;
+}
+
+bool RootVoiceHarness::platform_playing() const {
+  return fake_->Playing();
+}
+
+bool RootVoiceHarness::platform_recording() const {
+  return fake_->Recording();
+}
+
 uint64_t RootVoiceHarness::stream_epoch() const {
   return capture_->stream_epoch.load();
+}
+
+void RootVoiceHarness::set_remote_level(int16_t level) const {
+  transport_->SetRemoteLevel(level);
+}
+
+rust::Vec<int16_t> RootVoiceHarness::render(int32_t rate,
+                                            size_t channels) const {
+  rust::Vec<int16_t> result;
+  webrtc::AudioTransport* device = fake_->callback();
+  if (device == nullptr || rate < 100 || channels == 0) {
+    return result;
+  }
+  const size_t frames = static_cast<size_t>(rate / 100);
+  std::vector<int16_t> samples(frames * channels, 0);
+  std::thread device_thread([&] {
+    size_t samples_out = 0;
+    int64_t elapsed_time_ms = 0;
+    int64_t ntp_time_ms = 0;
+    device->NeedMorePlayData(frames, 2 * channels, channels,
+                             static_cast<uint32_t>(rate), samples.data(),
+                             samples_out, &elapsed_time_ms, &ntp_time_ms);
+  });
+  device_thread.join();
+  for (int16_t sample : samples) {
+    result.push_back(sample);
+  }
+  return result;
+}
+
+rust::Vec<int16_t> RootVoiceHarness::reverse_input() const {
+  rust::Vec<int16_t> result;
+  for (int16_t sample : transport_->ReverseInput()) {
+    result.push_back(sample);
+  }
+  return result;
 }
 
 rust::Vec<int16_t> RootVoiceHarness::capture(
@@ -867,6 +952,45 @@ bool RootVoiceHarness::webrtc_ns_applied() const {
 
 std::unique_ptr<RootVoiceHarness> new_root_voice_harness() {
   return std::make_unique<RootVoiceHarness>();
+}
+
+RootMonitorHarness::RootMonitorHarness()
+    : monitor_(std::make_unique<RootAudioMonitor>()) {}
+
+RootMonitorHarness::~RootMonitorHarness() = default;
+
+void RootMonitorHarness::set_enabled(bool enabled) const {
+  monitor_->SetEnabled(enabled);
+}
+
+void RootMonitorHarness::push(int32_t rate,
+                              rust::Slice<const float> samples) const {
+  monitor_->Push(samples.data(), samples.size(), rate);
+}
+
+rust::Vec<int16_t> RootMonitorHarness::mix(
+    uint32_t rate,
+    size_t channels,
+    rust::Slice<const int16_t> base) const {
+  const size_t frames = rate / 100;
+  std::vector<int16_t> samples(frames * channels, 0);
+  std::copy_n(base.data(), std::min(base.size(), samples.size()),
+              samples.begin());
+  monitor_->MixInto(samples.data(), frames, channels, rate);
+  rust::Vec<int16_t> result;
+  for (int16_t sample : samples) {
+    result.push_back(sample);
+  }
+  return result;
+}
+
+RootMonitorStats RootMonitorHarness::stats() const {
+  const RootAudioMonitorStats stats = monitor_->Read();
+  return RootMonitorStats{stats.active, stats.frames, stats.dropped_frames};
+}
+
+std::unique_ptr<RootMonitorHarness> new_root_monitor_harness() {
+  return std::make_unique<RootMonitorHarness>();
 }
 
 bool adm_name_matches_for_test(rust::Slice<const uint8_t> device,

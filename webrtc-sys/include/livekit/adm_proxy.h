@@ -45,6 +45,7 @@ class Thread;
 namespace livekit_ffi {
 
 class RootAudioMixer;
+class RootAudioMonitor;
 struct RootCaptureState;
 
 // Last Stop/Init/Start results: 0 is success, other values are ADM errors,
@@ -149,9 +150,15 @@ struct AdmNativeStats {
 // that starts while another one of its direction is in flight (a device thread
 // the ADM failed to stop, or the synthetic pump during a hand-over) is answered
 // with silence and counted instead.
+//
+// The mic test monitor is mixed into device render callbacks after
+// libwebrtc's NeedMorePlayData, which has already given its mix to the APM as
+// the echo canceller's reference.
 class AdmTransportTap : public webrtc::AudioTransport {
  public:
   void set_transport(webrtc::AudioTransport* transport);
+  // Set once, before any device opens; may be null.
+  void set_monitor(RootAudioMonitor* monitor);
 
   int32_t RecordedDataIsAvailable(const void* audio_samples,
                                   size_t samples_per_channel,
@@ -239,6 +246,7 @@ class AdmTransportTap : public webrtc::AudioTransport {
                  int64_t* ntp_time_ms);
 
   std::atomic<webrtc::AudioTransport*> transport_{nullptr};
+  std::atomic<RootAudioMonitor*> monitor_{nullptr};
   Direction capture_;
   Direction render_;
   std::atomic<bool> capture_busy_{false};
@@ -291,16 +299,25 @@ class AdmSyntheticTransport : public webrtc::AudioTransport {
 
 static_assert(std::atomic<double>::is_always_lock_free);
 
+enum class AdmMonitorResult : uint8_t {
+  kOk = 0,
+  kNotSupported = 1,
+  // libwebrtc records for a send stream (a call publishes the microphone).
+  kSending = 2,
+  kNotAcquired = 3,
+};
+
 /// ADM Proxy that manages synthetic and platform audio modes.
 ///
 /// - **Playout**: the Platform ADM plays while `ref_count > 0 &&
 ///   playout_enabled` and libwebrtc started playout, the app holds it
-///   (`SetPlayoutHold`) or the app started it (`SetAppPlayout`); otherwise the
-///   synthetic ADM pumps the pipeline while libwebrtc wants playout.
+///   (`SetPlayoutHold`), the app started it (`SetAppPlayout`) or the mic test
+///   monitor runs (`SetMonitor`); otherwise the synthetic ADM pumps the
+///   pipeline while libwebrtc wants playout.
 /// - **Recording**: the Platform ADM records while `ref_count > 0 &&
 ///   recording_enabled` and libwebrtc started recording (a device track's send
-///   stream) or the app started it (`SetAppRecording`). Synthetic mode has no
-///   microphone.
+///   stream), the app started it (`SetAppRecording`) or the monitor runs.
+///   Synthetic mode has no microphone.
 ///
 /// libwebrtc's and the app's calls only record the desired state. On desktop a
 /// dedicated `audio-device` thread brings the devices to it, so neither the
@@ -371,12 +388,18 @@ class AdmProxy : public webrtc::AudioDeviceModule {
   void SetAppPlayout(bool start);
   void SetAppRecording(bool start);
 
+  /// The mic test: the monitor plays the processed capture, and while it runs
+  /// both directions are wanted (a want of its own, OR-ed in like the hold).
+  /// Refused while libwebrtc records for a send stream; a send stream that
+  /// starts recording turns it off. Off again with the last reference.
+  AdmMonitorResult SetMonitor(bool enabled);
+
   /// What the newest device track asked of the shared APM (reported in stats).
   void SetDeviceTrackProcessing(bool echo_cancellation, bool noise_suppression);
 
   /// The capture post-processor's state, whose stream epoch moves right before
-  /// every recording start (the DSP chain starts the stream over). Set once,
-  /// before any device opens.
+  /// every recording start (the DSP chain starts the stream over), and its
+  /// mic test monitor. Set once, before any device opens.
   void SetCaptureState(std::shared_ptr<RootCaptureState> capture_state);
 
   /// Atomics only; the max gaps are reset on read.
@@ -489,6 +512,7 @@ class AdmProxy : public webrtc::AudioDeviceModule {
     bool hold = false;
     bool app_playout = false;
     bool app_recording = false;
+    bool monitor = false;
     AdmDeviceSelection playout_selection;
     AdmDeviceSelection recording_selection;
     uint64_t playout_selection_gen = 0;
@@ -558,6 +582,8 @@ class AdmProxy : public webrtc::AudioDeviceModule {
   uint64_t recording_opened_restart_gen_ = 0;
   // Guarded by mutex_.
   std::shared_ptr<RootCaptureState> capture_state_;
+  // capture_state_'s monitor, set with it.
+  std::atomic<RootAudioMonitor*> monitor_{nullptr};
 #if !LK_ADM_MOBILE
   bool delay_refresh_scheduled_ = false;
   bool retry_scheduled_ = false;

@@ -763,3 +763,148 @@ fn adm_proxy_controller_hands_the_fallback_over_to_the_hosts_ns_without_a_gap() 
     let stats = h.stats();
     assert!(stats.webrtc_ns_active && !stats.apm_policy_pending);
 }
+
+const MONITOR_APPLIED: u8 = 0;
+const MONITOR_SENDING: u8 = 2;
+const MONITOR_NOT_ACQUIRED: u8 = 3;
+
+fn both_open() -> Vec<String> {
+    vec![
+        default_device("Playout"),
+        "InitPlayout".into(),
+        "StartPlayout".into(),
+        default_device("Recording"),
+        "InitRecording".into(),
+        "StartRecording".into(),
+    ]
+}
+
+#[test]
+fn adm_proxy_monitor_opens_both_devices_without_claiming_them() {
+    let h = platform(&["{spk}"], &["{mic}"]);
+    assert_eq!(h.monitor(true), MONITOR_APPLIED);
+    assert_eq!(calls(&h), both_open());
+    assert!(h.platform_playing() && h.platform_recording());
+    assert!(!h.playing() && !h.recording(), "libwebrtc started neither");
+    assert!(!h.synthetic_playing());
+    let stats = h.stats();
+    assert!(stats.monitor_available && stats.monitor_active);
+    assert_eq!(h.control_state().stream_epoch, 1, "the DSP chain starts a stream");
+
+    assert_eq!(h.monitor(true), MONITOR_APPLIED);
+    assert_eq!(calls(&h), Vec::<String>::new(), "already on");
+
+    assert_eq!(h.monitor(false), MONITOR_APPLIED);
+    assert_eq!(calls(&h), ["StopPlayout", "StopRecording"]);
+    assert!(!h.platform_playing() && !h.platform_recording());
+    assert!(!h.stats().monitor_active);
+    assert_eq!(h.monitor(false), MONITOR_APPLIED, "stopping a stopped monitor is no error");
+}
+
+#[test]
+fn adm_proxy_monitor_stop_leaves_the_devices_others_keep() {
+    let h = platform(&["{spk}"], &["{mic}"]);
+    h.hold(true);
+    h.app_recording(true);
+    calls(&h);
+    assert_eq!(h.monitor(true), MONITOR_APPLIED);
+    assert_eq!(calls(&h), Vec::<String>::new(), "both already open");
+    assert_eq!(h.monitor(false), MONITOR_APPLIED);
+    assert_eq!(calls(&h), Vec::<String>::new(), "the hold and the app keep them");
+
+    h.hold(false);
+    h.app_recording(false);
+    calls(&h);
+    h.engine_start_playout();
+    calls(&h);
+    h.monitor(true);
+    assert_eq!(
+        calls(&h),
+        [default_device("Recording"), "InitRecording".into(), "StartRecording".into()]
+    );
+    h.monitor(false);
+    assert_eq!(calls(&h), ["StopRecording"], "libwebrtc's playout stays");
+    assert!(h.playing());
+}
+
+#[test]
+fn adm_proxy_monitor_is_refused_while_libwebrtc_records_and_ends_when_it_starts() {
+    let h = platform(&["{spk}"], &["{mic}"]);
+    h.engine_start_recording();
+    calls(&h);
+    assert_eq!(h.monitor(true), MONITOR_SENDING);
+    assert_eq!(calls(&h), Vec::<String>::new());
+    assert!(!h.stats().monitor_active);
+
+    h.engine_stop_recording();
+    calls(&h);
+    assert_eq!(h.monitor(true), MONITOR_APPLIED);
+    calls(&h);
+    let epoch = h.control_state().stream_epoch;
+
+    // A call publishes: its send stream takes the microphone over.
+    h.engine_start_recording();
+    assert_eq!(calls(&h), ["StopPlayout"], "the recording device stays open");
+    assert!(h.recording() && h.platform_recording());
+    assert!(!h.platform_playing());
+    assert!(!h.stats().monitor_active, "native turned the monitor off");
+    assert_eq!(h.control_state().stream_epoch, epoch, "no restart");
+    assert_eq!(h.monitor(true), MONITOR_SENDING);
+
+    h.engine_stop_recording();
+    assert_eq!(calls(&h), ["StopRecording"]);
+    assert!(!h.stats().monitor_active, "it stays off");
+}
+
+#[test]
+fn adm_proxy_monitor_needs_a_reference_and_ends_with_the_last_one() {
+    let h = harness(&["{spk}"], &["{mic}"]);
+    assert_eq!(h.monitor(true), MONITOR_NOT_ACQUIRED);
+    h.acquire();
+    h.enable(true, true);
+    calls(&h);
+    assert_eq!(h.monitor(true), MONITOR_APPLIED);
+    assert_eq!(calls(&h), both_open());
+
+    h.release();
+    assert_eq!(calls(&h), ["StopPlayout", "StopRecording"]);
+    assert!(!h.stats().monitor_active);
+    h.acquire();
+    assert_eq!(calls(&h), Vec::<String>::new(), "the next reference does not reopen them");
+}
+
+#[test]
+fn adm_proxy_monitor_moves_with_a_device_selection() {
+    let h = platform(&["{a}", "{b}"], &["{m1}", "{m2}"]);
+    h.monitor(true);
+    calls(&h);
+    let outcome = h.select(&guid("{m2}"), true, &guid("{b}"), true);
+    assert!(outcome.playout.attempted && outcome.recording.attempted);
+    assert_eq!(
+        h.take_calls(),
+        [
+            "StopPlayout",
+            "SetPlayoutDevice(1)",
+            "InitPlayout",
+            "StartPlayout",
+            "StopRecording",
+            "SetRecordingDevice(1)",
+            "InitRecording",
+            "StartRecording"
+        ]
+    );
+    assert!(h.stats().monitor_active);
+}
+
+#[test]
+fn adm_proxy_controller_reset_for_teardown_stops_the_monitor() {
+    let h = platform(&["{spk}"], &["{mic}"]);
+    h.monitor(true);
+    calls(&h);
+    h.reset_root_audio(false);
+    assert_eq!(calls(&h), Vec::<String>::new(), "a session start leaves it running");
+    assert!(h.stats().monitor_active);
+    h.reset_root_audio(true);
+    assert_eq!(calls(&h), ["StopPlayout", "StopRecording"]);
+    assert!(!h.stats().monitor_active);
+}
