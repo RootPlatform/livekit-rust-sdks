@@ -1,3 +1,12 @@
+#![forbid(unsafe_code)]
+
+mod chain;
+pub mod gain_ramp;
+pub mod sanitize;
+pub mod transmit_gate;
+
+pub use chain::DspChain;
+
 pub const MIN_RATE: u32 = 8_000;
 pub const MAX_RATE: u32 = 48_000;
 /// Largest frame (48 kHz / 100).
@@ -105,8 +114,10 @@ pub struct AlignerStats {
     pub padded_samples: u64,
     pub trimmed_samples: u64,
     pub drained_samples: u64,
-    /// Managed DenoiserStats.LatencyMs over the counters since the last aligner reset.
+    /// Latency the aligner added since its last reset (inserted minus drained and trimmed).
     pub latency_ms: f32,
+    /// Managed DenoiserStats.LatencyMs: the same over the cumulative counters.
+    pub lifetime_latency_ms: f32,
 }
 
 /// Written by every pre/post call (pre fills apm_out_sumsq, samples, unsupported, reset, flushed,
@@ -146,7 +157,7 @@ pub struct DspOutputs {
     pub transmit_open: bool,
     /// The transmit gate was above 0 for any sample of this frame.
     pub transmitting: bool,
-    /// Last value while auto gain is off (0 before any).
+    /// Last value while auto gain is off (0 before any and after a reset).
     pub voice_gain_db: f32,
     pub voice_gain_settled: bool,
     /// DenoiserOutput::Ran this frame.
@@ -161,63 +172,4 @@ pub struct DspOutputs {
     pub reset: bool,
     /// A flush ran this frame (command, rate change or reset).
     pub flushed: bool,
-}
-
-pub struct DspChain {
-    max_rate: u32,
-}
-
-impl DspChain {
-    /// Allocates everything for max_rate (clamped to MIN_RATE..=MAX_RATE). Never allocates
-    /// afterwards.
-    pub fn new(max_rate: u32) -> Self {
-        Self { max_rate: max_rate.clamp(MIN_RATE, MAX_RATE) }
-    }
-
-    pub fn max_rate(&self) -> u32 {
-        self.max_rate
-    }
-
-    /// frame: channel 0, FloatS16. Sanitised in place; otherwise unchanged, so the caller hands
-    /// exactly this to the SDK.
-    pub fn pre_denoise(
-        &mut self,
-        frame: &mut [f32],
-        settings: &DspSettings,
-        commands: &DspCommands,
-        out: &mut DspOutputs,
-    ) -> PreDenoise {
-        let _ = (commands, out);
-        let n = frame.len();
-        let r = settings.sample_rate;
-        let supported = (MIN_RATE..=self.max_rate).contains(&r)
-            && n > 0
-            && n <= MAX_FRAME
-            && n == (r / 100) as usize;
-        PreDenoise { flush_denoiser: false, supported }
-    }
-
-    /// Same frame and settings as the preceding pre_denoise. Writes the processed FloatS16 frame.
-    /// Called without a matching pre_denoise, the frame is treated as unsupported.
-    pub fn post_denoise(
-        &mut self,
-        frame: &mut [f32],
-        denoised: DenoiserOutput<'_>,
-        settings: &DspSettings,
-        out: &mut DspOutputs,
-    ) {
-        let _ = (frame, denoised, settings, out);
-    }
-
-    /// pre_denoise + post_denoise(NotInUse).
-    pub fn process(
-        &mut self,
-        frame: &mut [f32],
-        settings: &DspSettings,
-        commands: &DspCommands,
-        out: &mut DspOutputs,
-    ) {
-        self.pre_denoise(frame, settings, commands, out);
-        self.post_denoise(frame, DenoiserOutput::NotInUse, settings, out);
-    }
 }

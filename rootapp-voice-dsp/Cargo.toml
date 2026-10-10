@@ -9,7 +9,7 @@ description = "RootApp voice chain after the APM: voice gain, auto sensitivity, 
 [dependencies]
 
 [lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 
 [lints.clippy]
 indexing_slicing = "deny"
