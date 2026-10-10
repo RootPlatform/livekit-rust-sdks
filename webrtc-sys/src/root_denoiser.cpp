@@ -182,7 +182,9 @@ RootDenoiseResult RootDenoiserSlot::ProcessAudio(const float* in,
     slow_frames_.fetch_add(1, std::memory_order_relaxed);
     slow_times_us_[slow_count_ % kSlowFramesToBypass] = end_us;
     ++slow_count_;
-    bool latch = elapsed_us > kStalledFrameUs;
+    // The first call after an install or a flush may pay a one-off warm-up:
+    // measured and counted like any other, but alone it latches nothing.
+    bool latch = elapsed_us > kStalledFrameUs && !restart;
     if (slow_count_ >= kSlowFramesToBypass &&
         end_us - slow_times_us_[slow_count_ % kSlowFramesToBypass] <=
             kSlowWindowUs) {

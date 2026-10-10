@@ -144,6 +144,10 @@ class RootDenoiserSlot {
   // `flush` asks for flush(nullptr, 0) before the next process() (kept until
   // one runs; a new pipeline needs none). `power` is applied when it changed.
   // A rate-mismatch bypass ends, with a flush, once the frames fit again.
+  // Flush, power and process are timed together; kSlowFramesToBypass calls
+  // over kSlowFrameUs within kSlowWindowUs, or one over kStalledFrameUs,
+  // latch kSlow, except that the first call after an install or a flush (a
+  // warm-up) never latches on its own.
   RootDenoiseResult ProcessAudio(const float* in,
                                  size_t frames,
                                  int sample_rate,

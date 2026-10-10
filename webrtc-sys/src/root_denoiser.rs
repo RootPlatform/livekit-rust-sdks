@@ -364,9 +364,33 @@ mod tests {
         let b = h.add_fake(&RootFakeFxSpec { sleep_us: 25_000, ..fake(1.0) });
         h.install_now(b, 48_000);
         assert_eq!(run(&h, 48_000, 1.0).kind, RAN);
-        assert_eq!(h.slot_info(false).bypass, SLOW, "one call over 20 ms");
+        let warm_up = h.slot_info(true);
+        assert_eq!(warm_up.bypass, 0, "the first call after an install is a warm-up");
+        assert!(warm_up.process_max_us >= 25_000, "still measured: {}", warm_up.process_max_us);
+        assert_eq!((warm_up.slow_frames, warm_up.histogram[15]), (4, 1));
+        assert_eq!(run(&h, 48_000, 1.0).kind, RAN);
+        assert_eq!(h.slot_info(false).bypass, SLOW, "one later call over 20 ms");
         assert!(h.slot_info(true).process_max_us >= 20_000);
         assert_eq!(h.slot_info(true).process_max_us, 0, "the maximum resets on read");
+    }
+
+    #[test]
+    fn root_denoiser_a_warm_up_after_a_flush_latches_nothing_on_its_own() {
+        let h = harness();
+        let a = h.add_fake(&fake(1.0));
+        h.install_now(a, 48_000);
+        run(&h, 48_000, 1.0);
+        h.set_fake_sleep_us(a, 25_000);
+        let flushed = h.process(48_000, &frame(48_000, 1.0), true, 0.5, 3840);
+        assert!(flushed.restart);
+        let info = h.slot_info(false);
+        assert_eq!((info.bypass, info.slow_frames), (0, 1));
+        assert!(info.process_max_us >= 50_000, "flush and process: {}", info.process_max_us);
+
+        h.set_fake_sleep_us(a, 6_000);
+        run(&h, 48_000, 1.0);
+        assert_eq!(run(&h, 48_000, 1.0).kind, RAN);
+        assert_eq!(h.slot_info(false).bypass, SLOW, "the warm-up still counts toward three");
     }
 
     #[test]
