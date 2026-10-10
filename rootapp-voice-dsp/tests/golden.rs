@@ -39,8 +39,6 @@ const FLAG_NAMES: [&str; 8] = [
     "denoiser_stalled",
     "edge",
 ];
-/// Flags an unsupported frame reports as state (the rest are per-frame and false in the crate).
-const UNSUPPORTED_FLAGS: u8 = 0x02 | 0x20;
 
 struct Record {
     settings: DspSettings,
@@ -306,7 +304,7 @@ fn run_vector(records: &[Record], tolerance: Tolerance) -> Outcome {
         let flags = actual_flags(&out);
         let mut problems = Vec::new();
 
-        let flag_mask = if unsupported { UNSUPPORTED_FLAGS } else { 0x7E };
+        let flag_mask = 0x7Eu8;
         let expected_flags = record.flags & flag_mask;
         flag_history.push((expected_flags & 0x06, flags & 0x06));
         if flags & flag_mask != expected_flags {
@@ -323,7 +321,7 @@ fn run_vector(records: &[Record], tolerance: Tolerance) -> Outcome {
         }
 
         for (which, (&a, &e)) in values.iter().zip(record.values.iter()).enumerate() {
-            let skip = (which == 0 && edge) || (unsupported && (1..=3).contains(&which));
+            let skip = which == 0 && edge;
             if skip {
                 continue;
             }
