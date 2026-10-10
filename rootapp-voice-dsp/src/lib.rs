@@ -1,0 +1,223 @@
+pub const MIN_RATE: u32 = 8_000;
+pub const MAX_RATE: u32 = 48_000;
+/// Largest frame (48 kHz / 100).
+pub const MAX_FRAME: usize = 480;
+/// Denoiser output capacity per frame, as the managed wrapper's scratch (frame × 8).
+pub const DENOISER_OUTPUT_FRAMES: usize = 8;
+pub const STARTUP_HOLD_FRAMES: u32 = 20;
+pub const MAX_DENOISER_WAIT_FRAMES: u32 = 100;
+pub const DENOISER_STALL_FRAMES: u32 = 100;
+pub const TRANSMIT_FADE_MS: u32 = 5;
+pub const MAX_VOICE_GAIN_DB: f32 = 18.0;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PushToTalk {
+    #[default]
+    VoiceActivity,
+    Held,
+    Released,
+}
+
+impl PushToTalk {
+    /// 0 voice activity, 1 held, anything else released (closes the gate).
+    pub fn from_wire(value: u32) -> Self {
+        match value {
+            0 => Self::VoiceActivity,
+            1 => Self::Held,
+            _ => Self::Released,
+        }
+    }
+}
+
+/// Read once per frame. Values need not be sanitised (the chain does: NaN volume/threshold → 0,
+/// volume clamped 0..2, threshold 0..1).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DspSettings {
+    /// Rate of this frame; a supported frame has exactly rate/100 samples.
+    pub sample_rate: u32,
+    pub mic_muted: bool,
+    pub push_to_talk: PushToTalk,
+    /// Linear 0..2, after the noise gate (20 ms ramp).
+    pub input_volume: f32,
+    pub auto_gain: bool,
+    /// Linear RMS of a ±1 signal, 0..1 (manual sensitivity).
+    pub gate_threshold: f32,
+    pub auto_sensitivity: bool,
+    /// The host's NS mode is the Effects SDK: the startup hold waits for the denoiser (≤ 100 frames).
+    pub denoiser_wanted: bool,
+}
+
+impl Default for DspSettings {
+    fn default() -> Self {
+        Self {
+            sample_rate: 48_000,
+            mic_muted: false,
+            push_to_talk: PushToTalk::VoiceActivity,
+            input_volume: 1.0,
+            auto_gain: true,
+            gate_threshold: 0.025,
+            auto_sensitivity: true,
+            denoiser_wanted: false,
+        }
+    }
+}
+
+/// One-shot commands for this frame, applied in this order before anything else.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DspCommands {
+    /// Session start: every per-stream stage starts over and the voice gain restarts from 0 dB.
+    pub reset: bool,
+    /// Stream (re)start: aligner, stall count and startup hold start over.
+    pub flush: bool,
+    /// Restart the voice gain from gain_reset_db (non-finite: ignored; clamped 0..18).
+    pub gain_reset: bool,
+    pub gain_reset_db: f32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PreDenoise {
+    /// The chain was reset, flushed or reconfigured for a new rate this frame: flush the pipeline
+    /// (flush(null, 0)) before process() if one runs this frame, else before its next run.
+    pub flush_denoiser: bool,
+    /// The frame is supported (rate in MIN_RATE..=max_rate and len == rate/100 > 0).
+    pub supported: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum DenoiserOutput<'a> {
+    /// No pipeline ran or will: none installed, bypassed, or not wanted. Frame passes as is; the
+    /// aligner is reset (once) and the stall count cleared.
+    NotInUse,
+    /// A pipeline is installed but the slot was busy: the frame passes dry; aligner untouched.
+    Missed,
+    /// process() ran: its output (FloatS16), 0..=8×frame samples (extra samples are ignored).
+    /// restart: first frame of a newly installed pipeline, or the pipeline was flushed before this
+    /// call (the aligner is reset before the push).
+    Ran { samples: &'a [f32], restart: bool },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct AlignerStats {
+    pub primed: bool,
+    pub buffered_samples: u32,
+    /// Cumulative for the chain's lifetime.
+    pub underruns: u64,
+    pub padded_samples: u64,
+    pub trimmed_samples: u64,
+    pub drained_samples: u64,
+    /// Managed DenoiserStats.LatencyMs over the counters since the last aligner reset.
+    pub latency_ms: f32,
+}
+
+/// Written by every pre/post call (pre fills apm_out_sumsq, samples, unsupported, reset, flushed,
+/// non_finite_samples; post fills the rest). Per-frame unless noted.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DspOutputs {
+    /// Samples behind this frame's sums (the frame length).
+    pub samples: u32,
+    /// Sums of squares in FloatS16 (int16) units, channel 0: the sanitised input.
+    pub apm_out_sumsq: f64,
+    /// After the denoise stage (aligner output, or the input when not in use).
+    pub denoised_sumsq: f64,
+    /// After voice gain and startup hold (managed VoiceMicGateInput).
+    pub gate_in_sumsq: f64,
+    /// What leaves (after the transmit gate).
+    pub sent_sumsq: f64,
+    /// RMS (±1 units) after voice gain, before the hold: what auto sensitivity and the input duty
+    /// see.
+    pub gate_in_rms: f32,
+    /// Loudest gate block (after the hold), dBFS of ±1; -inf when every block is silent.
+    pub gate_in_block_peak_db: f32,
+    /// The gate's threshold after this frame.
+    pub threshold: f32,
+    /// After this frame.
+    pub envelope: f32,
+    /// NoiseGate.IsSpeaking after this frame.
+    pub gate_speaking: bool,
+    /// gate_speaking && transmit_open.
+    pub speaking: bool,
+    /// envelope > 0.
+    pub gate_open: bool,
+    /// gate_in_rms > threshold.
+    pub gate_input_above: bool,
+    /// The startup hold zeroed this frame.
+    pub held: bool,
+    /// Transmit gate target (not muted, PTT not Released).
+    pub transmit_open: bool,
+    /// The transmit gate was above 0 for any sample of this frame.
+    pub transmitting: bool,
+    /// Last value while auto gain is off (0 before any).
+    pub voice_gain_db: f32,
+    pub voice_gain_settled: bool,
+    /// DenoiserOutput::Ran this frame.
+    pub denoiser_ran: bool,
+    /// ≥ DENOISER_STALL_FRAMES empty outputs in a row.
+    pub denoiser_stalled: bool,
+    pub aligner: AlignerStats,
+    pub unsupported: bool,
+    /// Replaced in this frame (input and denoiser output).
+    pub non_finite_samples: u32,
+    /// A reset ran this frame.
+    pub reset: bool,
+    /// A flush ran this frame (command, rate change or reset).
+    pub flushed: bool,
+}
+
+pub struct DspChain {
+    max_rate: u32,
+}
+
+impl DspChain {
+    /// Allocates everything for max_rate (clamped to MIN_RATE..=MAX_RATE). Never allocates
+    /// afterwards.
+    pub fn new(max_rate: u32) -> Self {
+        Self { max_rate: max_rate.clamp(MIN_RATE, MAX_RATE) }
+    }
+
+    pub fn max_rate(&self) -> u32 {
+        self.max_rate
+    }
+
+    /// frame: channel 0, FloatS16. Sanitised in place; otherwise unchanged, so the caller hands
+    /// exactly this to the SDK.
+    pub fn pre_denoise(
+        &mut self,
+        frame: &mut [f32],
+        settings: &DspSettings,
+        commands: &DspCommands,
+        out: &mut DspOutputs,
+    ) -> PreDenoise {
+        let _ = (commands, out);
+        let n = frame.len();
+        let r = settings.sample_rate;
+        let supported = (MIN_RATE..=self.max_rate).contains(&r)
+            && n > 0
+            && n <= MAX_FRAME
+            && n == (r / 100) as usize;
+        PreDenoise { flush_denoiser: false, supported }
+    }
+
+    /// Same frame and settings as the preceding pre_denoise. Writes the processed FloatS16 frame.
+    /// Called without a matching pre_denoise, the frame is treated as unsupported.
+    pub fn post_denoise(
+        &mut self,
+        frame: &mut [f32],
+        denoised: DenoiserOutput<'_>,
+        settings: &DspSettings,
+        out: &mut DspOutputs,
+    ) {
+        let _ = (frame, denoised, settings, out);
+    }
+
+    /// pre_denoise + post_denoise(NotInUse).
+    pub fn process(
+        &mut self,
+        frame: &mut [f32],
+        settings: &DspSettings,
+        commands: &DspCommands,
+        out: &mut DspOutputs,
+    ) {
+        self.pre_denoise(frame, settings, commands, out);
+        self.post_denoise(frame, DenoiserOutput::NotInUse, settings, out);
+    }
+}

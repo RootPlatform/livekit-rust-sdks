@@ -22,6 +22,7 @@ members = [
     "device-info",
     "webrtc-sys",
     "webrtc-sys/build",
+    "rootapp-voice-dsp",
 
     "examples/agent_dispatch",
     "examples/api",

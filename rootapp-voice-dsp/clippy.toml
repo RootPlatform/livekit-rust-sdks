@@ -1,0 +1,15 @@
+disallowed-macros = [
+    "std::println",
+    "std::eprintln",
+    "std::print",
+    "std::eprint",
+    "std::dbg",
+    "std::todo",
+    "std::unimplemented",
+    "core::panic",
+    "std::unreachable",
+    "std::assert",
+    "std::assert_eq",
+    "std::assert_ne",
+    "std::debug_assert",
+]
