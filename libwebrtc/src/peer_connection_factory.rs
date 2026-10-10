@@ -143,7 +143,7 @@ pub mod native {
     pub use crate::imp::peer_connection_factory::{
         AudioDeviceOutcome, AudioDeviceRequest, AudioDeviceRequestOutcome, AudioDeviceSelection,
         EffectPlay, MonitorResult, NativeAudioControl, NativeAudioStats, NativeCaptureFormat,
-        NativeDenoiserCompletion, NativeDenoiserState, NativeReturnPipelines,
+        NativeDenoiserCompletion, NativeDenoiserState, NativeMixSourceLevel, NativeReturnPipelines,
         NativeReturnedPipeline, NativeSpeaking, ADM_RESULT_DEVICE_NOT_FOUND,
         ADM_RESULT_NOT_ATTEMPTED,
     };

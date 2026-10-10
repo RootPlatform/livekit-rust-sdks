@@ -462,6 +462,11 @@ impl<T: Clone> TrackGains<T> {
         self.gains.iter().map(|(handle, gain)| (*handle, gain.ssrc.is_some())).collect()
     }
 
+    /// Every handle whose SSRC is known, with it.
+    fn ssrcs(&self) -> impl Iterator<Item = (FfiHandleId, u32)> + '_ {
+        self.gains.iter().filter_map(|(handle, gain)| gain.ssrc.map(|ssrc| (*handle, ssrc)))
+    }
+
     fn clear(&mut self) {
         self.gains.clear();
     }
@@ -760,6 +765,15 @@ impl RootAudioSession {
         gains.forget(audio.as_ref().map(sink_of), handle);
     }
 
+    /// The remote audio track handles this session knows an SSRC for: the
+    /// ones it set gains for and the ones resolved at subscribe.
+    fn track_ssrcs(&self) -> Vec<(FfiHandleId, u32)> {
+        let mut tracks: Vec<(FfiHandleId, u32)> =
+            SESSIONS.lock().subscribed.iter().map(|(handle, ssrc)| (*handle, *ssrc)).collect();
+        tracks.extend(self.state.lock().gains.ssrcs());
+        tracks
+    }
+
     /// Stores the gains and applies the ones whose SSRC is known; returns the
     /// handles still to resolve, or Err when the session has ended.
     fn set_gains(&self, requests: Vec<GainRequest>) -> Result<Vec<FfiHandleId>, ()> {
@@ -973,7 +987,28 @@ pub fn on_stats(
 ) -> FfiResult<proto::RootAudioStatsResponse> {
     let stats =
         platform_audio_from_handle(server, req.platform_audio_handle)?.rootapp_audio_stats();
-    Ok(proto::RootAudioStatsResponse { stats: Some(stats.into()), error: None })
+    let mut stats: proto::RootAudioStats = stats.into();
+    if !stats.mix_source_levels.is_empty() {
+        let tracks = session_from_handle(server, req.platform_audio_handle)
+            .map(|session| session.track_ssrcs())
+            .unwrap_or_default();
+        attach_track_handles(&mut stats.mix_source_levels, &tracks);
+    }
+    Ok(proto::RootAudioStatsResponse { stats: Some(stats), error: None })
+}
+
+/// Each source level gets the track handles known under its SSRC, once each.
+fn attach_track_handles(levels: &mut [proto::RootAudioSourceLevel], tracks: &[(FfiHandleId, u32)]) {
+    for level in levels {
+        let mut handles: Vec<u64> = tracks
+            .iter()
+            .filter(|(_, ssrc)| level.ssrc == Some(*ssrc))
+            .map(|(handle, _)| *handle)
+            .collect();
+        handles.sort_unstable();
+        handles.dedup();
+        level.track_handles = handles;
+    }
 }
 
 /// Every field is sanitised (finite, clamped; an unknown push-to-talk value
@@ -1244,6 +1279,19 @@ impl From<RootAudioStats> for proto::RootAudioStats {
             monitor_active: stats.monitor_active,
             monitor_frames: stats.monitor_frames,
             monitor_dropped_frames: stats.monitor_dropped_frames,
+            mix_source_levels_counted: stats.mix_source_levels.as_ref().map(|_| true),
+            mix_source_levels: stats
+                .mix_source_levels
+                .unwrap_or_default()
+                .into_iter()
+                .map(|level| proto::RootAudioSourceLevel {
+                    ssrc: Some(level.ssrc),
+                    source_id: Some(level.source_id),
+                    sumsq: Some(level.sumsq),
+                    samples: Some(level.samples),
+                    track_handles: Vec::new(),
+                })
+                .collect(),
         }
     }
 }
@@ -1413,6 +1461,36 @@ mod tests {
         assert_eq!(proto.overlapping_callbacks, Some(2));
         assert_eq!(proto.device_stop_failures, Some(0));
         assert_eq!(proto::RootAudioStats::from(RootAudioStats::default()).aec_delay_ms, -1);
+        assert_eq!(proto.mix_source_levels_counted, None);
+        assert!(proto.mix_source_levels.is_empty());
+    }
+
+    #[test]
+    fn rootapp_audio_source_levels_convert_and_name_their_tracks() {
+        let level =
+            |ssrc, source_id| livekit::MixSourceLevel { ssrc, source_id, sumsq: 4.0, samples: 480 };
+        let stats = RootAudioStats {
+            mix_source_levels: Some(vec![level(7, 1), level(8, 2), level(9, 3)]),
+            ..Default::default()
+        };
+        let mut proto: proto::RootAudioStats = stats.into();
+        assert_eq!(proto.mix_source_levels_counted, Some(true));
+        assert_eq!(proto.mix_source_levels.len(), 3);
+        let first = &proto.mix_source_levels[0];
+        assert_eq!(
+            (first.ssrc, first.source_id, first.sumsq, first.samples),
+            (Some(7), Some(1), Some(4.0), Some(480))
+        );
+
+        attach_track_handles(&mut proto.mix_source_levels, &[(30, 8), (12, 7), (11, 7), (12, 7)]);
+        let handles: Vec<Vec<u64>> =
+            proto.mix_source_levels.iter().map(|l| l.track_handles.clone()).collect();
+        assert_eq!(handles, vec![vec![11, 12], vec![30], vec![]]);
+
+        let idle: proto::RootAudioStats =
+            RootAudioStats { mix_source_levels: Some(Vec::new()), ..Default::default() }.into();
+        assert_eq!(idle.mix_source_levels_counted, Some(true));
+        assert!(idle.mix_source_levels.is_empty());
     }
 
     /// Records what a session asks of the native engine.

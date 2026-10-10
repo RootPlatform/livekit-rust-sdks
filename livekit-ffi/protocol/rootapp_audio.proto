@@ -388,6 +388,24 @@ message RootAudioStats {
   optional bool monitor_active = 102;
   optional uint64 monitor_frames = 103;
   optional uint64 monitor_dropped_frames = 104;
+
+  // Per-source playout levels (absent from builds without them). mix_source_levels_counted says the
+  // build counts them, so an empty list then means no remote stream reaches the mixer.
+  repeated RootAudioSourceLevel mix_source_levels = 105;
+  optional bool mix_source_levels_counted = 106;
+}
+// One playout mixer source (a remote audio stream): its audio as it reached the mixer, decoded and
+// before its gain (tile volume, master volume, deafen; a muted frame counts as silence), as a sum of
+// squares in int16 units over `samples`, cumulative since the source was added. source_id tells a
+// stream added again under the same SSRC from the earlier one (its counts start over).
+// track_handles are the remote audio tracks livekit_ffi knows under that SSRC (the SSRCs it resolves
+// for track gains and at subscribe); empty while none is resolved.
+message RootAudioSourceLevel {
+  optional uint32 ssrc = 1;
+  optional uint64 source_id = 2;
+  optional double sumsq = 3;
+  optional uint64 samples = 4;
+  repeated uint64 track_handles = 5;
 }
 message RootAudioStatsRequest {
   required uint64 platform_audio_handle = 1;

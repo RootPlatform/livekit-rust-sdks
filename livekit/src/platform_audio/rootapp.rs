@@ -20,7 +20,8 @@ use std::fmt;
 use libwebrtc::peer_connection_factory::native::{
     AudioDeviceOutcome, AudioDeviceRequestOutcome, MonitorResult, NativeAudioControl,
     NativeAudioStats, NativeCaptureFormat, NativeDenoiserCompletion, NativeDenoiserState,
-    NativeReturnPipelines, NativeReturnedPipeline, NativeSpeaking, ADM_RESULT_NOT_ATTEMPTED,
+    NativeMixSourceLevel, NativeReturnPipelines, NativeReturnedPipeline, NativeSpeaking,
+    ADM_RESULT_NOT_ATTEMPTED,
 };
 pub use libwebrtc::peer_connection_factory::native::{AudioDeviceSelection, EffectPlay};
 
@@ -363,6 +364,30 @@ fn device_result(outcome: AudioDeviceOutcome) -> AudioResult<()> {
     Ok(())
 }
 
+/// One playout mixer source (a remote audio stream): its audio as it reached the
+/// mixer, decoded and before its gain (a muted frame counts as silence), as a sum
+/// of squares in int16 units over `samples`, cumulative since the source was
+/// added. `source_id` tells a stream added again under the same SSRC from the
+/// earlier one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MixSourceLevel {
+    pub ssrc: u32,
+    pub source_id: u64,
+    pub sumsq: f64,
+    pub samples: u64,
+}
+
+impl From<&NativeMixSourceLevel> for MixSourceLevel {
+    fn from(level: &NativeMixSourceLevel) -> Self {
+        Self {
+            ssrc: level.ssrc,
+            source_id: level.source_id,
+            sumsq: level.sumsq,
+            samples: level.samples,
+        }
+    }
+}
+
 /// Counters of the native audio engine, field for field the FFI `RootAudioStats`.
 ///
 /// Counters are cumulative since the engine started (take deltas); levels are sums
@@ -407,6 +432,9 @@ pub struct RootAudioStats {
     pub mix_out_samples: u64,
     pub effects_played: u64,
     pub effects_dropped: u64,
+    /// Each mixer source's level before its gain; `None` when the build does
+    /// not count them.
+    pub mix_source_levels: Option<Vec<MixSourceLevel>>,
 
     // Capture processing.
     pub processed_frames: u64,
@@ -526,6 +554,7 @@ impl Default for RootAudioStats {
             mix_out_samples: 0,
             effects_played: 0,
             effects_dropped: 0,
+            mix_source_levels: None,
             processed_frames: 0,
             process_rate: 0,
             process_channels: 0,
@@ -682,6 +711,9 @@ impl RootAudioStats {
             mix_out_samples: native.mix_out_samples,
             effects_played: native.effects_played,
             effects_dropped: native.effects_dropped,
+            mix_source_levels: native
+                .mix_source_levels_available
+                .then(|| native.mix_source_levels.iter().map(MixSourceLevel::from).collect()),
             processed_frames: native.processed_frames,
             process_rate: native.process_rate,
             process_channels: native.process_channels,
@@ -874,7 +906,26 @@ mod tests {
         assert_eq!(stats.ns_fallback_pending_frames, None);
         assert!(stats.denoiser_process_us_buckets.is_empty());
         assert_eq!((stats.apm_policy_applies, stats.apm_policy_pending), (None, None));
+        assert_eq!(stats.mix_source_levels, None);
         assert_eq!(RootAudioStats::default().aec_delay_ms, -1);
+    }
+
+    #[test]
+    fn root_audio_stats_carry_per_source_levels_when_the_mixer_counts_them() {
+        let level = NativeMixSourceLevel { ssrc: 9, source_id: 3, sumsq: 2.5, samples: 960 };
+        let native = NativeAudioStats {
+            mix_source_levels_available: true,
+            mix_source_levels: vec![level],
+            ..Default::default()
+        };
+        let stats = RootAudioStats::from_native(native);
+        assert_eq!(
+            stats.mix_source_levels,
+            Some(vec![MixSourceLevel { ssrc: 9, source_id: 3, sumsq: 2.5, samples: 960 }])
+        );
+
+        let idle = NativeAudioStats { mix_source_levels_available: true, ..Default::default() };
+        assert_eq!(RootAudioStats::from_native(idle).mix_source_levels, Some(Vec::new()));
     }
 
     #[test]
