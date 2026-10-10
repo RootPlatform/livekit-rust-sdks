@@ -747,16 +747,19 @@ it only changes .NET's own copy, so set the variable before the process starts o
 
 ## Native call audio (`rootapp/native-platform-audio`)
 
-Phases 0 and 1 of RootApp.Client.Desktop's `docs/native-platform-audio.md`: platform audio
+Phases 0-2 of RootApp.Client.Desktop's `docs/native-platform-audio.md`: platform audio
 (`PlatformAudio`, `AUDIO_SOURCE_PLATFORM`) carries a call, with device IO, mixing, echo cancellation,
-volumes, effects and the mute/push-to-talk gate in native code.
+volumes, effects, the mute/push-to-talk gate and (Phase 2) the app's voice chain and the Effects SDK
+denoiser hand-off in native code.
 
 `livekit_ffi_rootapp_audio_caps()` is a zero-protobuf export (every target) returning the native audio
 features the build implements: bit 0 SELECT_DEVICES, 1 PLAYOUT_HOLD, 2 STATS, 3 ADM_HARDENED, 4 MIXER,
 5 TRACK_GAINS, 6 EFFECTS, 7 CONTROL, 8 DSP, 9 DENOISER, 10 MONITOR, 11 APM_DECORATOR. This branch
-reports `0b100011111111` (bits 0-7 and 11) on desktop and 0 on mobile. The `RootAudio*` requests
-(`rootapp_audio.proto`, oneof cases from 1000) that a build does not implement answer "not supported
-by this build"; an older library rejects them as an empty request, so hosts check the export first.
+reports `0b101111111111` (3071: bits 0-9 and 11) on 64-bit desktop, `0b100111111111` (2559, no
+DENOISER) on 32-bit desktop and 0 on mobile; Phase 1 builds reported `0b100011111111` (2303). The
+`RootAudio*` requests (`rootapp_audio.proto`, oneof cases from 1000) that a build does not implement
+answer "not supported by this build"; an older library rejects them as an empty request, so hosts
+check the export first.
 
 What changes for every user of the library on Windows, macOS and Linux, the managed engine included:
 
@@ -810,7 +813,7 @@ Phase 1 (desktop; mobile keeps libwebrtc's APM and reports no capability):
   capture post-processor, wrapped in `RootApmDecorator`. The decorator forwards every
   `AudioProcessing` call; its `ApplyConfig` keeps AGC1 and AGC2 off and the high-pass filter on and
   takes AEC and NS from `RootAudioSetControl` once set (applied from the worker thread, at most once
-  a second; not yet deferred to a speech pause), and it swallows `set_output_will_be_muted` and the
+  a second; from Phase 2 also at a pause in speech), and it swallows `set_output_will_be_muted` and the
   `kCaptureOutputUsed` setting, so the post-processor runs on every frame. `GetConfig` serves the
   voice engine's own request with only AGC off and the high-pass filter on, so the engine's
   read-modify-write never copies the AEC/NS policy into it.
@@ -832,7 +835,7 @@ Phase 1 (desktop; mobile keeps libwebrtc's APM and reports no capability):
   (muted, push-to-talk key up) and gains, effects and the AEC/NS policy reset, before the handle
   lets go of the device. Dropping one of several handles changes nothing.
 - `RootAudioSetControl` fields `denoise_power`, `auto_gain`, `gate_threshold`, `auto_sensitivity`
-  and `gain_reset_db` are stored for the DSP chain and have no effect yet. A field the build cannot
+  and `gain_reset_db` are stored for the DSP chain (Phase 2 acts on them). A field the build cannot
   act on (no capture processor or decorator, e.g. when the APM failed to build) is answered "not
   supported by this build"; the other fields are applied.
 
@@ -840,6 +843,78 @@ Phase 1 (desktop; mobile keeps libwebrtc's APM and reports no capability):
 the echo delay and the divergent filter fraction come from the APM's statistics (NaN while it has
 none, the delay -1). Reading them takes the APM's statistics lock, which the capture thread holds
 briefly once per frame (as libwebrtc's own getStats does); the rest of `RootAudioStats` is atomics.
+
+### Phase 2: voice chain, Effects SDK hand-off, speech-pause APM policy
+
+Caps: DSP (bit 8) on every desktop build, where the factory builds its APM (`kRootDspSupported`, the
+condition of `LK_ADM_MOBILE`); DENOISER (bit 9) on 64-bit desktop only, where the Effects SDK's
+vtable calls follow the x64/arm64 C convention (`kRootDenoiserSupported`). The test
+`rootapp_audio_caps_cover_phase_2` ties both bits to those native constants and DENOISER to a
+non-null `livekit_ffi_rootapp_denoiser_notification_handler()`; `RootAudioStats` carries the DSP
+fields (74-83) only where `dsp_available` (the same constant, and an APM that was built).
+
+What changes for every desktop user whose device track goes through the factory's APM (not the
+managed engine's `NativeAudioSource` tracks, which bypass it):
+
+- `RootCaptureProcessor` runs `rootapp-voice-dsp` (pure Rust, no dependencies, no allocation, lock,
+  I/O or panic after construction) on channel 0 and copies the result to the other channels:
+  sanitise -> denoiser slot -> frame aligner -> voice gain -> auto sensitivity -> startup hold ->
+  noise gate -> input volume (20 ms ramp) -> mute/push-to-talk transmit gate (5 ms fade). The
+  input-volume ramp and the gate fade moved here from Phase 1's C++. Managed constants are used
+  unchanged (the crate scales FloatS16 by 2^-15 on entry); other rates scale the gate block by time
+  (128 samples at 48 kHz, 43 at 16 kHz).
+- With no `RootAudioSetControl` the chain runs on its defaults: noise gate in auto sensitivity
+  (threshold from the noise floor, 5 blocks to open), voice gain on from 0 dB (it only boosts, up to
+  18 dB), no denoiser. Every recording start silences its first 20 frames (200 ms, the startup
+  hold), and with `denoiser_wanted` up to 100 frames until the denoiser runs. Mute and push-to-talk
+  key up silence after the 5 ms fade; the gate, voice gain and auto sensitivity keep running.
+- Speaking (`RootAudioEvent.speaking`, stats 74/42) is the noise gate's speaking (envelope plus a
+  300 ms hold) while the transmit gate is open, so it is never reported while muted or with the key
+  up. It clears on `reset_root_audio` and when recording stops (no frame would clear it).
+- A recording start bumps the capture state's stream epoch (AdmProxy, right before
+  `StartRecording`): the aligner, the denoiser (flush) and the startup hold start over. A rate change
+  does the same; a session start (first handle) resets everything, the voice gain to 0 dB.
+- The APM decorator applies host AEC/NS changes at most once a second and at a pause in the user's
+  speech (published speaking false and not in the startup hold), at most 3 s late (then counted as
+  forced). Native WebRTC NS covers a wanted denoiser that stopped: on at once for an output stall
+  or slow frames (an urgent apply on the worker thread, no rate limit or pause), after 1 s of
+  flowing frames when it is missing, removed or at the wrong rate; off again with the normal rules.
+  Policy stats are atomics and never wait for an APM re-initialisation.
+- 64-bit desktop: `RootDenoiserSlot` runs an app-created `IPipeline*` on the capture thread (slots
+  4, 8 and 9 only; native never calls `release`). The `rootapp-effects` thread starts on the first
+  `RootAudioSetDenoiser` or `denoiser_wanted` and installs at a speech pause (<= 3 s), removes at
+  once, and hands each replaced pipeline back once (`pipelines_returned`). Bypasses: rate mismatch
+  (clears itself when the rate is back), 100 empty outputs in a row, or slow frames (3 over 5 ms
+  within 60 s, or one over 20 ms). Flush, power change and `process()` are timed together into a
+  16-bucket histogram and a maximum. The first call after an install or a flush is exempt from the
+  single 20 ms latch (still measured, still counted toward the 3-in-60 s rule): the Effects SDK
+  1.7.2 harness measured no first-call spike (2,649 calls from a fresh pipeline, maximum 516-525 us
+  including call 1), so the exemption only matters for a one-off warm-up on a slower machine, which
+  would otherwise turn into a final, process-wide Effects SDK disable on the desktop.
+- `RootAudioReturnPipelines` waits up to 200 ms in all (a change in progress and the audio thread);
+  with a scheduler tick and two short control-mutex waits the desktop's exit wait is sized at 300 ms.
+  The last session's reset runs outside the sessions lock; what it gives back waits for the next
+  handle or a `RootAudioReturnPipelines` response.
+- `livekit_ffi_rootapp_denoiser_notification_handler()` (new export, null on mobile and 32-bit) is a
+  static `INotificationHandler` that only counts notifications (stats 57 and 88).
+- Stats 34-45, 50-57 and 74-100 are filled. Field 89 (`denoiser_latency_ms`) is the latency the
+  aligner adds now, since it last started over; the managed figure counted from the denoiser's
+  creation, grew with every aligner reset and fell back after trims, so cumulative aligner counters
+  (90-94) are what a caller baselines per call. 38 and 40 are maxima since the previous read.
+
+Limits and what is not verified:
+
+- macOS and Linux were not compiled for this phase (Windows cannot build webrtc-sys for them; see
+  the checklist). The changed C++ has no platform-specific code; the mobile branches
+  (`WEBRTC_IOS`) pass a clang-cl syntax-only check, and MSVC and clang-cl `/W4` add no warnings.
+- The real Effects SDK was not driven natively: `createPipeline` at 8/16/32/44.1 kHz and
+  `pcmScale 32768`, `process()` latency on the capture thread (E8) and the slow-bypass thresholds
+  are unmeasured. Fakes with the SDK's vtable layout and output pattern stand in for it.
+- 8 kHz device streams reach the processor at 16 kHz (the APM upsamples); the chain's 8 kHz path
+  runs only in tests and golden vectors.
+- A device that dies mid-word without a stop keeps speaking published until the next stop or reset.
+- The golden vectors match bit for bit on Windows x64; other math libraries may need
+  `ROOTAPP_DSP_GOLDEN_LOOSE=1`.
 
 Known limit (libwebrtc prebuilt): `external_audio_source.patch` as built into the pinned prebuilt
 never clears `sending_` in `Stop()`, and `StoreEncoderProperties` still registers a sending external
@@ -852,9 +927,13 @@ fixed at publish; stereo munging is keyed to the track id in every offer), and `
 
 Tests that need no device: `cargo test -p webrtc-sys --lib -- adm_proxy root_
 device_selection` (AdmProxy over a fake platform ADM that records its calls, the mixer, the capture
-processor, and the decorator over a fake and over the real builtin APM), `cargo test -p
-libwebrtc --lib imp::rtp_sender`, `cargo test -p livekit --lib platform_audio` and `cargo test -p
-livekit-ffi --lib rootapp_audio`. Every test that creates the platform ADM
+processor, the decorator over a fake and over the real builtin APM, the denoiser slot and its
+control side, and `root_voice_*`: the whole voice path over one capture state with fake Effects SDK
+pipelines and a worker thread), `cargo test -p rootapp-voice-dsp` (ported managed tests, 22 golden
+vectors from the desktop's reference, no-allocation and no-panic sweeps; `cargo clippy -p
+rootapp-voice-dsp --all-targets -- -D warnings`), `cargo test -p libwebrtc --lib imp::rtp_sender`,
+`cargo test -p livekit platform_audio`, and `cargo test -p livekit-ffi --lib rootapp_audio` and
+`platform_audio`. Run them with `--release`. Every test that creates the platform ADM
 (`test_audio_device_controller_bridge`, `test_new_platform_audio`, the device tests in
 `livekit/tests/platform_audio_test.rs`) runs only with `LK_HW_AUDIO_TESTS=1`.
 
@@ -881,7 +960,7 @@ livekit-ffi --lib rootapp_audio`. Every test that creates the platform ADM
 | `rootapp/fx3` | MF encoder upload ring never blocks in `Map` (fence-gated slots, grows to 5, then a fence wait outside the device lock); `D3D11GpuFence` in `mf_gpu_fence.h` with a WARP test; MF decoder teardown on the deferred release thread; a release run needs all six RIDs and refuses a tag, or a draft, that points at another commit |
 | `rootapp/fx4-tokio` | FFI tokio runtime capped at 8 workers, `LK_FFI_WORKER_THREADS` override (see Tokio runtime size). Later: simulcast encodings lowest-first, periodic ALR probing, start bitrate through `SetBitrate` once per PeerConnection with a max that follows the published video (see Start bitrate), MF sessions counted until their delayed release with the D3D11 device kept alive that long, unpublished senders' streams left out of offers (see Unpublish and the publisher SDP), libwebrtc log levels and `LK_FFI_LOG_LEVEL` (see Logging), each video codec listed once by the codec factories |
 | `rootapp/fx4-dev` | Windows exports `livekit_ffi_d3d11_acquire_shared_device` / `_release_shared_device`, so the desktop's screen capture runs on the codecs' shared D3D11 device; the shared device is created without the driver's internal threading optimizations (`LK_MF_D3D11_DRIVER_THREADING=on` restores them). See "Sharing the D3D11 device with the host" |
-| `rootapp/native-platform-audio` | Native call audio, Phase 0: `rootapp_audio.proto`, `AdmProxy` on a device thread with stored selection, playout hold, restart and a transport tap, `RootAudioMixer`, explicit device-track options, external sources off the APM and mic, `livekit_ffi_rootapp_audio_caps`. Review fixes: one mix and one render/capture callback at a time, no second puller after a failed device stop, the app's start/stop apart from libwebrtc's, real-time rule counters in every build, AdmProxy tests over a fake platform ADM. Phase 1: mixer gains, ramps and effect bus, `RootApmDecorator` and `RootCaptureProcessor` (mute/PTT gate, input volume, levels, capture format events), track gains by SSRC, `RootAudioSetControl`, caps `0b100011111111`. Phase 1 review fixes: shared controls reset only by the first session and closed by the last, new streams held until their gain arrives, SSRCs resolved at subscribe, gate fades and one gate word, stale effects dropped, `unknown_track_handles`. See "Native call audio" |
+| `rootapp/native-platform-audio` | Native call audio, Phase 0: `rootapp_audio.proto`, `AdmProxy` on a device thread with stored selection, playout hold, restart and a transport tap, `RootAudioMixer`, explicit device-track options, external sources off the APM and mic, `livekit_ffi_rootapp_audio_caps`. Review fixes: one mix and one render/capture callback at a time, no second puller after a failed device stop, the app's start/stop apart from libwebrtc's, real-time rule counters in every build, AdmProxy tests over a fake platform ADM. Phase 1: mixer gains, ramps and effect bus, `RootApmDecorator` and `RootCaptureProcessor` (mute/PTT gate, input volume, levels, capture format events), track gains by SSRC, `RootAudioSetControl`, caps `0b100011111111`. Phase 1 review fixes: shared controls reset only by the first session and closed by the last, new streams held until their gain arrives, SSRCs resolved at subscribe, gate fades and one gate word, stale effects dropped, `unknown_track_handles`. Phase 2: `rootapp-voice-dsp` in the capture processor (voice gain, auto sensitivity, noise gate, startup hold, input volume, transmit gate, denoiser aligner; golden vectors), the Effects SDK slot with its `rootapp-effects` thread and native WebRTC NS fallback, speech-pause APM policy, speaking/denoiser events and stats 74-100, `livekit_ffi_rootapp_denoiser_notification_handler`, caps 3071, end-to-end voice tests. See "Native call audio" |
 
 `rootapp/fx-session` adds: unpublishing a video track releases its encoder (see above);
 received I420 frames whose planes are already packed are handed to the FFI handle without a
