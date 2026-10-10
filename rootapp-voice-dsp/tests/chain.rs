@@ -443,12 +443,22 @@ fn the_startup_hold_waits_for_the_denoiser_until_it_first_runs() {
     assert!(!h.out.held);
 
     h.settings.sample_rate = 16000;
+    for i in 0..MAX_DENOISER_WAIT_FRAMES {
+        h.run(1000.0);
+        assert!(h.out.held, "{i}: a rate change waits for a pipeline at the new rate");
+    }
+    h.run(1000.0);
+    assert!(!h.out.held, "at most 100 frames");
+
+    let input = vec![1000.0f32; 160];
+    h.run_with(&input, DenoiserOutput::Missed);
+    h.commands.flush = true;
     for i in 0..HOLD {
         h.run(1000.0);
         assert!(h.out.held, "{i}");
     }
     h.run(1000.0);
-    assert!(!h.out.held, "a rate change holds 20 frames, not until the denoiser at the new rate");
+    assert!(!h.out.held, "a flush at the same rate keeps the pipeline: 20 frames only");
 
     h.commands.reset = true;
     for _ in 0..MAX_DENOISER_WAIT_FRAMES {
@@ -457,6 +467,31 @@ fn the_startup_hold_waits_for_the_denoiser_until_it_first_runs() {
     }
     h.run(1000.0);
     assert!(!h.out.held, "a reset waits for the denoiser again");
+}
+
+/// A mid-call switch to a 16 kHz headset: the 48 kHz pipeline is NotInUse until the host installs
+/// one at 16 kHz, and the frames in between stay held rather than going out with no noise
+/// suppression at all.
+#[test]
+fn a_rate_change_holds_until_a_pipeline_at_the_new_rate_runs() {
+    let mut h = Harness::pass_through(48000);
+    h.settings.denoiser_wanted = true;
+    let input = vec![1000.0f32; 480];
+    for _ in 0..30 {
+        h.run_with(&input, DenoiserOutput::Ran { samples: &input, restart: false });
+    }
+    assert!(!h.out.held && h.out.denoiser_ran);
+
+    h.settings.sample_rate = 16000;
+    for i in 0..60 {
+        assert!(silent(&h.run(1000.0)), "{i}");
+        assert!(h.out.held && !h.out.denoiser_ran, "{i}");
+    }
+    let input = vec![1000.0f32; 160];
+    h.run_with(&input, DenoiserOutput::Ran { samples: &input, restart: true });
+    assert!(!h.out.held && h.out.denoiser_ran, "the pipeline at 16 kHz ends the wait");
+    h.run(1000.0);
+    assert!(!h.out.held, "and the latch holds while it is NotInUse again");
 }
 
 #[test]
@@ -620,10 +655,8 @@ fn unsupported_frames_report_the_last_state_and_no_per_frame_flags() {
     assert_eq!(out, input);
     let o = h.out;
     assert!(o.unsupported);
-    assert_eq!(
-        (o.threshold, o.envelope, o.gate_speaking),
-        (before.threshold, before.envelope, true)
-    );
+    assert_eq!((o.threshold, o.gate_speaking), (before.threshold, true));
+    assert!(o.envelope < before.envelope, "the gate heard 10 ms of silence");
     assert_eq!(
         (o.voice_gain_db, o.voice_gain_settled),
         (before.voice_gain_db, before.voice_gain_settled)
@@ -645,6 +678,54 @@ fn unsupported_frames_report_the_last_state_and_no_per_frame_flags() {
     assert!(silent(&h.run_input(&input)));
     assert!(!h.out.transmitting && !h.out.transmit_open && !h.out.speaking && h.out.gate_speaking);
     assert_eq!(h.out.sent_sumsq, 0.0);
+}
+
+/// A stream the chain cannot process never leaves speaking stuck on: the gate releases and its
+/// hold runs out as on silence.
+#[test]
+fn unsupported_frames_let_the_gate_run_out() {
+    let mut h = Harness::new(48000);
+    for _ in 0..40 {
+        h.run_tone(3000.0);
+    }
+    assert!(h.out.speaking);
+    let input = vec![3000.0f32; 479];
+    let mut frames = 0;
+    while h.out.gate_speaking {
+        assert_eq!(h.run_input(&input), input, "the audio itself still goes out");
+        frames += 1;
+        assert!(frames < 100);
+    }
+    assert!((68..=72).contains(&frames), "{frames}: as many as for supported silence");
+    assert!(!h.out.speaking && h.out.transmitting);
+}
+
+#[test]
+fn unsupported_frames_follow_the_input_volume() {
+    let mut h = Harness::pass_through(48000);
+    for _ in 0..30 {
+        h.run(1000.0);
+    }
+    let input = vec![1000.0f32; 479];
+    h.settings.input_volume = 0.5;
+    for _ in 0..3 {
+        h.run_input(&input);
+    }
+    assert_eq!(h.run_input(&input), vec![500.0; 479], "the 20 ms ramp lands on 0.5");
+
+    h.settings.input_volume = 0.0;
+    for _ in 0..3 {
+        h.run_input(&input);
+    }
+    assert!(silent(&h.run_input(&input)));
+    assert!(h.out.transmitting && h.out.sent_sumsq == 0.0, "open, at volume 0");
+
+    h.settings.input_volume = 2.0;
+    for _ in 0..3 {
+        h.run_input(&input);
+    }
+    assert_eq!(h.run_input(&[20000.0; 479]), vec![32768.0; 479], "clamped after the volume");
+    assert_eq!(h.run(1000.0), vec![2000.0; 480], "the next supported frame continues at 2");
 }
 
 #[test]

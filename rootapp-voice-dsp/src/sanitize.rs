@@ -1,8 +1,9 @@
 /// FloatS16 samples are clamped to ±4.0 of a ±1 signal: the APM never legitimately exceeds it and
 /// `s * s` stays finite in f32.
 pub const SAMPLE_LIMIT: f32 = 131_072.0;
-/// Smaller magnitudes become 0 (denormal guard).
-pub const DENORMAL_LIMIT: f32 = 1e-25;
+/// Smaller magnitudes become 0 (denormal guard: squares of ±1 values below about 3.6e-15 FloatS16
+/// are subnormal in f32).
+pub const DENORMAL_LIMIT: f32 = 1e-12;
 /// Full scale of a FloatS16 signal.
 pub const FULL_SCALE: f32 = 32_768.0;
 pub const MAX_INPUT_VOLUME: f32 = 2.0;

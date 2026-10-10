@@ -119,8 +119,8 @@ pub struct DspChain {
     aligner_in_use: bool,
     empty_outputs: u32,
     frames_since_open: u32,
-    /// A pipeline ran or was installed (Ran or Missed) since the last reset: the startup hold no
-    /// longer waits for the denoiser.
+    /// A pipeline ran or was installed (Ran or Missed) since the last reset or rate change: the
+    /// startup hold no longer waits for the denoiser.
     denoiser_seen: bool,
 }
 
@@ -179,9 +179,12 @@ impl DspChain {
         self.frames_since_open = 0;
     }
 
-    /// A new rate (or a reset): flush, a fresh noise gate, ramps and fade at their targets.
+    /// A new rate (or a reset): flush, a fresh noise gate, ramps and fade at their targets. The
+    /// installed pipeline runs at the old rate (NotInUse until one at the new rate arrives), so the
+    /// startup hold waits for the denoiser again; a flush at the same rate keeps that.
     fn reconfigure(&mut self, rate: u32, settings: &DspSettings) {
         self.rate = rate;
+        self.denoiser_seen = false;
         let threshold = self.gate.threshold();
         let min_open_blocks = self.gate.min_open_blocks();
         self.gate = NoiseGate::new(rate, block_samples_for(rate));
@@ -203,7 +206,6 @@ impl DspChain {
         self.voice_gain_db = 0.0;
         self.voice_gain_settled = false;
         self.auto_sensitivity_active = false;
-        self.denoiser_seen = false;
     }
 
     fn reset_gain(&mut self, db: f32) {
@@ -457,7 +459,9 @@ impl DspChain {
         out.aligner = self.aligner_stats();
     }
 
-    /// The transmit gate only, without a fade; everything else reports its last state.
+    /// The input volume and the transmit gate (without a fade) only. The noise gate hears a frame
+    /// of silence at the configured rate, so its speaking state runs out instead of freezing;
+    /// everything else reports its last state.
     fn post_unsupported(
         &mut self,
         frame: &mut [f32],
@@ -466,8 +470,16 @@ impl DspChain {
     ) {
         let open = transmit_open(settings);
         let passed = sanitize::sum_squares(frame);
+        self.ramp.set_target(sanitize::input_volume(settings.input_volume));
+        self.ramp.apply(frame);
         sanitize::clamp_full_scale(frame);
         let transmitting = self.transmit.apply_hard(frame, open);
+        if self.rate != 0 {
+            if let Some(silence) = self.work.get_mut(..frame_samples_for(self.rate)) {
+                silence.fill(0.0);
+                self.gate.process_gated(silence, false);
+            }
+        }
         out.sent_sumsq = sanitize::sum_squares(frame);
         out.denoised_sumsq = passed;
         out.gate_in_sumsq = passed;
