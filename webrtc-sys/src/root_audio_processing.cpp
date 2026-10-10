@@ -29,33 +29,35 @@
 #include "api/make_ref_counted.h"
 #include "api/task_queue/task_queue_base.h"
 #include "api/units/time_delta.h"
+#include "livekit/root_denoiser.h"
 #include "modules/audio_processing/audio_buffer.h"
 #include "modules/audio_processing/include/aec_dump.h"
 
 namespace livekit_ffi {
 namespace {
 
-constexpr float kMaxInputVolume = 2.0f;
-
-float SanitizeVolume(float volume) {
-  if (std::isnan(volume)) {
-    return 0.0f;
-  }
-  return std::min(kMaxInputVolume, std::max(0.0f, volume));
-}
-
-double SumSquares(const float* samples, size_t count) {
-  double sum = 0;
-  for (size_t i = 0; i < count; ++i) {
-    sum += static_cast<double>(samples[i]) * samples[i];
-  }
-  return sum;
-}
-
 // Single writer (the audio thread), so a load and a store is enough.
 void AddTo(std::atomic<double>& total, double value) {
   total.store(total.load(std::memory_order_relaxed) + value,
               std::memory_order_relaxed);
+}
+
+void CountIf(std::atomic<uint64_t>& counter, bool count) {
+  if (count) {
+    counter.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+// The audio thread raises it, a reader may exchange it; NaN is "none yet".
+void RaiseTo(std::atomic<float>& maximum, float value) {
+  if (std::isnan(value)) {
+    return;
+  }
+  float current = maximum.load(std::memory_order_relaxed);
+  while ((std::isnan(current) || value > current) &&
+         !maximum.compare_exchange_weak(current, value,
+                                        std::memory_order_relaxed)) {
+  }
 }
 
 double OrNaN(const std::optional<double>& value) {
@@ -64,6 +66,12 @@ double OrNaN(const std::optional<double>& value) {
 
 int64_t SteadyNowMs() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+int64_t SteadyNowUs() {
+  return std::chrono::duration_cast<std::chrono::microseconds>(
              std::chrono::steady_clock::now().time_since_epoch())
       .count();
 }
@@ -115,6 +123,10 @@ void RootCaptureState::SetGate(std::optional<bool> muted,
     }
   } while (!gate.compare_exchange_weak(current, next,
                                        std::memory_order_relaxed));
+  if (!GateOpen(current) && GateOpen(next)) {
+    gate_open_stamp_us.store(std::max<int64_t>(1, SteadyNowUs()),
+                             std::memory_order_relaxed);
+  }
 }
 
 void RootCaptureState::ResetControls(bool close_gate) {
@@ -128,17 +140,61 @@ void RootCaptureState::ResetControls(bool close_gate) {
   dsp_reset_seq.fetch_add(1, std::memory_order_release);
 }
 
-RootDspStatsSnapshot RootCaptureState::ReadDspStats(bool /* take_maxima */) {
-  RootDspStatsSnapshot snapshot;
-  snapshot.processed_frames = processed_frames.load(std::memory_order_relaxed);
-  snapshot.stage_samples = stage_samples.load(std::memory_order_relaxed);
-  snapshot.apm_out_sumsq = apm_out_sumsq.load(std::memory_order_relaxed);
-  snapshot.sent_sumsq = sent_sumsq.load(std::memory_order_relaxed);
-  return snapshot;
+RootDspStatsSnapshot RootCaptureState::ReadDspStats(bool take_maxima) {
+  constexpr auto kRelaxed = std::memory_order_relaxed;
+  RootDspStatsSnapshot s;
+  for (int attempt = 0; attempt < 8; ++attempt) {
+    const uint64_t before = levels_seq.load(std::memory_order_acquire);
+    s.processed_frames = processed_frames.load(kRelaxed);
+    s.stage_samples = stage_samples.load(kRelaxed);
+    s.apm_out_sumsq = apm_out_sumsq.load(kRelaxed);
+    s.denoised_sumsq = denoised_sumsq.load(kRelaxed);
+    s.gate_in_sumsq = gate_in_sumsq.load(kRelaxed);
+    s.sent_sumsq = sent_sumsq.load(kRelaxed);
+    std::atomic_thread_fence(std::memory_order_acquire);
+    const uint64_t after = levels_seq.load(kRelaxed);
+    if (before == after && (before & 1) == 0) {
+      break;
+    }
+  }
+  s.gate_open_frames = gate_open_frames.load(kRelaxed);
+  s.gate_input_above_frames = gate_input_above_frames.load(kRelaxed);
+  s.startup_hold_frames = startup_hold_frames.load(kRelaxed);
+  s.transmit_frames = transmit_frames.load(kRelaxed);
+  s.unsupported_frames = unsupported_frames.load(kRelaxed);
+  s.non_finite_samples = non_finite_samples.load(kRelaxed);
+  s.dsp_resets = dsp_resets.load(kRelaxed);
+  s.dsp_flushes = dsp_flushes.load(kRelaxed);
+  s.ns_gap_frames = ns_gap_frames.load(kRelaxed);
+  const RootSpeakingSnapshot published = ReadSpeaking();
+  s.speaking = published.speaking;
+  s.speaking_seq = published.seq;
+  s.gate_open_delay_us = gate_open_delay_us.load(kRelaxed);
+  s.threshold = threshold.load(kRelaxed);
+  s.voice_gain_db = voice_gain_db.load(kRelaxed);
+  s.voice_gain_settled = voice_gain_settled.load(kRelaxed);
+  s.gate_speaking = gate_speaking.load(kRelaxed);
+  if (take_maxima) {
+    s.gate_in_block_peak_db = gate_in_block_peak_db_max.exchange(
+        std::numeric_limits<float>::quiet_NaN(), kRelaxed);
+    s.envelope_max = envelope_max.exchange(0.0f, kRelaxed);
+  } else {
+    s.gate_in_block_peak_db = gate_in_block_peak_db_max.load(kRelaxed);
+    s.envelope_max = envelope_max.load(kRelaxed);
+  }
+  s.aligner_primed = aligner_primed.load(kRelaxed);
+  s.aligner_buffered_samples = aligner_buffered_samples.load(kRelaxed);
+  s.aligner_underruns = aligner_underruns.load(kRelaxed);
+  s.aligner_padded_samples = aligner_padded_samples.load(kRelaxed);
+  s.aligner_trimmed_samples = aligner_trimmed_samples.load(kRelaxed);
+  s.aligner_drained_samples = aligner_drained_samples.load(kRelaxed);
+  s.aligner_latency_ms = aligner_latency_ms.load(kRelaxed);
+  return s;
 }
 
 RootSpeakingSnapshot RootCaptureState::ReadSpeaking() const {
-  return RootSpeakingSnapshot{};
+  const uint64_t word = speaking_word.load(std::memory_order_acquire);
+  return RootSpeakingSnapshot{(word & 1) != 0, word >> 1};
 }
 
 RootCaptureFormatSnapshot ReadCaptureFormat(const RootCaptureState& state) {
@@ -164,7 +220,7 @@ RootCaptureFormatSnapshot ReadCaptureFormat(const RootCaptureState& state) {
 
 RootCaptureProcessor::RootCaptureProcessor(
     std::shared_ptr<RootCaptureState> state)
-    : state_(std::move(state)) {}
+    : state_(std::move(state)), dsp_(new_root_dsp_chain(kMaxRate)) {}
 
 void RootCaptureProcessor::Initialize(int sample_rate_hz, int num_channels) {
   state_->init_rate.store(sample_rate_hz, std::memory_order_relaxed);
@@ -178,61 +234,6 @@ std::string RootCaptureProcessor::ToString() const {
 
 void RootCaptureProcessor::SetRuntimeSetting(
     webrtc::AudioProcessing::RuntimeSetting /* setting */) {}
-
-// A new stream starts at the current volume and gate, with no ramp.
-void RootCaptureProcessor::ResetDsp() {
-  ramp_samples_ = std::max<size_t>(1, static_cast<size_t>(rate_ / 50));
-  volume_target_ =
-      SanitizeVolume(state_->input_volume.load(std::memory_order_relaxed));
-  volume_ = volume_target_;
-  volume_step_ = 0.0f;
-  volume_remaining_ = 0;
-  gate_step_ =
-      1.0f / static_cast<float>(std::max(1, rate_ * kGateFadeMs / 1000));
-  gate_ = RootCaptureState::GateOpen(
-              state_->gate.load(std::memory_order_relaxed))
-              ? 1.0f
-              : 0.0f;
-}
-
-// The app's GainRamp: linear over 20 ms toward the newest target.
-void RootCaptureProcessor::ApplyInputVolume(float* samples, size_t frames) {
-  size_t i = 0;
-  for (; i < frames && volume_remaining_ > 0; ++i) {
-    volume_ += volume_step_;
-    if (--volume_remaining_ == 0) {
-      volume_ = volume_target_;
-    }
-    samples[i] *= volume_;
-  }
-  if (i == frames || volume_ == 1.0f) {
-    return;
-  }
-  if (volume_ == 0.0f) {
-    std::fill(samples + i, samples + frames, 0.0f);
-    return;
-  }
-  for (; i < frames; ++i) {
-    samples[i] *= volume_;
-  }
-}
-
-// Linear toward 0 or 1 over kGateFadeMs.
-void RootCaptureProcessor::ApplyGate(float* samples,
-                                     size_t frames,
-                                     float target) {
-  if (gate_ == target) {
-    if (target == 0.0f) {
-      std::fill(samples, samples + frames, 0.0f);
-    }
-    return;
-  }
-  for (size_t i = 0; i < frames; ++i) {
-    gate_ = gate_ < target ? std::min(target, gate_ + gate_step_)
-                           : std::max(target, gate_ - gate_step_);
-    samples[i] *= gate_;
-  }
-}
 
 void RootCaptureProcessor::Process(webrtc::AudioBuffer* audio) {
   const size_t channels = audio->num_channels();
@@ -249,7 +250,6 @@ void RootCaptureProcessor::Process(webrtc::AudioBuffer* audio) {
   if (rate != rate_ || channels != channels_) {
     rate_ = rate;
     channels_ = channels;
-    ResetDsp();
     // Seqlock: odd while the format is being written.
     const uint64_t seq = state_->format_seq.load(std::memory_order_relaxed);
     state_->format_seq.store(seq + 1, std::memory_order_relaxed);
@@ -261,44 +261,143 @@ void RootCaptureProcessor::Process(webrtc::AudioBuffer* audio) {
     state_->format_seq.store(seq + 2, std::memory_order_release);
   }
 
+  RootCaptureState& state = *state_;
+  constexpr auto kRelaxed = std::memory_order_relaxed;
+  const uint32_t gate = state.gate.load(kRelaxed);
+  RootDspSettings settings{};
+  settings.sample_rate = static_cast<uint32_t>(rate);
+  settings.mic_muted = (gate & RootCaptureState::kGateMuted) != 0;
+  settings.push_to_talk = gate >> RootCaptureState::kGatePushToTalkShift;
+  settings.input_volume = state.input_volume.load(kRelaxed);
+  settings.auto_gain = state.auto_gain.load(kRelaxed);
+  settings.gate_threshold = state.gate_threshold.load(kRelaxed);
+  settings.auto_sensitivity = state.auto_sensitivity.load(kRelaxed);
+  settings.denoiser_wanted = state.denoiser_wanted.load(kRelaxed);
+  const float power = state.denoise_power.load(kRelaxed);
+
+  constexpr auto kAcquire = std::memory_order_acquire;
+  RootDspCommands commands{};
+  const uint64_t reset_seq = state.dsp_reset_seq.load(kAcquire);
+  commands.reset = reset_seq != seen_reset_seq_;
+  seen_reset_seq_ = reset_seq;
+  const uint64_t epoch = state.stream_epoch.load(kAcquire);
+  commands.flush = epoch != seen_stream_epoch_;
+  seen_stream_epoch_ = epoch;
+  const uint64_t gain_seq = state.gain_reset_seq.load(kAcquire);
+  if (gain_seq != seen_gain_reset_seq_) {
+    seen_gain_reset_seq_ = gain_seq;
+    commands.gain_reset = true;
+    commands.gain_reset_db = state.gain_reset_db.load(kRelaxed);
+  }
+
   float* const* data = audio->channels();
   float* samples = data[0];
-  const double apm_out_sumsq = SumSquares(samples, frames);
+  const rust::Slice<float> frame(samples, frames);
+  RootDspOutputs outputs{};
+  const RootDspPre pre = dsp_->pre_denoise(frame, settings, commands, outputs);
 
-  // Phase 2: the Rust DSP chain (voice gain, denoiser slot, auto sensitivity,
-  // startup hold, noise gate) runs here on channel 0, between the levels above
-  // and the mute/PTT gate below.
+  RootDenoiserSlot* slot = state.denoiser_slot.get();
+  RootDenoiseResult denoised;
+  if (pre.supported && slot != nullptr) {
+    denoised = slot->ProcessAudio(
+        samples, frames, rate, pre.flush_denoiser, power, denoise_out_.data(),
+        std::min(kDenoiseOutputFrames * frames, denoise_out_.size()));
+  }
+  const size_t denoised_samples =
+      denoised.kind == RootDenoiseKind::kRan
+          ? std::min(denoised.samples, denoise_out_.size())
+          : 0;
+  dsp_->post_denoise(
+      frame, static_cast<uint8_t>(denoised.kind),
+      rust::Slice<const float>(denoise_out_.data(), denoised_samples),
+      denoised.restart, settings, outputs);
+  if (slot != nullptr && outputs.denoiser_stalled && !stalled_) {
+    slot->LatchBypass(RootDenoiserBypass::kOutputStalled);
+  }
+  stalled_ = outputs.denoiser_stalled;
 
-  const float target =
-      SanitizeVolume(state_->input_volume.load(std::memory_order_relaxed));
-  if (target != volume_target_) {
-    volume_target_ = target;
-    volume_remaining_ = ramp_samples_;
-    volume_step_ =
-        (target - volume_) / static_cast<float>(ramp_samples_);
-  }
-  const float gate_target =
-      RootCaptureState::GateOpen(state_->gate.load(std::memory_order_relaxed))
-          ? 1.0f
-          : 0.0f;
-  double sent_sumsq = 0;
-  if (gate_ == 0.0f && gate_target == 0.0f) {
-    std::fill(samples, samples + frames, 0.0f);
-    volume_ = volume_target_;
-    volume_remaining_ = 0;
-  } else {
-    ApplyInputVolume(samples, frames);
-    ApplyGate(samples, frames, gate_target);
-    sent_sumsq = SumSquares(samples, frames);
-  }
   for (size_t c = 1; c < channels; ++c) {
     std::copy(samples, samples + frames, data[c]);
   }
+  Publish(outputs, frames, settings.denoiser_wanted);
+}
 
-  AddTo(state_->apm_out_sumsq, apm_out_sumsq);
-  AddTo(state_->sent_sumsq, sent_sumsq);
-  state_->stage_samples.fetch_add(frames, std::memory_order_relaxed);
-  state_->processed_frames.fetch_add(1, std::memory_order_relaxed);
+void RootCaptureProcessor::Publish(const RootDspOutputs& outputs,
+                                   size_t frames,
+                                   bool denoiser_wanted) {
+  RootCaptureState& state = *state_;
+  constexpr auto kRelaxed = std::memory_order_relaxed;
+  const bool supported = !outputs.unsupported;
+  // An unsupported frame passes the denoiser and gate stages untouched.
+  const double denoised_sumsq =
+      supported ? outputs.denoised_sumsq : outputs.apm_out_sumsq;
+  const double gate_in_sumsq =
+      supported ? outputs.gate_in_sumsq : outputs.apm_out_sumsq;
+
+  const uint64_t seq = state.levels_seq.load(kRelaxed);
+  state.levels_seq.store(seq + 1, kRelaxed);
+  std::atomic_thread_fence(std::memory_order_release);
+  AddTo(state.apm_out_sumsq, outputs.apm_out_sumsq);
+  AddTo(state.denoised_sumsq, denoised_sumsq);
+  AddTo(state.gate_in_sumsq, gate_in_sumsq);
+  AddTo(state.sent_sumsq, outputs.sent_sumsq);
+  state.stage_samples.fetch_add(frames, kRelaxed);
+  state.processed_frames.fetch_add(1, kRelaxed);
+  state.levels_seq.store(seq + 2, std::memory_order_release);
+
+  const bool held = supported && outputs.held;
+  const bool ran = supported && outputs.denoiser_ran;
+  CountIf(state.gate_open_frames, supported && outputs.gate_open);
+  CountIf(state.gate_input_above_frames,
+          supported && outputs.gate_input_above);
+  CountIf(state.startup_hold_frames, held);
+  CountIf(state.transmit_frames,
+          supported ? outputs.transmitting : outputs.transmit_open);
+  CountIf(state.unsupported_frames, !supported);
+  CountIf(state.dsp_resets, outputs.reset);
+  CountIf(state.dsp_flushes, outputs.flushed);
+  CountIf(state.ns_gap_frames,
+          outputs.transmit_open && denoiser_wanted && !held && !ran &&
+              !state.webrtc_ns_applied.load(kRelaxed));
+  if (outputs.non_finite_samples > 0) {
+    state.non_finite_samples.fetch_add(outputs.non_finite_samples, kRelaxed);
+  }
+
+  state.threshold.store(outputs.threshold, kRelaxed);
+  state.voice_gain_db.store(outputs.voice_gain_db, kRelaxed);
+  state.voice_gain_settled.store(outputs.voice_gain_settled, kRelaxed);
+  state.gate_speaking.store(outputs.gate_speaking, kRelaxed);
+  if (supported) {
+    RaiseTo(state.gate_in_block_peak_db_max, outputs.gate_in_block_peak_db);
+    RaiseTo(state.envelope_max, outputs.envelope);
+  }
+  state.aligner_primed.store(outputs.aligner_primed, kRelaxed);
+  state.aligner_buffered_samples.store(outputs.aligner_buffered_samples,
+                                       kRelaxed);
+  state.aligner_underruns.store(outputs.aligner_underruns, kRelaxed);
+  state.aligner_padded_samples.store(outputs.aligner_padded_samples, kRelaxed);
+  state.aligner_trimmed_samples.store(outputs.aligner_trimmed_samples,
+                                      kRelaxed);
+  state.aligner_drained_samples.store(outputs.aligner_drained_samples,
+                                      kRelaxed);
+  state.aligner_latency_ms.store(outputs.aligner_latency_ms, kRelaxed);
+
+  if (outputs.speaking != published_speaking_) {
+    published_speaking_ = outputs.speaking;
+    const uint64_t transitions = (state.speaking_word.load(kRelaxed) >> 1) + 1;
+    state.speaking_word.store(
+        (transitions << 1) | (outputs.speaking ? 1u : 0u),
+        std::memory_order_release);
+  }
+  if (outputs.transmit_open) {
+    int64_t stamp = state.gate_open_stamp_us.load(kRelaxed);
+    if (stamp != 0 &&
+        state.gate_open_stamp_us.compare_exchange_strong(stamp, 0, kRelaxed)) {
+      state.gate_open_delay_us.store(
+          static_cast<uint64_t>(std::max<int64_t>(0, SteadyNowUs() - stamp)),
+          kRelaxed);
+    }
+  }
 }
 
 // =============================================================================
@@ -388,6 +487,10 @@ void RootApmDecorator::ApplyLocked() {
                                   std::memory_order_relaxed);
   noise_suppression_active_.store(applied_.noise_suppression.enabled,
                                   std::memory_order_relaxed);
+  if (capture_) {
+    capture_->webrtc_ns_applied.store(applied_.noise_suppression.enabled,
+                                      std::memory_order_relaxed);
+  }
 }
 
 void RootApmDecorator::SetPolicy(std::optional<bool> echo_cancellation,
@@ -406,24 +509,65 @@ void RootApmDecorator::ResetPolicy() {
   webrtc::MutexLock lock(&mutex_);
   desired_echo_cancellation_.reset();
   desired_noise_suppression_.reset();
+  fallback_noise_suppression_ = false;
   SchedulePolicyLocked();
 }
 
-void RootApmDecorator::SchedulePolicyLocked() {
-  if (desired_echo_cancellation_ == effective_echo_cancellation_ &&
-      desired_noise_suppression_ == effective_noise_suppression_) {
+void RootApmDecorator::SetFallbackNoiseSuppression(bool on) {
+  webrtc::MutexLock lock(&mutex_);
+  if (fallback_noise_suppression_ == on) {
     return;
   }
-  if (policy_apply_scheduled_) {
+  fallback_noise_suppression_ = on;
+  SchedulePolicyLocked();
+}
+
+RootApmPolicyStats RootApmDecorator::ReadPolicyStats() const {
+  webrtc::MutexLock lock(&mutex_);
+  RootApmPolicyStats stats;
+  stats.applies = policy_applies_;
+  stats.deferred = policy_deferred_;
+  stats.forced = policy_forced_;
+  stats.pending = PolicyPendingLocked();
+  stats.fallback_ns = fallback_noise_suppression_;
+  return stats;
+}
+
+std::optional<bool> RootApmDecorator::DesiredNoiseSuppressionLocked() const {
+  return fallback_noise_suppression_ ? std::optional<bool>(true)
+                                     : desired_noise_suppression_;
+}
+
+bool RootApmDecorator::PolicyPendingLocked() const {
+  return desired_echo_cancellation_ != effective_echo_cancellation_ ||
+         DesiredNoiseSuppressionLocked() != effective_noise_suppression_;
+}
+
+bool RootApmDecorator::UrgentLocked() const {
+  return fallback_noise_suppression_ && effective_noise_suppression_ != true;
+}
+
+void RootApmDecorator::SchedulePolicyLocked() {
+  if (!PolicyPendingLocked()) {
+    change_since_ms_.reset();
+    policy_waited_ = false;
     return;
   }
   const int64_t now = clock_();
+  if (!change_since_ms_.has_value()) {
+    change_since_ms_ = now;
+  }
   if (!scheduler_) {
-    effective_echo_cancellation_ = desired_echo_cancellation_;
-    effective_noise_suppression_ = desired_noise_suppression_;
-    last_policy_apply_ms_ = now;
-    policy_applied_once_ = true;
-    ApplyLocked();
+    ApplyPolicyNowLocked(now, false);
+    return;
+  }
+  // A dead denoiser leaves the user without noise suppression: no rate
+  // limit, no waiting for a pause, and any scheduled application is replaced.
+  if (UrgentLocked()) {
+    PostPolicyLocked(0);
+    return;
+  }
+  if (policy_apply_scheduled_) {
     return;
   }
   int64_t delay_ms = 0;
@@ -431,27 +575,56 @@ void RootApmDecorator::SchedulePolicyLocked() {
     delay_ms = std::max<int64_t>(
         0, last_policy_apply_ms_ + kMinPolicyIntervalMs - now);
   }
+  PostPolicyLocked(delay_ms);
+}
+
+void RootApmDecorator::PostPolicyLocked(int64_t delay_ms) {
   policy_apply_scheduled_ = true;
-  scheduler_(delay_ms,
-             [self = webrtc::scoped_refptr<RootApmDecorator>(this)]() mutable {
-               self->ApplyPolicy();
-             });
+  const uint64_t generation = ++policy_generation_;
+  scheduler_(delay_ms, [self = webrtc::scoped_refptr<RootApmDecorator>(this),
+                        generation]() mutable {
+    self->ApplyPolicy(generation);
+  });
 }
 
-void RootApmDecorator::ApplyPolicy() {
+void RootApmDecorator::ApplyPolicy(uint64_t generation) {
   webrtc::MutexLock lock(&mutex_);
+  if (generation != policy_generation_) {
+    return;
+  }
   policy_apply_scheduled_ = false;
-  effective_echo_cancellation_ = desired_echo_cancellation_;
-  effective_noise_suppression_ = desired_noise_suppression_;
-  last_policy_apply_ms_ = clock_();
-  policy_applied_once_ = true;
-  ApplyLocked();
+  if (!PolicyPendingLocked()) {
+    change_since_ms_.reset();
+    policy_waited_ = false;
+    return;
+  }
+  const int64_t now = clock_();
+  const bool speaking =
+      !UrgentLocked() && capture_ && capture_->ReadSpeaking().speaking;
+  if (speaking && change_since_ms_.has_value() &&
+      now < *change_since_ms_ + kSpeechPauseMaxMs) {
+    policy_waited_ = true;
+    PostPolicyLocked(kSpeechPausePollMs);
+    return;
+  }
+  ApplyPolicyNowLocked(now, speaking);
 }
 
-void RootApmDecorator::SetFallbackNoiseSuppression(bool /* on */) {}
-
-RootApmPolicyStats RootApmDecorator::ReadPolicyStats() const {
-  return RootApmPolicyStats{};
+void RootApmDecorator::ApplyPolicyNowLocked(int64_t now_ms, bool forced) {
+  effective_echo_cancellation_ = desired_echo_cancellation_;
+  effective_noise_suppression_ = DesiredNoiseSuppressionLocked();
+  last_policy_apply_ms_ = now_ms;
+  policy_applied_once_ = true;
+  ++policy_applies_;
+  if (policy_waited_) {
+    ++policy_deferred_;
+  }
+  if (forced) {
+    ++policy_forced_;
+  }
+  policy_waited_ = false;
+  change_since_ms_.reset();
+  ApplyLocked();
 }
 
 RootApmStats RootApmDecorator::ReadStats() {
@@ -671,11 +844,33 @@ webrtc::scoped_refptr<RootApmDecorator> CreateRootAudioProcessing(
 // Test hooks
 // =============================================================================
 
+namespace {
+
+std::shared_ptr<RootCaptureState> NewCaptureStateWithSlot() {
+  auto state = std::make_shared<RootCaptureState>();
+  state->denoiser_slot = std::make_shared<RootDenoiserSlot>();
+  return state;
+}
+
+void SetDsp(RootCaptureState& state,
+            bool auto_gain,
+            bool auto_sensitivity,
+            float gate_threshold) {
+  state.auto_gain.store(auto_gain);
+  state.auto_sensitivity.store(auto_sensitivity);
+  state.gate_threshold.store(gate_threshold);
+}
+
+}  // namespace
+
 RootProcessorHarness::RootProcessorHarness()
-    : state_(std::make_shared<RootCaptureState>()),
+    : state_(NewCaptureStateWithSlot()),
       processor_(std::make_unique<RootCaptureProcessor>(state_)) {}
 
-RootProcessorHarness::~RootProcessorHarness() = default;
+RootProcessorHarness::~RootProcessorHarness() {
+  processor_.reset();
+  state_->denoiser_slot->RemoveForTest();
+}
 
 void RootProcessorHarness::initialize(int32_t rate, int32_t channels) const {
   processor_->Initialize(rate, channels);
@@ -704,6 +899,33 @@ void RootProcessorHarness::set_input_volume(float volume) const {
 
 void RootProcessorHarness::reset_controls() const {
   state_->ResetControls(false);
+}
+
+void RootProcessorHarness::set_dsp(bool auto_gain,
+                                   bool auto_sensitivity,
+                                   float gate_threshold) const {
+  SetDsp(*state_, auto_gain, auto_sensitivity, gate_threshold);
+}
+
+void RootProcessorHarness::set_denoiser_wanted(bool wanted) const {
+  state_->denoiser_wanted.store(wanted);
+}
+
+void RootProcessorHarness::set_denoise_power(float power) const {
+  state_->denoise_power.store(power);
+}
+
+void RootProcessorHarness::set_webrtc_ns_applied(bool applied) const {
+  state_->webrtc_ns_applied.store(applied);
+}
+
+void RootProcessorHarness::bump_stream_epoch() const {
+  state_->stream_epoch.fetch_add(1, std::memory_order_release);
+}
+
+void RootProcessorHarness::gain_reset(float db) const {
+  state_->gain_reset_db.store(db, std::memory_order_relaxed);
+  state_->gain_reset_seq.fetch_add(1, std::memory_order_release);
 }
 
 RootProcessorFrame RootProcessorHarness::process(
@@ -745,6 +967,83 @@ RootProcessorStats RootProcessorHarness::stats() const {
   stats.sent_sumsq = state_->sent_sumsq.load();
   stats.stage_samples = state_->stage_samples.load();
   return stats;
+}
+
+RootProcessorDsp RootProcessorHarness::dsp(bool take_maxima) const {
+  const RootDspStatsSnapshot s = state_->ReadDspStats(take_maxima);
+  const RootSpeakingSnapshot published = state_->ReadSpeaking();
+  RootProcessorDsp dsp{};
+  dsp.processed_frames = s.processed_frames;
+  dsp.stage_samples = s.stage_samples;
+  dsp.apm_out_sumsq = s.apm_out_sumsq;
+  dsp.denoised_sumsq = s.denoised_sumsq;
+  dsp.gate_in_sumsq = s.gate_in_sumsq;
+  dsp.sent_sumsq = s.sent_sumsq;
+  dsp.gate_open_frames = s.gate_open_frames;
+  dsp.gate_input_above_frames = s.gate_input_above_frames;
+  dsp.startup_hold_frames = s.startup_hold_frames;
+  dsp.transmit_frames = s.transmit_frames;
+  dsp.unsupported_frames = s.unsupported_frames;
+  dsp.non_finite_samples = s.non_finite_samples;
+  dsp.dsp_resets = s.dsp_resets;
+  dsp.dsp_flushes = s.dsp_flushes;
+  dsp.ns_gap_frames = s.ns_gap_frames;
+  dsp.speaking_seq = s.speaking_seq;
+  dsp.gate_open_delay_us = s.gate_open_delay_us;
+  dsp.threshold = s.threshold;
+  dsp.voice_gain_db = s.voice_gain_db;
+  dsp.voice_gain_settled = s.voice_gain_settled;
+  dsp.gate_speaking = s.gate_speaking;
+  dsp.speaking = s.speaking;
+  dsp.gate_in_block_peak_db = s.gate_in_block_peak_db;
+  dsp.envelope_max = s.envelope_max;
+  dsp.aligner_primed = s.aligner_primed;
+  dsp.aligner_buffered_samples = s.aligner_buffered_samples;
+  dsp.aligner_underruns = s.aligner_underruns;
+  dsp.aligner_padded_samples = s.aligner_padded_samples;
+  dsp.aligner_trimmed_samples = s.aligner_trimmed_samples;
+  dsp.aligner_drained_samples = s.aligner_drained_samples;
+  dsp.aligner_latency_ms = s.aligner_latency_ms;
+  dsp.published_speaking = published.speaking;
+  dsp.published_seq = published.seq;
+  return dsp;
+}
+
+bool RootProcessorHarness::install_fake_denoiser(uint32_t rate,
+                                                 float scale,
+                                                 uint32_t delay_samples,
+                                                 uint32_t burst_call,
+                                                 uint32_t empty_from,
+                                                 uint32_t empty_count) const {
+  RootFakeFxConfig config;
+  config.scale = scale;
+  config.delay_samples = delay_samples;
+  config.burst_call = burst_call;
+  config.empty_from = empty_from;
+  config.empty_count = empty_count;
+  auto fake = std::make_unique<RootFakeFxPipeline>(config);
+  const bool installed =
+      state_->denoiser_slot->InstallForTest(fake->pipeline(), rate);
+  fakes_.push_back(std::move(fake));
+  return installed;
+}
+
+bool RootProcessorHarness::remove_fake_denoiser() const {
+  return state_->denoiser_slot->RemoveForTest() != nullptr;
+}
+
+RootFakeDenoiserProbe RootProcessorHarness::fake_denoiser() const {
+  RootFakeDenoiserProbe probe{};
+  if (!fakes_.empty()) {
+    const RootFakeFxPipeline& fake = *fakes_.back();
+    probe.process_calls = fake.process_calls();
+    probe.flush_calls = fake.flush_calls();
+    probe.power_sets = fake.power_sets();
+    probe.last_power = fake.last_power();
+  }
+  probe.installed = state_->denoiser_slot->installed();
+  probe.bypass = static_cast<uint32_t>(state_->denoiser_slot->bypass());
+  return probe;
 }
 
 std::unique_ptr<RootProcessorHarness> new_root_processor_harness() {
@@ -916,7 +1215,7 @@ RootApmHarness::RootApmHarness(bool real_apm)
       [now, tasks](int64_t delay_ms, absl::AnyInvocable<void() &&> task) {
         tasks->push_back(Task{*now + delay_ms, std::move(task)});
       },
-      [now] { return *now; });
+      [now] { return *now; }, capture_);
 }
 
 RootApmHarness::~RootApmHarness() {
@@ -1054,6 +1353,37 @@ int16_t RootApmHarness::process_frame(int32_t rate,
 
 void RootApmHarness::set_mic_muted(bool muted) const {
   capture_->SetGate(muted, std::nullopt);
+}
+
+void RootApmHarness::set_dsp(bool auto_gain,
+                             bool auto_sensitivity,
+                             float gate_threshold) const {
+  SetDsp(*capture_, auto_gain, auto_sensitivity, gate_threshold);
+}
+
+bool RootApmHarness::speaking() const {
+  return capture_->ReadSpeaking().speaking;
+}
+
+void RootApmHarness::set_speaking(bool speaking) const {
+  const uint64_t transitions = capture_->ReadSpeaking().seq + 1;
+  capture_->speaking_word.store((transitions << 1) | (speaking ? 1u : 0u));
+}
+
+void RootApmHarness::set_fallback_ns(bool on) const {
+  decorator_->SetFallbackNoiseSuppression(on);
+}
+
+RootPolicyProbe RootApmHarness::policy() const {
+  const RootApmPolicyStats stats = decorator_->ReadPolicyStats();
+  RootPolicyProbe probe{};
+  probe.applies = stats.applies;
+  probe.deferred = stats.deferred;
+  probe.forced = stats.forced;
+  probe.pending = stats.pending;
+  probe.fallback_ns = stats.fallback_ns;
+  probe.webrtc_ns_applied = capture_->webrtc_ns_applied.load();
+  return probe;
 }
 
 uint64_t RootApmHarness::processed_frames() const {

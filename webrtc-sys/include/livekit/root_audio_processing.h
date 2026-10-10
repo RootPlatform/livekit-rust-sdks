@@ -42,9 +42,17 @@ class TaskQueueBase;
 }  // namespace webrtc
 
 namespace livekit_ffi {
+struct RootDspSettings;
+struct RootDspCommands;
+struct RootDspPre;
+struct RootDspOutputs;
+struct RootDspChain;
 struct RootProcessorFrame;
 struct RootProcessorStats;
+struct RootProcessorDsp;
+struct RootFakeDenoiserProbe;
 struct RootDecoratorProbe;
+struct RootPolicyProbe;
 class RootProcessorHarness;
 class RootApmHarness;
 }  // namespace livekit_ffi
@@ -62,6 +70,7 @@ enum class RootPushToTalk : uint32_t {
 constexpr float kRootMaxVoiceGainDb = 18.0f;
 
 class RootDenoiserSlot;
+class RootFakeFxPipeline;
 
 struct RootDspStatsSnapshot {
   // Consistent with each other (seqlock).
@@ -150,12 +159,49 @@ struct RootCaptureState {
   std::atomic<uint64_t> format_seq{0};
   std::atomic<uint32_t> process_rate{0};
   std::atomic<uint32_t> process_channels{0};
+  // Seqlock (odd while written) over processed_frames, stage_samples and the
+  // four channel 0 sums of squares in int16 units: the APM output, after the
+  // denoiser, the noise gate's input and what is sent.
+  std::atomic<uint64_t> levels_seq{0};
   std::atomic<uint64_t> processed_frames{0};
-  // Channel 0 sums of squares in int16 units: the APM output (before the
-  // gate) and what is sent; stage_samples counts the samples behind both.
   std::atomic<double> apm_out_sumsq{0.0};
+  std::atomic<double> denoised_sumsq{0.0};
+  std::atomic<double> gate_in_sumsq{0.0};
   std::atomic<double> sent_sumsq{0.0};
   std::atomic<uint64_t> stage_samples{0};
+
+  // DSP chain outputs, written by the audio thread only.
+  std::atomic<uint64_t> gate_open_frames{0};
+  std::atomic<uint64_t> gate_input_above_frames{0};
+  std::atomic<uint64_t> startup_hold_frames{0};
+  std::atomic<uint64_t> transmit_frames{0};
+  std::atomic<uint64_t> unsupported_frames{0};
+  std::atomic<uint64_t> non_finite_samples{0};
+  std::atomic<uint64_t> dsp_resets{0};
+  std::atomic<uint64_t> dsp_flushes{0};
+  std::atomic<uint64_t> ns_gap_frames{0};
+  std::atomic<float> threshold{0.0f};
+  std::atomic<float> voice_gain_db{0.0f};
+  std::atomic<bool> voice_gain_settled{false};
+  std::atomic<bool> gate_speaking{false};
+  // The published speaking flag and its transition count in one word:
+  // seq << 1 | speaking.
+  std::atomic<uint64_t> speaking_word{0};
+  // Maxima since the last ReadDspStats(true); NaN: no frame since.
+  std::atomic<float> gate_in_block_peak_db_max{
+      std::numeric_limits<float>::quiet_NaN()};
+  std::atomic<float> envelope_max{0.0f};
+  std::atomic<bool> aligner_primed{false};
+  std::atomic<uint32_t> aligner_buffered_samples{0};
+  std::atomic<uint64_t> aligner_underruns{0};
+  std::atomic<uint64_t> aligner_padded_samples{0};
+  std::atomic<uint64_t> aligner_trimmed_samples{0};
+  std::atomic<uint64_t> aligner_drained_samples{0};
+  std::atomic<float> aligner_latency_ms{0.0f};
+  // SetGate stamps (steady clock, µs) the gate going from closed to open; the
+  // first frame processed open turns it into gate_open_delay_us.
+  std::atomic<int64_t> gate_open_stamp_us{0};
+  std::atomic<uint64_t> gate_open_delay_us{0};
 
   bool mic_muted() const;
   uint32_t push_to_talk() const;
@@ -186,17 +232,18 @@ RootCaptureFormatSnapshot ReadCaptureFormat(const RootCaptureState& state);
 
 // The APM's capture post-processor. Its buffer is FloatS16 (+-32768) at the
 // APM's full-band rate (8, 16, 32 or 48 kHz) with the output stream's channel
-// count. It processes channel 0 and copies it to the other channels:
-//   levels -> [Phase 2: Rust DSP chain] -> input volume (20 ms ramp) ->
-//   mute/PTT gate (5 ms fade each way) -> levels.
+// count. It runs the voice chain (rootapp-voice-dsp) on channel 0 around the
+// denoiser slot and copies the result to the other channels:
+//   sanitise, voice gain level -> denoiser slot (Effects SDK) -> aligner ->
+//   voice gain -> auto sensitivity -> startup hold -> noise gate -> input
+//   volume (20 ms ramp) -> mute/PTT gate (5 ms fade each way).
 // Real-time code: no locks, allocation, logging or APM calls. Initialize runs
 // under both APM locks on up to four threads and only stores the format.
 class RootCaptureProcessor : public webrtc::CustomProcessing {
  public:
-  // The app's gate reaches full gain 4 ms into a push-to-talk press
-  // (NoiseGate: 20 ms attack, full at envelope 0.2); closing fades as long so
-  // the far side hears no click.
-  static constexpr int kGateFadeMs = 5;
+  static constexpr int kMaxRate = 48000;
+  // The denoiser's output capacity per frame (the app's wrapper: 8 frames).
+  static constexpr size_t kDenoiseOutputFrames = 8;
 
   explicit RootCaptureProcessor(std::shared_ptr<RootCaptureState> state);
 
@@ -207,22 +254,23 @@ class RootCaptureProcessor : public webrtc::CustomProcessing {
       webrtc::AudioProcessing::RuntimeSetting setting) override;
 
  private:
-  void ResetDsp();
-  void ApplyInputVolume(float* samples, size_t frames);
-  void ApplyGate(float* samples, size_t frames, float target);
+  void Publish(const RootDspOutputs& outputs,
+               size_t frames,
+               bool denoiser_wanted);
 
   const std::shared_ptr<RootCaptureState> state_;
+  // Built at the largest rate here, never on the audio thread.
+  rust::Box<RootDspChain> dsp_;
   // Audio thread only.
   int rate_ = 0;
   size_t channels_ = 0;
   int init_rate_ = 0;
-  size_t ramp_samples_ = 1;
-  float volume_ = 1.0f;
-  float volume_target_ = 1.0f;
-  float volume_step_ = 0.0f;
-  size_t volume_remaining_ = 0;
-  float gate_ = 1.0f;
-  float gate_step_ = 1.0f;
+  uint64_t seen_reset_seq_ = 0;
+  uint64_t seen_stream_epoch_ = 0;
+  uint64_t seen_gain_reset_seq_ = 0;
+  bool stalled_ = false;
+  bool published_speaking_ = false;
+  std::array<float, kDenoiseOutputFrames * kMaxRate / 100> denoise_out_{};
 };
 
 struct RootApmStats {
@@ -257,13 +305,18 @@ struct RootApmPolicyStats {
 //    swallowed, so the capture output is always used and the post-processor
 //    runs every frame; mute and PTT are the post-processor's gate.
 //  - Policy changes (SetPolicy) are applied from the scheduler's thread, at
-//    most once per kMinPolicyIntervalMs, coalesced; toggling AEC or NS
-//    re-initializes them.
+//    most once per kMinPolicyIntervalMs, coalesced, at a pause in speech
+//    (at most kSpeechPauseMaxMs late); toggling AEC or NS re-initializes
+//    them. The denoiser fallback turning NS on is applied at once.
 // Lock order: mutex_ -> APM render -> APM capture. No lock is added to the
 // per-frame calls, and mutex_ is never taken on an audio thread.
 class RootApmDecorator : public webrtc::AudioProcessing {
  public:
   static constexpr int64_t kMinPolicyIntervalMs = 1000;
+  // A policy change waits for the published speaking flag to clear, polling
+  // every kSpeechPausePollMs, at most kSpeechPauseMaxMs after it was asked.
+  static constexpr int64_t kSpeechPauseMaxMs = 3000;
+  static constexpr int64_t kSpeechPausePollMs = 50;
 
   using Clock = std::function<int64_t()>;
   using Scheduler =
@@ -352,8 +405,14 @@ class RootApmDecorator : public webrtc::AudioProcessing {
   static Config Forced(const Config& requested);
   Config MergeLocked(const Config& requested) const;
   void ApplyLocked();
+  std::optional<bool> DesiredNoiseSuppressionLocked() const;
+  bool PolicyPendingLocked() const;
+  // The fallback needs WebRTC NS and the policy does not have it on yet.
+  bool UrgentLocked() const;
   void SchedulePolicyLocked();
-  void ApplyPolicy();
+  void PostPolicyLocked(int64_t delay_ms);
+  void ApplyPolicy(uint64_t generation);
+  void ApplyPolicyNowLocked(int64_t now_ms, bool forced);
 
   const webrtc::scoped_refptr<webrtc::AudioProcessing> inner_;
   const Scheduler scheduler_;
@@ -367,9 +426,18 @@ class RootApmDecorator : public webrtc::AudioProcessing {
   std::optional<bool> desired_noise_suppression_;
   std::optional<bool> effective_echo_cancellation_;
   std::optional<bool> effective_noise_suppression_;
+  bool fallback_noise_suppression_ = false;
   bool policy_apply_scheduled_ = false;
   bool policy_applied_once_ = false;
   int64_t last_policy_apply_ms_ = 0;
+  // Only the newest posted application runs; older ones find another number.
+  uint64_t policy_generation_ = 0;
+  // When the desired policy first differed from the effective one.
+  std::optional<int64_t> change_since_ms_;
+  bool policy_waited_ = false;
+  uint64_t policy_applies_ = 0;
+  uint64_t policy_deferred_ = 0;
+  uint64_t policy_forced_ = 0;
 
   std::atomic<bool> echo_cancellation_active_{false};
   std::atomic<bool> noise_suppression_active_{false};
@@ -407,6 +475,14 @@ class RootProcessorHarness {
   void set_gate(int8_t mic_muted, int32_t push_to_talk) const;
   void set_input_volume(float volume) const;
   void reset_controls() const;
+  void set_dsp(bool auto_gain,
+               bool auto_sensitivity,
+               float gate_threshold) const;
+  void set_denoiser_wanted(bool wanted) const;
+  void set_denoise_power(float power) const;
+  void set_webrtc_ns_applied(bool applied) const;
+  void bump_stream_epoch() const;
+  void gain_reset(float db) const;
   // One frame through Process on a buffer of `rate` / 100 frames and
   // `channels` channels: channel 0 gets `input` (zero-padded), the others
   // something Process must overwrite. Returns channel 0.
@@ -414,10 +490,22 @@ class RootProcessorHarness {
                              size_t channels,
                              rust::Slice<const float> input) const;
   RootProcessorStats stats() const;
+  RootProcessorDsp dsp(bool take_maxima) const;
+  // A fake Effects SDK pipeline in the processor's denoiser slot.
+  bool install_fake_denoiser(uint32_t rate,
+                             float scale,
+                             uint32_t delay_samples,
+                             uint32_t burst_call,
+                             uint32_t empty_from,
+                             uint32_t empty_count) const;
+  bool remove_fake_denoiser() const;
+  RootFakeDenoiserProbe fake_denoiser() const;
 
  private:
   std::shared_ptr<RootCaptureState> state_;
   std::unique_ptr<RootCaptureProcessor> processor_;
+  // Replaced pipelines are kept until the harness goes.
+  mutable std::vector<std::unique_ptr<RootFakeFxPipeline>> fakes_;
 };
 
 std::unique_ptr<RootProcessorHarness> new_root_processor_harness();
@@ -452,9 +540,16 @@ class RootApmHarness {
   // `amplitude` through ProcessStream. Returns the output's peak.
   int16_t process_frame(int32_t rate, size_t channels, int16_t amplitude) const;
   void set_mic_muted(bool muted) const;
+  void set_dsp(bool auto_gain,
+               bool auto_sensitivity,
+               float gate_threshold) const;
   uint64_t processed_frames() const;
   uint32_t processor_rate() const;
   uint32_t processor_channels() const;
+  bool speaking() const;
+  void set_speaking(bool speaking) const;
+  void set_fallback_ns(bool on) const;
+  RootPolicyProbe policy() const;
 
  private:
   struct Task {
