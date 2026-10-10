@@ -950,13 +950,23 @@ Mic test monitor (`RootAudioSetMonitor`, `PlatformAudio::set_monitor`, stats 102
   every playout channel. The transport tap adds it to device render callbacks after libwebrtc's
   `NeedMorePlayData`, which has already given its mix to the APM as the AEC reference, so the echo
   canceller never sees it; the synthetic pump never plays it.
-- One producer (capture post-processor) and one consumer (render callback) share 8 preallocated
-  10 ms frames: playback starts with 20 ms queued (older frames skipped), primes again after an
-  underrun, and a capture frame that finds 40 ms queued while playing is dropped. `monitor_frames`
-  counts render frames played in full, `monitor_dropped_frames` underruns plus those drops.
+- One producer (capture post-processor) and one consumer (render callback) share 16 preallocated
+  10 ms frames. The consumer owns a prime target: playback starts once 30 ms are queued (older
+  frames skipped), each underrun adds 10 ms (up to 80 ms, for devices whose callbacks come in
+  bursts, e.g. PipeWire quanta) and 10 s without one takes 10 ms away. Latency that stayed more than
+  20 ms above the target for 100 callbacks is skipped; a render callback after more than 6 capture
+  frames without one (a stall) drops what queued and primes again; `AdmProxy` resyncs the ring
+  before every device stop and start, so frames captured across a restart never play. A capture
+  frame that finds the ring full counts only while the render side runs. 2.5 ms fades after
+  priming and around underruns and skips. `monitor_frames` counts render frames played in full,
+  `monitor_dropped_frames` underruns, skipped frames and full-ring drops while rendering.
   Catmull-Rom rate conversion on an integer phase converts the processor's 16/32/48 kHz to any
   render rate without allocation; equal rates pass samples through with the APM's own int16
-  rounding (bit-exact with what the APM sends).
+  rounding (bit-exact with what the APM sends, outside the fades).
+- While libwebrtc records for no send stream (the mic test, the app's own start), the transport tap
+  averages the device's channels to one before libwebrtc (as `DownmixInterleavedToMono` does for a
+  mono send stream), so the APM and the processor see what a call sends; a send stream's
+  `StartRecording` hands libwebrtc the device's channels again.
 - `AdmProxy::SetMonitor` adds a want of its own on both directions (OR-ed in like the hold): the
   current selection opens on the device thread, `Playing()`/`Recording()` stay libwebrtc's. It is
   refused while libwebrtc records for a send stream, and libwebrtc's `StartRecording` (a call that
@@ -970,25 +980,33 @@ Device ids (all platforms; the macOS and Linux rules come from `audio_device_mac
 `audio_device_pulse_linux.cc` at m150):
 
 - GUIDs match exactly: Windows MMDevice ids; macOS AudioObjectIDs as decimal strings, index 0 being
-  the current default under the GUID "default" and the default listed again under its own id. A
-  stale AudioObjectID (replug, coreaudiod restart) is DeviceNotFound, never another device.
+  the current default under the GUID "default" and the default listed again under its own id.
+  AudioObjectIDs move after a replug or a coreaudiod restart (when a stored one can name another
+  device), so macOS selects by UID (`RootAudioDeviceSelection.uid`): `ResolveSelectionLocked`
+  translates it with `kAudioHardwarePropertyTranslateUIDToDevice` at every open and matches the id;
+  an unknown UID is DeviceNotFound, never another device, and a UID selects nothing elsewhere.
 - Names match exactly (Linux: the PulseAudio description; GUIDs are empty there), or by the complete
   UTF-8 characters an ADM kept of a name it cut to 127 bytes, so the full name and the FFI's lossy
   copy both match. Of duplicate names the first in the ADM's order wins.
-- ADM name buffers are read up to their size (the macOS ADM copies a CoreAudio name unterminated
-  when it fills the buffer), and names and GUIDs cross the cxx bridge lossily: `rust::String`'s
-  constructor throws on a name cut inside a UTF-8 sequence, which aborted the process.
+- ADM name buffers are read up to their size and handed to the ADM with a zeroed byte past it (the
+  macOS ADM copies a CoreAudio name unterminated when it fills the buffer, and libwebrtc's ADM
+  wrapper logs it as a C string), and names and GUIDs cross the cxx bridge lossily:
+  `rust::String`'s constructor throws on a name cut inside a UTF-8 sequence, which aborted the
+  process.
 - Linux: the PulseAudio ADM enumerates through members its `InitPlayout`/`StartPlayout` also use
   (`_deviceIndex`, `_numPlayDevices`, the display-name pointers) with no lock of its own, so
-  enumeration from the FFI now takes the device mutex there. Windows and macOS enumeration stays
-  lock-free (their ADMs enumerate safely on any thread).
+  enumeration from the FFI takes the device mutex there, waiting at most 2 s for a device operation
+  (a PulseAudio stream start can wait 12 s per direction); past that it reports no devices, and
+  the enumerations in the next 2 s give up at once. Windows and macOS enumeration stays lock-free
+  (their ADMs enumerate safely on any thread).
 
 Portability review of the fork's Phases 0-3 C++ and Rust:
 
 - Platform branches are few: COM and `kDefaultDevice` (Windows), the enumeration lock (Linux), and
   the mobile branches. Each file includes the standard headers it uses (checked by hand, since
-  libc++ includes less transitively than MSVC's STL). No MSVC-only constructs; `std::atomic<double>` lock-freedom is asserted
-  (true on every 64-bit desktop target; it would fail a 32-bit ARM build).
+  libc++ includes less transitively than MSVC's STL). No MSVC-only constructs; `std::atomic<double>` and (in the monitor)
+  `std::atomic<uint64_t>` lock-freedom is asserted (true on every 64-bit desktop target; it would
+  fail a 32-bit ARM build).
 - The Effects SDK is called through raw vtables (no virtual destructors, `this` first); that holds
   for the Itanium ABI on x86-64 SysV and AArch64 as for MSVC, as the desktop's managed binding
   already relies on.
@@ -998,8 +1016,9 @@ Portability review of the fork's Phases 0-3 C++ and Rust:
   prebuilt were built with DCHECKs on.
 - Checked here: every audio C++ file compiles syntax-only with clang-cl (`/W4`) under the Linux
   (`WEBRTC_POSIX`, `WEBRTC_LINUX`) and macOS (`WEBRTC_POSIX`, `WEBRTC_MAC`) defines against the
-  Windows prebuilt's headers, MSVC's STL and stubbed POSIX headers; no warning in our files except
-  the existing unused `AdmProxy::worker_thread_`. Not checked here: AppleClang with Apple's libc++,
+  Windows prebuilt's headers, MSVC's STL and stubbed POSIX headers (and, for the UID translation,
+  stubbed CoreAudio/CoreFoundation declarations with the SDK's types); no warning in our files
+  except the existing unused `AdmProxy::worker_thread_`. Not checked here: AppleClang with Apple's libc++,
   clang with the hermetic libc++ and a Linux sysroot, linking, and running anything on macOS or Linux.
 
 Still for CI (macOS x64/arm64, Linux x64/arm64): build and link; the device-free suites above plus
