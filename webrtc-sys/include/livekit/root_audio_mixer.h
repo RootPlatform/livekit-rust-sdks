@@ -35,6 +35,7 @@ namespace livekit_ffi {
 struct RootMixTestSource;
 struct RootMixTestResult;
 struct RootMixFrame;
+struct RootMixLevel;
 struct RootMixStress;
 class RootMixerHarness;
 }  // namespace livekit_ffi
@@ -72,6 +73,17 @@ struct RootAudioMixerStats {
   uint64_t effects_dropped = 0;
 };
 
+// One source's audio as it reached the mixer (decoded, before its gain; a
+// muted frame counts as silence), cumulative since the source was added.
+// source_id is sources_added() when it was added, so a stream added again
+// under the same SSRC starts a new count.
+struct RootAudioMixerSourceLevel {
+  uint32_t ssrc = 0;
+  uint64_t source_id = 0;
+  double sumsq = 0;
+  uint64_t samples = 0;
+};
+
 // The factory's playout mixer: asks every source for 48 kHz, mixes in float with
 // no limiter, soft clips and writes int16 at the requested channel count. Its
 // output is what the ADM plays and what the echo canceller gets as reference.
@@ -96,7 +108,8 @@ struct RootAudioMixerStats {
 // Control calls (gains, master, deafen, effects) come from any thread but the
 // render thread; they store atomics or take control_mutex_/effects_mutex_,
 // which Mix never takes. Per-source gains are keyed by Source::Ssrc() and kept
-// for sources that have not been added yet.
+// for sources that have not been added yet. Mix also counts each source's
+// level before its gain (ReadSourceLevels).
 class RootAudioMixer : public webrtc::AudioMixer {
  public:
   static constexpr int kSampleRateHz = 48000;
@@ -162,6 +175,8 @@ class RootAudioMixer : public webrtc::AudioMixer {
 
   // Atomics only. Max gap is reset on read.
   RootAudioMixerStats ReadStats();
+  // Atomics only; a source removed or replaced while it is read is left out.
+  std::vector<RootAudioMixerSourceLevel> ReadSourceLevels() const;
 
   // Tests only: shorter hold and effect wait, so they run in real time.
   void SetTimeoutsForTest(int64_t unconfigured_hold_ms,
@@ -214,6 +229,7 @@ class RootAudioMixer : public webrtc::AudioMixer {
   // `target` as the app's GainRamp does. Returns false when all are 0.
   bool RampGains(Entry& entry, float target);
   void Accumulate(const webrtc::AudioFrame& frame, size_t mix_channels);
+  void CountSource(size_t slot, double sumsq, uint64_t samples);
   bool MixEffects(bool active, size_t mix_channels, int64_t now_ns);
   void WaitForMixToRelease();
 
@@ -221,6 +237,11 @@ class RootAudioMixer : public webrtc::AudioMixer {
   std::unordered_map<uint32_t, GainSetting> gain_settings_;
   std::array<std::atomic<Entry*>, kMaxSources> slots_{};
   std::array<std::atomic<uint32_t>, kMaxSources> slot_ssrcs_{};
+  // Per slot: the source's id (set with the slot) and its level, which only
+  // Mix adds to.
+  std::array<std::atomic<uint64_t>, kMaxSources> slot_ids_{};
+  std::array<std::atomic<double>, kMaxSources> slot_sumsq_{};
+  std::array<std::atomic<uint64_t>, kMaxSources> slot_samples_{};
   std::atomic<size_t> slot_limit_{0};
   std::atomic<uint64_t> mix_epoch_{0};
   std::atomic<uint32_t> source_count_{0};
@@ -299,6 +320,7 @@ class RootMixerHarness {
   uint64_t effects_played() const;
   uint64_t effects_dropped() const;
   uint64_t sources_added() const;
+  rust::Vec<RootMixLevel> source_levels() const;
   void set_timeouts(int64_t unconfigured_hold_ms,
                     int64_t max_effect_wait_ms) const;
 

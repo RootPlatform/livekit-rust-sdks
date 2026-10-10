@@ -60,6 +60,18 @@ pub mod ffi {
         pub playout: AudioDeviceOutcome,
     }
 
+    /// One playout mixer source (a remote audio stream): its audio as it
+    /// reached the mixer, before its gain (a muted frame counts as silence),
+    /// cumulative since it was added; `source_id` tells a stream added again
+    /// under the same SSRC from the earlier one.
+    #[derive(Debug, Clone, Copy, Default, PartialEq)]
+    pub struct RootMixSourceLevel {
+        pub ssrc: u32,
+        pub source_id: u64,
+        pub sumsq: f64,
+        pub samples: u64,
+    }
+
     #[derive(Debug, Clone, Default)]
     pub struct RootAudioNativeStats {
         pub capture_callbacks: u64,
@@ -88,6 +100,9 @@ pub mod ffi {
         pub mix_out_samples: u64,
         pub effects_played: u64,
         pub effects_dropped: u64,
+        /// The mixer counts per-source levels (the playout mixer exists).
+        pub mix_source_levels_available: bool,
+        pub mix_source_levels: Vec<RootMixSourceLevel>,
         pub processed_frames: u64,
         pub process_rate: u32,
         pub process_channels: u32,

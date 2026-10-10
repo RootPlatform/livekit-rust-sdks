@@ -1166,3 +1166,11 @@ fn adm_proxy_never_touches_the_speaker_volume_or_mute() {
     assert_eq!(h.take_channel_calls(), Vec::<String>::new());
     assert_eq!(calls(&h), Vec::<String>::new());
 }
+
+#[test]
+fn adm_proxy_stats_count_mixer_source_levels() {
+    let h = platform(&["{spk}"], &["{mic}"]);
+    let stats = h.stats();
+    assert!(stats.mix_source_levels_available);
+    assert!(stats.mix_source_levels.is_empty());
+}

@@ -59,6 +59,15 @@ pub mod ffi {
         pub data: Vec<i16>,
     }
 
+    /// One source's level as `RootAudioMixer::ReadSourceLevels` reports it.
+    #[derive(Debug, Clone, Copy, Default, PartialEq)]
+    pub struct RootMixLevel {
+        pub ssrc: u32,
+        pub source_id: u64,
+        pub sumsq: f64,
+        pub samples: u64,
+    }
+
     #[derive(Debug, Clone, Copy, Default)]
     pub struct RootMixStress {
         pub mix_calls: u64,
@@ -103,6 +112,7 @@ pub mod ffi {
         fn effects_played(self: &RootMixerHarness) -> u64;
         fn effects_dropped(self: &RootMixerHarness) -> u64;
         fn sources_added(self: &RootMixerHarness) -> u64;
+        fn source_levels(self: &RootMixerHarness) -> Vec<RootMixLevel>;
         fn set_timeouts(
             self: &RootMixerHarness,
             unconfigured_hold_ms: i64,
@@ -679,6 +689,61 @@ mod gain_tests {
         assert_eq!(h.effects_dropped(), 1);
         let expected = 32.0 * level(s16(0.001));
         assert!((last(&h.mix(1)) - expected).abs() < 1e-3);
+    }
+
+    #[test]
+    fn root_audio_mixer_counts_each_source_before_its_gain() {
+        let h = active();
+        h.add_source(&mono(0.5, 1));
+        h.add_source(&RootMixTestSource { channels: 2, right: s16(-0.25), ..mono(0.25, 2) });
+        h.set_source_gain(1, 2.0, false);
+        h.set_source_gain(2, 0.0, false);
+        h.set_deafened(true);
+        settle(&h, 2);
+
+        let levels = h.source_levels();
+        assert_eq!(levels.len(), 2);
+        let one = levels.iter().find(|l| l.ssrc == 1).unwrap();
+        let two = levels.iter().find(|l| l.ssrc == 2).unwrap();
+        let s1 = s16(0.5) as f64;
+        let s2 = s16(0.25) as f64;
+        assert_eq!((one.samples, two.samples), (3 * 480, 3 * 960));
+        assert!((one.sumsq - 3.0 * 480.0 * s1 * s1).abs() < 1.0, "{}", one.sumsq);
+        assert!((two.sumsq - 3.0 * 960.0 * s2 * s2).abs() < 1.0, "{}", two.sumsq);
+        assert_ne!(one.source_id, two.source_id);
+    }
+
+    #[test]
+    fn root_audio_mixer_counts_a_muted_source_as_silence_and_a_failed_one_not_at_all() {
+        let h = active();
+        h.add_source(&RootMixTestSource { info: 1, ..mono(0.5, 1) });
+        h.add_source(&RootMixTestSource { info: 2, ..mono(0.5, 2) });
+        h.mix(1);
+        h.mix(1);
+
+        let levels = h.source_levels();
+        let muted = levels.iter().find(|l| l.ssrc == 1).unwrap();
+        let failed = levels.iter().find(|l| l.ssrc == 2).unwrap();
+        assert_eq!((muted.samples, muted.sumsq), (960, 0.0));
+        assert_eq!((failed.samples, failed.sumsq), (0, 0.0));
+    }
+
+    #[test]
+    fn root_audio_mixer_source_added_again_starts_a_new_count() {
+        let h = active();
+        let first = h.add_source(&mono(0.5, 7));
+        h.mix(1);
+        let before = h.source_levels()[0];
+        assert_eq!(before.samples, 480);
+
+        h.remove_source(first);
+        assert!(h.source_levels().is_empty());
+        h.add_source(&mono(0.5, 7));
+        let after = h.source_levels()[0];
+        assert_eq!((after.ssrc, after.samples, after.sumsq), (7, 0, 0.0));
+        assert!(after.source_id > before.source_id);
+        h.mix(1);
+        assert_eq!(h.source_levels()[0].samples, 480);
     }
 
     #[test]

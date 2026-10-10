@@ -323,6 +323,13 @@ RootAudioNativeStats AudioDeviceController::root_audio_stats() const {
   stats.mix_out_samples = native.mix_out_samples;
   stats.effects_played = native.effects_played;
   stats.effects_dropped = native.effects_dropped;
+  if (mixer_) {
+    stats.mix_source_levels_available = true;
+    for (const RootAudioMixerSourceLevel& level : mixer_->ReadSourceLevels()) {
+      stats.mix_source_levels.push_back(RootMixSourceLevel{
+          level.ssrc, level.source_id, level.sumsq, level.samples});
+    }
+  }
   stats.echo_cancellation_active = native.echo_cancellation;
   stats.webrtc_ns_active = native.noise_suppression;
   stats.audio_thread_lock_violations = native.audio_thread_lock_violations;

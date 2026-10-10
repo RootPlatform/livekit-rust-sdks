@@ -110,6 +110,10 @@ bool RootAudioMixer::AddSource(Source* source) {
       continue;
     }
     slot_ssrcs_[i].store(ssrc, std::memory_order_relaxed);
+    slot_sumsq_[i].store(0.0, std::memory_order_relaxed);
+    slot_samples_[i].store(0, std::memory_order_relaxed);
+    slot_ids_[i].store(sources_added_.load(std::memory_order_relaxed) + 1,
+                       std::memory_order_release);
     slots_[i].store(entry.release(), std::memory_order_seq_cst);
     if (i + 1 > slot_limit_.load(std::memory_order_relaxed)) {
       slot_limit_.store(i + 1, std::memory_order_release);
@@ -491,6 +495,10 @@ void RootAudioMixer::Mix(size_t number_of_channels,
     const bool audible = RampGains(*entry, target);
     const auto info =
         entry->source->GetAudioFrameWithInfo(kSampleRateHz, &entry->frame);
+    if (info == Source::AudioFrameInfo::kMuted) {
+      CountSource(i, 0.0, kSamplesPerChannel);
+      continue;
+    }
     if (info != Source::AudioFrameInfo::kNormal) {
       continue;
     }
@@ -499,6 +507,15 @@ void RootAudioMixer::Mix(size_t number_of_channels,
         frame.samples_per_channel() != kSamplesPerChannel ||
         frame.num_channels() < 1 || frame.num_channels() > 2) {
       continue;
+    }
+    {
+      const size_t count = kSamplesPerChannel * frame.num_channels();
+      const int16_t* data = frame.data();
+      double source_sumsq = 0;
+      for (size_t k = 0; k < count; ++k) {
+        source_sumsq += static_cast<double>(data[k]) * data[k];
+      }
+      CountSource(i, source_sumsq, count);
     }
     if (audible) {
       Accumulate(frame, mix_channels);
@@ -570,6 +587,37 @@ RootAudioMixerStats RootAudioMixer::ReadStats() {
   }
   stats.sources = static_cast<uint32_t>(stats.ssrcs.size());
   return stats;
+}
+
+// Render thread only, for a slot whose entry it holds.
+void RootAudioMixer::CountSource(size_t slot, double sumsq, uint64_t samples) {
+  slot_sumsq_[slot].store(
+      slot_sumsq_[slot].load(std::memory_order_relaxed) + sumsq,
+      std::memory_order_relaxed);
+  slot_samples_[slot].fetch_add(samples, std::memory_order_relaxed);
+}
+
+std::vector<RootAudioMixerSourceLevel> RootAudioMixer::ReadSourceLevels()
+    const {
+  std::vector<RootAudioMixerSourceLevel> levels;
+  const size_t limit = slot_limit_.load(std::memory_order_acquire);
+  for (size_t i = 0; i < limit; ++i) {
+    if (slots_[i].load(std::memory_order_acquire) == nullptr) {
+      continue;
+    }
+    const uint64_t id = slot_ids_[i].load(std::memory_order_acquire);
+    RootAudioMixerSourceLevel level;
+    level.ssrc = slot_ssrcs_[i].load(std::memory_order_relaxed);
+    level.source_id = id;
+    level.sumsq = slot_sumsq_[i].load(std::memory_order_relaxed);
+    level.samples = slot_samples_[i].load(std::memory_order_relaxed);
+    if (slot_ids_[i].load(std::memory_order_acquire) != id ||
+        slots_[i].load(std::memory_order_acquire) == nullptr) {
+      continue;
+    }
+    levels.push_back(level);
+  }
+  return levels;
 }
 
 float root_audio_soft_clip(float sample) {
@@ -787,6 +835,15 @@ uint64_t RootMixerHarness::effects_dropped() const {
 
 uint64_t RootMixerHarness::sources_added() const {
   return mixer_->sources_added();
+}
+
+rust::Vec<RootMixLevel> RootMixerHarness::source_levels() const {
+  rust::Vec<RootMixLevel> result;
+  for (const RootAudioMixerSourceLevel& level : mixer_->ReadSourceLevels()) {
+    result.push_back(
+        RootMixLevel{level.ssrc, level.source_id, level.sumsq, level.samples});
+  }
+  return result;
 }
 
 void RootMixerHarness::set_timeouts(int64_t unconfigured_hold_ms,
