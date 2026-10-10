@@ -550,6 +550,7 @@ class AdmProxy : public webrtc::AudioDeviceModule {
                                 AdmDirectionOutcome* outcome);
   // Returns false when the stop failed and the direction must wait.
   bool StopDeviceLocked(bool playout, AdmDirectionOutcome* outcome);
+  void ResyncMonitorLocked();
   void CompleteOutcomeLocked(const DesiredState& desired,
                              AdmRequestOutcome* outcome);
   void PublishStateLocked(const DesiredState& desired);

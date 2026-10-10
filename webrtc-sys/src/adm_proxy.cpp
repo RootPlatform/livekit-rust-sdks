@@ -715,8 +715,17 @@ void AdmProxy::ReconcileLocked(AdmRequestOutcome* outcome) {
   }
 }
 
+// What the monitor queued is stale once a device stops or starts: the render
+// side is gone for a while, or capture comes from another device.
+void AdmProxy::ResyncMonitorLocked() {
+  if (RootAudioMonitor* monitor = monitor_.load(std::memory_order_acquire)) {
+    monitor->Resync();
+  }
+}
+
 bool AdmProxy::StopDeviceLocked(bool playout, AdmDirectionOutcome* outcome) {
   webrtc::AudioDeviceModule* platform_adm = platform();
+  ResyncMonitorLocked();
   const int32_t result =
       playout ? platform_adm->StopPlayout() : platform_adm->StopRecording();
   if (outcome) {
@@ -808,6 +817,7 @@ void AdmProxy::ReconcilePlayoutLocked(const DesiredState& desired,
     if (mixer_) {
       mixer_->ResetGapClock();
     }
+    ResyncMonitorLocked();
     const int32_t result = platform_adm->StartPlayout();
     playout_start_result_.store(result, std::memory_order_relaxed);
     if (outcome) {
@@ -872,6 +882,7 @@ void AdmProxy::ReconcileRecordingLocked(const DesiredState& desired,
     if (capture_state_) {
       capture_state_->stream_epoch.fetch_add(1, std::memory_order_release);
     }
+    ResyncMonitorLocked();
     const int32_t result = platform_adm->StartRecording();
     recording_start_result_.store(result, std::memory_order_relaxed);
     if (outcome) {

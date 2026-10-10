@@ -866,7 +866,7 @@ fn root_voice_monitor_plays_what_a_call_would_send_outside_the_aec_reference() {
     h.set_remote_level(REMOTE);
 
     let mut signal = Signal::new(48_000);
-    let mut sent_before: Option<Vec<i16>> = None;
+    let mut sent_frames: Vec<Vec<i16>> = Vec::new();
     let mut heard = 0usize;
     for frame in 0..60 {
         let sent = h.capture(48_000, 1, &signal.speech(3000.0));
@@ -878,20 +878,22 @@ fn root_voice_monitor_plays_what_a_call_would_send_outside_the_aec_reference() {
         let left: Vec<i16> = played.iter().step_by(2).copied().collect();
         let right: Vec<i16> = played.iter().skip(1).step_by(2).copied().collect();
         assert_eq!(left, right, "frame {frame}");
-        match &sent_before {
-            None => assert!(silent(&without_remote(&left)), "20 ms are queued before it plays"),
-            Some(sent) => assert_eq!(&without_remote(&left), sent, "frame {frame}"),
+        if frame < 2 {
+            assert!(silent(&without_remote(&left)), "30 ms are queued before it plays");
+        } else {
+            // During the startup hold, so its fade-in is silence too.
+            assert_eq!(without_remote(&left), sent_frames[frame - 2], "frame {frame}");
         }
         if sumsq(&sent) > 0.0 {
             heard += 1;
         }
-        sent_before = Some(sent);
+        sent_frames.push(sent);
     }
     assert!(heard >= 30, "{heard} frames carried the voice");
 
     let stats = c.root_audio_stats();
     assert!(stats.monitor_available && stats.monitor_active);
-    assert_eq!((stats.monitor_frames, stats.monitor_dropped_frames), (59, 0));
+    assert_eq!((stats.monitor_frames, stats.monitor_dropped_frames), (58, 0));
     assert_eq!(stats.startup_hold_frames, HOLD_FRAMES as u64, "processed as in a call");
 
     // Muted, what a call would send is silence, and so is the monitor.

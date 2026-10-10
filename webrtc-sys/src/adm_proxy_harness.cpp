@@ -413,6 +413,32 @@ uint8_t AdmProxyHarness::monitor(bool enabled) const {
   return controller_->set_root_audio_monitor(enabled);
 }
 
+void AdmProxyHarness::monitor_push(int32_t rate,
+                                   rust::Slice<const float> samples) const {
+  capture_->monitor->Push(samples.data(), samples.size(), rate);
+}
+
+rust::Vec<int16_t> AdmProxyHarness::render_frame() const {
+  rust::Vec<int16_t> result;
+  webrtc::AudioTransport* device = fake_->callback();
+  if (device == nullptr) {
+    return result;
+  }
+  std::array<int16_t, 960> samples{};
+  std::thread device_thread([device, &samples] {
+    size_t samples_out = 0;
+    int64_t elapsed_time_ms = 0;
+    int64_t ntp_time_ms = 0;
+    device->NeedMorePlayData(480, 4, 2, 48000, samples.data(), samples_out,
+                             &elapsed_time_ms, &ntp_time_ms);
+  });
+  device_thread.join();
+  for (int16_t sample : samples) {
+    result.push_back(sample);
+  }
+  return result;
+}
+
 void AdmProxyHarness::engine_start_playout() const {
   proxy_->StartPlayout();
 }
@@ -980,6 +1006,10 @@ RootMonitorHarness::~RootMonitorHarness() = default;
 
 void RootMonitorHarness::set_enabled(bool enabled) const {
   monitor_->SetEnabled(enabled);
+}
+
+void RootMonitorHarness::resync() const {
+  monitor_->Resync();
 }
 
 void RootMonitorHarness::push(int32_t rate,

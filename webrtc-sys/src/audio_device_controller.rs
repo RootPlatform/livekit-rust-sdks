@@ -413,6 +413,8 @@ pub mod ffi {
         /// A RootAudioMonitor driven as its capture and render threads would.
         fn new_root_monitor_harness() -> UniquePtr<RootMonitorHarness>;
         fn set_enabled(self: &RootMonitorHarness, enabled: bool);
+        /// What AdmProxy does around a device stop or start.
+        fn resync(self: &RootMonitorHarness);
         /// One capture frame of FloatS16 samples at `rate`.
         fn push(self: &RootMonitorHarness, rate: i32, samples: &[f32]);
         /// One render callback of rate / 100 frames over `base`; returns what
@@ -451,6 +453,12 @@ pub mod ffi {
         fn app_recording(self: &AdmProxyHarness, start: bool);
         /// The controller's set_root_audio_monitor.
         fn monitor(self: &AdmProxyHarness, enabled: bool) -> u8;
+        /// One frame into the monitor, as the capture post-processor gives it.
+        fn monitor_push(self: &AdmProxyHarness, rate: i32, samples: &[f32]);
+        /// One 10 ms 48 kHz stereo render callback from a device thread
+        /// through the transport tap (libwebrtc's side plays silence);
+        /// returns what the device plays.
+        fn render_frame(self: &AdmProxyHarness) -> Vec<i16>;
         fn engine_start_playout(self: &AdmProxyHarness);
         fn engine_stop_playout(self: &AdmProxyHarness);
         fn engine_start_recording(self: &AdmProxyHarness);

@@ -195,6 +195,7 @@ class RootMonitorHarness {
   ~RootMonitorHarness();
 
   void set_enabled(bool enabled) const;
+  void resync() const;
   // One capture frame: rate / 100 samples of FloatS16.
   void push(int32_t rate, rust::Slice<const float> samples) const;
   // One render callback of rate / 100 frames over `base` (interleaved,
@@ -249,6 +250,11 @@ class AdmProxyHarness {
   void app_recording(bool start) const;
   // The controller's set_root_audio_monitor.
   uint8_t monitor(bool enabled) const;
+  // One frame into the monitor, as the capture post-processor gives it.
+  void monitor_push(int32_t rate, rust::Slice<const float> samples) const;
+  // One 10 ms 48 kHz stereo render callback through the tap from a device
+  // thread; returns what the device plays.
+  rust::Vec<int16_t> render_frame() const;
   void engine_start_playout() const;
   void engine_stop_playout() const;
   void engine_start_recording() const;

@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace livekit_ffi {
 namespace {
@@ -42,19 +43,33 @@ float CatmullRom(const std::array<float, 4>& w, float t) {
                    t * (3.0f * (w[1] - w[2]) + w[3] - w[0])));
 }
 
+// Linear fade over `length` samples ending at `end` (exclusive): the last
+// sample before `end` is nearly silent.
+void FadeOut(float* samples, size_t end, uint32_t length) {
+  const size_t count = std::min<size_t>(end, length);
+  const float step = 1.0f / static_cast<float>(count + 1);
+  for (size_t k = 0; k < count; ++k) {
+    samples[end - count + k] *= static_cast<float>(count - k) * step;
+  }
+}
+
 }  // namespace
 
 void RootAudioMonitor::SetEnabled(bool enabled) {
   if (enabled) {
-    epoch_start_.store(written_.load(std::memory_order_acquire),
-                       std::memory_order_relaxed);
-    epoch_.fetch_add(1, std::memory_order_release);
+    Resync();
   }
   enabled_.store(enabled, std::memory_order_release);
 }
 
 bool RootAudioMonitor::enabled() const {
   return enabled_.load(std::memory_order_acquire);
+}
+
+void RootAudioMonitor::Resync() {
+  epoch_start_.store(written_.load(std::memory_order_acquire),
+                     std::memory_order_relaxed);
+  epoch_.fetch_add(1, std::memory_order_release);
 }
 
 void RootAudioMonitor::Push(const float* samples, size_t frames, int rate) {
@@ -65,10 +80,14 @@ void RootAudioMonitor::Push(const float* samples, size_t frames, int rate) {
       rate > kMaxRate) {
     return;
   }
+  const uint64_t pushes = pushes_.fetch_add(1, std::memory_order_relaxed) + 1;
   const uint64_t written = written_.load(std::memory_order_relaxed);
   const uint64_t read = read_.load(std::memory_order_acquire);
-  if (written - read >= kMaxQueuedFrames) {
-    if (playing_.load(std::memory_order_relaxed)) {
+  if (written - read >= kSlots) {
+    // Full. Only a loss while the render side runs; with it stopped (a
+    // device restart, a stall) the frames are stale before it comes back.
+    if (pushes - consumer_mark_.load(std::memory_order_relaxed) <=
+        kAliveFrames) {
       dropped_.fetch_add(1, std::memory_order_relaxed);
     }
     return;
@@ -89,6 +108,9 @@ bool RootAudioMonitor::NextSample(float* sample) {
     return false;
   }
   const Slot& slot = slots_[read % kSlots];
+  if (read_offset_ >= slot.frames) {
+    read_offset_ = 0;
+  }
   *sample = slot.samples[read_offset_];
   source_rate_ = slot.rate;
   if (++read_offset_ >= slot.frames) {
@@ -114,7 +136,33 @@ bool RootAudioMonitor::FillWindow() {
 void RootAudioMonitor::Unprime() {
   primed_ = false;
   window_ready_ = false;
-  playing_.store(false, std::memory_order_relaxed);
+  ResetTrim();
+}
+
+void RootAudioMonitor::ResetTrim() {
+  trim_min_ = std::numeric_limits<uint64_t>::max();
+  trim_calls_ = 0;
+}
+
+size_t RootAudioMonitor::Render(size_t count) {
+  if (!window_ready_ && !FillWindow()) {
+    return 0;
+  }
+  const float inverse_rate = 1.0f / static_cast<float>(render_rate_);
+  for (size_t i = 0; i < count; ++i) {
+    while (phase_ >= render_rate_) {
+      float next = 0.0f;
+      if (!NextSample(&next)) {
+        return i;
+      }
+      window_ = {window_[1], window_[2], window_[3], next};
+      phase_ -= render_rate_;
+    }
+    render_[i] =
+        CatmullRom(window_, static_cast<float>(phase_) * inverse_rate);
+    phase_ += source_rate_;
+  }
+  return count;
 }
 
 void RootAudioMonitor::MixInto(int16_t* audio,
@@ -127,7 +175,12 @@ void RootAudioMonitor::MixInto(int16_t* audio,
     }
     return;
   }
-  if (audio == nullptr || samples_per_channel == 0 || channels == 0 ||
+  // The render side runs (even when it cannot play this callback).
+  const uint64_t pushes = pushes_.load(std::memory_order_relaxed);
+  const uint64_t since_last =
+      pushes - consumer_mark_.exchange(pushes, std::memory_order_relaxed);
+  if (audio == nullptr || samples_per_channel == 0 ||
+      samples_per_channel > kMaxRenderFrames || channels == 0 ||
       sample_rate == 0) {
     return;
   }
@@ -135,56 +188,92 @@ void RootAudioMonitor::MixInto(int16_t* audio,
   if (epoch != seen_epoch_) {
     seen_epoch_ = epoch;
     Unprime();
+    read_offset_ = 0;
     const uint64_t start = epoch_start_.load(std::memory_order_relaxed);
     if (start > read_.load(std::memory_order_relaxed)) {
-      read_offset_ = 0;
       read_.store(start, std::memory_order_release);
     }
-  }
-  if (!primed_) {
-    const uint64_t written = written_.load(std::memory_order_acquire);
-    const uint64_t read = read_.load(std::memory_order_relaxed);
-    if (written - read < kPrimeFrames) {
-      return;
-    }
-    if (written - read > kPrimeFrames) {
-      read_offset_ = 0;
-      read_.store(written - kPrimeFrames, std::memory_order_release);
-    }
-    primed_ = true;
-    playing_.store(true, std::memory_order_relaxed);
+  } else if (primed_ && since_last > kStallFrames) {
+    // The render side stalled while capture went on: what queued is late.
+    Unprime();
+    read_offset_ = 0;
+    read_.store(written_.load(std::memory_order_acquire),
+                std::memory_order_release);
   }
   if (render_rate_ != sample_rate) {
     render_rate_ = sample_rate;
+    fade_length_ = std::max<uint32_t>(1, sample_rate / kFadeDivisor);
     phase_ = 0;
   }
-  if (!window_ready_ && !FillWindow()) {
-    dropped_.fetch_add(1, std::memory_order_relaxed);
-    Unprime();
-    return;
+
+  const uint64_t written = written_.load(std::memory_order_acquire);
+  const uint64_t queued = written - read_.load(std::memory_order_relaxed);
+  uint64_t skip = 0;
+  if (!primed_) {
+    if (queued < target_) {
+      return;
+    }
+    if (queued > target_) {
+      read_offset_ = 0;
+      read_.store(written - target_, std::memory_order_release);
+    }
+    primed_ = true;
+    window_ready_ = false;
+    fade_in_done_ = 0;
+    ResetTrim();
+  } else {
+    trim_min_ = std::min(trim_min_, queued);
+    if (++trim_calls_ >= kTrimWindow) {
+      if (trim_min_ > target_ + kTrimSlack) {
+        skip = trim_min_ - target_;
+      }
+      ResetTrim();
+    }
+    if (++calls_since_underrun_ >= kDecayCallbacks) {
+      calls_since_underrun_ = 0;
+      target_ = std::max(kPrimeFrames, target_ - 1);
+    }
   }
 
-  const float inverse_rate = 1.0f / static_cast<float>(render_rate_);
-  for (size_t i = 0; i < samples_per_channel; ++i) {
-    while (phase_ >= render_rate_) {
-      float next = 0.0f;
-      if (!NextSample(&next)) {
-        dropped_.fetch_add(1, std::memory_order_relaxed);
-        Unprime();
-        return;
-      }
-      window_ = {window_[1], window_[2], window_[3], next};
-      phase_ -= render_rate_;
-    }
-    const int16_t value =
-        ToS16(CatmullRom(window_, static_cast<float>(phase_) * inverse_rate));
+  const size_t produced = Render(samples_per_channel);
+  const bool underrun = produced < samples_per_channel;
+  float* const out = render_.data();
+  if (underrun || skip > 0) {
+    FadeOut(out, produced, fade_length_);
+  }
+  for (size_t i = 0; i < produced && fade_in_done_ < fade_length_; ++i) {
+    out[i] *= static_cast<float>(++fade_in_done_) /
+              static_cast<float>(fade_length_ + 1);
+  }
+  for (size_t i = 0; i < produced; ++i) {
+    const int32_t value = ToS16(out[i]);
     int16_t* frame = audio + i * channels;
     for (size_t c = 0; c < channels; ++c) {
       frame[c] = Saturate(static_cast<int32_t>(frame[c]) + value);
     }
-    phase_ += source_rate_;
+  }
+
+  if (underrun) {
+    dropped_.fetch_add(1, std::memory_order_relaxed);
+    Unprime();
+    target_ = std::min(kMaxPrimeFrames, target_ + 1);
+    calls_since_underrun_ = 0;
+    return;
   }
   frames_.fetch_add(1, std::memory_order_relaxed);
+  if (skip > 0) {
+    // `skip` frames' worth from the read position, never past the newest
+    // frame; playback resumes there faded in.
+    const uint64_t read = read_.load(std::memory_order_relaxed);
+    const uint64_t available = written_.load(std::memory_order_acquire) - read;
+    skip = std::min(skip, available > 1 ? available - 1 : 0);
+    if (skip > 0) {
+      read_.store(read + skip, std::memory_order_release);
+      dropped_.fetch_add(skip, std::memory_order_relaxed);
+    }
+    window_ready_ = false;
+    fade_in_done_ = 0;
+  }
 }
 
 RootAudioMonitorStats RootAudioMonitor::Read() const {

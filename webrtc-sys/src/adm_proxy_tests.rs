@@ -983,6 +983,68 @@ fn adm_proxy_monitor_moves_with_a_device_selection() {
     assert!(h.stats().monitor_active);
 }
 
+fn level(value: f32) -> Vec<f32> {
+    vec![value; 480]
+}
+
+/// Playout restarts (the watchdog, a device change) while capture goes on:
+/// what the monitor queued before is stale, and frames that found its ring
+/// full while nothing rendered are no loss.
+#[test]
+fn adm_proxy_monitor_starts_over_after_a_playout_restart() {
+    let h = platform(&["{spk}"], &["{mic}"]);
+    h.register_transport();
+    assert_eq!(h.monitor(true), MONITOR_APPLIED);
+    calls(&h);
+    h.monitor_push(48_000, &level(1000.0));
+    h.monitor_push(48_000, &level(1000.0));
+    let mut played = Vec::new();
+    for _ in 0..10 {
+        h.monitor_push(48_000, &level(1000.0));
+        played = h.render_frame();
+    }
+    assert!(played.iter().all(|&s| s == 1000), "both channels");
+    assert_eq!(h.stats().monitor_dropped_frames, 0);
+
+    for _ in 0..5 {
+        h.monitor_push(48_000, &level(2000.0));
+    }
+    let restart = h.restart(false, true);
+    assert!(restart.playout.attempted);
+    assert_eq!(
+        h.take_calls(),
+        [
+            "StopPlayout".to_string(),
+            default_device("Playout"),
+            "InitPlayout".into(),
+            "StartPlayout".into()
+        ]
+    );
+    let mut after = Vec::new();
+    for _ in 0..5 {
+        h.monitor_push(48_000, &level(3000.0));
+        after.push(h.render_frame());
+    }
+    assert!(after[..2].iter().all(|f| f.iter().all(|&s| s == 0)), "it primes on fresh frames");
+    assert!(after[2].iter().all(|&s| s > 0 && s <= 3000) && after[2][959] == 3000, "faded in");
+    assert!(after[3..].iter().all(|f| f.iter().all(|&s| s == 3000)), "never what queued before");
+    assert_eq!(h.stats().monitor_dropped_frames, 0);
+
+    // 300 ms without playout: the ring fills, nothing is counted.
+    for _ in 0..30 {
+        h.monitor_push(48_000, &level(4000.0));
+    }
+    h.restart(false, true);
+    for _ in 0..5 {
+        h.monitor_push(48_000, &level(5000.0));
+        h.render_frame();
+    }
+    assert!(h.render_frame().iter().all(|&s| s == 5000));
+    let stats = h.stats();
+    assert_eq!(stats.monitor_dropped_frames, 0);
+    assert!(stats.monitor_active);
+}
+
 #[test]
 fn adm_proxy_controller_reset_for_teardown_stops_the_monitor() {
     let h = platform(&["{spk}"], &["{mic}"]);
