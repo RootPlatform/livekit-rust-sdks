@@ -590,7 +590,7 @@ fn adm_proxy_controller_hands_pipelines_to_the_slot_and_back() {
     assert!(controller.set_root_denoiser(7, 70, first, 48_000));
     assert_eq!(
         denoiser_completions(&h, 1),
-        [RootDenoiserCompletionItem { owner: 7, async_id: 70, error: String::new() }]
+        [RootDenoiserCompletionItem { owner: 7, async_id: 70, error: String::new(), pipeline: 0 }]
     );
     assert_eq!(
         controller.root_denoiser_state(),

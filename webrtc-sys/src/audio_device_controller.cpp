@@ -597,6 +597,7 @@ AudioDeviceController::take_root_denoiser_completions() const {
     item.owner = completion.owner;
     item.async_id = completion.async_id;
     item.error = rust::String(completion.error);
+    item.pipeline = completion.pipeline;
     result.push_back(std::move(item));
   }
   return result;

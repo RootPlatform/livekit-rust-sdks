@@ -212,12 +212,15 @@ pub mod ffi {
         pub channels: u32,
     }
 
-    /// A SetDenoiser request finished (`error` empty on success).
+    /// A SetDenoiser request finished (`error` empty on success). With an
+    /// error, `pipeline` is the request's pipeline when native let go of it
+    /// and lists it nowhere else (superseded, busy); else 0.
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct RootDenoiserCompletionItem {
         pub owner: u64,
         pub async_id: u64,
         pub error: String,
+        pub pipeline: u64,
     }
 
     /// A pipeline native no longer holds, for the owner that set it.

@@ -108,6 +108,8 @@ trait RootAudioSink {
     fn set_source_gain(&self, ssrc: u32, tile: f32, paused: bool) -> bool;
     fn clear_source_gain(&self, ssrc: u32);
     fn reset_controls(&self, close_gate: bool);
+    /// Denoiser completions and returned pipelines native has not handed out.
+    fn take_denoiser(&self) -> (Vec<DenoiserCompletion>, Vec<ReturnedPipeline>);
 }
 
 impl RootAudioSink for PlatformAudio {
@@ -121,6 +123,13 @@ impl RootAudioSink for PlatformAudio {
 
     fn reset_controls(&self, close_gate: bool) {
         self.reset_rootapp_controls(close_gate)
+    }
+
+    fn take_denoiser(&self) -> (Vec<DenoiserCompletion>, Vec<ReturnedPipeline>) {
+        if !self.denoiser_available() {
+            return (Vec::new(), Vec::new());
+        }
+        (self.take_denoiser_completions(), self.take_returned_pipelines())
     }
 }
 
@@ -144,23 +153,24 @@ struct Sessions {
 }
 
 impl Sessions {
-    fn open(&mut self, handle: FfiHandleId, sink: &dyn RootAudioSink) {
+    /// True for the first live session.
+    fn open(&mut self, handle: FfiHandleId) -> bool {
         self.live.insert(handle);
-        if self.live.len() == 1 {
-            sink.reset_controls(false);
-        }
         self.mail.opened(handle);
+        self.live.len() == 1
     }
 
-    fn close(&mut self, handle: FfiHandleId, sink: &dyn RootAudioSink) {
+    /// True when the last live session ended.
+    fn close(&mut self, handle: FfiHandleId) -> bool {
         if !self.live.remove(&handle) {
-            return;
+            return false;
         }
-        if self.live.is_empty() {
-            sink.reset_controls(true);
+        let last = self.live.is_empty();
+        if last {
             self.subscribed.clear();
         }
         self.mail.closed(&self.live, handle);
+        last
     }
 
     fn deliver(&mut self, completions: Vec<DenoiserCompletion>, returned: Vec<ReturnedPipeline>) {
@@ -168,15 +178,55 @@ impl Sessions {
     }
 }
 
+/// Orders session starts and ends with their control resets. The last end's
+/// reset can wait up to 200 ms for the audio thread, so it runs under this
+/// lock only, never under SESSIONS, which every handle's events task takes.
+static LIFECYCLE: Mutex<()> = Mutex::new(());
+
+/// A session starts; the first one resets the shared controls.
+fn open_session(sessions: &Mutex<Sessions>, handle: FfiHandleId, sink: &dyn RootAudioSink) {
+    let _order = LIFECYCLE.lock();
+    if sessions.lock().open(handle) {
+        sink.reset_controls(false);
+    }
+}
+
+/// A session ends; the last one closes the capture gate and resets the
+/// shared controls. What native gave back then (the installed and waiting
+/// pipelines) is kept for the next handle and any ReturnPipelines response,
+/// since the engine and its lists may go with the last handle.
+fn close_session(sessions: &Mutex<Sessions>, handle: FfiHandleId, sink: &dyn RootAudioSink) {
+    let _order = LIFECYCLE.lock();
+    if !sessions.lock().close(handle) {
+        return;
+    }
+    sink.reset_controls(true);
+    let (completions, returned) = sink.take_denoiser();
+    sessions.lock().deliver(completions, returned);
+}
+
+/// The ReturnPipelines response: what native took back, then everything not
+/// sent yet, each pipeline once.
+fn merge_returned(held: Vec<u64>, undelivered: Vec<u64>) -> Vec<u64> {
+    let mut pipelines = Vec::with_capacity(held.len() + undelivered.len());
+    for pipeline in held.into_iter().chain(undelivered) {
+        if pipeline != 0 && !pipelines.contains(&pipeline) {
+            pipelines.push(pipeline);
+        }
+    }
+    pipelines
+}
+
 /// Where SetDenoiser completions and returned pipelines go, each exactly once:
-/// a completion to the handle that asked (dropped once it is gone: native
-/// never held an errored pipeline, and a held one comes back as returned), a
-/// pipeline to the handle whose request installed it while that one lives,
-/// else to the newest live handle, else to the next handle to open (and to a
-/// ReturnPipelines response before that).
+/// a completion to the handle that asked; once that handle is gone, the
+/// pipeline an error let go of (superseded, busy) goes on as a returned one,
+/// since nobody else would release it. A pipeline goes to the handle whose
+/// request installed it while that one lives, else to the newest live handle,
+/// else to the next handle to open (and to a ReturnPipelines response before
+/// that).
 #[derive(Default)]
 struct DenoiserMail {
-    completions: HashMap<FfiHandleId, Vec<(u64, Option<String>)>>,
+    completions: HashMap<FfiHandleId, Vec<DenoiserCompletion>>,
     returned: HashMap<FfiHandleId, Vec<u64>>,
     orphans: Vec<u64>,
 }
@@ -190,20 +240,24 @@ impl DenoiserMail {
     ) {
         for completion in completions {
             if live.contains(&completion.owner) {
-                self.completions
-                    .entry(completion.owner)
-                    .or_default()
-                    .push((completion.async_id, completion.error));
+                self.completions.entry(completion.owner).or_default().push(completion);
             } else {
-                log::debug!(
-                    "RootAudio: denoiser result {} for dropped handle {}",
-                    completion.async_id,
-                    completion.owner
-                );
+                self.undeliverable(live, completion);
             }
         }
         for returned in returned {
             self.return_to(live, returned.owner, returned.pipeline);
+        }
+    }
+
+    fn undeliverable(&mut self, live: &BTreeSet<FfiHandleId>, completion: DenoiserCompletion) {
+        log::debug!(
+            "RootAudio: denoiser result {} for dropped handle {}",
+            completion.async_id,
+            completion.owner
+        );
+        if completion.error.is_some() && completion.pipeline != 0 {
+            self.return_to(live, completion.owner, completion.pipeline);
         }
     }
 
@@ -223,7 +277,9 @@ impl DenoiserMail {
     }
 
     fn closed(&mut self, live: &BTreeSet<FfiHandleId>, handle: FfiHandleId) {
-        self.completions.remove(&handle);
+        for completion in self.completions.remove(&handle).unwrap_or_default() {
+            self.undeliverable(live, completion);
+        }
         for pipeline in self.returned.remove(&handle).unwrap_or_default() {
             self.return_to(live, handle, pipeline);
         }
@@ -231,8 +287,9 @@ impl DenoiserMail {
 
     /// The handle's completions (async id, error) and returned pipelines.
     fn take(&mut self, handle: FfiHandleId) -> (Vec<(u64, Option<String>)>, Vec<u64>) {
+        let completions = self.completions.remove(&handle).unwrap_or_default();
         (
-            self.completions.remove(&handle).unwrap_or_default(),
+            completions.into_iter().map(|c| (c.async_id, c.error)).collect(),
             self.returned.remove(&handle).unwrap_or_default(),
         )
     }
@@ -509,7 +566,7 @@ impl RootAudioSession {
         handle: FfiHandleId,
         audio: PlatformAudio,
     ) -> Arc<Self> {
-        SESSIONS.lock().open(handle, &audio);
+        open_session(&SESSIONS, handle, &audio);
         let session = Arc::new(Self {
             handle,
             state: Mutex::new(SessionState {
@@ -536,7 +593,7 @@ impl RootAudioSession {
             state.audio.take()
         };
         if let Some(audio) = audio {
-            SESSIONS.lock().close(self.handle, &audio);
+            close_session(&SESSIONS, self.handle, &audio);
         }
     }
 
@@ -1030,9 +1087,10 @@ pub fn on_set_denoiser(
 }
 
 /// Synchronous: every pipeline native holds (installed, waiting to be, or
-/// returned and not sent yet). Waiting requests complete with an error
-/// event; the installed pipeline is removed unless the audio thread holds on
-/// for 200 ms (then it stays and `error` says so).
+/// returned and not sent yet), each once. Waiting requests complete with an
+/// error event; the installed pipeline is removed unless a change in progress
+/// or the audio thread holds on past 200 ms in all (then it stays and `error`
+/// says so).
 pub fn on_return_pipelines(
     server: &'static FfiServer,
     req: proto::RootAudioReturnPipelinesRequest,
@@ -1049,12 +1107,7 @@ pub fn on_return_pipelines(
         sessions.deliver(completions, returned);
         sessions.mail.take_undelivered()
     };
-    let mut pipelines = held.pipelines;
-    for pipeline in undelivered {
-        if !pipelines.contains(&pipeline) {
-            pipelines.push(pipeline);
-        }
-    }
+    let pipelines = merge_returned(held.pipelines, undelivered);
     Ok(proto::RootAudioReturnPipelinesResponse { pipelines, error: held.error })
 }
 
@@ -1331,6 +1384,11 @@ mod tests {
         fn reset_controls(&self, close_gate: bool) {
             self.calls.borrow_mut().push(format!("reset closed={close_gate}"));
         }
+
+        fn take_denoiser(&self) -> (Vec<DenoiserCompletion>, Vec<ReturnedPipeline>) {
+            self.calls.borrow_mut().push("take denoiser".into());
+            (Vec::new(), Vec::new())
+        }
     }
 
     /// `handle` resolved to `ssrc` (track `handle`).
@@ -1342,25 +1400,87 @@ mod tests {
     #[test]
     fn rootapp_audio_sessions_reset_on_the_first_start_and_close_on_the_last_end() {
         let sink = Recorder::default();
-        let mut sessions = Sessions::default();
-        sessions.open(1, &sink);
+        let sessions = Mutex::new(Sessions::default());
+        open_session(&sessions, 1, &sink);
         assert_eq!(sink.take(), ["reset closed=false"]);
-        sessions.open(2, &sink);
-        sessions.subscribed.insert(9, 99);
-        sessions.close(1, &sink);
+        open_session(&sessions, 2, &sink);
+        sessions.lock().subscribed.insert(9, 99);
+        close_session(&sessions, 1, &sink);
         assert_eq!(sink.take(), Vec::<String>::new(), "another handle is still live");
-        assert_eq!(sessions.subscribed.len(), 1);
-        sessions.close(1, &sink);
+        assert_eq!(sessions.lock().subscribed.len(), 1);
+        close_session(&sessions, 1, &sink);
         assert_eq!(sink.take(), Vec::<String>::new(), "a handle closes once");
-        sessions.close(2, &sink);
-        assert_eq!(sink.take(), ["reset closed=true"], "the last end closes the gate");
-        assert!(sessions.subscribed.is_empty());
-        sessions.open(3, &sink);
+        close_session(&sessions, 2, &sink);
+        assert_eq!(
+            sink.take(),
+            ["reset closed=true", "take denoiser"],
+            "the last end closes the gate"
+        );
+        assert!(sessions.lock().subscribed.is_empty());
+        open_session(&sessions, 3, &sink);
         assert_eq!(sink.take(), ["reset closed=false"]);
     }
 
+    /// Notes whether SESSIONS was free during each reset, and hands out what
+    /// native gave back.
+    struct LifecycleSink<'a> {
+        sessions: &'a Mutex<Sessions>,
+        resets: std::cell::RefCell<Vec<(bool, bool)>>,
+        native: std::cell::RefCell<(Vec<DenoiserCompletion>, Vec<ReturnedPipeline>)>,
+    }
+
+    impl RootAudioSink for LifecycleSink<'_> {
+        fn set_source_gain(&self, _ssrc: u32, _tile: f32, _paused: bool) -> bool {
+            true
+        }
+
+        fn clear_source_gain(&self, _ssrc: u32) {}
+
+        fn reset_controls(&self, close_gate: bool) {
+            let free = self.sessions.try_lock().is_some();
+            self.resets.borrow_mut().push((close_gate, free));
+        }
+
+        fn take_denoiser(&self) -> (Vec<DenoiserCompletion>, Vec<ReturnedPipeline>) {
+            std::mem::take(&mut *self.native.borrow_mut())
+        }
+    }
+
+    #[test]
+    fn rootapp_audio_last_end_resets_outside_the_sessions_lock_and_keeps_what_native_gave_back() {
+        let sessions = Mutex::new(Sessions::default());
+        let sink = LifecycleSink {
+            sessions: &sessions,
+            resets: Default::default(),
+            native: Default::default(),
+        };
+        open_session(&sessions, 1, &sink);
+        open_session(&sessions, 2, &sink);
+        close_session(&sessions, 1, &sink);
+        *sink.native.borrow_mut() = (
+            vec![
+                failed(2, 20, "the last platform audio handle was dropped before install", 0),
+                failed(1, 21, "superseded by a newer denoiser request", 0x2000),
+            ],
+            vec![returned(2, 0x1000)],
+        );
+        close_session(&sessions, 2, &sink);
+        assert_eq!(*sink.resets.borrow(), [(false, true), (true, true)], "SESSIONS stays free");
+        assert!(sink.native.borrow().1.is_empty(), "taken before the engine can go");
+
+        open_session(&sessions, 3, &sink);
+        let (completions, mut pipelines) = sessions.lock().mail.take(3);
+        pipelines.sort_unstable();
+        assert_eq!(pipelines, [0x1000, 0x2000], "kept for the next handle");
+        assert!(completions.is_empty());
+    }
+
     fn completion(owner: u64, async_id: u64, error: Option<&str>) -> DenoiserCompletion {
-        DenoiserCompletion { owner, async_id, error: error.map(str::to_string) }
+        DenoiserCompletion { owner, async_id, error: error.map(str::to_string), pipeline: 0 }
+    }
+
+    fn failed(owner: u64, async_id: u64, error: &str, pipeline: u64) -> DenoiserCompletion {
+        DenoiserCompletion { owner, async_id, error: Some(error.to_string()), pipeline }
     }
 
     fn returned(owner: u64, pipeline: u64) -> ReturnedPipeline {
@@ -1369,10 +1489,9 @@ mod tests {
 
     #[test]
     fn rootapp_audio_denoiser_results_go_to_the_handle_that_asked() {
-        let sink = Recorder::default();
         let mut sessions = Sessions::default();
-        sessions.open(1, &sink);
-        sessions.open(2, &sink);
+        sessions.open(1);
+        sessions.open(2);
         sessions.deliver(
             vec![completion(1, 10, None), completion(2, 11, Some("busy")), completion(9, 12, None)],
             Vec::new(),
@@ -1382,7 +1501,7 @@ mod tests {
         assert_eq!(sessions.mail.take(1), (Vec::new(), Vec::new()), "each once");
 
         sessions.deliver(vec![completion(2, 13, None)], Vec::new());
-        sessions.close(2, &sink);
+        sessions.close(2);
         assert_eq!(
             sessions.mail.take(2),
             (Vec::new(), Vec::new()),
@@ -1392,34 +1511,64 @@ mod tests {
     }
 
     #[test]
-    fn rootapp_audio_returned_pipelines_reach_exactly_one_handle() {
-        let sink = Recorder::default();
+    fn rootapp_audio_an_error_for_a_dropped_handle_hands_its_pipeline_on() {
         let mut sessions = Sessions::default();
-        sessions.open(1, &sink);
-        sessions.open(5, &sink);
+        sessions.open(1);
+        sessions.open(2);
+        sessions.deliver(vec![failed(1, 10, "superseded", 0x100)], Vec::new());
+        sessions.close(1);
+        assert_eq!(
+            sessions.mail.take(2),
+            (Vec::new(), vec![0x100]),
+            "the event never reached handle 1"
+        );
+
+        sessions.deliver(
+            vec![
+                failed(1, 11, "the audio thread did not let go", 0x200),
+                failed(1, 12, "returned before install", 0),
+                completion(1, 13, None),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(
+            sessions.mail.take(2),
+            (Vec::new(), vec![0x200]),
+            "only a pipeline nothing else names"
+        );
+
+        sessions.close(2);
+        sessions.deliver(vec![failed(2, 14, "superseded", 0x300)], Vec::new());
+        assert_eq!(sessions.mail.take_undelivered(), [0x300], "no handle left");
+    }
+
+    #[test]
+    fn rootapp_audio_returned_pipelines_reach_exactly_one_handle() {
+        let mut sessions = Sessions::default();
+        sessions.open(1);
+        sessions.open(5);
         sessions.deliver(Vec::new(), vec![returned(1, 100), returned(7, 101), returned(5, 102)]);
         assert_eq!(sessions.mail.take(1).1, [100], "to the owner while it lives");
         assert_eq!(sessions.mail.take(5).1, [101, 102], "else to the newest live handle");
 
         sessions.deliver(Vec::new(), vec![returned(1, 103)]);
-        sessions.close(1, &sink);
+        sessions.close(1);
         assert_eq!(sessions.mail.take(5).1, [103], "a closed handle's pipelines move on");
 
         sessions.deliver(Vec::new(), vec![returned(5, 104)]);
-        sessions.close(5, &sink);
+        sessions.close(5);
         sessions.deliver(Vec::new(), vec![returned(5, 105)]);
         assert_eq!(sessions.mail.take(5).1, Vec::<u64>::new());
-        sessions.open(6, &sink);
+        sessions.open(6);
         assert_eq!(sessions.mail.take(6).1, [104, 105], "kept for the next handle");
     }
 
     #[test]
     fn rootapp_audio_return_pipelines_takes_every_undelivered_pipeline() {
-        let sink = Recorder::default();
         let mut sessions = Sessions::default();
         sessions.deliver(Vec::new(), vec![returned(1, 100)]);
-        sessions.open(2, &sink);
-        sessions.open(3, &sink);
+        sessions.open(2);
+        sessions.open(3);
         sessions.deliver(Vec::new(), vec![returned(3, 101), returned(2, 102)]);
         let mut undelivered = sessions.mail.take_undelivered();
         undelivered.sort_unstable();
@@ -1427,6 +1576,24 @@ mod tests {
         assert_eq!(sessions.mail.take(2).1, Vec::<u64>::new());
         assert_eq!(sessions.mail.take(3).1, Vec::<u64>::new());
         assert!(sessions.mail.take_undelivered().is_empty());
+    }
+
+    #[test]
+    fn rootapp_audio_return_pipelines_response_names_each_pipeline_once() {
+        assert_eq!(merge_returned(vec![1, 2, 2], vec![3, 1, 0, 3]), [1, 2, 3]);
+        assert_eq!(merge_returned(Vec::new(), vec![5]), [5]);
+        assert!(merge_returned(vec![0], Vec::new()).is_empty());
+
+        let mut sessions = Sessions::default();
+        sessions.open(1);
+        sessions.deliver(
+            vec![failed(9, 10, "superseded", 0x10)],
+            vec![returned(1, 0x20), returned(1, 0x30)],
+        );
+        let undelivered = sessions.mail.take_undelivered();
+        let mut pipelines = merge_returned(vec![0x30, 0x40], undelivered);
+        pipelines.sort_unstable();
+        assert_eq!(pipelines, [0x10, 0x20, 0x30, 0x40]);
     }
 
     fn speaking(speaking: bool, seq: u64) -> LocalSpeaking {

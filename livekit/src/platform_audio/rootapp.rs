@@ -170,20 +170,26 @@ impl RootAudioControl {
 
 /// A finished [`set_denoiser`](super::PlatformAudio::set_denoiser) request of
 /// `owner`; `error` is `None` once native holds the pipeline. On an error
-/// native never held it.
+/// native no longer holds it: `pipeline` names it when nothing else will
+/// (superseded, or the audio thread did not let go), and is 0 when it comes
+/// back another way (a ReturnPipelines response, or the returned list when the
+/// last session ended).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DenoiserCompletion {
     pub owner: u64,
     pub async_id: u64,
     pub error: Option<String>,
+    pub pipeline: u64,
 }
 
 impl From<NativeDenoiserCompletion> for DenoiserCompletion {
     fn from(value: NativeDenoiserCompletion) -> Self {
+        let error = (!value.error.is_empty()).then_some(value.error);
         Self {
             owner: value.owner,
             async_id: value.async_id,
-            error: (!value.error.is_empty()).then_some(value.error),
+            pipeline: if error.is_some() { value.pipeline } else { 0 },
+            error,
         }
     }
 }
@@ -203,8 +209,8 @@ impl From<NativeReturnedPipeline> for ReturnedPipeline {
 }
 
 /// Everything [`return_denoiser_pipelines`](super::PlatformAudio::return_denoiser_pipelines)
-/// took back. `error` says the installed pipeline could not be removed (it
-/// stays installed and is not listed).
+/// took back, each once. `error` says the installed pipeline could not be
+/// removed in time (it stays installed and is not listed).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReturnedPipelines {
     pub pipelines: Vec<u64>,
@@ -926,11 +932,18 @@ mod tests {
     #[test]
     fn root_audio_denoiser_results_map_empty_errors_to_success() {
         let ok: DenoiserCompletion =
-            NativeDenoiserCompletion { owner: 1, async_id: 2, error: String::new() }.into();
-        assert_eq!(ok, DenoiserCompletion { owner: 1, async_id: 2, error: None });
-        let failed: DenoiserCompletion =
-            NativeDenoiserCompletion { owner: 1, async_id: 3, error: "superseded".into() }.into();
+            NativeDenoiserCompletion { owner: 1, async_id: 2, error: String::new(), pipeline: 9 }
+                .into();
+        assert_eq!(ok, DenoiserCompletion { owner: 1, async_id: 2, error: None, pipeline: 0 });
+        let failed: DenoiserCompletion = NativeDenoiserCompletion {
+            owner: 1,
+            async_id: 3,
+            error: "superseded".into(),
+            pipeline: 0x1000,
+        }
+        .into();
         assert_eq!(failed.error.as_deref(), Some("superseded"));
+        assert_eq!(failed.pipeline, 0x1000);
 
         let all: ReturnedPipelines =
             NativeReturnPipelines { pipelines: vec![5, 6], error: String::new() }.into();

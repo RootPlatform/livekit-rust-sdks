@@ -1114,7 +1114,8 @@ impl PlatformAudio {
 
     /// Takes back every pipeline native holds: the installed one, those
     /// waiting to be installed (which complete with an error) and those
-    /// returned but not taken yet. Blocks up to 200 ms for the audio thread.
+    /// returned but not taken yet. Blocks up to 200 ms in all for a change in
+    /// progress and the audio thread (plus one scheduler tick).
     pub fn return_denoiser_pipelines(&self) -> ReturnedPipelines {
         self.handle.runtime.return_root_denoiser_pipelines().into()
     }
