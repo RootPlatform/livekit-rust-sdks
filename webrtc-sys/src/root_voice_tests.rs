@@ -956,6 +956,65 @@ fn root_voice_monitor_converts_16_khz_capture_to_48_khz_playout() {
     assert_eq!(stats.monitor_dropped_frames, 0);
 }
 
+/// A mic test over 60 frames of a 1 kHz tone: on the right channel of a
+/// stereo device (the mic on input 2), or as one channel holding what
+/// libwebrtc's downmix makes of that. Returns what was sent and played.
+fn stereo_mic_test(stereo: bool) -> (UniquePtr<RootVoiceHarness>, Vec<i16>, Vec<i16>) {
+    let h = new_root_voice_harness();
+    control(
+        &h,
+        RootAudioControlUpdate {
+            has_auto_gain: true,
+            auto_gain: false,
+            has_auto_sensitivity: true,
+            auto_sensitivity: false,
+            has_gate_threshold: true,
+            gate_threshold: 0.0,
+            ..Default::default()
+        },
+    );
+    assert_eq!(h.monitor(true), MONITOR_APPLIED);
+    let mut signal = Signal::new(48_000);
+    let (mut sent_all, mut played_all) = (Vec::new(), Vec::new());
+    for frame in 0..60 {
+        let tone = signal.tone(8000.0);
+        let sent = if stereo {
+            let input: Vec<i16> = tone.iter().flat_map(|&s| [0, s]).collect();
+            h.capture(48_000, 2, &input)
+        } else {
+            let average: Vec<i16> = tone.iter().map(|&s| s / 2).collect();
+            h.capture(48_000, 1, &average)
+        };
+        assert_eq!(sent.len(), 480, "frame {frame}: processed as one channel");
+        sent_all.extend(sent);
+        played_all.extend(h.render(48_000, 1));
+    }
+    (h, sent_all, played_all)
+}
+
+/// A call sends the average of a stereo mic's channels (libwebrtc remixes to
+/// its mono send stream); the mic test, with no send stream, hears exactly
+/// that instead of the left channel alone.
+#[test]
+fn root_voice_monitor_hears_a_stereo_mic_averaged_as_a_call_sends_it() {
+    let (h, sent, played) = stereo_mic_test(true);
+    let (_, sent_mono, played_mono) = stereo_mic_test(false);
+    assert!(sumsq(&sent[24_000..]) > 0.0, "the right channel is heard");
+    assert_eq!(sent, sent_mono, "processed as the mono average");
+    assert_eq!(played, played_mono);
+    let stats = h.controller().root_audio_stats();
+    assert_eq!((stats.capture_channels, stats.process_channels), (2, 1));
+    assert_eq!(stats.monitor_dropped_frames, 0);
+
+    // A call that sends: libwebrtc gets both channels and remixes them to its
+    // send streams' format itself.
+    h.engine_recording(true);
+    let both: Vec<i16> = (0..960).map(|i| if i % 2 == 1 { 1000 } else { 0 }).collect();
+    assert_eq!(h.capture(48_000, 2, &both).len(), 960);
+    h.engine_recording(false);
+    assert_eq!(h.capture(48_000, 2, &both).len(), 480);
+}
+
 #[test]
 fn root_voice_monitor_gives_way_to_a_call_that_sends() {
     let h = new_root_voice_harness();

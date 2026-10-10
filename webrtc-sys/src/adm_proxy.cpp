@@ -274,6 +274,10 @@ void AdmTransportTap::set_monitor(RootAudioMonitor* monitor) {
   monitor_.store(monitor, std::memory_order_release);
 }
 
+void AdmTransportTap::set_mono_capture(bool mono) {
+  mono_capture_.store(mono, std::memory_order_relaxed);
+}
+
 void AdmTransportTap::Count(Direction& direction,
                             size_t frames,
                             uint32_t sample_rate,
@@ -347,12 +351,35 @@ int32_t AdmTransportTap::RecordedDataIsAvailable(
     capture_samples_.fetch_add(count, std::memory_order_relaxed);
   }
 
+  const void* forward = audio_samples;
+  size_t forward_channels = channels;
+  size_t forward_bytes = bytes_per_frame;
+  if (channels > 1 && audio_samples != nullptr &&
+      bytes_per_frame == channels * sizeof(int16_t) &&
+      samples_per_channel <= mono_.size() &&
+      mono_capture_.load(std::memory_order_relaxed)) {
+    // As libwebrtc's DownmixInterleavedToMono: the int32 sum over the
+    // channels divided by their count.
+    const int16_t* in = static_cast<const int16_t*>(audio_samples);
+    const int32_t count = static_cast<int32_t>(channels);
+    for (size_t i = 0; i < samples_per_channel; ++i) {
+      int32_t sum = 0;
+      for (size_t c = 0; c < channels; ++c) {
+        sum += in[i * channels + c];
+      }
+      mono_[i] = static_cast<int16_t>(sum / count);
+    }
+    forward = mono_.data();
+    forward_channels = 1;
+    forward_bytes = sizeof(int16_t);
+  }
+
   webrtc::AudioTransport* transport =
       transport_.load(std::memory_order_acquire);
   int32_t result = 0;
   if (transport != nullptr) {
     result = transport->RecordedDataIsAvailable(
-        audio_samples, samples_per_channel, bytes_per_frame, channels,
+        forward, samples_per_channel, forward_bytes, forward_channels,
         sample_rate, total_delay_ms, clock_drift, current_mic_level,
         key_pressed, new_mic_level, estimated_capture_time_ns);
   }
@@ -1585,6 +1612,8 @@ int32_t AdmProxy::StartRecording() {
     AdmLock lock(&state_mutex_);
     desired_.engine_recording = true;
     engine_recording_.store(true, std::memory_order_release);
+    // libwebrtc remixes to its send streams' format itself.
+    tap_.set_mono_capture(false);
     if (desired_.monitor) {
       desired_.monitor = false;
       if (RootAudioMonitor* monitor =
@@ -1602,6 +1631,7 @@ int32_t AdmProxy::StopRecording() {
     AdmLock lock(&state_mutex_);
     desired_.engine_recording = false;
     engine_recording_.store(false, std::memory_order_release);
+    tap_.set_mono_capture(true);
   }
   RequestReconcile();
   return 0;

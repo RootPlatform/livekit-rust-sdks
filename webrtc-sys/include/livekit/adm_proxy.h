@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -25,6 +26,7 @@
 #include <vector>
 
 #include "absl/functional/any_invocable.h"
+#include "api/audio/audio_frame.h"
 #include "api/environment/environment.h"
 #include "api/scoped_refptr.h"
 #include "livekit/synthetic_audio_device.h"
@@ -166,6 +168,11 @@ class AdmTransportTap : public webrtc::AudioTransport {
   void set_transport(webrtc::AudioTransport* transport);
   // Set once, before any device opens; may be null.
   void set_monitor(RootAudioMonitor* monitor);
+  // While libwebrtc records for no send stream (the mic test, the app's own
+  // start) the device's channels reach libwebrtc averaged to one, as a mono
+  // send stream's RemixAndResample averages them, so the APM and the capture
+  // processor run on what a call would send.
+  void set_mono_capture(bool mono);
 
   int32_t RecordedDataIsAvailable(const void* audio_samples,
                                   size_t samples_per_channel,
@@ -265,6 +272,9 @@ class AdmTransportTap : public webrtc::AudioTransport {
   std::atomic<uint64_t> capture_samples_{0};
   std::atomic<uint32_t> capture_total_delay_ms_{0};
   std::atomic<uint16_t> playout_delay_ms_{0};
+  std::atomic<bool> mono_capture_{true};
+  // Capture thread only (inside the capture guard).
+  std::array<int16_t, webrtc::AudioFrame::kMaxDataSizeSamples> mono_{};
 };
 
 // What the synthetic ADM pulls through: the tap's render guard, so it never
