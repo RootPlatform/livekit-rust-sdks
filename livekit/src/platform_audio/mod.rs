@@ -117,8 +117,8 @@ pub use error::{AudioError, AudioResult};
 pub use processing::{AudioProcessingOptions, AudioProcessingType};
 pub use rootapp::{
     sanitize_volume, AudioDeviceResults, AudioDeviceSelection, CaptureFormat, DenoiserCompletion,
-    DenoiserState, EffectPlay, LocalSpeaking, PushToTalk, ReturnedPipeline, ReturnedPipelines,
-    RootAudioControl, RootAudioStats, MAX_VOICE_GAIN_DB, MAX_VOLUME,
+    DenoiserState, EffectPlay, LocalSpeaking, MonitorError, PushToTalk, ReturnedPipeline,
+    ReturnedPipelines, RootAudioControl, RootAudioStats, MAX_VOICE_GAIN_DB, MAX_VOLUME,
 };
 
 // Re-export RtcAudioSource for convenience
@@ -1083,6 +1083,19 @@ impl PlatformAudio {
     /// up) in the same store, so a teardown never passes through an open gate.
     pub fn reset_rootapp_controls(&self, close_gate: bool) {
         self.handle.runtime.reset_root_audio(close_gate)
+    }
+
+    /// The mic test: plays the processed capture (what a call would send,
+    /// following mute, push-to-talk, the gate and the input volume) on the
+    /// playout device, outside the echo canceller's reference. While it runs
+    /// both selected devices are open for it; stopping it closes them unless a
+    /// call, the playout hold or [`start_recording`](Self::start_recording) /
+    /// `start_playout` keep them. Refused while a call sends from the platform
+    /// microphone; a call that starts sending turns it off. Returns at once;
+    /// the devices follow on the native device thread. Stopped with the last
+    /// session (see [`reset_rootapp_controls`](Self::reset_rootapp_controls)).
+    pub fn set_monitor(&self, enabled: bool) -> Result<(), MonitorError> {
+        rootapp::monitor_result(self.handle.runtime.set_root_audio_monitor(enabled))
     }
 
     /// The capture processor runs Effects SDK pipelines (desktop, 64-bit).

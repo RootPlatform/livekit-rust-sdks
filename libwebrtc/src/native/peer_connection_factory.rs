@@ -51,6 +51,18 @@ pub enum EffectPlay {
     Idle,
 }
 
+/// What a mic test monitor request did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MonitorResult {
+    Applied,
+    /// This build has no capture processor (mobile).
+    NotSupported,
+    /// A send stream records from the platform microphone (a call publishes).
+    Sending,
+    /// No platform audio reference exists.
+    NotAcquired,
+}
+
 use crate::{
     audio_source::{native::NativeAudioSource, AudioSourceOptions},
     audio_track::RtcAudioTrack,
@@ -602,6 +614,17 @@ impl PeerConnectionFactory {
     /// Controls back to their defaults, with the capture gate open or closed.
     pub fn reset_root_audio(&self, close_gate: bool) {
         self.sys_handle.audio_device().reset_root_audio(close_gate)
+    }
+
+    /// Starts or stops the mic test monitor; returns at once, the devices
+    /// follow on the native device thread.
+    pub fn set_root_audio_monitor(&self, enabled: bool) -> MonitorResult {
+        match self.sys_handle.audio_device().set_root_audio_monitor(enabled) {
+            0 => MonitorResult::Applied,
+            2 => MonitorResult::Sending,
+            3 => MonitorResult::NotAcquired,
+            _ => MonitorResult::NotSupported,
+        }
     }
 
     /// The capture processor has an Effects SDK slot (desktop, 64-bit).

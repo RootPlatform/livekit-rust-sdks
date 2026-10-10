@@ -24,9 +24,9 @@ use thiserror::Error;
 
 #[cfg(not(target_arch = "wasm32"))]
 use libwebrtc::peer_connection_factory::native::{
-    AudioDeviceRequest, AudioDeviceSelection, EffectPlay, NativeAudioControl, NativeAudioStats,
-    NativeCaptureFormat, NativeDenoiserCompletion, NativeDenoiserState, NativeReturnPipelines,
-    NativeReturnedPipeline, NativeSpeaking, PeerConnectionFactoryExt,
+    AudioDeviceRequest, AudioDeviceSelection, EffectPlay, MonitorResult, NativeAudioControl,
+    NativeAudioStats, NativeCaptureFormat, NativeDenoiserCompletion, NativeDenoiserState,
+    NativeReturnPipelines, NativeReturnedPipeline, NativeSpeaking, PeerConnectionFactoryExt,
 };
 
 lazy_static! {
@@ -402,6 +402,11 @@ impl LkRuntime {
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn reset_root_audio(&self, close_gate: bool) {
         self.pc_factory.reset_root_audio(close_gate)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn set_root_audio_monitor(&self, enabled: bool) -> MonitorResult {
+        self.pc_factory.set_root_audio_monitor(enabled)
     }
 
     #[cfg(not(target_arch = "wasm32"))]

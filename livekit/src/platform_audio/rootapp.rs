@@ -15,14 +15,48 @@
 //! Types of the RootApp native audio engine (device requests, controls and
 //! stats).
 
+use std::fmt;
+
 use libwebrtc::peer_connection_factory::native::{
-    AudioDeviceOutcome, AudioDeviceRequestOutcome, NativeAudioControl, NativeAudioStats,
-    NativeCaptureFormat, NativeDenoiserCompletion, NativeDenoiserState, NativeReturnPipelines,
-    NativeReturnedPipeline, NativeSpeaking, ADM_RESULT_NOT_ATTEMPTED,
+    AudioDeviceOutcome, AudioDeviceRequestOutcome, MonitorResult, NativeAudioControl,
+    NativeAudioStats, NativeCaptureFormat, NativeDenoiserCompletion, NativeDenoiserState,
+    NativeReturnPipelines, NativeReturnedPipeline, NativeSpeaking, ADM_RESULT_NOT_ATTEMPTED,
 };
 pub use libwebrtc::peer_connection_factory::native::{AudioDeviceSelection, EffectPlay};
 
 use super::{AudioError, AudioResult};
+
+/// Why [`set_monitor`](super::PlatformAudio::set_monitor) changed nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MonitorError {
+    /// This build has no capture processor (mobile).
+    NotSupported,
+    /// A call sends from the platform microphone; the mic test waits for it.
+    Sending,
+    /// The platform audio device module is not acquired.
+    NotAcquired,
+}
+
+impl fmt::Display for MonitorError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::NotSupported => "not supported by this build",
+            Self::Sending => "refused: a call is sending from the platform microphone",
+            Self::NotAcquired => "platform audio is not acquired",
+        })
+    }
+}
+
+impl std::error::Error for MonitorError {}
+
+pub(crate) fn monitor_result(result: MonitorResult) -> Result<(), MonitorError> {
+    match result {
+        MonitorResult::Applied => Ok(()),
+        MonitorResult::NotSupported => Err(MonitorError::NotSupported),
+        MonitorResult::Sending => Err(MonitorError::Sending),
+        MonitorResult::NotAcquired => Err(MonitorError::NotAcquired),
+    }
+}
 
 /// Slider volumes (input, master, tile) are linear 0..2.
 pub const MAX_VOLUME: f32 = 2.0;
@@ -450,6 +484,13 @@ pub struct RootAudioStats {
     pub apm_policy_deferred: Option<u64>,
     pub apm_policy_forced: Option<u64>,
     pub apm_policy_pending: Option<bool>,
+
+    // Mic test monitor (with the capture processor). Frames are 10 ms render
+    // frames that played it; dropped frames are underruns of the render side
+    // and capture frames that found its ring full.
+    pub monitor_active: Option<bool>,
+    pub monitor_frames: Option<u64>,
+    pub monitor_dropped_frames: Option<u64>,
 }
 
 impl Default for RootAudioStats {
@@ -543,6 +584,9 @@ impl Default for RootAudioStats {
             apm_policy_deferred: None,
             apm_policy_forced: None,
             apm_policy_pending: None,
+            monitor_active: None,
+            monitor_frames: None,
+            monitor_dropped_frames: None,
         }
     }
 }
@@ -552,7 +596,11 @@ impl RootAudioStats {
         let dsp = native.dsp_available;
         let denoiser = native.denoiser_available;
         let policy = native.policy_available;
+        let monitor = native.monitor_available;
         Self {
+            monitor_active: monitor.then_some(native.monitor_active),
+            monitor_frames: monitor.then_some(native.monitor_frames),
+            monitor_dropped_frames: monitor.then_some(native.monitor_dropped_frames),
             denoised_sumsq: native.denoised_sumsq,
             gate_in_sumsq: native.gate_in_sumsq,
             gate_in_block_peak_db: native.gate_in_block_peak_db,
@@ -937,6 +985,44 @@ mod tests {
             (Some(5), Some(2), Some(1))
         );
         assert_eq!(stats.apm_policy_pending, Some(true));
+        assert_eq!(
+            (stats.monitor_active, stats.monitor_frames, stats.monitor_dropped_frames),
+            (None, None, None),
+            "a library without the monitor leaves its fields unset"
+        );
+    }
+
+    #[test]
+    fn root_audio_stats_fill_the_monitor_fields_it_has() {
+        let native = NativeAudioStats {
+            monitor_available: true,
+            monitor_active: true,
+            monitor_frames: 120,
+            monitor_dropped_frames: 3,
+            ..Default::default()
+        };
+        let stats = RootAudioStats::from_native(native);
+        assert_eq!(
+            (stats.monitor_active, stats.monitor_frames, stats.monitor_dropped_frames),
+            (Some(true), Some(120), Some(3))
+        );
+        let idle = RootAudioStats::from_native(NativeAudioStats {
+            monitor_available: true,
+            ..Default::default()
+        });
+        assert_eq!((idle.monitor_active, idle.monitor_frames), (Some(false), Some(0)));
+    }
+
+    #[test]
+    fn monitor_results_map_to_errors_with_stable_messages() {
+        assert_eq!(monitor_result(MonitorResult::Applied), Ok(()));
+        assert_eq!(monitor_result(MonitorResult::Sending), Err(MonitorError::Sending));
+        assert_eq!(monitor_result(MonitorResult::NotAcquired), Err(MonitorError::NotAcquired));
+        assert_eq!(
+            monitor_result(MonitorResult::NotSupported).unwrap_err().to_string(),
+            "not supported by this build"
+        );
+        assert!(MonitorError::Sending.to_string().contains("sending"));
     }
 
     #[test]

@@ -142,7 +142,7 @@ pub mod native {
     use super::PeerConnectionFactory;
     pub use crate::imp::peer_connection_factory::{
         AudioDeviceOutcome, AudioDeviceRequest, AudioDeviceRequestOutcome, AudioDeviceSelection,
-        EffectPlay, NativeAudioControl, NativeAudioStats, NativeCaptureFormat,
+        EffectPlay, MonitorResult, NativeAudioControl, NativeAudioStats, NativeCaptureFormat,
         NativeDenoiserCompletion, NativeDenoiserState, NativeReturnPipelines,
         NativeReturnedPipeline, NativeSpeaking, ADM_RESULT_DEVICE_NOT_FOUND,
         ADM_RESULT_NOT_ATTEMPTED,
@@ -187,6 +187,7 @@ pub mod native {
         fn root_audio_capture_format(&self) -> NativeCaptureFormat;
         fn root_audio_sources_added(&self) -> u64;
         fn reset_root_audio(&self, close_gate: bool);
+        fn set_root_audio_monitor(&self, enabled: bool) -> MonitorResult;
         // The Effects SDK hand-off and the published speaking flag.
         fn root_denoiser_available(&self) -> bool;
         fn set_root_denoiser(
@@ -332,6 +333,10 @@ pub mod native {
 
         fn reset_root_audio(&self, close_gate: bool) {
             self.handle.reset_root_audio(close_gate)
+        }
+
+        fn set_root_audio_monitor(&self, enabled: bool) -> MonitorResult {
+            self.handle.set_root_audio_monitor(enabled)
         }
 
         fn root_denoiser_available(&self) -> bool {
