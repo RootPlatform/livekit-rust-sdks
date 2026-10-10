@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstring>
@@ -33,6 +34,7 @@
 #include "livekit/root_audio_mixer.h"
 #include "modules/audio_device/include/audio_device_default.h"
 #include "rtc_base/event.h"
+#include "rtc_base/thread.h"
 
 namespace livekit_ffi {
 namespace {
@@ -645,6 +647,213 @@ std::unique_ptr<AdmProxyHarness> new_adm_proxy_harness_with_apm(
     rust::Slice<const rust::String> recording_guids) {
   return std::make_unique<AdmProxyHarness>(playout_guids, recording_guids,
                                            true);
+}
+
+// The voice engine's capture path in miniature (AudioTransportImpl): each
+// recorded frame through the APM as int16 in its own format.
+class HarnessApmTransport : public webrtc::AudioTransport {
+ public:
+  explicit HarnessApmTransport(
+      webrtc::scoped_refptr<webrtc::AudioProcessing> apm)
+      : apm_(std::move(apm)) {}
+
+  std::vector<int16_t> TakeOutput() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return std::exchange(output_, {});
+  }
+
+  using webrtc::AudioTransport::RecordedDataIsAvailable;
+  int32_t RecordedDataIsAvailable(const void* audio_samples,
+                                  size_t samples_per_channel,
+                                  size_t /* bytes_per_frame */,
+                                  size_t channels,
+                                  uint32_t sample_rate,
+                                  uint32_t total_delay_ms,
+                                  int32_t /* clock_drift */,
+                                  uint32_t current_mic_level,
+                                  bool key_pressed,
+                                  uint32_t& new_mic_level) override {
+    std::vector<int16_t> output(samples_per_channel * channels);
+    const webrtc::StreamConfig config(static_cast<int>(sample_rate), channels);
+    apm_->set_stream_delay_ms(static_cast<int>(total_delay_ms));
+    apm_->set_stream_key_pressed(key_pressed);
+    apm_->ProcessStream(static_cast<const int16_t*>(audio_samples), config,
+                        config, output.data());
+    new_mic_level = current_mic_level;
+    std::lock_guard<std::mutex> lock(mutex_);
+    output_ = std::move(output);
+    return 0;
+  }
+
+  int32_t NeedMorePlayData(size_t samples_per_channel,
+                           size_t bytes_per_frame,
+                           size_t channels,
+                           uint32_t /* sample_rate */,
+                           void* audio_samples,
+                           size_t& samples_out,
+                           int64_t* elapsed_time_ms,
+                           int64_t* ntp_time_ms) override {
+    std::memset(audio_samples, 0, samples_per_channel * bytes_per_frame);
+    samples_out = samples_per_channel * channels;
+    *elapsed_time_ms = -1;
+    *ntp_time_ms = -1;
+    return 0;
+  }
+
+  void PullRenderData(int,
+                      int,
+                      size_t,
+                      size_t,
+                      void*,
+                      int64_t*,
+                      int64_t*) override {}
+
+ private:
+  const webrtc::scoped_refptr<webrtc::AudioProcessing> apm_;
+  std::mutex mutex_;
+  std::vector<int16_t> output_;
+};
+
+RootVoiceHarness::RootVoiceHarness()
+    : worker_(webrtc::Thread::Create()),
+      fake_(webrtc::make_ref_counted<FakePlatformAdm>()),
+      mixer_(webrtc::make_ref_counted<RootAudioMixer>()),
+      capture_(std::make_shared<RootCaptureState>()),
+      worker_hold_(std::make_shared<webrtc::Event>()) {
+  worker_->SetName("root-voice-worker", nullptr);
+  worker_->Start();
+  fake_->SetDevices({"{spk}"}, {"{mic}"});
+  if constexpr (kRootDenoiserSupported) {
+    capture_->denoiser_slot = std::make_shared<RootDenoiserSlot>();
+  }
+  apm_ = CreateRootAudioProcessing(webrtc::CreateEnvironment(), capture_,
+                                   worker_.get());
+  transport_ = std::make_unique<HarnessApmTransport>(apm_);
+  proxy_ = webrtc::make_ref_counted<AdmProxy>(webrtc::CreateEnvironment(),
+                                              nullptr, mixer_, fake_);
+  proxy_->SetCaptureState(capture_);
+  controller_ = std::make_unique<AudioDeviceController>(proxy_, mixer_, apm_,
+                                                        capture_);
+  proxy_->AcquirePlatformAdm();
+  proxy_->set_recording_enabled(true);
+  proxy_->set_playout_enabled(true);
+  proxy_->RegisterAudioCallback(transport_.get());
+  // A session starts, as the FFI's first handle does.
+  controller_->reset_root_audio(false);
+  proxy_->FlushDeviceTasksForTest();
+}
+
+RootVoiceHarness::~RootVoiceHarness() {
+  worker_hold_->Set();
+  controller_ = nullptr;
+  proxy_->RegisterAudioCallback(nullptr);
+  proxy_ = nullptr;
+  worker_->Stop();
+  transport_ = nullptr;
+  apm_ = nullptr;
+  fakes_.clear();
+}
+
+const AudioDeviceController& RootVoiceHarness::controller() const {
+  return *controller_;
+}
+
+void RootVoiceHarness::recording(bool start) const {
+  if (start) {
+    controller_->start_recording();
+  } else {
+    controller_->stop_recording();
+  }
+  proxy_->FlushDeviceTasksForTest();
+}
+
+uint64_t RootVoiceHarness::stream_epoch() const {
+  return capture_->stream_epoch.load();
+}
+
+rust::Vec<int16_t> RootVoiceHarness::capture(
+    int32_t rate,
+    size_t channels,
+    rust::Slice<const int16_t> input) const {
+  rust::Vec<int16_t> result;
+  webrtc::AudioTransport* device = fake_->callback();
+  if (device == nullptr || rate < 100 || channels == 0) {
+    return result;
+  }
+  const size_t frames = static_cast<size_t>(rate / 100);
+  std::vector<int16_t> samples(frames * channels, 0);
+  std::copy_n(input.data(), std::min(input.size(), samples.size()),
+              samples.begin());
+  std::thread device_thread([&] {
+    uint32_t new_mic_level = 0;
+    device->RecordedDataIsAvailable(samples.data(), frames, 2 * channels,
+                                    channels, static_cast<uint32_t>(rate), 0,
+                                    0, 0, false, new_mic_level);
+  });
+  device_thread.join();
+  for (int16_t sample : transport_->TakeOutput()) {
+    result.push_back(sample);
+  }
+  return result;
+}
+
+RootFakeFxPipeline* RootVoiceHarness::Fake(uint64_t pipeline) const {
+  for (const std::unique_ptr<RootFakeFxPipeline>& fake : fakes_) {
+    if (static_cast<uint64_t>(reinterpret_cast<uintptr_t>(fake->pipeline())) ==
+        pipeline) {
+      return fake.get();
+    }
+  }
+  return nullptr;
+}
+
+uint64_t RootVoiceHarness::add_fake_pipeline(float scale,
+                                             uint32_t delay_samples) const {
+  RootFakeFxConfig config;
+  config.scale = scale;
+  config.delay_samples = delay_samples;
+  fakes_.push_back(std::make_unique<RootFakeFxPipeline>(config));
+  return static_cast<uint64_t>(
+      reinterpret_cast<uintptr_t>(fakes_.back()->pipeline()));
+}
+
+void RootVoiceHarness::set_fake_empty(uint64_t pipeline, bool empty) const {
+  if (RootFakeFxPipeline* fake = Fake(pipeline)) {
+    fake->set_empty(empty);
+  }
+}
+
+RootVoiceFakeCounts RootVoiceHarness::fake_counts(uint64_t pipeline) const {
+  RootVoiceFakeCounts counts{};
+  if (const RootFakeFxPipeline* fake = Fake(pipeline)) {
+    counts.process_calls = fake->process_calls();
+    counts.flush_calls = fake->flush_calls();
+    counts.power_sets = fake->power_sets();
+    counts.last_power = fake->last_power();
+  }
+  return counts;
+}
+
+void RootVoiceHarness::hold_worker(bool hold) const {
+  if (!hold) {
+    worker_hold_->Set();
+    return;
+  }
+  worker_hold_->Reset();
+  auto entered = std::make_shared<webrtc::Event>();
+  worker_->PostTask([entered, release = worker_hold_] {
+    entered->Set();
+    release->Wait(webrtc::Event::kForever);
+  });
+  entered->Wait(webrtc::Event::kForever);
+}
+
+bool RootVoiceHarness::webrtc_ns_applied() const {
+  return capture_->webrtc_ns_applied.load();
+}
+
+std::unique_ptr<RootVoiceHarness> new_root_voice_harness() {
+  return std::make_unique<RootVoiceHarness>();
 }
 
 }  // namespace livekit_ffi

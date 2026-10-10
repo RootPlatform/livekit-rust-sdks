@@ -1,0 +1,701 @@
+// Copyright 2026 LiveKit, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! The native voice path end to end over one capture state, wired as the
+//! factory wires it (`RootVoiceHarness`): device frames through AdmProxy and
+//! libwebrtc's builtin APM into the capture processor and the DSP crate, the
+//! denoiser slot with fake Effects SDK pipelines, the controller with its
+//! rootapp-effects thread, and the APM decorator applying policy on a worker
+//! thread. No audio device is opened.
+
+use std::time::{Duration, Instant};
+
+use cxx::UniquePtr;
+
+use crate::{
+    audio_device_controller::ffi::{
+        new_root_voice_harness, AudioDeviceController, RootAudioControlUpdate,
+        RootDenoiserCompletionItem, RootSpeakingInfo, RootVoiceHarness,
+    },
+    root_denoiser::ffi::root_denoiser_supported,
+};
+
+const NOT_SPEAKING_AFTER_FRAMES: usize = 100;
+const HOLD_FRAMES: usize = 20;
+/// The transmit gate's fade at 48 kHz (5 ms).
+const FADE: usize = 240;
+
+/// A deterministic test signal at one rate, continuous across frames.
+struct Signal {
+    rate: u32,
+    position: u64,
+    noise: u32,
+}
+
+impl Signal {
+    fn new(rate: u32) -> Self {
+        Self { rate, position: 0, noise: 0x1234_5678 }
+    }
+
+    fn frames(&self) -> usize {
+        (self.rate / 100) as usize
+    }
+
+    fn noise(&mut self) -> f64 {
+        self.noise = self.noise.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        f64::from(self.noise >> 8) / f64::from(1u32 << 24) * 2.0 - 1.0
+    }
+
+    /// `floor`: white noise of that peak amplitude added.
+    fn frame(&mut self, floor: f64, sample: impl Fn(f64) -> f64) -> Vec<i16> {
+        let start = self.position;
+        self.position += self.frames() as u64;
+        (0..self.frames())
+            .map(|i| {
+                let t = (start + i as u64) as f64 / f64::from(self.rate);
+                let noise = floor * self.noise();
+                (sample(t) + noise).round().clamp(-32768.0, 32767.0) as i16
+            })
+            .collect()
+    }
+
+    /// Syllables of a 180 Hz voice with two harmonics, 200 ms on and 100 ms
+    /// off with 10 ms edges (on when the startup hold ends), over a noise
+    /// floor near -75 dBFS.
+    fn speech(&mut self, amplitude: f64) -> Vec<i16> {
+        self.frame(10.0, |t| {
+            let phase = (t + 0.1) % 0.3;
+            let edge = (phase / 0.01).min((0.2 - phase) / 0.01).clamp(0.0, 1.0);
+            let w = 2.0 * std::f64::consts::PI * 180.0 * t;
+            amplitude * edge * (w.sin() + 0.5 * (2.0 * w).sin() + 0.25 * (3.0 * w).sin()) / 1.75
+        })
+    }
+
+    /// 1 kHz without noise: every 10 ms frame the same at 8-48 kHz.
+    fn tone(&mut self, amplitude: f64) -> Vec<i16> {
+        self.frame(0.0, |t| amplitude * (2.0 * std::f64::consts::PI * 1000.0 * t).sin())
+    }
+
+    /// The noise floor alone.
+    fn quiet(&mut self) -> Vec<i16> {
+        self.frame(10.0, |_| 0.0)
+    }
+}
+
+fn silent(samples: &[i16]) -> bool {
+    samples.iter().all(|&s| s == 0)
+}
+
+fn sumsq(samples: &[i16]) -> f64 {
+    samples.iter().map(|&s| f64::from(s) * f64::from(s)).sum()
+}
+
+fn wait_until(what: &str, done: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !done() {
+        assert!(Instant::now() < deadline, "timed out waiting until {what}");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// A session has started and the app records.
+fn started() -> UniquePtr<RootVoiceHarness> {
+    let h = new_root_voice_harness();
+    h.recording(true);
+    h
+}
+
+fn control(h: &RootVoiceHarness, update: RootAudioControlUpdate) {
+    assert!(h.controller().set_root_audio_control(&update), "{update:?}");
+}
+
+fn denoiser_wanted(h: &RootVoiceHarness, wanted: bool) {
+    control(
+        h,
+        RootAudioControlUpdate {
+            has_denoiser_wanted: true,
+            denoiser_wanted: wanted,
+            ..Default::default()
+        },
+    );
+}
+
+fn speaking(c: &AudioDeviceController) -> bool {
+    c.root_audio_speaking().speaking
+}
+
+fn ok(owner: u64, async_id: u64) -> RootDenoiserCompletionItem {
+    RootDenoiserCompletionItem { owner, async_id, error: String::new(), pipeline: 0 }
+}
+
+fn completions(c: &AudioDeviceController, count: usize) -> Vec<RootDenoiserCompletionItem> {
+    let all = std::cell::RefCell::new(Vec::new());
+    wait_until("denoiser completions", || {
+        all.borrow_mut().extend(c.take_root_denoiser_completions());
+        all.borrow().len() >= count
+    });
+    all.into_inner()
+}
+
+/// A fake pipeline at `rate`, installed before any frame (nobody speaks).
+fn install(h: &RootVoiceHarness, rate: u32, scale: f32) -> u64 {
+    let c = h.controller();
+    let pipeline = h.add_fake_pipeline(scale, 0);
+    assert!(c.set_root_denoiser(1, 10, pipeline, rate));
+    assert_eq!(completions(c, 1), [ok(1, 10)]);
+    assert!(c.root_denoiser_state().installed);
+    pipeline
+}
+
+/// Speech until it is published as speaking; returns the frame it rose on.
+fn speak_until_speaking(h: &RootVoiceHarness, signal: &mut Signal) -> usize {
+    let rate = signal.rate as i32;
+    for frame in 0..NOT_SPEAKING_AFTER_FRAMES {
+        h.capture(rate, 1, &signal.speech(3000.0));
+        if speaking(h.controller()) {
+            return frame;
+        }
+    }
+    panic!("speech was never published as speaking");
+}
+
+/// Quiet until speaking is released; returns how many frames that took.
+fn quiet_until_released(h: &RootVoiceHarness, signal: &mut Signal) -> usize {
+    let rate = signal.rate as i32;
+    for frame in 1..=NOT_SPEAKING_AFTER_FRAMES {
+        h.capture(rate, 1, &signal.quiet());
+        if !speaking(h.controller()) {
+            return frame;
+        }
+    }
+    panic!("speaking was never released");
+}
+
+#[test]
+fn root_voice_speech_is_published_as_speaking_and_released_after_the_gate() {
+    let h = started();
+    let c = h.controller();
+    let mut signal = Signal::new(48_000);
+    let start = c.root_audio_speaking();
+    assert!(!start.speaking);
+    for _ in 0..HOLD_FRAMES {
+        assert!(silent(&h.capture(48_000, 1, &signal.speech(3000.0))), "the startup hold");
+    }
+    let rose = HOLD_FRAMES + speak_until_speaking(&h, &mut signal);
+    assert!(rose < HOLD_FRAMES + 3, "five gate blocks after the hold: frame {rose}");
+    let mut audible = 0;
+    for _ in 0..100 {
+        let out = h.capture(48_000, 1, &signal.speech(3000.0));
+        if sumsq(&out) > 480.0 * 500.0 * 500.0 {
+            audible += 1;
+        }
+    }
+    assert!(audible >= 60, "{audible} loud frames of 100");
+    let talking = c.root_audio_speaking();
+    assert_eq!(talking.seq, start.seq + 1, "one rise across the syllables");
+    let stats = c.root_audio_stats();
+    assert!(stats.speaking && stats.gate_speaking);
+    assert_eq!(stats.speaking_seq, talking.seq);
+
+    let quiet = quiet_until_released(&h, &mut signal);
+    assert!((40..=80).contains(&quiet), "400 ms release and 300 ms hold: {quiet} frames");
+    let released = c.root_audio_speaking();
+    assert_eq!(released.seq, start.seq + 2);
+    let stats = c.root_audio_stats();
+    assert!(!stats.speaking && !stats.gate_speaking);
+    assert_eq!(stats.startup_hold_frames, HOLD_FRAMES as u64);
+    assert_eq!((stats.dsp_resets, stats.dsp_flushes), (1, 1), "the session start");
+}
+
+#[test]
+fn root_voice_mute_and_push_to_talk_key_up_send_silence_and_no_speaking() {
+    let h = started();
+    let c = h.controller();
+    let mut signal = Signal::new(48_000);
+    speak_until_speaking(&h, &mut signal);
+    let seq = c.root_audio_speaking().seq;
+
+    control(
+        &h,
+        RootAudioControlUpdate { has_mic_muted: true, mic_muted: true, ..Default::default() },
+    );
+    let muting = h.capture(48_000, 1, &signal.speech(3000.0));
+    assert!(silent(&muting[FADE..]), "silent after the 5 ms fade");
+    assert_eq!(
+        c.root_audio_speaking(),
+        RootSpeakingInfo { speaking: false, seq: seq + 1 },
+        "muting stops speaking on the same frame"
+    );
+    let transmitted = c.root_audio_stats().transmit_frames;
+    for _ in 0..50 {
+        assert!(silent(&h.capture(48_000, 1, &signal.speech(3000.0))));
+        assert!(!speaking(c));
+    }
+    let stats = c.root_audio_stats();
+    assert!(stats.gate_speaking, "the gate keeps listening while muted");
+    assert!(!stats.speaking);
+    assert_eq!(stats.transmit_frames, transmitted);
+    assert_eq!(stats.speaking_seq, seq + 1);
+
+    control(
+        &h,
+        RootAudioControlUpdate { has_mic_muted: true, mic_muted: false, ..Default::default() },
+    );
+    assert!(!silent(&h.capture(48_000, 1, &signal.speech(3000.0))));
+    assert!(speaking(c), "unmuted mid-word speaks at once");
+
+    control(
+        &h,
+        RootAudioControlUpdate { has_push_to_talk: true, push_to_talk: 2, ..Default::default() },
+    );
+    let key_up = h.capture(48_000, 1, &signal.speech(3000.0));
+    assert!(silent(&key_up[FADE..]));
+    assert!(!speaking(c), "key up stops speaking on the same frame");
+    for _ in 0..50 {
+        assert!(silent(&h.capture(48_000, 1, &signal.speech(3000.0))));
+        assert!(!speaking(c));
+    }
+    control(
+        &h,
+        RootAudioControlUpdate {
+            has_mic_muted: true,
+            mic_muted: true,
+            has_push_to_talk: true,
+            push_to_talk: 1,
+            ..Default::default()
+        },
+    );
+    for _ in 0..10 {
+        assert!(silent(&h.capture(48_000, 1, &signal.speech(3000.0))), "muted with the key down");
+        assert!(!speaking(c));
+    }
+}
+
+#[test]
+fn root_voice_push_to_talk_press_is_heard_within_one_frame_and_the_fade() {
+    let h = started();
+    let c = h.controller();
+    control(
+        &h,
+        RootAudioControlUpdate {
+            has_auto_gain: true,
+            auto_gain: false,
+            has_auto_sensitivity: true,
+            auto_sensitivity: false,
+            has_gate_threshold: true,
+            gate_threshold: 0.01,
+            ..Default::default()
+        },
+    );
+    let mut signal = Signal::new(48_000);
+    let mut open = Vec::new();
+    for _ in 0..HOLD_FRAMES + 10 {
+        open = h.capture(48_000, 1, &signal.tone(3000.0));
+    }
+    assert!(sumsq(&open) > 480.0 * 1500.0 * 1500.0);
+
+    control(
+        &h,
+        RootAudioControlUpdate { has_push_to_talk: true, push_to_talk: 2, ..Default::default() },
+    );
+    for _ in 0..10 {
+        h.capture(48_000, 1, &signal.tone(3000.0));
+    }
+    assert!(silent(&h.capture(48_000, 1, &signal.tone(3000.0))));
+    assert!(!speaking(c));
+
+    control(
+        &h,
+        RootAudioControlUpdate { has_push_to_talk: true, push_to_talk: 1, ..Default::default() },
+    );
+    std::thread::sleep(Duration::from_millis(2));
+    let pressed = h.capture(48_000, 1, &signal.tone(3000.0));
+    assert!(pressed[0].abs() <= 20, "the fade starts near 0: {}", pressed[0]);
+    assert!(pressed[..FADE].iter().any(|&s| s != 0), "audio within the first 5 ms");
+    // From the end of the fade (and of the gate's two-block attack) on, the
+    // frame is what an open mic sends.
+    for i in 256..480 {
+        assert!(
+            (i32::from(pressed[i]) - i32::from(open[i])).abs() <= 1,
+            "{i}: {} vs {}",
+            pressed[i],
+            open[i]
+        );
+    }
+    assert!(speaking(c), "a press speaks on its first frame");
+    let delay = c.root_audio_stats().gate_open_delay_us;
+    assert!((2_000..1_000_000).contains(&delay), "{delay} us from the press to its frame");
+}
+
+#[test]
+fn root_voice_a_stalled_denoiser_gets_webrtc_ns_at_once_through_the_worker() {
+    if !root_denoiser_supported() {
+        return;
+    }
+    let h = started();
+    let c = h.controller();
+    control(
+        &h,
+        RootAudioControlUpdate {
+            has_auto_gain: true,
+            auto_gain: false,
+            has_denoiser_wanted: true,
+            denoiser_wanted: true,
+            ..Default::default()
+        },
+    );
+    let pipeline = install(&h, 48_000, 0.5);
+    // A host AEC change first: applied on the worker, opening its 1 s window.
+    control(
+        &h,
+        RootAudioControlUpdate {
+            has_echo_cancellation: true,
+            echo_cancellation: false,
+            ..Default::default()
+        },
+    );
+    wait_until("the host's change", || {
+        let stats = c.root_audio_stats();
+        stats.apm_policy_applies == 1 && !stats.apm_policy_pending
+    });
+    let mut signal = Signal::new(48_000);
+    speak_until_speaking(&h, &mut signal);
+    let before = c.root_audio_stats();
+    assert_eq!(before.ns_gap_frames, 0);
+    assert!(!before.webrtc_ns_active && !before.webrtc_ns_fallback && !h.webrtc_ns_applied());
+    assert!(h.fake_counts(pipeline).process_calls > HOLD_FRAMES as u64);
+
+    h.hold_worker(true);
+    h.set_fake_empty(pipeline, true);
+    let mut empty = 0;
+    while c.root_denoiser_state().bypass_reason == 0 {
+        h.capture(48_000, 1, &signal.speech(3000.0));
+        empty += 1;
+        assert!(empty <= 100);
+    }
+    assert_eq!(empty, 100, "bypassed after 100 empty outputs in a row");
+    assert_eq!(c.root_denoiser_state().bypass_reason, 2);
+    assert_eq!(c.root_audio_stats().ns_gap_frames, 0, "the empty outputs were the denoiser's");
+    let calls = h.fake_counts(pipeline).process_calls;
+    wait_until("the native fallback", || c.root_denoiser_state().webrtc_ns_fallback);
+
+    // The worker is held: every frame sent dry until WebRTC NS is applied is
+    // a gap. The user is heard talking again.
+    let mut dry = 0;
+    while dry < 5 || !speaking(c) {
+        h.capture(48_000, 1, &signal.speech(3000.0));
+        dry += 1;
+        assert!(dry < 40, "dry speech is heard");
+    }
+    assert_eq!(c.root_audio_stats().ns_gap_frames, dry);
+    assert!(!h.webrtc_ns_applied());
+
+    let released = Instant::now();
+    h.hold_worker(false);
+    wait_until("WebRTC NS applied", || h.webrtc_ns_applied());
+    let waited = released.elapsed();
+    assert!(waited < Duration::from_millis(500), "no rate limit, no pause: {waited:?}");
+    let stats = c.root_audio_stats();
+    assert!(stats.webrtc_ns_active && stats.webrtc_ns_fallback);
+    assert_eq!(stats.denoiser_bypass_reason, 2);
+    assert_eq!(stats.apm_policy_applies, before.apm_policy_applies + 1);
+    assert_eq!(
+        (stats.apm_policy_deferred, stats.apm_policy_forced),
+        (before.apm_policy_deferred, before.apm_policy_forced),
+        "applied while the user spoke, without waiting for a pause"
+    );
+    for _ in 0..5 {
+        h.capture(48_000, 1, &signal.speech(3000.0));
+    }
+    assert_eq!(c.root_audio_stats().ns_gap_frames, dry, "WebRTC NS covers the bypassed denoiser");
+    assert_eq!(h.fake_counts(pipeline).process_calls, calls, "never called again");
+}
+
+#[test]
+fn root_voice_an_install_asked_while_speaking_lands_at_the_next_pause() {
+    if !root_denoiser_supported() {
+        return;
+    }
+    let h = started();
+    let c = h.controller();
+    let mut signal = Signal::new(48_000);
+    // Past the stream's first second, so wanting a denoiser holds nothing.
+    for _ in 0..110 {
+        h.capture(48_000, 1, &signal.speech(3000.0));
+    }
+    assert!(speaking(c));
+    denoiser_wanted(&h, true);
+    let pipeline = h.add_fake_pipeline(0.5, 0);
+    let asked = Instant::now();
+    assert!(c.set_root_denoiser(3, 30, pipeline, 48_000));
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!c.root_denoiser_state().installed, "not mid-word");
+    assert!(c.take_root_denoiser_completions().is_empty());
+
+    quiet_until_released(&h, &mut signal);
+    let paused = Instant::now();
+    wait_until("the install", || c.root_denoiser_state().installed);
+    let landed = paused.elapsed();
+    assert!(landed < Duration::from_millis(500), "at the pause: {landed:?}");
+    assert!(asked.elapsed() < Duration::from_secs(3));
+    assert_eq!(completions(c, 1), [ok(3, 30)]);
+
+    for _ in 0..10 {
+        h.capture(48_000, 1, &signal.speech(3000.0));
+    }
+    assert_eq!(h.fake_counts(pipeline).process_calls, 10, "it runs from the next frame");
+    let stats = c.root_audio_stats();
+    assert_eq!((stats.denoiser_installs, stats.denoiser_frames), (1, 10));
+    assert!(!stats.webrtc_ns_fallback);
+}
+
+#[test]
+fn root_voice_an_install_lands_at_the_3_s_limit_while_the_user_keeps_talking() {
+    if !root_denoiser_supported() {
+        return;
+    }
+    let h = started();
+    let c = h.controller();
+    let mut signal = Signal::new(48_000);
+    speak_until_speaking(&h, &mut signal);
+    let pipeline = h.add_fake_pipeline(0.5, 0);
+    let asked = Instant::now();
+    assert!(c.set_root_denoiser(1, 11, pipeline, 48_000));
+    // No frame clears the published flag: the user is still talking.
+    wait_until("the install", || c.root_denoiser_state().installed);
+    let waited = asked.elapsed();
+    assert!(
+        waited >= Duration::from_millis(2_900) && waited < Duration::from_millis(4_000),
+        "{waited:?}"
+    );
+    assert!(speaking(c));
+    assert_eq!(completions(c, 1), [ok(1, 11)]);
+}
+
+#[test]
+fn root_voice_runs_at_16_and_8_khz() {
+    for rate in [16_000u32, 8_000] {
+        let h = started();
+        let c = h.controller();
+        let denoiser = root_denoiser_supported();
+        let pipeline = if denoiser {
+            denoiser_wanted(&h, true);
+            Some(install(&h, 16_000, 0.5))
+        } else {
+            None
+        };
+        let mut signal = Signal::new(rate);
+        let samples = (rate / 100) as usize;
+        for _ in 0..HOLD_FRAMES {
+            let out = h.capture(rate as i32, 1, &signal.speech(3000.0));
+            assert_eq!(out.len(), samples, "{rate}");
+            assert!(silent(&out), "{rate}: the startup hold");
+        }
+        let rose = speak_until_speaking(&h, &mut signal);
+        assert!(rose < 3, "{rate}: {rose}");
+        let format = c.root_audio_capture_format();
+        assert_eq!(
+            (format.sample_rate, format.channels),
+            (16_000, 1),
+            "{rate}: the APM runs at 16 kHz"
+        );
+        let mut loud = 0;
+        for _ in 0..30 {
+            let out = h.capture(rate as i32, 1, &signal.speech(3000.0));
+            if sumsq(&out) > samples as f64 * 300.0 * 300.0 {
+                loud += 1;
+            }
+        }
+        assert!(loud >= 15, "{rate}: {loud} loud frames of 30");
+        let quiet = quiet_until_released(&h, &mut signal);
+        assert!((40..=80).contains(&quiet), "{rate}: {quiet}");
+
+        let stats = c.root_audio_stats();
+        assert_eq!(stats.process_rate, 16_000);
+        assert_eq!(stats.stage_samples, stats.processed_frames * 160, "{rate}");
+        assert_eq!(stats.startup_hold_frames, HOLD_FRAMES as u64, "{rate}");
+        if let Some(pipeline) = pipeline {
+            let counts = h.fake_counts(pipeline);
+            assert_eq!(
+                counts.process_calls, stats.processed_frames,
+                "{rate}: every frame denoised"
+            );
+            assert_eq!((stats.denoiser_rate, stats.denoiser_bypass_reason), (16_000, 0), "{rate}");
+            assert_eq!(stats.denoiser_frames, counts.process_calls, "{rate}");
+            assert_eq!((stats.ns_gap_frames, stats.webrtc_ns_fallback), (0, false), "{rate}");
+        }
+
+        control(
+            &h,
+            RootAudioControlUpdate { has_mic_muted: true, mic_muted: true, ..Default::default() },
+        );
+        // The fade, and at 8 kHz the APM's resampler still holding a little.
+        h.capture(rate as i32, 1, &signal.speech(3000.0));
+        h.capture(rate as i32, 1, &signal.speech(3000.0));
+        for _ in 0..20 {
+            assert!(silent(&h.capture(rate as i32, 1, &signal.speech(3000.0))), "{rate}");
+            assert!(!speaking(c), "{rate}");
+        }
+    }
+}
+
+#[test]
+fn root_voice_a_new_recording_flushes_the_chain_and_the_denoiser() {
+    let h = started();
+    let c = h.controller();
+    let denoiser = root_denoiser_supported();
+    let pipeline = if denoiser {
+        denoiser_wanted(&h, true);
+        Some(install(&h, 48_000, 0.5))
+    } else {
+        None
+    };
+    let epoch = h.stream_epoch();
+    let mut signal = Signal::new(48_000);
+    speak_until_speaking(&h, &mut signal);
+    let before = c.root_audio_stats();
+    let seq = c.root_audio_speaking().seq;
+
+    h.recording(false);
+    assert!(!speaking(c), "no frame will clear it, so stopping does");
+    assert_eq!(c.root_audio_speaking().seq, seq + 1);
+    h.recording(true);
+    assert_eq!(h.stream_epoch(), epoch + 1);
+    for _ in 0..HOLD_FRAMES {
+        assert!(silent(&h.capture(48_000, 1, &signal.speech(3000.0))), "the hold starts over");
+    }
+    speak_until_speaking(&h, &mut signal);
+
+    let after = c.root_audio_stats();
+    assert_eq!(after.dsp_flushes - before.dsp_flushes, 1);
+    assert_eq!(after.dsp_resets, before.dsp_resets);
+    assert_eq!(after.startup_hold_frames - before.startup_hold_frames, HOLD_FRAMES as u64);
+    if let Some(pipeline) = pipeline {
+        let counts = h.fake_counts(pipeline);
+        assert_eq!(counts.flush_calls, 1, "the pipeline starts over with the stream");
+        assert_eq!(counts.process_calls, after.processed_frames, "and runs on every frame");
+        assert_eq!((after.denoiser_installs, after.denoiser_bypass_reason), (1, 0));
+        assert_eq!(after.ns_gap_frames, 0);
+    }
+}
+
+#[test]
+fn root_voice_stats_agree_with_what_the_chain_sent() {
+    let h = started();
+    let c = h.controller();
+    control(
+        &h,
+        RootAudioControlUpdate {
+            has_auto_gain: true,
+            auto_gain: false,
+            has_auto_sensitivity: true,
+            auto_sensitivity: false,
+            has_gate_threshold: true,
+            gate_threshold: 0.0,
+            ..Default::default()
+        },
+    );
+    let denoiser = root_denoiser_supported();
+    let pipeline = if denoiser {
+        denoiser_wanted(&h, true);
+        Some(install(&h, 48_000, 0.5))
+    } else {
+        None
+    };
+    let mut signal = Signal::new(48_000);
+    for _ in 0..HOLD_FRAMES {
+        assert!(silent(&h.capture(48_000, 1, &signal.speech(3000.0))));
+    }
+    // A threshold of 0 opens the gate fully within two blocks.
+    h.capture(48_000, 1, &signal.speech(3000.0));
+    let s0 = c.root_audio_stats();
+    let f0 = pipeline.map(|p| h.fake_counts(p));
+
+    const FRAMES: u64 = 60;
+    let mut sent = 0.0;
+    let mut rounding = 0.0;
+    let mut peak_db = f64::NEG_INFINITY;
+    for _ in 0..FRAMES {
+        let out = h.capture(48_000, 1, &signal.speech(3000.0));
+        sent += sumsq(&out);
+        rounding += out.iter().map(|&s| f64::from(s).abs() + 0.25).sum::<f64>();
+        for block in out.chunks(128) {
+            let rms = (sumsq(block) / block.len() as f64).sqrt() / 32768.0;
+            peak_db = peak_db.max(20.0 * rms.log10());
+        }
+    }
+    let s1 = c.root_audio_stats();
+
+    assert_eq!(s1.processed_frames - s0.processed_frames, FRAMES);
+    assert_eq!(s1.processed_frames, HOLD_FRAMES as u64 + 1 + FRAMES);
+    assert_eq!(s1.stage_samples - s0.stage_samples, FRAMES * 480);
+    assert_eq!(s1.transmit_frames - s0.transmit_frames, FRAMES);
+    assert_eq!(s1.gate_open_frames - s0.gate_open_frames, FRAMES);
+    assert_eq!(s1.gate_input_above_frames - s0.gate_input_above_frames, FRAMES);
+    assert_eq!(s1.startup_hold_frames, HOLD_FRAMES as u64);
+    assert_eq!((s1.unsupported_frames, s1.non_finite_samples, s1.ns_gap_frames), (0, 0, 0));
+
+    let apm = s1.apm_out_sumsq - s0.apm_out_sumsq;
+    let denoised = s1.denoised_sumsq - s0.denoised_sumsq;
+    let gate_in = s1.gate_in_sumsq - s0.gate_in_sumsq;
+    let chain_sent = s1.sent_sumsq - s0.sent_sumsq;
+    // What left the chain is what the APM sent, before its int16 rounding.
+    assert!((chain_sent - sent).abs() <= rounding, "{chain_sent} vs {sent} (bound {rounding})");
+    // Gate fully open, unity input volume, transmit gate open, no voice gain.
+    assert!((gate_in - chain_sent).abs() <= 1e-9 * chain_sent, "{gate_in} vs {chain_sent}");
+    assert!((denoised - gate_in).abs() <= 1e-9 * gate_in, "{denoised} vs {gate_in}");
+    if denoiser {
+        assert!(
+            (denoised - 0.25 * apm).abs() <= 0.02 * denoised,
+            "half the amplitude: {denoised} vs {apm}"
+        );
+    } else {
+        assert!((denoised - apm).abs() <= 1e-9 * apm);
+    }
+
+    assert!(
+        (f64::from(s1.gate_in_block_peak_db) - peak_db).abs() < 0.05,
+        "{} vs {peak_db}",
+        s1.gate_in_block_peak_db
+    );
+    assert_eq!(s1.envelope, 1.0);
+    assert_eq!((s1.threshold, s1.voice_gain_db, s1.voice_gain_settled), (0.0, 0.0, false));
+    let published = c.root_audio_speaking();
+    assert_eq!((s1.speaking, s1.speaking_seq), (published.speaking, published.seq));
+    assert!(s1.speaking && s1.gate_speaking);
+    assert!(s1.dsp_available && s1.policy_available);
+
+    if let (Some(pipeline), Some(f0)) = (pipeline, f0) {
+        let f1 = h.fake_counts(pipeline);
+        assert_eq!(f1.process_calls - f0.process_calls, FRAMES);
+        assert_eq!(s1.denoiser_frames, f1.process_calls);
+        assert_eq!(s1.denoiser_frames, s1.processed_frames, "the denoiser ran on every frame");
+        assert_eq!(s1.denoiser_process_us_buckets.iter().sum::<u64>(), s1.denoiser_frames);
+        assert_eq!(
+            (s1.denoiser_installs, s1.denoiser_rate, s1.denoiser_bypass_reason),
+            (1, 48_000, 0)
+        );
+        assert_eq!(
+            (s1.denoiser_misses, s1.denoiser_empty_outputs, s1.denoiser_bypassed_frames),
+            (0, 0, 0)
+        );
+        assert_eq!(s1.denoiser_frames_until_first_output, 0);
+        assert_eq!(
+            (s1.denoiser_latency_ms, s1.denoiser_buffered_samples, s1.denoiser_underruns),
+            (0.0, 0, 0)
+        );
+        assert_eq!(f1.last_power, 0.75, "the session's default power");
+        assert!(s1.denoiser_available && !s1.webrtc_ns_fallback);
+    }
+}

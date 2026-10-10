@@ -26,9 +26,16 @@
 #include "livekit/root_denoiser.h"
 #include "rust/cxx.h"
 
+namespace webrtc {
+class Event;
+class Thread;
+}  // namespace webrtc
+
 namespace livekit_ffi {
 class AudioDeviceController;
 class AdmProxyHarness;
+class RootVoiceHarness;
+struct RootVoiceFakeCounts;
 struct AudioDeviceSelection;
 struct AudioDeviceRequestOutcome;
 struct RootAudioNativeStats;
@@ -272,5 +279,56 @@ std::unique_ptr<AdmProxyHarness> new_adm_proxy_harness(
 std::unique_ptr<AdmProxyHarness> new_adm_proxy_harness_with_apm(
     rust::Slice<const rust::String> playout_guids,
     rust::Slice<const rust::String> recording_guids);
+
+class HarnessApmTransport;
+
+// The native voice path end to end over one RootCaptureState, wired as the
+// factory wires it: AdmProxy over a fake platform ADM, libwebrtc's builtin APM
+// with RootCaptureProcessor behind RootApmDecorator (policy changes on a
+// worker thread), the denoiser slot with fake Effects SDK pipelines, and the
+// controller with its rootapp-effects thread. A recorded frame goes device ->
+// AdmProxy -> the APM on a device thread, as the voice engine runs it. Tests
+// only; no audio device is opened.
+class RootVoiceHarness {
+ public:
+  RootVoiceHarness();
+  ~RootVoiceHarness();
+
+  const AudioDeviceController& controller() const;
+  // The app starts or stops recording (a start bumps the stream epoch).
+  void recording(bool start) const;
+  uint64_t stream_epoch() const;
+  // One 10 ms frame of interleaved int16 channels from the device; returns
+  // what the APM sends.
+  rust::Vec<int16_t> capture(int32_t rate,
+                             size_t channels,
+                             rust::Slice<const int16_t> input) const;
+  // A fake Effects SDK pipeline owned by the harness: output round(scale x
+  // input) delayed by delay_samples.
+  uint64_t add_fake_pipeline(float scale, uint32_t delay_samples) const;
+  // Every output of that pipeline is empty from now on (or again not).
+  void set_fake_empty(uint64_t pipeline, bool empty) const;
+  RootVoiceFakeCounts fake_counts(uint64_t pipeline) const;
+  // Holds the worker thread, so policy applications wait, until released.
+  void hold_worker(bool hold) const;
+  // What the decorator applied, as the capture processor reads it.
+  bool webrtc_ns_applied() const;
+
+ private:
+  RootFakeFxPipeline* Fake(uint64_t pipeline) const;
+
+  std::unique_ptr<webrtc::Thread> worker_;
+  webrtc::scoped_refptr<FakePlatformAdm> fake_;
+  webrtc::scoped_refptr<RootAudioMixer> mixer_;
+  std::shared_ptr<RootCaptureState> capture_;
+  webrtc::scoped_refptr<RootApmDecorator> apm_;
+  std::unique_ptr<HarnessApmTransport> transport_;
+  webrtc::scoped_refptr<AdmProxy> proxy_;
+  std::unique_ptr<AudioDeviceController> controller_;
+  mutable std::vector<std::unique_ptr<RootFakeFxPipeline>> fakes_;
+  std::shared_ptr<webrtc::Event> worker_hold_;
+};
+
+std::unique_ptr<RootVoiceHarness> new_root_voice_harness();
 
 }  // namespace livekit_ffi

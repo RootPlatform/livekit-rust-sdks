@@ -252,12 +252,22 @@ pub mod ffi {
         pub seq: u64,
     }
 
+    /// What a fake Effects SDK pipeline was asked (tests).
+    #[derive(Debug, Clone, Copy, Default, PartialEq)]
+    pub struct RootVoiceFakeCounts {
+        pub process_calls: u64,
+        pub flush_calls: u64,
+        pub power_sets: u64,
+        pub last_power: f32,
+    }
+
     unsafe extern "C++" {
         include!("livekit/audio_device_controller.h");
         include!("livekit/peer_connection_factory.h");
 
         type AudioDeviceController;
         type AdmProxyHarness;
+        type RootVoiceHarness;
         type PeerConnectionFactory = crate::peer_connection_factory::ffi::PeerConnectionFactory;
 
         fn audio_device(self: &PeerConnectionFactory) -> SharedPtr<AudioDeviceController>;
@@ -450,6 +460,30 @@ pub mod ffi {
         fn latch_denoiser_bypass(self: &AdmProxyHarness, reason: u32);
         /// Stores the speaking flag as the capture processor publishes it.
         fn set_speaking(self: &AdmProxyHarness, speaking: bool);
+
+        /// The voice path end to end over one capture state, wired as the
+        /// factory does: AdmProxy over a fake platform ADM, the builtin APM
+        /// with the capture processor behind the decorator (policy on a worker
+        /// thread), the denoiser slot and the controller (tests only; no
+        /// device). A session has started; recording has not.
+        fn new_root_voice_harness() -> UniquePtr<RootVoiceHarness>;
+        fn controller(self: &RootVoiceHarness) -> &AudioDeviceController;
+        /// The app starts or stops recording (a start bumps the stream epoch).
+        fn recording(self: &RootVoiceHarness, start: bool);
+        fn stream_epoch(self: &RootVoiceHarness) -> u64;
+        /// One 10 ms frame of interleaved channels from the device, through
+        /// AdmProxy and the APM on a device thread; returns what is sent.
+        fn capture(self: &RootVoiceHarness, rate: i32, channels: usize, input: &[i16]) -> Vec<i16>;
+        /// A fake Effects SDK pipeline (output round(scale x input) delayed
+        /// by delay_samples) owned by the harness.
+        fn add_fake_pipeline(self: &RootVoiceHarness, scale: f32, delay_samples: u32) -> u64;
+        /// Every output of that pipeline is empty from now on (or again not).
+        fn set_fake_empty(self: &RootVoiceHarness, pipeline: u64, empty: bool);
+        fn fake_counts(self: &RootVoiceHarness, pipeline: u64) -> RootVoiceFakeCounts;
+        /// Holds the worker thread (policy applications wait) until released.
+        fn hold_worker(self: &RootVoiceHarness, hold: bool);
+        /// What the decorator applied, as the capture processor reads it.
+        fn webrtc_ns_applied(self: &RootVoiceHarness) -> bool;
     }
 
     extern "Rust" {
