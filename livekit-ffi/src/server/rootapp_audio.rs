@@ -894,6 +894,33 @@ impl From<RootAudioStats> for proto::RootAudioStats {
             audio_thread_logs_dropped: Some(stats.audio_thread_logs_dropped),
             overlapping_callbacks: Some(stats.overlapping_callbacks),
             device_stop_failures: Some(stats.device_stop_failures),
+            speaking: None,
+            gate_input_above_frames: None,
+            startup_hold_frames: None,
+            transmit_frames: None,
+            unsupported_frames: None,
+            non_finite_samples: None,
+            dsp_resets: None,
+            dsp_flushes: None,
+            gate_open_delay_us: None,
+            ns_gap_frames: None,
+            denoiser_rate: None,
+            denoiser_installs: None,
+            denoiser_bypassed_frames: None,
+            denoiser_process_us_buckets: Vec::new(),
+            denoiser_other_notifications: None,
+            denoiser_latency_ms: None,
+            denoiser_buffered_samples: None,
+            denoiser_underruns: None,
+            denoiser_padded_samples: None,
+            denoiser_trimmed_samples: None,
+            denoiser_drained_samples: None,
+            denoiser_frames_until_first_output: None,
+            webrtc_ns_fallback: None,
+            apm_policy_applies: None,
+            apm_policy_deferred: None,
+            apm_policy_forced: None,
+            apm_policy_pending: None,
         }
     }
 }
@@ -941,6 +968,7 @@ mod tests {
             gate_threshold: Some(3.0),
             auto_sensitivity: Some(true),
             gain_reset_db: Some(f32::NAN),
+            denoiser_wanted: None,
         });
         assert_eq!(control.push_to_talk, Some(PushToTalk::Released));
         assert_eq!(control.input_volume, Some(0.0));

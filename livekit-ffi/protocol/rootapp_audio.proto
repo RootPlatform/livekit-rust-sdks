@@ -51,31 +51,41 @@ message RootAudioSetPlayoutHoldResponse {
 
 // Live control. Only the fields that are set change. Values are sanitised natively (finite, clamped).
 // The response's error says "not supported by this build" when a set field has nothing to act on
-// (the other fields are applied).
+// (the other fields are applied). Fields 8-13 act with the DSP chain (capability DSP; denoise_power
+// and denoiser_wanted with DENOISER) and are only stored by builds without it.
 message RootAudioControl {
-  // Gate: no audio leaves and no speaking is reported while muted. The gate fades over 5 ms each
+  // Transmit gate: no audio leaves and no speaking is reported while muted. It fades over 5 ms each
   // way; mic_muted and push_to_talk of one control change together.
   optional bool mic_muted = 1;
-  // 0 = voice activity, 1 = push-to-talk key held (gate forced open), 2 = key up (gate closed);
-  // other values close the gate.
+  // 0 = voice activity (the noise gate decides), 1 = push-to-talk key held (gate forced open),
+  // 2 = key up (gate closed); other values close the gate.
   optional uint32 push_to_talk = 2;
-  // Linear input gain after the gate, 0..2.
+  // Linear input gain after the noise gate, 0..2 (20 ms ramp).
   optional float input_volume = 3;
   // Output volume slider value / 100 (0..2); the curve is applied natively.
   optional float master_volume = 4;
   optional bool deafened = 5;
+  // Echo cancellation and WebRTC noise suppression: the host's APM policy. Each change re-initialises
+  // the echo canceller, so changes are applied at most once a second and, with the DSP chain, at a
+  // pause in the user's speech (at most 3 s later). Independently of webrtc_noise_suppression, native
+  // turns WebRTC NS on by itself (at once, no pause or rate limit) while denoiser_wanted is set and the
+  // denoiser stopped (RootAudioStats.webrtc_ns_fallback).
   optional bool echo_cancellation = 6;
-  // WebRTC noise suppression (interim denoiser and Effects SDK fallback).
   optional bool webrtc_noise_suppression = 7;
-  // Effects SDK power 0..1 (0 = pass-through).
+  // Effects SDK power 0..1 (0 = pass-through), applied to the installed pipeline on the next frame.
   optional float denoise_power = 8;
-  // Voice gain (the app's automatic gain control).
+  // Voice gain (the app's automatic gain control). Turning it on restarts it from the last
+  // gain_reset_db (0 dB before any).
   optional bool auto_gain = 9;
-  // Gate threshold, linear RMS (manual sensitivity).
+  // Noise gate threshold, linear RMS of a ±1 signal, 0..1 (manual sensitivity).
   optional float gate_threshold = 10;
+  // The threshold follows the noise floor instead of gate_threshold.
   optional bool auto_sensitivity = 11;
-  // Command: restart the voice gain from this gain in dB.
+  // Command: restart the voice gain from this gain in dB (0..18); every set value restarts it once.
   optional float gain_reset_db = 12;
+  // The host's noise suppression mode is the Effects SDK: a stream's startup hold waits for the
+  // denoiser (at most 1 s), and native WebRTC NS covers a denoiser that stops or does not arrive.
+  optional bool denoiser_wanted = 13;
 }
 message RootAudioSetControlRequest {
   required uint64 platform_audio_handle = 1;
@@ -132,9 +142,17 @@ message RootAudioStopEffectsResponse {
   optional string error = 1;
 }
 
-// Effects SDK pipeline hand-off. pipeline_ptr is an audio_effects_sdk::IPipeline* created by the app
-// at the capture rate from RootAudioEvent.capture_format with pcmScale 32768; 0 removes the
-// pipeline. Removed or replaced pipelines come back in RootAudioEvent.pipelines_returned for release.
+// Effects SDK pipeline hand-off (capability DENOISER). pipeline_ptr is an audio_effects_sdk::IPipeline*
+// the app created with createPipeline(pcmFloat32, sample_rate, 1 channel, pcmScale 32768) at the
+// capture processor's rate (RootAudioEvent.capture_format, RootAudioStats.process_rate), with
+// streaming latency, noise suppression on, its power set and the notification handler from
+// livekit_ffi_rootapp_denoiser_notification_handler() installed; native never calls release().
+// A pipeline is installed at a pause in the user's speech (at most 3 s after the request) and
+// replaces the previous one; 0 removes the installed pipeline at once. Completion arrives as
+// RootAudioEvent.denoiser_result with the async_id: on success native owns the pipeline until it
+// comes back in RootAudioEvent.pipelines_returned (removed, replaced, or the last handle dropped);
+// on an error native never held it and the app releases it. A pipeline whose rate is not the
+// processor's is bypassed (RootAudioStats.denoiser_bypass_reason 1) until a matching one arrives.
 message RootAudioSetDenoiserRequest {
   required uint64 platform_audio_handle = 1;
   required uint64 pipeline_ptr = 2;
@@ -143,7 +161,9 @@ message RootAudioSetDenoiserRequest {
 message RootAudioSetDenoiserResponse {
   required uint64 async_id = 1;
 }
-// Returns every pipeline native holds (app exit). Synchronous; waits for the audio thread to let go.
+// Returns every pipeline native holds, installed or waiting to be (app exit, before the SDK factory's
+// waitUntilAsyncWorkFinished). Synchronous; waits up to 200 ms for the audio thread to let go of the
+// installed one (on a timeout it stays installed and error says so). Later SetDenoiser requests work.
 message RootAudioReturnPipelinesRequest {
   required uint64 platform_audio_handle = 1;
 }
@@ -196,7 +216,11 @@ message RootAudioStats {
   required uint64 effects_played = 26;
   required uint64 effects_dropped = 27;
 
-  // Capture processing (zero until the processor runs).
+  // Capture processing (zero until the processor runs). Stage levels are channel 0 of every processed
+  // frame: the APM output, after the denoiser (and its aligner), the noise gate's input (after the
+  // voice gain and the startup hold) and what is sent; stage_samples counts the samples behind each.
+  // denoised_sumsq, gate_in_sumsq, fields 38-45 and 74-83 come from the DSP chain (capability DSP);
+  // without it they stay 0, false, or NaN for dB values.
   required uint64 processed_frames = 30;
   required uint32 process_rate = 31;
   required uint32 process_channels = 32;
@@ -205,16 +229,30 @@ message RootAudioStats {
   required double gate_in_sumsq = 35;
   required double sent_sumsq = 36;
   required uint64 stage_samples = 37;
+  // Loudest gate block (about 2.7 ms) at the gate input since the previous read, dBFS of a ±1 signal
+  // (reset on read; -inf when every block was silent, NaN before any frame).
   required float gate_in_block_peak_db = 38;
+  // The gate's threshold on the last frame (linear RMS of a ±1 signal; the automatic one in auto mode).
   required float threshold = 39;
+  // Highest gate envelope (0..1) since the previous read (reset on read).
   required float envelope = 40;
+  // The noise gate's own speaking state on the last frame (envelope plus its 300 ms hold), muted or not.
   required bool gate_speaking = 41;
+  // Transitions of `speaking` (the value RootAudioEvent.speaking reports).
   required uint64 speaking_seq = 42;
+  // The voice gain on the last frame, and whether it heard enough speech to be remembered.
   required float voice_gain_db = 43;
   required bool voice_gain_settled = 44;
+  // Frames that ended with the gate envelope above 0.
   required uint64 gate_open_frames = 45;
 
-  // Denoiser.
+  // Denoiser (capability DENOISER). denoiser_frames counts process() calls; denoiser_misses frames
+  // the slot was busy (installing or removing) and passed dry; denoiser_slow_frames process() calls
+  // over 5 ms; denoiser_notifications the SDK's slowProcessing notifications through the native
+  // handler (process-wide, cumulative). denoiser_bypass_reason: 0 none, 1 rate mismatch (until a
+  // pipeline at the processor's rate is installed), 2 output stalled (100 empty outputs in a row),
+  // 3 slow (3 calls over 5 ms within 60 s, or one over 20 ms); 2 and 3 last until the pipeline is
+  // replaced or removed.
   required bool denoiser_installed = 50;
   required uint64 denoiser_frames = 51;
   required uint64 denoiser_misses = 52;
@@ -240,6 +278,66 @@ message RootAudioStats {
   optional uint64 audio_thread_logs_dropped = 71;
   optional uint64 overlapping_callbacks = 72;
   optional uint64 device_stop_failures = 73;
+
+  // DSP chain (capability DSP; absent from builds without it).
+  // What RootAudioEvent.speaking reports, on the last frame: gate_speaking while the transmit gate is
+  // open (not muted, push-to-talk key not up).
+  optional bool speaking = 74;
+  // Frames whose gate input RMS was above the threshold (the input duty cycle).
+  optional uint64 gate_input_above_frames = 75;
+  // Frames the startup hold silenced: a stream's first 20, and while denoiser_wanted up to its 100th
+  // until the denoiser runs.
+  optional uint64 startup_hold_frames = 76;
+  // Frames that left with the transmit gate open (any part of them).
+  optional uint64 transmit_frames = 77;
+  // Frames the chain could not process (rate outside 8-48 kHz or not rate/100 samples): only the
+  // transmit gate applied.
+  optional uint64 unsupported_frames = 78;
+  // Non-finite samples (NaN, ±Inf) in the APM output or the denoiser output, replaced by 0.
+  optional uint64 non_finite_samples = 79;
+  // Session starts (everything per stream starts over) and stream (re)starts (recording started,
+  // or the processing rate changed: the denoiser, its aligner and the startup hold start over).
+  optional uint64 dsp_resets = 80;
+  optional uint64 dsp_flushes = 81;
+  // The last time the transmit gate went from closed to open (unmute, push-to-talk press): from the
+  // control reaching native to the first frame processed with it open; 0 before any.
+  optional uint64 gate_open_delay_us = 82;
+  // Frames sent with the transmit gate open while denoiser_wanted was set but neither the denoiser
+  // ran nor WebRTC NS was applied (startup hold excluded): a gap in noise suppression.
+  optional uint64 ns_gap_frames = 83;
+
+  // Denoiser details (capability DENOISER; absent without it).
+  // The installed pipeline's rate (0 none), pipelines installed so far, and frames passed dry
+  // because the installed pipeline is bypassed.
+  optional uint32 denoiser_rate = 84;
+  optional uint64 denoiser_installs = 85;
+  optional uint64 denoiser_bypassed_frames = 86;
+  // Cumulative histogram of process() durations: 16 buckets with upper bounds 50, 100, 150, 200,
+  // 300, 400, 500, 750, 1000, 1500, 2000, 3000, 5000, 10000, 20000 µs and the rest.
+  repeated uint64 denoiser_process_us_buckets = 87;
+  // Notifications with a code other than slowProcessing.
+  optional uint64 denoiser_other_notifications = 88;
+  // The aligner (DenoiseFrameAligner): latency it added (inserted minus drained and trimmed),
+  // samples it holds, and its cumulative underruns and padded, trimmed and drained samples.
+  optional float denoiser_latency_ms = 89;
+  optional uint32 denoiser_buffered_samples = 90;
+  optional uint64 denoiser_underruns = 91;
+  optional uint64 denoiser_padded_samples = 92;
+  optional uint64 denoiser_trimmed_samples = 93;
+  optional uint64 denoiser_drained_samples = 94;
+  // process() calls of the installed pipeline before its first output (-1 none yet or no pipeline).
+  optional int32 denoiser_frames_until_first_output = 95;
+  // Native turned WebRTC NS on because denoiser_wanted is set and the denoiser stopped (output
+  // stalled or slow: at once) or is missing, bypassed for its rate or removed for over 1 s.
+  optional bool webrtc_ns_fallback = 96;
+
+  // APM policy (echo cancellation and WebRTC NS changes): applications that reached the APM, those
+  // that waited for a pause in speech, those made at the 3 s limit while the user spoke, and whether
+  // a change is waiting now (rate limit or speech).
+  optional uint64 apm_policy_applies = 97;
+  optional uint64 apm_policy_deferred = 98;
+  optional uint64 apm_policy_forced = 99;
+  optional bool apm_policy_pending = 100;
 }
 message RootAudioStatsRequest {
   required uint64 platform_audio_handle = 1;
@@ -249,6 +347,9 @@ message RootAudioStatsResponse {
   optional string error = 2;
 }
 
+// The local user's speaking state (capability DSP): the noise gate's speaking while the transmit gate
+// is open. Sent when it differs from the last value sent to this handle (polled every 10 ms, so
+// transitions shorter than that are merged); seq is RootAudioStats.speaking_seq at that time.
 message RootAudioSpeaking {
   required bool speaking = 1;
   required uint64 seq = 2;
@@ -260,6 +361,8 @@ message RootAudioCaptureFormat {
   required uint32 sample_rate = 1;
   required uint32 channels = 2;
 }
+// Pipelines native no longer holds, for the app to release, each sent once: to the handle that set
+// it while that handle lives, else to the newest live handle.
 message RootAudioPipelinesReturned {
   repeated uint64 pipelines = 1;
 }
@@ -272,6 +375,14 @@ message RootAudioDenoiserResult {
   required uint64 async_id = 1;
   optional string error = 2;
 }
+// The denoiser slot's state (capability DENOISER), sent when any field changes and about 100 ms after
+// the handle is created. bypass_reason as RootAudioStats.denoiser_bypass_reason.
+message RootAudioDenoiserState {
+  required bool installed = 1;
+  required uint32 rate = 2;
+  required uint32 bypass_reason = 3;
+  required bool webrtc_ns_fallback = 4;
+}
 
 message RootAudioEvent {
   required uint64 platform_audio_handle = 1;
@@ -281,5 +392,6 @@ message RootAudioEvent {
     RootAudioPipelinesReturned pipelines_returned = 4;
     RootAudioDeviceResult device_result = 5;
     RootAudioDenoiserResult denoiser_result = 6;
+    RootAudioDenoiserState denoiser_state = 7;
   }
 }
