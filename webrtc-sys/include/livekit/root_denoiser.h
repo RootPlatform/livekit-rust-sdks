@@ -18,6 +18,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -142,6 +143,7 @@ class RootDenoiserSlot {
   // frame (frames = rate / 100); `out` receives up to 8 x frames samples.
   // `flush` asks for flush(nullptr, 0) before the next process() (kept until
   // one runs; a new pipeline needs none). `power` is applied when it changed.
+  // A rate-mismatch bypass ends, with a flush, once the frames fit again.
   RootDenoiseResult ProcessAudio(const float* in,
                                  size_t frames,
                                  int sample_rate,
@@ -222,11 +224,14 @@ class RootDenoiserSlot {
 
 // Native WebRTC NS covering a denoiser that is wanted but not running: on at
 // once when the installed pipeline was bypassed for a stalled output or slow
-// frames, on after `grace_ms` when none runs for another reason (missing,
-// removed, bypassed for its rate); off once it runs again or is not wanted.
+// frames, on after `grace_ms` of frames when none runs for another reason
+// (missing, removed, bypassed for its rate); off once it runs again or is not
+// wanted. The grace only counts while frames flow (processed_frames moved in
+// the last kFlowingMs) and starts over with each new stream.
 class RootNsFallback {
  public:
   static constexpr int64_t kGraceMs = 1000;
+  static constexpr int64_t kFlowingMs = 100;
 
   explicit RootNsFallback(int64_t grace_ms = kGraceMs);
 
@@ -236,7 +241,9 @@ class RootNsFallback {
                              bool installed,
                              RootDenoiserBypass bypass,
                              uint32_t pipeline_rate,
-                             uint32_t process_rate);
+                             uint32_t process_rate,
+                             uint64_t processed_frames,
+                             uint64_t stream_epoch);
   bool on() const { return on_; }
   void Reset();
 
@@ -244,6 +251,9 @@ class RootNsFallback {
   const int64_t grace_ms_;
   bool on_ = false;
   std::optional<int64_t> inactive_since_ms_;
+  uint64_t frames_ = 0;
+  std::optional<int64_t> frames_moved_ms_;
+  uint64_t epoch_ = 0;
 };
 
 struct RootDenoiserCompletion {
@@ -251,6 +261,9 @@ struct RootDenoiserCompletion {
   uint64_t async_id = 0;
   // Empty on success.
   std::string error;
+  // With an error, the request's pipeline when native let go of it and lists
+  // it nowhere else (superseded, busy); 0 otherwise.
+  uint64_t pipeline = 0;
 };
 
 struct RootDenoiserReturned {
@@ -269,14 +282,24 @@ struct RootDenoiserReturnAll {
 // most install_wait_ms), runs the WebRTC NS fallback every tick, and keeps the
 // completions and returned pipelines until the FFI layer takes them. Owners
 // are the FFI handles that made the requests.
+//
+// A pipeline is named in an error completion, the returned list or a
+// ReturnAll result only once native holds it nowhere (installed, being
+// installed, waiting or queued), so a pipeline handed over twice is never
+// given back while native may still call it: the request whose pipeline
+// native still holds completes as a success instead.
 class RootDenoiserControl {
  public:
   struct Hooks {
-    // The published speaking flag.
+    // The user is audibly speaking (an install waits for a pause).
     std::function<bool()> speaking;
     std::function<bool()> wanted;
     // The capture processor's rate, 0 before any frame.
     std::function<uint32_t()> process_rate;
+    // Frames the capture processor ran, and the recording (re)start count:
+    // the missing-denoiser grace only counts while frames flow.
+    std::function<uint64_t()> processed_frames;
+    std::function<uint64_t()> stream_epoch;
     // Turns the native WebRTC NS fallback on or off.
     std::function<void(bool)> set_fallback;
   };
@@ -301,15 +324,18 @@ class RootDenoiserControl {
   RootDenoiserControl(const RootDenoiserControl&) = delete;
   RootDenoiserControl& operator=(const RootDenoiserControl&) = delete;
 
-  // Queues an install (`pipeline` non-zero) or a removal; completes once.
+  // Queues an install (`pipeline` non-zero) or a removal; completes once. A
+  // pipeline returned but not taken back yet is held again.
   void Set(uint64_t owner, uint64_t async_id, uint64_t pipeline, uint32_t rate);
   // Something the fallback depends on changed (denoiser_wanted).
   void Wake();
   // Every pipeline held, waiting or not yet taken back: the requests still
   // waiting complete with kErrorReturned and the installed one is removed.
+  // Waiting for a change in progress and for the audio thread share one
+  // control_timeout_ms budget.
   RootDenoiserReturnAll ReturnAll();
   // The last session ended: the installed and waiting pipelines go to the
-  // returned list and the fallback is off.
+  // returned list and the fallback is off (same budget as ReturnAll).
   void Reset();
   std::vector<RootDenoiserCompletion> TakeCompletions();
   std::vector<RootDenoiserReturned> TakeReturned();
@@ -331,21 +357,34 @@ class RootDenoiserControl {
   // Takes mutex_ again before returning.
   void CommitLocked(std::unique_lock<std::mutex>& lock, uint64_t seq);
   bool TickLocked(int64_t now_ms);
-  void CompleteLocked(const Request& request, std::string error);
-  void ReturnLocked(uint64_t owner, RootFxPipeline* pipeline);
+  // Native holds `pipeline` (installed, being installed, waiting or queued).
+  bool HeldLocked(uint64_t pipeline) const;
+  void CompleteLocked(const Request& request,
+                      std::string error,
+                      uint64_t released_pipeline);
+  // A request that ends without installing its pipeline.
+  void FailLocked(const Request& request, const char* error);
+  void ReturnLocked(uint64_t owner, uint64_t pipeline);
   void DrainRequestsLocked(const char* error, std::vector<uint64_t>* into);
+  // Removes the installed pipeline within the shared budget (slot_mutex_ and
+  // the audio thread); false when it stays installed.
+  bool RemoveWithin(std::chrono::steady_clock::time_point deadline,
+                    uint64_t* previous);
 
   const std::shared_ptr<RootDenoiserSlot> slot_;
   const Hooks hooks_;
   const Timing timing_;
 
   // Serialises the control side's slot changes; taken before mutex_.
-  std::mutex slot_mutex_;
+  std::timed_mutex slot_mutex_;
   mutable std::mutex mutex_;
   std::condition_variable wake_;
   std::deque<Request> queue_;
   std::optional<Request> waiting_;
   uint64_t next_seq_ = 0;
+  // What the control side installed, and the pipeline it is installing.
+  uint64_t installed_pipeline_ = 0;
+  uint64_t in_flight_pipeline_ = 0;
   uint64_t installed_owner_ = 0;
   std::vector<RootDenoiserCompletion> completions_;
   std::vector<RootDenoiserReturned> returned_;
@@ -373,7 +412,8 @@ void root_denoiser_notify_for_test(rust::Slice<const int32_t> codes,
 // input) delayed by delay_samples (a FIFO that starts, and restarts on a flush,
 // with that many zeros). Call numbers count from 1 after construction or a
 // flush; burst_call pops two frames' worth, calls [empty_from, empty_from +
-// empty_count) return nothing.
+// empty_count) return nothing. Process, flush and the power setter each
+// busy-wait sleep_us.
 struct RootFakeFxConfig {
   float scale = 1.0f;
   uint32_t delay_samples = 0;
@@ -429,6 +469,8 @@ class RootFakeFxPipeline {
   static const RootFxPipelineVtbl kVtbl;
 
   void Touch();
+  // Busy-waits sleep_us (process, flush and the power setter).
+  void Spin() const;
   void Restart();
 
   Object object_;
@@ -476,14 +518,19 @@ class RootDenoiserHarness {
   void latch_bypass(uint32_t reason) const;
   RootDenoiserSlotInfo slot_info(bool take_max) const;
 
-  // A thread calling ProcessAudio back to back on a tone at `rate`.
-  void start_audio(uint32_t rate) const;
+  // A thread calling ProcessAudio back to back on a tone at `rate`, and
+  // LatchBypass(kOutputStalled) after every `latch_every`-th frame (0 never),
+  // as the capture processor does for a stalled output.
+  void start_audio(uint32_t rate, uint32_t latch_every) const;
   // Stops it; returns how many frames it ran.
   uint64_t stop_audio() const;
 
   void set_speaking(bool speaking) const;
   void set_wanted(bool wanted) const;
   void set_process_rate(uint32_t rate) const;
+  // Whether the processed-frames hook moves (it does from the start).
+  void set_frames_flowing(bool flowing) const;
+  void bump_stream_epoch() const;
   void request(uint64_t owner,
                uint64_t async_id,
                uint64_t pipeline,
@@ -504,7 +551,9 @@ class RootDenoiserHarness {
                          bool installed,
                          uint32_t bypass,
                          uint32_t pipeline_rate,
-                         uint32_t process_rate) const;
+                         uint32_t process_rate,
+                         uint64_t processed_frames,
+                         uint64_t stream_epoch) const;
 
  private:
   struct State;

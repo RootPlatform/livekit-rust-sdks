@@ -104,6 +104,12 @@ AudioDeviceController::AudioDeviceController(
   hooks.process_rate = [state] {
     return ReadCaptureFormat(*state).sample_rate;
   };
+  hooks.processed_frames = [state] {
+    return state->processed_frames.load(std::memory_order_relaxed);
+  };
+  hooks.stream_epoch = [state] {
+    return state->stream_epoch.load(std::memory_order_relaxed);
+  };
   hooks.set_fallback = [decorator](bool on) {
     if (decorator) {
       decorator->SetFallbackNoiseSuppression(on);

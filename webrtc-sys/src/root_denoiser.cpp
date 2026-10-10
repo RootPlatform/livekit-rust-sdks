@@ -110,16 +110,27 @@ RootDenoiseResult RootDenoiserSlot::ProcessAudio(const float* in,
   }
   ApplyPendingBypass();
   RootFxPipeline* const pipeline = pipeline_;
-  if (!pipeline || bypass_.load(std::memory_order_relaxed) != 0) {
+  const size_t rate = sample_rate > 0 ? static_cast<size_t>(sample_rate) : 0;
+  const bool fits = rate == pipeline_rate_ && frames != 0 &&
+                    frames == rate / 100 && in && out &&
+                    out_capacity >= kOutputFrames * frames;
+  uint32_t bypass = bypass_.load(std::memory_order_relaxed);
+  if (pipeline && fits &&
+      bypass == static_cast<uint32_t>(RootDenoiserBypass::kRateMismatch)) {
+    // The rate is back (a device flapping between rates). The pipeline missed
+    // everything since, so it starts over.
+    bypass = 0;
+    bypass_.store(0, std::memory_order_relaxed);
+    flush_pending_ = true;
+  }
+  if (!pipeline || bypass != 0) {
     owner_.store(kFree, std::memory_order_release);
     if (pipeline) {
       bypassed_frames_.fetch_add(1, std::memory_order_relaxed);
     }
     return {};
   }
-  const size_t rate = sample_rate > 0 ? static_cast<size_t>(sample_rate) : 0;
-  if (rate != pipeline_rate_ || frames == 0 || frames != rate / 100 || !in ||
-      !out || out_capacity < kOutputFrames * frames) {
+  if (!fits) {
     bypass_.store(static_cast<uint32_t>(RootDenoiserBypass::kRateMismatch),
                   std::memory_order_relaxed);
     owner_.store(kFree, std::memory_order_release);
@@ -135,6 +146,8 @@ RootDenoiseResult RootDenoiserSlot::ProcessAudio(const float* in,
     calls_before_output_ = 0;
     slow_count_ = 0;
   }
+  // Everything the SDK does on this frame is timed: flush, power and process.
+  const int64_t start_us = NowUs();
   if (flush_pending_) {
     if (!restart) {
       pipeline->vtbl->flush(pipeline, nullptr, 0);
@@ -150,7 +163,6 @@ RootDenoiseResult RootDenoiserSlot::ProcessAudio(const float* in,
   }
 
   const uint32_t capacity = static_cast<uint32_t>(kOutputFrames * frames);
-  const int64_t start_us = NowUs();
   uint32_t samples = pipeline->vtbl->process(
       pipeline, in, static_cast<uint32_t>(frames), out, capacity);
   const int64_t end_us = NowUs();
@@ -364,18 +376,34 @@ std::optional<bool> RootNsFallback::Update(int64_t now_ms,
                                            bool installed,
                                            RootDenoiserBypass bypass,
                                            uint32_t pipeline_rate,
-                                           uint32_t process_rate) {
+                                           uint32_t process_rate,
+                                           uint64_t processed_frames,
+                                           uint64_t stream_epoch) {
+  if (processed_frames != frames_) {
+    frames_ = processed_frames;
+    frames_moved_ms_ = now_ms;
+  }
+  const bool flowing =
+      frames_moved_ms_.has_value() && now_ms - *frames_moved_ms_ <= kFlowingMs;
+  if (stream_epoch != epoch_) {
+    epoch_ = stream_epoch;
+    inactive_since_ms_.reset();
+  }
   const bool active = installed && bypass == RootDenoiserBypass::kNone &&
                       (process_rate == 0 || pipeline_rate == process_rate);
   bool on = false;
   if (wanted && !active) {
-    if (!inactive_since_ms_) {
+    if (!flowing) {
+      inactive_since_ms_.reset();
+    } else if (!inactive_since_ms_) {
       inactive_since_ms_ = now_ms;
     }
     const bool died =
         installed && (bypass == RootDenoiserBypass::kOutputStalled ||
                       bypass == RootDenoiserBypass::kSlow);
-    on = on_ || died || now_ms - *inactive_since_ms_ >= grace_ms_;
+    on = on_ || died ||
+         (inactive_since_ms_.has_value() &&
+          now_ms - *inactive_since_ms_ >= grace_ms_);
   } else {
     inactive_since_ms_.reset();
   }
@@ -389,6 +417,7 @@ std::optional<bool> RootNsFallback::Update(int64_t now_ms,
 void RootNsFallback::Reset() {
   on_ = false;
   inactive_since_ms_.reset();
+  frames_moved_ms_.reset();
 }
 
 // =============================================================================
@@ -426,6 +455,13 @@ void RootDenoiserControl::Set(uint64_t owner,
                               uint32_t rate) {
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (pipeline != 0) {
+      returned_.erase(std::remove_if(returned_.begin(), returned_.end(),
+                                     [pipeline](const RootDenoiserReturned& r) {
+                                       return r.pipeline == pipeline;
+                                     }),
+                      returned_.end());
+    }
     Request request;
     request.seq = ++next_seq_;
     request.owner = owner;
@@ -458,12 +494,15 @@ void RootDenoiserControl::Run() {
     }
     if (waiting_) {
       if (waiting_->pipeline != 0 && !queue_.empty()) {
-        CompleteLocked(*waiting_, kErrorSuperseded);
+        const Request superseded = *waiting_;
         waiting_.reset();
+        FailLocked(superseded, kErrorSuperseded);
         continue;
       }
+      // Re-installing the installed pipeline changes nothing: no wait.
       const bool ready =
           waiting_->pipeline == 0 ||
+          waiting_->pipeline == installed_pipeline_ ||
           now_ms - waiting_->since_ms >= timing_.install_wait_ms ||
           !(hooks_.speaking && hooks_.speaking());
       if (ready) {
@@ -486,13 +525,20 @@ void RootDenoiserControl::Run() {
 void RootDenoiserControl::CommitLocked(std::unique_lock<std::mutex>& lock,
                                        uint64_t seq) {
   lock.unlock();
-  std::lock_guard<std::mutex> slot_lock(slot_mutex_);
+  std::lock_guard<std::timed_mutex> slot_lock(slot_mutex_);
   lock.lock();
   if (!waiting_ || waiting_->seq != seq) {
     return;
   }
   const Request request = *waiting_;
   waiting_.reset();
+  if (request.pipeline != 0 && request.pipeline == installed_pipeline_) {
+    // Handed over again while installed: nothing to swap or give back.
+    installed_owner_ = request.owner;
+    CompleteLocked(request, std::string(), 0);
+    return;
+  }
+  in_flight_pipeline_ = request.pipeline;
   lock.unlock();
   RootFxPipeline* previous = nullptr;
   const bool done =
@@ -501,21 +547,28 @@ void RootDenoiserControl::CommitLocked(std::unique_lock<std::mutex>& lock,
                            timing_.control_timeout_ms, &previous)
           : slot_->Remove(timing_.control_timeout_ms, &previous);
   lock.lock();
+  in_flight_pipeline_ = 0;
   if (!done) {
-    CompleteLocked(request, kErrorBusy);
+    FailLocked(request, kErrorBusy);
     return;
   }
-  ReturnLocked(installed_owner_, previous);
+  const uint64_t previous_owner = installed_owner_;
+  installed_pipeline_ = request.pipeline;
   installed_owner_ = request.pipeline != 0 ? request.owner : 0;
-  CompleteLocked(request, std::string());
+  ReturnLocked(previous_owner, Address(previous));
+  CompleteLocked(request, std::string(), 0);
 }
 
 bool RootDenoiserControl::TickLocked(int64_t now_ms) {
   const bool wanted = hooks_.wanted && hooks_.wanted();
   const bool installed = slot_->installed();
   const uint32_t process_rate = hooks_.process_rate ? hooks_.process_rate() : 0;
-  const std::optional<bool> change = fallback_.Update(
-      now_ms, wanted, installed, slot_->bypass(), slot_->rate(), process_rate);
+  const uint64_t frames =
+      hooks_.processed_frames ? hooks_.processed_frames() : 0;
+  const uint64_t epoch = hooks_.stream_epoch ? hooks_.stream_epoch() : 0;
+  const std::optional<bool> change =
+      fallback_.Update(now_ms, wanted, installed, slot_->bypass(),
+                       slot_->rate(), process_rate, frames, epoch);
   if (change) {
     fallback_on_.store(*change, std::memory_order_relaxed);
     if (hooks_.set_fallback) {
@@ -526,67 +579,134 @@ bool RootDenoiserControl::TickLocked(int64_t now_ms) {
          fallback_.on();
 }
 
+bool RootDenoiserControl::HeldLocked(uint64_t pipeline) const {
+  if (pipeline == 0) {
+    return false;
+  }
+  if (pipeline == installed_pipeline_ || pipeline == in_flight_pipeline_ ||
+      (waiting_ && waiting_->pipeline == pipeline)) {
+    return true;
+  }
+  return std::any_of(
+      queue_.begin(), queue_.end(),
+      [pipeline](const Request& request) { return request.pipeline == pipeline; });
+}
+
 void RootDenoiserControl::CompleteLocked(const Request& request,
-                                         std::string error) {
+                                         std::string error,
+                                         uint64_t released_pipeline) {
   RootDenoiserCompletion completion;
   completion.owner = request.owner;
   completion.async_id = request.async_id;
   completion.error = std::move(error);
+  completion.pipeline = released_pipeline;
   completions_.push_back(std::move(completion));
 }
 
-void RootDenoiserControl::ReturnLocked(uint64_t owner,
-                                       RootFxPipeline* pipeline) {
-  if (pipeline) {
-    returned_.push_back(RootDenoiserReturned{owner, Address(pipeline)});
+void RootDenoiserControl::FailLocked(const Request& request,
+                                     const char* error) {
+  if (HeldLocked(request.pipeline)) {
+    // The same pipeline is still held by another request or installed: an
+    // error would have the app release it. It comes back with that one.
+    CompleteLocked(request, std::string(), 0);
+    return;
+  }
+  CompleteLocked(request, error, request.pipeline);
+}
+
+void RootDenoiserControl::ReturnLocked(uint64_t owner, uint64_t pipeline) {
+  if (pipeline == 0 || HeldLocked(pipeline) ||
+      std::any_of(returned_.begin(), returned_.end(),
+                  [pipeline](const RootDenoiserReturned& returned) {
+                    return returned.pipeline == pipeline;
+                  })) {
+    return;
+  }
+  returned_.push_back(RootDenoiserReturned{owner, pipeline});
+}
+
+namespace {
+
+void AddUnique(std::vector<uint64_t>& pipelines, uint64_t pipeline) {
+  if (pipeline != 0 &&
+      std::find(pipelines.begin(), pipelines.end(), pipeline) ==
+          pipelines.end()) {
+    pipelines.push_back(pipeline);
   }
 }
+
+int MsUntil(std::chrono::steady_clock::time_point deadline) {
+  const int64_t left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           deadline - std::chrono::steady_clock::now())
+                           .count();
+  return static_cast<int>(std::max<int64_t>(0, left));
+}
+
+}  // namespace
 
 void RootDenoiserControl::DrainRequestsLocked(const char* error,
                                               std::vector<uint64_t>* into) {
-  auto drain = [&](const Request& request) {
-    CompleteLocked(request, error);
-    if (request.pipeline != 0) {
-      if (into) {
-        into->push_back(request.pipeline);
-      } else {
-        returned_.push_back(
-            RootDenoiserReturned{request.owner, request.pipeline});
-      }
-    }
-  };
+  std::deque<Request> drained = std::exchange(queue_, {});
   if (waiting_) {
-    drain(*waiting_);
+    drained.push_front(*waiting_);
     waiting_.reset();
   }
-  for (const Request& request : queue_) {
-    drain(request);
+  for (const Request& request : drained) {
+    if (HeldLocked(request.pipeline)) {
+      // Installed (or being installed): it comes back with the slot's copy.
+      CompleteLocked(request, std::string(), 0);
+      continue;
+    }
+    CompleteLocked(request, error, 0);
+    if (into) {
+      AddUnique(*into, request.pipeline);
+    } else {
+      ReturnLocked(request.owner, request.pipeline);
+    }
   }
-  queue_.clear();
+}
+
+bool RootDenoiserControl::RemoveWithin(
+    std::chrono::steady_clock::time_point deadline,
+    uint64_t* previous) {
+  std::unique_lock<std::timed_mutex> slot_lock(slot_mutex_, std::defer_lock);
+  if (!slot_lock.try_lock_until(deadline)) {
+    return false;
+  }
+  RootFxPipeline* removed = nullptr;
+  if (!slot_->Remove(MsUntil(deadline), &removed)) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(mutex_);
+  *previous = Address(removed);
+  installed_pipeline_ = 0;
+  return true;
 }
 
 RootDenoiserReturnAll RootDenoiserControl::ReturnAll() {
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(
+                            std::max(0, timing_.control_timeout_ms));
   RootDenoiserReturnAll result;
-  std::lock_guard<std::mutex> slot_lock(slot_mutex_);
   {
     std::lock_guard<std::mutex> lock(mutex_);
     DrainRequestsLocked(kErrorReturned, &result.pipelines);
   }
-  RootFxPipeline* previous = nullptr;
-  const bool removed = slot_->Remove(timing_.control_timeout_ms, &previous);
+  uint64_t previous = 0;
+  const bool removed = RemoveWithin(deadline, &previous);
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (removed) {
-      if (previous) {
-        result.pipelines.push_back(Address(previous));
-      }
       installed_owner_ = 0;
+      if (!HeldLocked(previous)) {
+        AddUnique(result.pipelines, previous);
+      }
     } else {
       result.error =
           std::string(kErrorBusy) + "; the installed pipeline stays installed";
     }
     for (const RootDenoiserReturned& returned : returned_) {
-      result.pipelines.push_back(returned.pipeline);
+      AddUnique(result.pipelines, returned.pipeline);
     }
     returned_.clear();
   }
@@ -595,18 +715,21 @@ RootDenoiserReturnAll RootDenoiserControl::ReturnAll() {
 }
 
 void RootDenoiserControl::Reset() {
-  std::lock_guard<std::mutex> slot_lock(slot_mutex_);
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(
+                            std::max(0, timing_.control_timeout_ms));
   {
     std::lock_guard<std::mutex> lock(mutex_);
     DrainRequestsLocked(kErrorSessionEnded, nullptr);
   }
-  RootFxPipeline* previous = nullptr;
-  const bool removed = slot_->Remove(timing_.control_timeout_ms, &previous);
+  uint64_t previous = 0;
+  const bool removed = RemoveWithin(deadline, &previous);
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (removed) {
-      ReturnLocked(installed_owner_, previous);
+      const uint64_t owner = installed_owner_;
       installed_owner_ = 0;
+      ReturnLocked(owner, previous);
     }
     const bool was_on = fallback_.on();
     fallback_.Reset();
@@ -769,6 +892,14 @@ void RootFakeFxPipeline::Touch() {
   }
 }
 
+void RootFakeFxPipeline::Spin() const {
+  // A sleep can last a timer tick (15.6 ms on Windows) longer than asked.
+  const uint32_t sleep_us = sleep_us_.load(std::memory_order_relaxed);
+  const int64_t until_us = NowUs() + sleep_us;
+  while (sleep_us > 0 && NowUs() < until_us) {
+  }
+}
+
 void RootFakeFxPipeline::Restart() {
   const size_t delay = std::min<size_t>(config_.delay_samples, kCapacity);
   std::fill(fifo_.get(), fifo_.get() + delay, 0.0f);
@@ -799,6 +930,7 @@ float RootFakeFxPipeline::Power(const void* object) {
 void RootFakeFxPipeline::SetPower(void* object, float power) {
   RootFakeFxPipeline* self = Self(object);
   self->Touch();
+  self->Spin();
   self->power_sets_.fetch_add(1, std::memory_order_relaxed);
   self->power_.store(power, std::memory_order_relaxed);
 }
@@ -824,10 +956,7 @@ uint32_t RootFakeFxPipeline::Process(void* object,
   RootFakeFxPipeline* self = Self(object);
   self->Touch();
   self->process_calls_.fetch_add(1, std::memory_order_relaxed);
-  const uint32_t sleep_us = self->sleep_us_.load(std::memory_order_relaxed);
-  if (sleep_us > 0) {
-    std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
-  }
+  self->Spin();
   const auto* input = static_cast<const float*>(in);
   for (uint32_t i = 0; i < in_frames && self->size_ < kCapacity; ++i) {
     const float sample = input ? input[i] : 0.0f;
@@ -859,6 +988,7 @@ uint32_t RootFakeFxPipeline::Process(void* object,
 uint32_t RootFakeFxPipeline::Flush(void* object, void*, uint32_t) {
   RootFakeFxPipeline* self = Self(object);
   self->Touch();
+  self->Spin();
   self->flush_calls_.fetch_add(1, std::memory_order_relaxed);
   self->Restart();
   return 0;
@@ -874,6 +1004,9 @@ struct RootDenoiserHarness::State {
   std::atomic<bool> speaking{false};
   std::atomic<bool> wanted{false};
   std::atomic<uint32_t> process_rate{0};
+  std::atomic<bool> frames_flowing{true};
+  std::atomic<uint64_t> frames{0};
+  std::atomic<uint64_t> epoch{0};
   std::mutex changes_mutex;
   std::vector<uint8_t> changes;
   RootNsFallback fallback;
@@ -898,6 +1031,14 @@ RootDenoiserHarness::RootDenoiserHarness(int64_t install_wait_ms,
   };
   hooks.process_rate = [state] {
     return state->process_rate.load(std::memory_order_relaxed);
+  };
+  hooks.processed_frames = [state] {
+    return state->frames_flowing.load(std::memory_order_relaxed)
+               ? state->frames.fetch_add(1, std::memory_order_relaxed) + 1
+               : state->frames.load(std::memory_order_relaxed);
+  };
+  hooks.stream_epoch = [state] {
+    return state->epoch.load(std::memory_order_relaxed);
   };
   hooks.set_fallback = [state](bool on) {
     std::lock_guard<std::mutex> lock(state->changes_mutex);
@@ -1026,13 +1167,14 @@ RootDenoiserSlotInfo RootDenoiserHarness::slot_info(bool take_max) const {
   return info;
 }
 
-void RootDenoiserHarness::start_audio(uint32_t rate) const {
+void RootDenoiserHarness::start_audio(uint32_t rate,
+                                      uint32_t latch_every) const {
   if (state_->audio.joinable()) {
     return;
   }
   state_->audio_running.store(true, std::memory_order_relaxed);
   State* state = state_.get();
-  state_->audio = std::thread([state, rate] {
+  state_->audio = std::thread([state, rate, latch_every] {
     const size_t frames = rate / 100;
     std::vector<float> in(frames);
     for (size_t i = 0; i < frames; ++i) {
@@ -1045,7 +1187,11 @@ void RootDenoiserHarness::start_audio(uint32_t rate) const {
       state->slot->ProcessAudio(in.data(), frames, static_cast<int>(rate),
                                 false, 0.5f, out.data(),
                                 RootDenoiserSlot::kOutputFrames * frames);
-      state->audio_frames.fetch_add(1, std::memory_order_relaxed);
+      const uint64_t done =
+          state->audio_frames.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (latch_every != 0 && done % latch_every == 0) {
+        state->slot->LatchBypass(RootDenoiserBypass::kOutputStalled);
+      }
       // Back to back, but leaving the slot free between frames as the 10 ms
       // cadence of a real capture thread does.
       const int64_t resume_us = NowUs() + 50;
@@ -1074,6 +1220,14 @@ void RootDenoiserHarness::set_wanted(bool wanted) const {
 
 void RootDenoiserHarness::set_process_rate(uint32_t rate) const {
   state_->process_rate.store(rate, std::memory_order_relaxed);
+}
+
+void RootDenoiserHarness::set_frames_flowing(bool flowing) const {
+  state_->frames_flowing.store(flowing, std::memory_order_relaxed);
+}
+
+void RootDenoiserHarness::bump_stream_epoch() const {
+  state_->epoch.fetch_add(1, std::memory_order_relaxed);
 }
 
 void RootDenoiserHarness::request(uint64_t owner,
@@ -1110,6 +1264,7 @@ rust::Vec<RootDenoiserTestCompletion> RootDenoiserHarness::take_completions()
     item.owner = completion.owner;
     item.async_id = completion.async_id;
     item.error = rust::String(completion.error);
+    item.pipeline = completion.pipeline;
     result.push_back(std::move(item));
   }
   return result;
@@ -1147,10 +1302,12 @@ int8_t RootDenoiserHarness::fallback_update(int64_t now_ms,
                                             bool installed,
                                             uint32_t bypass,
                                             uint32_t pipeline_rate,
-                                            uint32_t process_rate) const {
+                                            uint32_t process_rate,
+                                            uint64_t processed_frames,
+                                            uint64_t stream_epoch) const {
   const std::optional<bool> change = state_->fallback.Update(
       now_ms, wanted, installed, static_cast<RootDenoiserBypass>(bypass),
-      pipeline_rate, process_rate);
+      pipeline_rate, process_rate, processed_frames, stream_epoch);
   if (!change) {
     return -1;
   }
