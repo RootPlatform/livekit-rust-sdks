@@ -32,6 +32,9 @@ pub mod ffi {
         Guid = 1,
         Name = 2,
         Index = 3,
+        /// macOS: a CoreAudio device UID, translated to the device's current
+        /// AudioObjectID at every open.
+        Uid = 4,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -433,6 +436,9 @@ pub mod ffi {
             playout_guids: &[String],
             recording_guids: &[String],
         );
+        /// UID translation as CoreAudio would answer it now: `uids[i]` is
+        /// the device with GUID `guids[i]`; any other UID is no device.
+        fn set_uid_map(self: &AdmProxyHarness, uids: &[String], guids: &[String]);
         fn fail_next_stop_playout(self: &AdmProxyHarness, result: i32);
         fn fail_next_stop_recording(self: &AdmProxyHarness, result: i32);
         fn set_device_playout_delay(self: &AdmProxyHarness, delay_ms: u16);
@@ -615,6 +621,11 @@ mod tests {
         assert_eq!(resolve(AudioDeviceSelectionKind::Guid, "", 0), NOT_FOUND);
         assert_eq!(resolve(AudioDeviceSelectionKind::Name, "", 0), NOT_FOUND);
         assert_eq!(resolve(AudioDeviceSelectionKind::Guid, "Headset", 0), NOT_FOUND);
+        assert_eq!(
+            resolve(AudioDeviceSelectionKind::Uid, "{a}", 0),
+            NOT_FOUND,
+            "a UID matches only once translated to a GUID"
+        );
     }
 
     #[test]

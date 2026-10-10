@@ -229,6 +229,10 @@ class AdmProxyHarness {
   rust::Vec<rust::String> take_calls() const;
   void set_devices(rust::Slice<const rust::String> playout_guids,
                    rust::Slice<const rust::String> recording_guids) const;
+  // UID translation as CoreAudio would answer it: uids[i] is the device with
+  // GUID guids[i]; any other UID is no device.
+  void set_uid_map(rust::Slice<const rust::String> uids,
+                   rust::Slice<const rust::String> guids) const;
   // The next StopPlayout fails with `result` and leaves the device closed, as
   // the Windows ADM does when it gives up joining its render thread.
   void fail_next_stop_playout(int32_t result) const;

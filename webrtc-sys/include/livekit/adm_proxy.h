@@ -58,10 +58,13 @@ enum class AdmSelectionKind : uint8_t {
   kGuid = 1,
   kName = 2,
   kIndex = 3,
+  kUid = 4,
 };
 
 // Which device a direction opens. Default is the OS default (the console role
 // on Windows, index 0 elsewhere); kIndex only serves the legacy index setters.
+// kUid is a macOS CoreAudio device UID, translated to the device's current
+// AudioObjectID (the ADM's GUID) at every open; elsewhere it matches nothing.
 struct AdmDeviceSelection {
   AdmSelectionKind kind = AdmSelectionKind::kDefault;
   std::string id;
@@ -85,6 +88,10 @@ int ResolveAdmDeviceIndex(
 
 // An ADM name or GUID buffer as a string, also when it is unterminated.
 std::string AdmDeviceString(const char* buffer, size_t size);
+
+// A device UID's current ADM GUID, or nullopt when no device has that UID.
+using AdmUidTranslator =
+    std::function<std::optional<std::string>(const std::string& uid)>;
 
 struct AdmDirectionOutcome {
   bool requested = false;
@@ -323,7 +330,8 @@ enum class AdmMonitorResult : uint8_t {
 /// dedicated `audio-device` thread brings the devices to it, so neither the
 /// worker nor an FFI caller ever waits for a device to stop. The queries the
 /// worker makes per audio packet read atomics. The selected device is stored
-/// as {default | GUID | name} per direction and applied before every open.
+/// as {default | GUID | name | UID} per direction and applied before every
+/// open.
 ///
 /// On desktop the OS effects (Windows' voice capture DMO) are off and refused,
 /// mute never stops recording or touches the endpoint mute, and recording only
@@ -408,6 +416,8 @@ class AdmProxy : public webrtc::AudioDeviceModule {
   /// Returns once every device task posted before the call has run.
   void FlushDeviceTasksForTest();
   bool SyntheticPlayingForTest() const;
+  /// Replaces the UID translation (CoreAudio on macOS, none elsewhere).
+  void SetUidTranslatorForTest(AdmUidTranslator translator);
 
   // ===========================================================================
   // AudioDeviceModule Interface
@@ -582,6 +592,7 @@ class AdmProxy : public webrtc::AudioDeviceModule {
   uint64_t recording_opened_restart_gen_ = 0;
   // Guarded by mutex_.
   std::shared_ptr<RootCaptureState> capture_state_;
+  AdmUidTranslator uid_translator_;
   // capture_state_'s monitor, set with it.
   std::atomic<RootAudioMonitor*> monitor_{nullptr};
 #if !LK_ADM_MOBILE

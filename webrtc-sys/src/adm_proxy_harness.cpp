@@ -19,6 +19,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -339,6 +340,24 @@ void AdmProxyHarness::set_devices(
     rust::Slice<const rust::String> playout_guids,
     rust::Slice<const rust::String> recording_guids) const {
   fake_->SetDevices(ToStrings(playout_guids), ToStrings(recording_guids));
+}
+
+void AdmProxyHarness::set_uid_map(rust::Slice<const rust::String> uids,
+                                  rust::Slice<const rust::String> guids) const {
+  auto map = std::make_shared<std::map<std::string, std::string>>();
+  const std::vector<std::string> keys = ToStrings(uids);
+  const std::vector<std::string> values = ToStrings(guids);
+  for (size_t i = 0; i < std::min(keys.size(), values.size()); ++i) {
+    (*map)[keys[i]] = values[i];
+  }
+  proxy_->SetUidTranslatorForTest(
+      [map](const std::string& uid) -> std::optional<std::string> {
+        const auto found = map->find(uid);
+        if (found == map->end()) {
+          return std::nullopt;
+        }
+        return found->second;
+      });
 }
 
 void AdmProxyHarness::fail_next_stop_recording(int32_t result) const {

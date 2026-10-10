@@ -177,6 +177,93 @@ fn adm_proxy_missing_device_fails_the_open_and_stays_closed() {
     assert!(h.playing());
 }
 
+fn uid(id: &str) -> AudioDeviceSelection {
+    AudioDeviceSelection { kind: AudioDeviceSelectionKind::Uid, id: id.to_string(), index: 0 }
+}
+
+/// macOS: a CoreAudio UID is translated to the device's current AudioObjectID
+/// (the ADM's GUID) at every open, so a coreaudiod restart that moves the ids
+/// needs no new selection and never opens the device that took the old id.
+#[test]
+fn adm_proxy_uid_is_translated_to_the_current_guid_at_every_open() {
+    let h = platform(&["default", "73", "91"], &["default", "74"]);
+    let uids = strings(&["Speakers-UID", "AirPods-UID"]);
+    h.set_uid_map(&uids, &strings(&["73", "91"]));
+    let outcome = h.select(&unset(), false, &uid("AirPods-UID"), true);
+    assert!(outcome.playout.found && !outcome.playout.attempted);
+    h.hold(true);
+    assert_eq!(calls(&h), ["SetPlayoutDevice(2)", "InitPlayout", "StartPlayout"]);
+
+    // coreaudiod restarted: the AirPods are 95 now, and 91 is the speakers.
+    h.set_devices(&strings(&["default", "91", "95"]), &strings(&["default", "74"]));
+    h.set_uid_map(&uids, &strings(&["91", "95"]));
+    let restarted = h.restart(false, true);
+    assert!(restarted.playout.found && restarted.playout.attempted);
+    assert_eq!(
+        h.take_calls(),
+        ["StopPlayout", "SetPlayoutDevice(2)", "InitPlayout", "StartPlayout"],
+        "the AirPods' new id, not the old one"
+    );
+
+    let again = h.select(&unset(), false, &uid("AirPods-UID"), true);
+    assert!(again.playout.found && !again.playout.attempted, "the same UID is no change");
+    assert_eq!(h.take_calls(), Vec::<String>::new());
+
+    h.set_uid_map(
+        &strings(&["Speakers-UID", "AirPods-UID", "Mic-UID"]),
+        &strings(&["91", "95", "74"]),
+    );
+    h.select(&uid("Mic-UID"), true, &unset(), false);
+    h.monitor(true);
+    assert_eq!(calls(&h), ["SetRecordingDevice(1)", "InitRecording", "StartRecording"]);
+}
+
+#[test]
+fn adm_proxy_unknown_uid_is_device_not_found_never_another_device() {
+    let h = platform(&["default", "73"], &["default", "74"]);
+    h.set_uid_map(&strings(&["Speakers-UID", "Gone-UID"]), &strings(&["73", "99"]));
+    h.hold(true);
+    calls(&h);
+
+    let outcome = h.select(&unset(), false, &uid("AirPods-UID"), true);
+    assert!(!outcome.playout.found && outcome.playout.attempted);
+    assert_eq!(outcome.playout.init_result, ADM_RESULT_DEVICE_NOT_FOUND);
+    assert_eq!(h.take_calls(), ["StopPlayout"], "never the default instead");
+    assert!(!h.platform_playing());
+
+    for missing in ["", "speakers-uid", "Speakers-UID ", "Gone-UID"] {
+        let outcome = h.select(&unset(), false, &uid(missing), true);
+        assert!(!outcome.playout.found, "{missing:?}");
+        assert_eq!(h.take_calls(), Vec::<String>::new(), "{missing:?}");
+        assert_eq!(h.stats().playout_init_result, ADM_RESULT_DEVICE_NOT_FOUND, "{missing:?}");
+    }
+
+    // Gone-UID's device appears: the next open finds it without a new
+    // selection.
+    h.set_devices(&strings(&["default", "73", "99"]), &strings(&["default", "74"]));
+    h.hold(false);
+    h.hold(true);
+    assert_eq!(calls(&h), ["SetPlayoutDevice(2)", "InitPlayout", "StartPlayout"]);
+}
+
+/// Windows and Linux have no UIDs: a UID selection is no device, never the
+/// default.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn adm_proxy_uid_selects_nothing_without_coreaudio() {
+    let h = platform(&["{spk}"], &["{mic}"]);
+    let outcome = h.select(&uid("{mic}"), true, &uid("{spk}"), true);
+    assert!(!outcome.recording.found && !outcome.playout.found);
+    h.hold(true);
+    h.app_recording(true);
+    assert_eq!(calls(&h), Vec::<String>::new());
+    let stats = h.stats();
+    assert_eq!(
+        (stats.playout_init_result, stats.recording_init_result),
+        (ADM_RESULT_DEVICE_NOT_FOUND, ADM_RESULT_DEVICE_NOT_FOUND)
+    );
+}
+
 #[test]
 fn adm_proxy_init_alone_opens_nothing() {
     let h = platform(&["{spk}"], &["{mic}"]);

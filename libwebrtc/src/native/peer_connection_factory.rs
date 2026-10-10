@@ -84,6 +84,9 @@ pub enum AudioDeviceSelection {
     Guid(String),
     /// The ADM device name (Linux, where the ADM leaves GUIDs empty).
     Name(String),
+    /// The macOS CoreAudio device UID, translated to the device's current
+    /// AudioObjectID at every open; no device elsewhere.
+    Uid(String),
 }
 
 /// What a device request did for one direction. Results are ADM return codes:
@@ -132,6 +135,9 @@ fn to_sys_selection(
         }
         Some(AudioDeviceSelection::Name(name)) => {
             (sys_adc::ffi::AudioDeviceSelectionKind::Name, name.clone())
+        }
+        Some(AudioDeviceSelection::Uid(uid)) => {
+            (sys_adc::ffi::AudioDeviceSelectionKind::Uid, uid.clone())
         }
         Some(AudioDeviceSelection::SystemDefault) | None => {
             (sys_adc::ffi::AudioDeviceSelectionKind::Default, String::new())

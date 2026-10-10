@@ -7,13 +7,17 @@ package livekit.proto;
 option csharp_namespace = "LiveKit.Proto";
 
 // Which device a direction uses. system_default follows the OS default (the console role on Windows,
-// index 0 on macOS); guid is the ADM GUID (Windows: MMDevice id; macOS: AudioObjectID as a decimal
-// string); name selects by the ADM device name (Linux, where the ADM leaves GUIDs empty).
+// index 0 on macOS and Linux); guid is the ADM GUID (Windows: MMDevice id; macOS: AudioObjectID as a
+// decimal string); name selects by the ADM device name (Linux, where the ADM leaves GUIDs empty);
+// uid is the macOS CoreAudio device UID (kAudioDevicePropertyDeviceUID), which native translates to
+// the device's current AudioObjectID at every open, so it survives a replug or a coreaudiod restart.
+// A uid that matches no device, and any uid on Windows or Linux, is DeviceNotFound.
 message RootAudioDeviceSelection {
   oneof device {
     bool system_default = 1;
     string guid = 2;
     string name = 3;
+    string uid = 4;
   }
 }
 

@@ -895,6 +895,7 @@ fn device_selection(selection: proto::RootAudioDeviceSelection) -> AudioDeviceSe
     match selection.device {
         Some(Device::Guid(guid)) => AudioDeviceSelection::Guid(guid),
         Some(Device::Name(name)) => AudioDeviceSelection::Name(name),
+        Some(Device::Uid(uid)) => AudioDeviceSelection::Uid(uid),
         Some(Device::SystemDefault(_)) | None => AudioDeviceSelection::SystemDefault,
     }
 }
@@ -1383,6 +1384,10 @@ mod tests {
         assert_eq!(
             device_selection(selection(Some(Device::Name("Headset".into())))),
             AudioDeviceSelection::Name("Headset".into())
+        );
+        assert_eq!(
+            device_selection(selection(Some(Device::Uid("BuiltInSpeakerDevice".into())))),
+            AudioDeviceSelection::Uid("BuiltInSpeakerDevice".into())
         );
     }
 

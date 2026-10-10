@@ -69,6 +69,9 @@ AdmDeviceSelection ToAdmSelection(const AudioDeviceSelection& selection) {
     case AudioDeviceSelectionKind::Index:
       result.kind = AdmSelectionKind::kIndex;
       break;
+    case AudioDeviceSelectionKind::Uid:
+      result.kind = AdmSelectionKind::kUid;
+      break;
     default:
       result.kind = AdmSelectionKind::kDefault;
       break;

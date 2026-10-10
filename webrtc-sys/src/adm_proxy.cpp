@@ -38,6 +38,11 @@
 #include <objbase.h>
 #endif
 
+#if defined(WEBRTC_MAC) && !defined(WEBRTC_IOS)
+#include <CoreAudio/CoreAudio.h>
+#include <CoreFoundation/CoreFoundation.h>
+#endif
+
 #if defined(__ANDROID__)
 #include <jni.h>
 #include "sdk/android/native_api/audio_device_module/audio_device_android.h"
@@ -168,6 +173,32 @@ void Silence(void* audio_samples,
   *ntp_time_ms = -1;
 }
 
+#if defined(WEBRTC_MAC) && !defined(WEBRTC_IOS)
+// The macOS ADM names a device by its AudioObjectID as a decimal string, an
+// id CoreAudio reassigns after a replug or a coreaudiod restart; the UID stays.
+std::optional<std::string> CoreAudioUidToGuid(const std::string& uid) {
+  CFStringRef cf_uid = CFStringCreateWithBytes(
+      kCFAllocatorDefault, reinterpret_cast<const UInt8*>(uid.data()),
+      static_cast<CFIndex>(uid.size()), kCFStringEncodingUTF8, false);
+  if (cf_uid == nullptr) {
+    return std::nullopt;
+  }
+  const AudioObjectPropertyAddress address = {
+      kAudioHardwarePropertyTranslateUIDToDevice,
+      kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+  AudioObjectID device = kAudioObjectUnknown;
+  UInt32 size = sizeof(device);
+  const OSStatus status =
+      AudioObjectGetPropertyData(kAudioObjectSystemObject, &address,
+                                 sizeof(cf_uid), &cf_uid, &size, &device);
+  CFRelease(cf_uid);
+  if (status != noErr || device == kAudioObjectUnknown) {
+    return std::nullopt;
+  }
+  return std::to_string(device);
+}
+#endif
+
 webrtc::scoped_refptr<webrtc::AudioDeviceModule> CreatePlatformAdm(
     const webrtc::Environment& env) {
 #if defined(__ANDROID__)
@@ -200,6 +231,10 @@ int ResolveAdmDeviceIndex(
     case AdmSelectionKind::kIndex:
       return selection.index < device_count ? selection.index
                                             : kAdmResolveNotFound;
+    case AdmSelectionKind::kUid:
+      // Translated to a GUID before it gets here; untranslated it is no
+      // device.
+      return kAdmResolveNotFound;
     case AdmSelectionKind::kGuid:
     case AdmSelectionKind::kName:
       break;
@@ -535,6 +570,9 @@ AdmProxy::AdmProxy(
       worker_thread_(worker_thread),
       mixer_(std::move(mixer)),
       platform_adm_(std::move(platform_adm)) {
+#if defined(WEBRTC_MAC) && !defined(WEBRTC_IOS)
+  uid_translator_ = CoreAudioUidToGuid;
+#endif
   // Create the synthetic ADM for synthetic mode. SyntheticAudioDevice pumps
   // the WebRTC audio pipeline without platform audio, allowing FFI callbacks
   // to receive decoded remote audio.
@@ -904,10 +942,24 @@ int AdmProxy::ResolveSelectionLocked(
   if (!platform_adm) {
     return kAdmResolveNotFound;
   }
+  const AdmDeviceSelection* wanted = &selection;
+  AdmDeviceSelection translated;
+  if (selection.kind == AdmSelectionKind::kUid) {
+    std::optional<std::string> guid;
+    if (uid_translator_ && !selection.id.empty()) {
+      guid = uid_translator_(selection.id);
+    }
+    if (!guid || guid->empty()) {
+      return kAdmResolveNotFound;
+    }
+    translated.kind = AdmSelectionKind::kGuid;
+    translated.id = std::move(*guid);
+    wanted = &translated;
+  }
   const int count = playout ? platform_adm->PlayoutDevices()
                             : platform_adm->RecordingDevices();
   return ResolveAdmDeviceIndex(
-      selection, count,
+      *wanted, count,
       [platform_adm, playout](int index, std::string* name, std::string* guid) {
         char name_buf[webrtc::kAdmMaxDeviceNameSize] = {0};
         char guid_buf[webrtc::kAdmMaxGuidSize] = {0};
@@ -1280,6 +1332,11 @@ void AdmProxy::FlushDeviceTasksForTest() {
 
 bool AdmProxy::SyntheticPlayingForTest() const {
   return synthetic_adm_ && synthetic_adm_->Playing();
+}
+
+void AdmProxy::SetUidTranslatorForTest(AdmUidTranslator translator) {
+  AdmLock lock(&mutex_);
+  uid_translator_ = std::move(translator);
 }
 
 AdmNativeStats AdmProxy::ReadNativeStats() {
