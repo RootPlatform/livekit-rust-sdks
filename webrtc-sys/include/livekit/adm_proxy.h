@@ -73,12 +73,17 @@ constexpr int kAdmResolveDefault = -1;
 constexpr int kAdmResolveNotFound = -2;
 
 // Maps a selection onto the current device list: an index, kAdmResolveDefault,
-// or kAdmResolveNotFound (never a fallback to another device).
+// or kAdmResolveNotFound (never a fallback to another device). GUIDs match
+// exactly; names exactly, or by the part the ADM kept of a name it cut to
+// its buffer (kAdmMaxDeviceNameSize - 1 bytes); the first match wins.
 int ResolveAdmDeviceIndex(
     const AdmDeviceSelection& selection,
     int device_count,
     const std::function<bool(int index, std::string* name, std::string* guid)>&
         device_at);
+
+// An ADM name or GUID buffer as a string, also when it is unterminated.
+std::string AdmDeviceString(const char* buffer, size_t size);
 
 struct AdmDirectionOutcome {
   bool requested = false;

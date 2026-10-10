@@ -869,4 +869,20 @@ std::unique_ptr<RootVoiceHarness> new_root_voice_harness() {
   return std::make_unique<RootVoiceHarness>();
 }
 
+bool adm_name_matches_for_test(rust::Slice<const uint8_t> device,
+                               rust::Str wanted) {
+  AdmDeviceSelection selection;
+  selection.kind = AdmSelectionKind::kName;
+  selection.id = std::string(wanted);
+  return ResolveAdmDeviceIndex(
+             selection, 1,
+             [&device](int, std::string* name, std::string* guid) {
+               *name = AdmDeviceString(
+                   reinterpret_cast<const char*>(device.data()),
+                   device.size());
+               guid->clear();
+               return true;
+             }) == 0;
+}
+
 }  // namespace livekit_ffi

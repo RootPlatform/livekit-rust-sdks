@@ -16,6 +16,7 @@
 
 #include "livekit/adm_proxy.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <utility>
@@ -86,6 +87,73 @@ class AdmLock {
   webrtc::Mutex* const mutex_;
 };
 
+// The PulseAudio ADM enumerates through members its device opens use as well
+// (_deviceIndex, _numPlayDevices, the name pointers), without a lock of its
+// own: it expects a single thread. On Linux enumeration therefore takes the
+// device mutex. The Windows and macOS ADMs enumerate safely on any thread, so
+// there a device list never waits for a device that is slow to stop.
+#if defined(WEBRTC_LINUX) && !LK_ADM_MOBILE
+constexpr bool kSerializeEnumeration = true;
+#else
+constexpr bool kSerializeEnumeration = false;
+#endif
+
+class EnumerationLock {
+ public:
+  explicit EnumerationLock(webrtc::Mutex* mutex) {
+    if (kSerializeEnumeration) {
+      lock_.emplace(mutex);
+    }
+  }
+
+ private:
+  std::optional<AdmLock> lock_;
+};
+
+// ADM names and GUIDs are C strings in fixed buffers, but the macOS ADM
+// copies a device name straight from CoreAudio, unterminated when it fills
+// the buffer.
+std::string FromAdmBuffer(const char* buffer, size_t size) {
+  return std::string(buffer, std::find(buffer, buffer + size, '\0'));
+}
+
+// The length of `s` without a UTF-8 sequence cut off at its end.
+size_t CompleteUtf8Length(const std::string& s) {
+  size_t start = s.size();
+  size_t continuation = 0;
+  while (start > 0 && continuation < 3 &&
+         (static_cast<unsigned char>(s[start - 1]) & 0xC0) == 0x80) {
+    --start;
+    ++continuation;
+  }
+  if (start == 0) {
+    return s.size();
+  }
+  const unsigned char lead = static_cast<unsigned char>(s[start - 1]);
+  size_t length = 1;
+  if ((lead & 0xE0) == 0xC0) {
+    length = 2;
+  } else if ((lead & 0xF0) == 0xE0) {
+    length = 3;
+  } else if ((lead & 0xF8) == 0xF0) {
+    length = 4;
+  }
+  return continuation + 1 < length ? start - 1 : s.size();
+}
+
+// The ADMs cut names to their buffer, possibly inside a UTF-8 sequence: a cut
+// name matches every name that starts with its complete characters (the full
+// name, and the name as read through the FFI, where the cut sequence became
+// U+FFFD).
+bool AdmNameMatches(const std::string& device, const std::string& wanted) {
+  constexpr size_t kKept = webrtc::kAdmMaxDeviceNameSize - 1;
+  if (device.size() < kKept) {
+    return device == wanted;
+  }
+  const size_t kept = CompleteUtf8Length(device);
+  return wanted.size() >= kept && wanted.compare(0, kept, device, 0, kept) == 0;
+}
+
 void Silence(void* audio_samples,
              size_t samples_per_channel,
              size_t bytes_per_frame,
@@ -144,13 +212,18 @@ int ResolveAdmDeviceIndex(
     if (!device_at(index, &name, &guid)) {
       continue;
     }
-    const std::string& key =
-        selection.kind == AdmSelectionKind::kGuid ? guid : name;
-    if (key == selection.id) {
+    const bool match = selection.kind == AdmSelectionKind::kGuid
+                           ? guid == selection.id
+                           : AdmNameMatches(name, selection.id);
+    if (match) {
       return index;
     }
   }
   return kAdmResolveNotFound;
+}
+
+std::string AdmDeviceString(const char* buffer, size_t size) {
+  return FromAdmBuffer(buffer, size);
 }
 
 // =============================================================================
@@ -833,8 +906,8 @@ int AdmProxy::ResolveSelectionLocked(
         if (result != 0) {
           return false;
         }
-        *name = name_buf;
-        *guid = guid_buf;
+        *name = FromAdmBuffer(name_buf, sizeof(name_buf));
+        *guid = FromAdmBuffer(guid_buf, sizeof(guid_buf));
         return true;
       });
 #endif
@@ -1246,9 +1319,10 @@ bool AdmProxy::Initialized() const {
   return synthetic_init || platform_init;
 }
 
-// Enumeration goes straight to the Platform ADM, which serializes it internally,
-// so a device list is never stuck behind a device being stopped.
+// Enumeration goes straight to the Platform ADM, so (except on Linux, see
+// EnumerationLock) a device list is never stuck behind a device being stopped.
 int16_t AdmProxy::PlayoutDevices() {
+  EnumerationLock lock(&mutex_);
   if (webrtc::AudioDeviceModule* platform_adm = platform()) {
     return platform_adm->PlayoutDevices();
   }
@@ -1257,6 +1331,7 @@ int16_t AdmProxy::PlayoutDevices() {
 }
 
 int16_t AdmProxy::RecordingDevices() {
+  EnumerationLock lock(&mutex_);
   if (webrtc::AudioDeviceModule* platform_adm = platform()) {
     return platform_adm->RecordingDevices();
   }
@@ -1267,6 +1342,7 @@ int16_t AdmProxy::RecordingDevices() {
 int32_t AdmProxy::PlayoutDeviceName(uint16_t index,
                                     char name[webrtc::kAdmMaxDeviceNameSize],
                                     char guid[webrtc::kAdmMaxGuidSize]) {
+  EnumerationLock lock(&mutex_);
   if (webrtc::AudioDeviceModule* platform_adm = platform()) {
     return platform_adm->PlayoutDeviceName(index, name, guid);
   }
@@ -1276,6 +1352,7 @@ int32_t AdmProxy::PlayoutDeviceName(uint16_t index,
 int32_t AdmProxy::RecordingDeviceName(uint16_t index,
                                       char name[webrtc::kAdmMaxDeviceNameSize],
                                       char guid[webrtc::kAdmMaxGuidSize]) {
+  EnumerationLock lock(&mutex_);
   if (webrtc::AudioDeviceModule* platform_adm = platform()) {
     return platform_adm->RecordingDeviceName(index, name, guid);
   }

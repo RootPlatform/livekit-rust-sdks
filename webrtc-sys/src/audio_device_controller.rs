@@ -384,6 +384,9 @@ pub mod ffi {
             names: &[String],
             guids: &[String],
         ) -> i32;
+        /// A selection by `wanted` against one device the ADM names with
+        /// these raw bytes.
+        fn adm_name_matches_for_test(device: &[u8], wanted: &str) -> bool;
 
         // AdmProxy over a fake platform ADM (tests only; opens no device).
         fn new_adm_proxy_harness(
@@ -519,7 +522,8 @@ impl AudioDeviceRequestCallback {
 #[cfg(test)]
 mod tests {
     use super::ffi::{
-        resolve_audio_device_index_for_test, AudioDeviceSelection, AudioDeviceSelectionKind,
+        adm_name_matches_for_test, resolve_audio_device_index_for_test, AudioDeviceSelection,
+        AudioDeviceSelectionKind,
     };
     use crate::peer_connection_factory::ffi::create_peer_connection_factory;
     use std::sync::Mutex;
@@ -582,6 +586,98 @@ mod tests {
             index: 0,
         };
         assert_eq!(resolve_audio_device_index_for_test(&selection, &none, &none), NOT_FOUND);
+    }
+
+    fn resolve_in(
+        names: &[&str],
+        guids: &[&str],
+        kind: AudioDeviceSelectionKind,
+        id: &str,
+    ) -> i32 {
+        let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+        let guids: Vec<String> = guids.iter().map(|s| s.to_string()).collect();
+        resolve_audio_device_index_for_test(
+            &AudioDeviceSelection { kind, id: id.to_string(), index: 0 },
+            &names,
+            &guids,
+        )
+    }
+
+    /// The macOS ADM's list: the system default first (GUID "default"), then
+    /// every device of the scope under its AudioObjectID, the default again
+    /// among them.
+    #[test]
+    fn device_selection_macos_audio_object_ids_match_exactly() {
+        const GUID: AudioDeviceSelectionKind = AudioDeviceSelectionKind::Guid;
+        let system = AudioDeviceSelectionKind::Default;
+        let names = ["default (MacBook Pro Speakers)", "MacBook Pro Speakers", "AirPods Pro"];
+        let guids = ["default", "73", "91"];
+        assert_eq!(resolve_in(&names, &guids, GUID, "91"), 2);
+        assert_eq!(resolve_in(&names, &guids, GUID, "73"), 1, "the default itself, not index 0");
+        assert_eq!(resolve_in(&names, &guids, GUID, "default"), 0, "the system default");
+        assert_eq!(resolve_in(&names, &guids, system, ""), DEFAULT, "opened as index 0");
+        assert_eq!(resolve_in(&names, &guids, GUID, "7"), NOT_FOUND, "no prefix match");
+        assert_eq!(resolve_in(&names, &guids, GUID, " 91"), NOT_FOUND);
+
+        // Unplugged and plugged in again: CoreAudio gave the AirPods a new id.
+        let replugged = ["default", "73", "95"];
+        assert_eq!(resolve_in(&names, &replugged, GUID, "91"), NOT_FOUND, "never another device");
+        assert_eq!(resolve_in(&names, &replugged, GUID, "95"), 2);
+    }
+
+    /// The PulseAudio ADM's list: "default: <description>" first, then every
+    /// sink or source (monitors left out) by description; GUIDs are empty.
+    #[test]
+    fn device_selection_linux_names_match_pulse_descriptions() {
+        const NAME: AudioDeviceSelectionKind = AudioDeviceSelectionKind::Name;
+        const GUID: AudioDeviceSelectionKind = AudioDeviceSelectionKind::Guid;
+        let names = [
+            "default: Built-in Audio Analog Stereo",
+            "Built-in Audio Analog Stereo",
+            "USB Headset Analog Stereo",
+            "USB Headset Analog Stereo",
+        ];
+        let guids = ["", "", "", ""];
+        assert_eq!(resolve_in(&names, &guids, NAME, "Built-in Audio Analog Stereo"), 1);
+        assert_eq!(
+            resolve_in(&names, &guids, NAME, "USB Headset Analog Stereo"),
+            2,
+            "of two devices with one description, the first"
+        );
+        assert_eq!(resolve_in(&names, &guids, NAME, "Built-in Audio"), NOT_FOUND);
+        assert_eq!(resolve_in(&names, &guids, NAME, "built-in audio analog stereo"), NOT_FOUND);
+        assert_eq!(resolve_in(&names, &guids, GUID, ""), NOT_FOUND, "an empty GUID selects nothing");
+        assert_eq!(
+            resolve_in(&names, &guids, NAME, "default: Built-in Audio Analog Stereo"),
+            0,
+            "the default entry"
+        );
+    }
+
+    /// The ADMs keep 127 bytes of a name (the macOS one up to 128, unterminated).
+    #[test]
+    fn device_selection_long_names_match_the_part_the_adm_kept() {
+        let long = "Family 17h (Models 10h-1fh) HD Audio Controller Analog Stereo + ".repeat(3);
+        assert!(long.len() > 127);
+        let kept = &long.as_bytes()[..127];
+        assert!(adm_name_matches_for_test(kept, &long));
+        assert!(adm_name_matches_for_test(kept, &long[..127]));
+        assert!(!adm_name_matches_for_test(kept, &long[..126]));
+        assert!(!adm_name_matches_for_test(kept, &format!("x{long}")));
+        assert!(adm_name_matches_for_test(&long.as_bytes()[..128], &long), "unterminated");
+
+        // Cut inside a two-byte character: the full name and the name as read
+        // through the FFI (the cut character replaced) both match.
+        let accented = "é".repeat(70);
+        let cut = &accented.as_bytes()[..127];
+        let lossy = format!("{}\u{FFFD}", "é".repeat(63));
+        assert!(adm_name_matches_for_test(cut, &accented));
+        assert!(adm_name_matches_for_test(cut, &lossy));
+        assert!(!adm_name_matches_for_test(cut, &format!("{}x", "é".repeat(62))));
+
+        assert!(adm_name_matches_for_test(b"USB Mic", "USB Mic"));
+        assert!(!adm_name_matches_for_test(b"USB Mic", "USB Mic 2"));
+        assert!(!adm_name_matches_for_test(b"USB Mic 2", "USB Mic"));
     }
 
     #[test]

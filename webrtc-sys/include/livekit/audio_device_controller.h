@@ -175,6 +175,10 @@ int32_t resolve_audio_device_index_for_test(
     const AudioDeviceSelection& selection,
     rust::Slice<const rust::String> names,
     rust::Slice<const rust::String> guids);
+// Whether a selection by `wanted` picks a device the ADM names `device`, raw
+// bytes as in the ADM's buffer (unterminated when it fills it).
+bool adm_name_matches_for_test(rust::Slice<const uint8_t> device,
+                               rust::Str wanted);
 
 class FakePlatformAdm;
 class HarnessTransport;
