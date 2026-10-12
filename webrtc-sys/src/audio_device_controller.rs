@@ -188,6 +188,21 @@ pub mod ffi {
         pub monitor_active: bool,
         pub monitor_frames: u64,
         pub monitor_dropped_frames: u64,
+
+        /// The speech detector exists (with the DSP chain). The setting (0 off,
+        /// 1 ring, 2 gate), the highest probability since the previous read
+        /// (-1: none), whether the speech gate judged the last frame and found
+        /// it speech, and frames with confirmed speech, frames it held the
+        /// noise gate shut or forced it closed, and frames with detection on
+        /// but no probability.
+        pub speech_available: bool,
+        pub speech_detection: u32,
+        pub speech_probability: f32,
+        pub speech_detector_running: bool,
+        pub speech: bool,
+        pub speech_frames: u64,
+        pub speech_closed_frames: u64,
+        pub speech_unavailable_frames: u64,
     }
 
     /// A RootAudioMonitor's counters (tests).
@@ -227,6 +242,9 @@ pub mod ffi {
         pub gain_reset_db: f32,
         pub has_denoiser_wanted: bool,
         pub denoiser_wanted: bool,
+        /// 0 off, 1 ring, 2 gate; other values are off.
+        pub has_speech_detection: bool,
+        pub speech_detection: u32,
     }
 
     /// The stored controls (tests).
@@ -244,6 +262,7 @@ pub mod ffi {
         pub master_volume: f32,
         pub deafened: bool,
         pub denoiser_wanted: bool,
+        pub speech_detection: u32,
         pub stream_epoch: u64,
         pub dsp_reset_seq: u64,
     }

@@ -28,6 +28,7 @@ use crate::{
         new_root_voice_harness, AudioDeviceController, RootAudioControlUpdate,
         RootDenoiserCompletionItem, RootSpeakingInfo, RootVoiceHarness,
     },
+    root_audio_processing::ffi::root_speech_test_signal,
     root_denoiser::ffi::root_denoiser_supported,
 };
 
@@ -228,6 +229,60 @@ fn root_voice_speech_is_published_as_speaking_and_released_after_the_gate() {
     assert!(!stats.speaking && !stats.gate_speaking);
     assert_eq!(stats.startup_hold_frames, HOLD_FRAMES as u64);
     assert_eq!((stats.dsp_resets, stats.dsp_flushes), (1, 1), "the session start");
+}
+
+/// `frames` of `root_speech_test_signal(signal)` at 48 kHz as device frames.
+fn speech_fixture(signal: u32, frames: u32) -> Vec<Vec<i16>> {
+    root_speech_test_signal(signal, 48_000, frames)
+        .chunks(480)
+        .map(|frame| frame.iter().map(|&v| v.round().clamp(-32768.0, 32767.0) as i16).collect())
+        .collect()
+}
+
+#[test]
+fn root_voice_speech_detection_keeps_keys_off_the_ring_and_rings_for_a_voice() {
+    const KEYS: u32 = 6;
+    const VOWEL: u32 = 0;
+    let h = started();
+    let c = h.controller();
+    control(
+        &h,
+        RootAudioControlUpdate {
+            has_auto_gain: true,
+            auto_gain: false,
+            has_auto_sensitivity: true,
+            auto_sensitivity: false,
+            has_gate_threshold: true,
+            gate_threshold: 0.003,
+            has_speech_detection: true,
+            speech_detection: 2,
+            ..Default::default()
+        },
+    );
+    for frame in speech_fixture(KEYS, 300) {
+        h.capture(48_000, 1, &frame);
+        assert!(!speaking(c), "typing never rings");
+    }
+    let keys = c.root_audio_stats();
+    assert_eq!((keys.speech_detection, keys.speech_frames), (2, 0));
+    assert!(keys.speech_detector_running && keys.speech_closed_frames > 10);
+    assert!(keys.speech_probability >= 0.0 && keys.speech_unavailable_frames == 0);
+
+    let mut rose = None;
+    let vowel = speech_fixture(VOWEL, 100);
+    for (i, frame) in vowel.iter().enumerate() {
+        h.capture(48_000, 1, frame);
+        if rose.is_none() && speaking(c) {
+            rose = Some(i);
+        }
+    }
+    let rose = rose.expect("the voice rings");
+    assert!(rose <= 10, "rings {} ms into the voice", rose * 10);
+    let stats = c.root_audio_stats();
+    assert!(stats.speech && stats.speaking && stats.speech_probability > 0.9);
+    assert!(stats.speech_frames - keys.speech_frames >= 80);
+    let quiet = quiet_until_released(&h, &mut Signal::new(48_000));
+    assert!((25..=40).contains(&quiet), "the ring ends {} ms after the voice", quiet * 10);
 }
 
 #[test]

@@ -18,13 +18,15 @@
 //! only reachable through libwebrtc.
 
 use rootapp_voice_dsp::{
-    DenoiserOutput, DspChain, DspCommands, DspOutputs, DspSettings, PushToTalk,
+    DenoiserOutput, DspChain, DspCommands, DspOutputs, DspSettings, PushToTalk, SpeechDetection,
 };
 
 #[cxx::bridge(namespace = "livekit_ffi")]
 pub mod ffi {
     /// `rootapp_voice_dsp::DspSettings`; push_to_talk 0 voice activity, 1 held,
-    /// anything else released.
+    /// anything else released; speech_detection 0 off, 1 ring, 2 gate, anything
+    /// else off; speech_probability the detector's for this frame (negative:
+    /// it did not run).
     #[derive(Debug, Clone, Copy, Default)]
     pub struct RootDspSettings {
         pub sample_rate: u32,
@@ -35,6 +37,8 @@ pub mod ffi {
         pub gate_threshold: f32,
         pub auto_sensitivity: bool,
         pub denoiser_wanted: bool,
+        pub speech_detection: u32,
+        pub speech_probability: f32,
     }
 
     #[derive(Debug, Clone, Copy, Default)]
@@ -85,6 +89,9 @@ pub mod ffi {
         pub non_finite_samples: u32,
         pub reset: bool,
         pub flushed: bool,
+        pub speech_probability: f32,
+        pub speech: bool,
+        pub speech_closed: bool,
     }
 
     extern "Rust" {
@@ -190,6 +197,33 @@ pub mod ffi {
         pub aligner_latency_ms: f32,
         pub published_speaking: bool,
         pub published_seq: u64,
+        pub speech_detection: u32,
+        /// NaN: the detector judged no frame since the last take.
+        pub speech_probability_max: f32,
+        pub speech_detector_running: bool,
+        pub speech: bool,
+        pub speech_frames: u64,
+        pub speech_closed_frames: u64,
+        pub speech_unavailable_frames: u64,
+    }
+
+    /// RootSpeechDetector over a synthetic signal (`root_speech_detector_probe`).
+    /// The statistics skip the first 200 ms (the detector's warm-up) and
+    /// frames it could not analyze.
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct RootSpeechDetectorProbe {
+        pub frames: u32,
+        /// Frames the detector returned -1 for (a rate it does not run at).
+        pub unsupported: u32,
+        /// Largest difference from libwebrtc's VoiceActivityDetectorWrapper
+        /// on the same frames (0 at rates the wrapper is not compared at).
+        pub max_diff: f32,
+        pub judged: u32,
+        pub mean: f32,
+        pub max: f32,
+        /// Frames at 0.5 or above, and the longest run of them.
+        pub above: u32,
+        pub longest_run: u32,
     }
 
     #[derive(Debug, Clone, Copy, Default)]
@@ -243,6 +277,8 @@ pub mod ffi {
         );
         fn set_denoiser_wanted(self: &RootProcessorHarness, wanted: bool);
         fn set_denoise_power(self: &RootProcessorHarness, power: f32);
+        /// 0 off, 1 ring, 2 gate (as the controller stores it).
+        fn set_speech_detection(self: &RootProcessorHarness, mode: u32);
         fn set_webrtc_ns_applied(self: &RootProcessorHarness, applied: bool);
         /// As the denoiser control does when it decides the NS fallback.
         fn set_ns_fallback_decided(self: &RootProcessorHarness, on: bool);
@@ -312,6 +348,8 @@ pub mod ffi {
             auto_sensitivity: bool,
             gate_threshold: f32,
         );
+        fn set_speech_detection(self: &RootApmHarness, mode: u32);
+        fn dsp(self: &RootApmHarness, take_maxima: bool) -> RootProcessorDsp;
         fn processed_frames(self: &RootApmHarness) -> u64;
         fn processor_rate(self: &RootApmHarness) -> u32;
         fn processor_channels(self: &RootApmHarness) -> u32;
@@ -328,6 +366,18 @@ pub mod ffi {
         /// A policy stats read during another thread's inner ApplyConfig
         /// returns at once.
         fn root_apm_policy_stats_never_wait_for_an_apply_for_test() -> bool;
+
+        /// `frames` 10 ms frames of a synthetic FloatS16 signal: 0 vowel, 1 white
+        /// noise, 2 clicks, 3 tone, 4 silence, 5 breath, 6 keys.
+        fn root_speech_test_signal(signal: u32, rate: i32, frames: u32) -> Vec<f32>;
+        /// RootSpeechDetector over that signal, next to libwebrtc's wrapper.
+        fn root_speech_detector_probe(
+            signal: u32,
+            rate: i32,
+            frames: u32,
+        ) -> RootSpeechDetectorProbe;
+        /// A fresh detector's probability for each whole 10 ms frame of `input`.
+        fn root_speech_detector_probabilities(rate: i32, input: &[f32]) -> Vec<f32>;
     }
 }
 
@@ -352,6 +402,8 @@ fn dsp_settings(settings: &ffi::RootDspSettings) -> DspSettings {
         gate_threshold: settings.gate_threshold,
         auto_sensitivity: settings.auto_sensitivity,
         denoiser_wanted: settings.denoiser_wanted,
+        speech_detection: SpeechDetection::from_wire(settings.speech_detection),
+        speech_probability: settings.speech_probability,
     }
 }
 
@@ -388,6 +440,9 @@ fn copy_outputs(from: &DspOutputs, to: &mut ffi::RootDspOutputs) {
         non_finite_samples: from.non_finite_samples,
         reset: from.reset,
         flushed: from.flushed,
+        speech_probability: from.speech_probability,
+        speech: from.speech,
+        speech_closed: from.speech_closed,
     };
 }
 
@@ -1232,6 +1287,292 @@ mod processor_tests {
             run(&h, 48000, 1, 1.0);
         }
         assert_eq!(run(&h, 48000, 1, 1.0), vec![1.0; 480]);
+    }
+}
+
+#[cfg(test)]
+mod speech_tests {
+    use super::ffi::{
+        new_root_apm_harness, new_root_processor_harness, root_speech_detector_probabilities,
+        root_speech_detector_probe, root_speech_test_signal, RootProcessorHarness,
+    };
+
+    const VOWEL: u32 = 0;
+    const WHITE_NOISE: u32 = 1;
+    const CLICKS: u32 = 2;
+    const TONE: u32 = 3;
+    const SILENCE: u32 = 4;
+    const BREATH: u32 = 5;
+    const KEYS: u32 = 6;
+    const ALL: [u32; 7] = [VOWEL, WHITE_NOISE, CLICKS, TONE, SILENCE, BREATH, KEYS];
+    const NOISES: [(u32, &str); 3] = [(BREATH, "breath"), (CLICKS, "clicks"), (KEYS, "keys")];
+
+    const OFF: u32 = 0;
+    const RING: u32 = 1;
+    const GATE: u32 = 2;
+    const HELD: u32 = 1;
+    /// rootapp_voice_dsp::speech_gate::{CONFIRM_FRAMES, HANG_FRAMES}.
+    const CONFIRM_FRAMES: u32 = 3;
+    const HANG_FRAMES: usize = 30;
+    const HOLD_FRAMES: usize = 20;
+
+    fn frames(rate: i32) -> usize {
+        (rate / 100) as usize
+    }
+
+    #[test]
+    fn root_speech_detector_matches_libwebrtcs_wrapper_at_16_32_and_48_khz() {
+        for rate in [16000, 32000, 48000] {
+            for signal in ALL {
+                let probe = root_speech_detector_probe(signal, rate, 300);
+                assert_eq!((probe.frames, probe.unsupported), (300, 0), "{rate}/{signal}");
+                assert_eq!(probe.max_diff, 0.0, "{rate}/{signal}: {probe:?}");
+            }
+        }
+    }
+
+    /// Decisions, not exact values: AVX2, SSE2 and NEON round differently.
+    #[test]
+    fn root_speech_detector_scores_voices_and_rejects_noises() {
+        for rate in [16000, 32000, 48000] {
+            let vowel = root_speech_detector_probe(VOWEL, rate, 300);
+            assert!(vowel.above * 10 >= vowel.judged * 8, "{rate}: {vowel:?}");
+            let tone = root_speech_detector_probe(TONE, rate, 300);
+            assert!(tone.mean > 0.8, "{rate}: a steady tone counts as speech: {tone:?}");
+            let white = root_speech_detector_probe(WHITE_NOISE, rate, 300);
+            assert!(white.max < 0.5, "{rate}: {white:?}");
+            let silence = root_speech_detector_probe(SILENCE, rate, 300);
+            assert_eq!(silence.max, 0.0, "{rate}");
+            for (signal, name) in NOISES {
+                let probe = root_speech_detector_probe(signal, rate, 600);
+                assert!(
+                    probe.longest_run < CONFIRM_FRAMES,
+                    "{rate} {name}: never confirmed: {probe:?}"
+                );
+                assert!(probe.mean < 0.3, "{rate} {name}: {probe:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn root_speech_detector_judges_a_voice_after_silence_within_30_ms() {
+        for rate in [16000, 32000, 48000] {
+            let input = script(VOWEL, rate, 40, 30, 0);
+            let p = root_speech_detector_probabilities(rate, &input);
+            assert_eq!(p.len(), 70);
+            assert!(p[..40].iter().all(|&v| v == 0.0), "{rate}: silence");
+            let confirmed = (40..70)
+                .find(|&f| p[f + 1 - CONFIRM_FRAMES as usize..=f].iter().all(|&v| v >= 0.5))
+                .expect("confirmed");
+            assert!(confirmed <= 43, "{rate}: confirmed {} ms in: {p:?}", (confirmed - 40) * 10);
+        }
+    }
+
+    #[test]
+    fn root_speech_detector_runs_only_at_the_apms_rates() {
+        for rate in [8000, 22050, 24000, 44100] {
+            let probe = root_speech_detector_probe(VOWEL, rate, 50);
+            assert_eq!((probe.unsupported, probe.judged), (50, 0), "{rate}");
+        }
+        assert_eq!(root_speech_test_signal(VOWEL, 48000, 3).len(), 1440);
+        assert!(root_speech_test_signal(7, 48000, 3).is_empty());
+    }
+
+    fn harness(rate: i32, mode: u32) -> cxx::UniquePtr<RootProcessorHarness> {
+        let h = new_root_processor_harness();
+        h.initialize(rate, 1);
+        // No voice gain and a manual threshold every fixture is above (-54
+        // dBFS): what the level gate alone would send and ring for.
+        h.set_dsp(false, false, 0.002);
+        h.set_speech_detection(mode);
+        h
+    }
+
+    /// Runs `signal` frame by frame; returns the published speaking flag and
+    /// whether the frame went out.
+    fn run(h: &RootProcessorHarness, rate: i32, signal: &[f32]) -> Vec<(bool, bool)> {
+        signal
+            .chunks(frames(rate))
+            .map(|input| {
+                let out = h.process(rate, 1, input);
+                (h.dsp(false).published_speaking, out.samples.iter().any(|&v| v != 0.0))
+            })
+            .collect()
+    }
+
+    /// `quiet` frames of silence (past the startup hold), `signal` for
+    /// `length` frames, then `tail` frames of silence.
+    fn script(signal: u32, rate: i32, quiet: u32, length: u32, tail: u32) -> Vec<f32> {
+        let mut s = root_speech_test_signal(SILENCE, rate, quiet);
+        s.extend(root_speech_test_signal(signal, rate, length));
+        s.extend(root_speech_test_signal(SILENCE, rate, tail));
+        s
+    }
+
+    #[test]
+    fn root_capture_processor_speech_gate_never_rings_on_breath_clicks_or_keys() {
+        for rate in [16000, 48000] {
+            for (signal, name) in NOISES {
+                let input = script(signal, rate, 30, 400, 0);
+                let level = run(&harness(rate, OFF), rate, &input);
+                assert!(level.iter().any(|&(ring, _)| ring), "{rate} {name}: the level gate rings");
+
+                let h = harness(rate, GATE);
+                let gate = run(&h, rate, &input);
+                assert!(gate.iter().all(|&(ring, _)| !ring), "{rate} {name}: never rings");
+                let dsp = h.dsp(true);
+                assert_eq!(dsp.speech_frames, 0, "{rate} {name}");
+                assert!(dsp.speech_detector_running && !dsp.speech, "{rate} {name}");
+                assert_eq!(dsp.speech_unavailable_frames, 0, "{rate} {name}");
+                // The breath holds the level gate open, so the speech gate
+                // closes it after the 200 ms provisional open and keeps it shut
+                // (above the threshold, under 0.5). A click or a key opens the
+                // level gate for less than that, as without the detector.
+                if signal == BREATH {
+                    assert!(dsp.speech_closed_frames > 0, "{rate} {name}");
+                    let sent = |frames: &[(bool, bool)]| frames.iter().filter(|f| f.1).count();
+                    assert!(
+                        sent(&gate) * 2 < sent(&level),
+                        "{rate} {name}: {} of {} frames sent",
+                        sent(&gate),
+                        sent(&level)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn root_capture_processor_speech_gate_rings_within_60_ms_and_300_ms_after_a_voice() {
+        for rate in [16000, 32000, 48000] {
+            let (quiet, voice) = (40usize, 150usize);
+            let input = script(VOWEL, rate, quiet as u32, voice as u32, 120);
+            let level = run(&harness(rate, OFF), rate, &input);
+            let h = harness(rate, GATE);
+            let gate = run(&h, rate, &input);
+
+            let onset = (0..gate.len()).find(|&f| gate[f].0).expect("the voice rings");
+            assert!(
+                (quiet..=quiet + 6).contains(&onset),
+                "{rate}: rings {} ms after the voice starts",
+                (onset as i64 - quiet as i64) * 10
+            );
+            assert!(gate[quiet + 1].1, "{rate}: the level opens before the detector confirms");
+
+            let end = quiet + voice;
+            let ring_off = |frames: &[(bool, bool)]| (end..frames.len()).find(|&f| !frames[f].0);
+            let gate_off = ring_off(&gate).expect("the ring ends") - end;
+            let level_off = ring_off(&level).expect("the level ring ends") - end;
+            assert!(
+                (HANG_FRAMES - 3..=HANG_FRAMES + 8).contains(&gate_off),
+                "{rate}: ring ends {} ms after the voice",
+                gate_off * 10
+            );
+            assert!(level_off >= 65, "{rate}: the level gate alone rings {} ms", level_off * 10);
+            let dsp = h.dsp(true);
+            assert!(dsp.speech_frames >= (voice as u64) * 8 / 10, "{rate}: {dsp:?}");
+            assert!(dsp.speech_probability_max > 0.9, "{rate}");
+            assert_eq!(dsp.speech_detection, GATE);
+        }
+    }
+
+    #[test]
+    fn root_capture_processor_ring_mode_leaves_the_audio_to_the_level_gate() {
+        let input = script(CLICKS, 48000, 30, 200, 0);
+        let mut input = input;
+        input.extend(root_speech_test_signal(VOWEL, 48000, 100));
+        let off = harness(48000, OFF);
+        let ring = harness(48000, RING);
+        let mut rang = false;
+        for chunk in input.chunks(480) {
+            let a = off.process(48000, 1, chunk);
+            let b = ring.process(48000, 1, chunk);
+            assert_eq!(a.samples, b.samples);
+            let (off_dsp, ring_dsp) = (off.dsp(false), ring.dsp(false));
+            assert!(!ring_dsp.published_speaking || off_dsp.published_speaking);
+            rang |= ring_dsp.published_speaking;
+        }
+        assert!(rang, "the voice rings");
+        let (off_dsp, ring_dsp) = (off.dsp(true), ring.dsp(true));
+        assert_eq!(ring_dsp.speech_closed_frames, 0);
+        assert!(ring_dsp.speech_frames > 50);
+        assert!(!off_dsp.speech_detector_running && off_dsp.speech_probability_max.is_nan());
+        assert_eq!((off_dsp.speech_frames, off_dsp.speech_unavailable_frames), (0, 0));
+    }
+
+    #[test]
+    fn root_capture_processor_speech_detection_needs_a_rate_the_detector_runs_at() {
+        for rate in [8000, 44100] {
+            let input = script(CLICKS, rate, 30, 100, 0);
+            let off = run(&harness(rate, OFF), rate, &input);
+            let h = harness(rate, GATE);
+            let gate = run(&h, rate, &input);
+            assert_eq!(off, gate, "{rate}: the level gate alone, bit for bit");
+            let dsp = h.dsp(true);
+            assert_eq!(dsp.speech_unavailable_frames, 130, "{rate}");
+            assert!(!dsp.speech_detector_running && dsp.speech_probability_max.is_nan());
+        }
+    }
+
+    #[test]
+    fn root_capture_processor_push_to_talk_and_mute_bypass_the_speech_gate() {
+        let input = script(WHITE_NOISE, 48000, 30, 100, 0);
+        let h = harness(48000, GATE);
+        h.set_push_to_talk(HELD);
+        let held = run(&h, 48000, &input);
+        assert!(held[30..].iter().all(|&(ring, sent)| ring && sent), "the key decides");
+        assert!(held[HOLD_FRAMES + 2..30].iter().all(|&(ring, _)| ring));
+        let dsp = h.dsp(true);
+        assert!(!dsp.speech_detector_running && dsp.speech_probability_max >= 0.0);
+        assert_eq!((dsp.speech_closed_frames, dsp.speech_unavailable_frames), (0, 0));
+
+        let h = harness(48000, GATE);
+        h.set_mic_muted(true);
+        let mut input = script(SILENCE, 48000, 30, 0, 0);
+        input.extend(root_speech_test_signal(VOWEL, 48000, 60));
+        let muted = run(&h, 48000, &input);
+        assert!(muted.iter().all(|&(ring, sent)| !ring && !sent));
+        assert!(h.dsp(false).speech, "the detector keeps judging while muted");
+        h.set_mic_muted(false);
+        let vowel = root_speech_test_signal(VOWEL, 48000, 61);
+        run(&h, 48000, &vowel[vowel.len() - 480..]);
+        assert!(h.dsp(false).published_speaking, "unmuting mid-word rings at once");
+    }
+
+    #[test]
+    fn root_capture_processor_a_reset_turns_speech_detection_off() {
+        let h = harness(48000, GATE);
+        run(&h, 48000, &script(VOWEL, 48000, 30, 10, 0));
+        assert_eq!(h.dsp(false).speech_detection, GATE);
+        let before = h.dsp(true);
+        h.reset_controls();
+        h.set_dsp(false, false, 0.002);
+        let input = script(CLICKS, 48000, 30, 100, 0);
+        let after = run(&h, 48000, &input);
+        let dsp = h.dsp(true);
+        assert_eq!(dsp.speech_detection, OFF);
+        assert!(!dsp.speech_detector_running && dsp.speech_probability_max.is_nan());
+        assert_eq!(dsp.speech_closed_frames, before.speech_closed_frames);
+        assert_eq!(after, run(&harness(48000, OFF), 48000, &input), "the level gate alone");
+    }
+
+    #[test]
+    fn root_apm_decorator_real_apm_runs_the_speech_detector_at_the_processors_rate() {
+        // A steady tone counts as speech. 8 kHz streams reach it at 16 kHz.
+        for (rate, processed) in [(48000, 48000), (32000, 32000), (16000, 16000), (8000, 16000)] {
+            let h = new_root_apm_harness(true);
+            h.engine_apply(true, false, false, false, true);
+            h.set_dsp(false, false, 0.003);
+            h.set_speech_detection(GATE);
+            for _ in 0..60 {
+                h.process_frame(rate, 1, 8000);
+            }
+            assert_eq!(h.processor_rate(), processed, "{rate}");
+            let dsp = h.dsp(true);
+            assert!(dsp.speech_detector_running && dsp.speech, "{rate}: {dsp:?}");
+            assert_eq!(dsp.speech_unavailable_frames, 0, "{rate}");
+            assert!(h.speaking(), "{rate}");
+        }
     }
 }
 

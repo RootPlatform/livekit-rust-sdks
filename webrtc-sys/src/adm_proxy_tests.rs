@@ -787,6 +787,35 @@ fn adm_proxy_controller_stores_denoiser_wanted_until_a_reset() {
     assert_eq!(h.control_state().dsp_reset_seq, resets + 1);
 }
 
+#[test]
+fn adm_proxy_controller_stores_speech_detection_until_a_reset_and_turns_unknown_modes_off() {
+    let h = harness(&["{spk}"], &["{mic}"]);
+    assert_eq!(h.control_state().speech_detection, 0, "off until the host asks");
+    let mode = |value: u32| {
+        assert!(h.apply_control(&RootAudioControlUpdate {
+            has_speech_detection: true,
+            speech_detection: value,
+            ..Default::default()
+        }));
+        h.control_state().speech_detection
+    };
+    assert_eq!(mode(2), 2);
+    assert_eq!(mode(1), 1);
+    assert_eq!(mode(7), 0);
+    assert_eq!(mode(2), 2);
+    h.apply_control(&RootAudioControlUpdate {
+        has_mic_muted: true,
+        mic_muted: true,
+        ..Default::default()
+    });
+    assert_eq!(h.control_state().speech_detection, 2, "an unset field keeps its value");
+    h.reset_root_audio(false);
+    assert_eq!(h.control_state().speech_detection, 0);
+    let stats = h.stats();
+    assert!(stats.speech_available);
+    assert_eq!((stats.speech_detection, stats.speech_probability), (0, -1.0));
+}
+
 fn denoiser_completions(h: &AdmProxyHarness, count: usize) -> Vec<RootDenoiserCompletionItem> {
     let all = std::cell::RefCell::new(Vec::new());
     wait_until("denoiser completions", || {

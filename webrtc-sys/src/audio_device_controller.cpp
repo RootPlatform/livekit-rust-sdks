@@ -394,6 +394,16 @@ RootAudioNativeStats AudioDeviceController::root_audio_stats() const {
     stats.denoiser_padded_samples = dsp.aligner_padded_samples;
     stats.denoiser_trimmed_samples = dsp.aligner_trimmed_samples;
     stats.denoiser_drained_samples = dsp.aligner_drained_samples;
+    stats.speech_available = kRootDspSupported;
+    stats.speech_detection = dsp.speech_detection;
+    stats.speech_probability = std::isnan(dsp.speech_probability_max)
+                                   ? -1.0f
+                                   : dsp.speech_probability_max;
+    stats.speech_detector_running = dsp.speech_detector_running;
+    stats.speech = dsp.speech;
+    stats.speech_frames = dsp.speech_frames;
+    stats.speech_closed_frames = dsp.speech_closed_frames;
+    stats.speech_unavailable_frames = dsp.speech_unavailable_frames;
   }
   if (denoiser_) {
     const RootDenoiserSlotStats slot = capture_->denoiser_slot->ReadStats(true);
@@ -446,7 +456,7 @@ bool AudioDeviceController::set_root_audio_control(
       control.has_input_volume || control.has_denoise_power ||
       control.has_auto_gain || control.has_gate_threshold ||
       control.has_auto_sensitivity || control.has_gain_reset_db ||
-      control.has_denoiser_wanted;
+      control.has_denoiser_wanted || control.has_speech_detection;
   const bool mixer_fields = control.has_master_volume || control.has_deafened;
   const bool apm_fields =
       control.has_echo_cancellation || control.has_noise_suppression;
@@ -483,6 +493,14 @@ bool AudioDeviceController::set_root_audio_control(
           std::min(kRootMaxVoiceGainDb, std::max(0.0f, control.gain_reset_db)),
           std::memory_order_relaxed);
       capture_->gain_reset_seq.fetch_add(1, std::memory_order_release);
+    }
+    if (control.has_speech_detection) {
+      const uint32_t mode =
+          control.speech_detection <=
+                  static_cast<uint32_t>(RootSpeechDetection::kGate)
+              ? control.speech_detection
+              : static_cast<uint32_t>(RootSpeechDetection::kOff);
+      capture_->speech_detection.store(mode, std::memory_order_relaxed);
     }
     if (control.has_denoiser_wanted && control.denoiser_wanted) {
       capture_->denoiser_wanted.store(true, std::memory_order_relaxed);

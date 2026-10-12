@@ -53,6 +53,7 @@ struct RootProcessorDsp;
 struct RootFakeDenoiserProbe;
 struct RootDecoratorProbe;
 struct RootPolicyProbe;
+struct RootSpeechDetectorProbe;
 class RootProcessorHarness;
 class RootApmHarness;
 }  // namespace livekit_ffi
@@ -82,6 +83,18 @@ bool root_dsp_supported();
 class RootAudioMonitor;
 class RootDenoiserSlot;
 class RootFakeFxPipeline;
+class RootSpeechDetector;
+
+// RootCaptureState::speech_detection: what the speech detector's verdict
+// qualifies (rootapp_voice_dsp::SpeechDetection); other values are kOff.
+enum class RootSpeechDetection : uint32_t {
+  kOff = 0,
+  // The ring and the speaking flag need confirmed speech; the audio follows
+  // the level gate.
+  kRing = 1,
+  // As kRing, and the audio gate also closes on what the detector rejects.
+  kGate = 2,
+};
 
 struct RootDspStatsSnapshot {
   // Consistent with each other (seqlock).
@@ -119,6 +132,16 @@ struct RootDspStatsSnapshot {
   uint64_t aligner_trimmed_samples = 0;
   uint64_t aligner_drained_samples = 0;
   float aligner_latency_ms = 0;
+  // The speech detector: the setting, the highest probability since the last
+  // take (NaN when it judged no frame since), and on the last frame whether
+  // the speech gate judged it and confirmed speech.
+  uint32_t speech_detection = 0;
+  float speech_probability_max = std::numeric_limits<float>::quiet_NaN();
+  bool speech_detector_running = false;
+  bool speech = false;
+  uint64_t speech_frames = 0;
+  uint64_t speech_closed_frames = 0;
+  uint64_t speech_unavailable_frames = 0;
 };
 
 struct RootSpeakingSnapshot {
@@ -149,6 +172,8 @@ struct RootCaptureState {
   std::atomic<float> gate_threshold{0.025f};
   std::atomic<bool> auto_sensitivity{true};
   std::atomic<bool> denoiser_wanted{false};
+  // RootSpeechDetection; off until the host asks (the managed engine's gate).
+  std::atomic<uint32_t> speech_detection{0};
   // Command: the payload is stored before the sequence number is bumped.
   std::atomic<float> gain_reset_db{0.0f};
   std::atomic<uint64_t> gain_reset_seq{0};
@@ -220,6 +245,18 @@ struct RootCaptureState {
   std::atomic<uint64_t> aligner_trimmed_samples{0};
   std::atomic<uint64_t> aligner_drained_samples{0};
   std::atomic<float> aligner_latency_ms{0.0f};
+  // The speech detector and the speech gate: frames with confirmed speech,
+  // frames the speech gate held the noise gate shut or forced it to close,
+  // frames with detection on that had no probability (a rate the detector
+  // does not run at), the highest probability since the last
+  // ReadDspStats(true) (NaN: none), and the last frame's state.
+  std::atomic<uint64_t> speech_frames{0};
+  std::atomic<uint64_t> speech_closed_frames{0};
+  std::atomic<uint64_t> speech_unavailable_frames{0};
+  std::atomic<float> speech_probability_max{
+      std::numeric_limits<float>::quiet_NaN()};
+  std::atomic<bool> speech_detector_running{false};
+  std::atomic<bool> speech{false};
   // SetGate stamps (steady clock, µs) the gate going from closed to open; the
   // first frame processed open turns it into gate_open_delay_us.
   std::atomic<int64_t> gate_open_stamp_us{0};
@@ -273,9 +310,11 @@ RootCaptureFormatSnapshot ReadCaptureFormat(const RootCaptureState& state);
 // APM's full-band rate (8, 16, 32 or 48 kHz) with the output stream's channel
 // count. It runs the voice chain (rootapp-voice-dsp) on channel 0 around the
 // denoiser slot and copies the result to the other channels:
-//   sanitise, voice gain level -> denoiser slot (Effects SDK) -> aligner ->
-//   voice gain -> auto sensitivity -> startup hold -> noise gate -> input
-//   volume (20 ms ramp) -> mute/PTT gate (5 ms fade each way).
+//   sanitise, voice gain level -> speech detector (while speech_detection is
+//   set; 16, 32 and 48 kHz) -> denoiser slot (Effects SDK) -> aligner ->
+//   voice gain -> auto sensitivity -> startup hold -> noise gate (with the
+//   speech gate) -> input volume (20 ms ramp) -> mute/PTT gate (5 ms fade
+//   each way).
 // Real-time code: no locks, allocation, logging or APM calls. Initialize runs
 // under both APM locks on up to four threads and only stores the format.
 class RootCaptureProcessor : public webrtc::CustomProcessing {
@@ -285,6 +324,7 @@ class RootCaptureProcessor : public webrtc::CustomProcessing {
   static constexpr size_t kDenoiseOutputFrames = 8;
 
   explicit RootCaptureProcessor(std::shared_ptr<RootCaptureState> state);
+  ~RootCaptureProcessor() override;
 
   void Initialize(int sample_rate_hz, int num_channels) override;
   void Process(webrtc::AudioBuffer* audio) override;
@@ -294,12 +334,14 @@ class RootCaptureProcessor : public webrtc::CustomProcessing {
 
  private:
   void Publish(const RootDspOutputs& outputs,
-               size_t frames,
-               bool denoiser_wanted);
+               const RootDspSettings& settings,
+               size_t frames);
 
   const std::shared_ptr<RootCaptureState> state_;
   // Built at the largest rate here, never on the audio thread.
   rust::Box<RootDspChain> dsp_;
+  // Built here too (about 50 KB); Analyze and Reset never allocate.
+  const std::unique_ptr<RootSpeechDetector> speech_;
   // Audio thread only.
   int rate_ = 0;
   size_t channels_ = 0;
@@ -311,6 +353,9 @@ class RootCaptureProcessor : public webrtc::CustomProcessing {
   // The pipeline was not fed while the denoiser was not wanted: flush it
   // before it runs again.
   bool denoiser_flush_owed_ = false;
+  // The detector judged the last frame. When it did not (detection off, an
+  // unsupported frame), its state is stale and it starts over.
+  bool speech_running_ = false;
   std::array<float, kDenoiseOutputFrames * kMaxRate / 100> denoise_out_{};
 };
 
@@ -531,6 +576,8 @@ class RootProcessorHarness {
                float gate_threshold) const;
   void set_denoiser_wanted(bool wanted) const;
   void set_denoise_power(float power) const;
+  // RootSpeechDetection, stored as the controller stores it.
+  void set_speech_detection(uint32_t mode) const;
   void set_webrtc_ns_applied(bool applied) const;
   void set_ns_fallback_decided(bool on) const;
   void bump_stream_epoch() const;
@@ -605,6 +652,8 @@ class RootApmHarness {
   void set_dsp(bool auto_gain,
                bool auto_sensitivity,
                float gate_threshold) const;
+  void set_speech_detection(uint32_t mode) const;
+  RootProcessorDsp dsp(bool take_maxima) const;
   uint64_t processed_frames() const;
   uint32_t processor_rate() const;
   uint32_t processor_channels() const;
@@ -638,5 +687,21 @@ bool root_apm_decorator_race_for_test(uint32_t iterations);
 // A policy stats read while another thread's policy change sits in the inner
 // ApplyConfig (the decorator's mutex held) returns at once.
 bool root_apm_policy_stats_never_wait_for_an_apply_for_test();
+
+// Tests only (root_speech_detector.cpp): `frames` 10 ms frames of a synthetic
+// signal at `rate` (FloatS16), and RootSpeechDetector over it next to
+// libwebrtc's VoiceActivityDetectorWrapper (without its periodic reset) at the
+// rates the APM runs at. signal: 0 vowel, 1 white noise, 2 clicks, 3 tone,
+// 4 silence, 5 breath, 6 keys; others give nothing.
+rust::Vec<float> root_speech_test_signal(uint32_t signal,
+                                         int32_t rate,
+                                         uint32_t frames);
+RootSpeechDetectorProbe root_speech_detector_probe(uint32_t signal,
+                                                   int32_t rate,
+                                                   uint32_t frames);
+// A fresh RootSpeechDetector's probability for each whole frame of `input`.
+rust::Vec<float> root_speech_detector_probabilities(
+    int32_t rate,
+    rust::Slice<const float> input);
 
 }  // namespace livekit_ffi

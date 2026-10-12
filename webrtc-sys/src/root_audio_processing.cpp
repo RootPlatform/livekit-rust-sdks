@@ -32,6 +32,7 @@
 #include "api/units/time_delta.h"
 #include "livekit/root_audio_monitor.h"
 #include "livekit/root_denoiser.h"
+#include "livekit/root_speech_detector.h"
 #include "modules/audio_processing/audio_buffer.h"
 #include "modules/audio_processing/include/aec_dump.h"
 
@@ -143,6 +144,7 @@ void RootCaptureState::ResetControls(bool close_gate) {
   gate_threshold.store(0.025f, std::memory_order_relaxed);
   auto_sensitivity.store(true, std::memory_order_relaxed);
   denoiser_wanted.store(false, std::memory_order_relaxed);
+  speech_detection.store(0, std::memory_order_relaxed);
   // A press of the last session that no frame saw is no delay of this one.
   gate_open_stamp_us.store(0, std::memory_order_relaxed);
   ClearSpeaking();
@@ -211,10 +213,19 @@ RootDspStatsSnapshot RootCaptureState::ReadDspStats(bool take_maxima) {
     s.gate_in_block_peak_db = gate_in_block_peak_db_max.exchange(
         std::numeric_limits<float>::quiet_NaN(), kRelaxed);
     s.envelope_max = envelope_max.exchange(0.0f, kRelaxed);
+    s.speech_probability_max = speech_probability_max.exchange(
+        std::numeric_limits<float>::quiet_NaN(), kRelaxed);
   } else {
     s.gate_in_block_peak_db = gate_in_block_peak_db_max.load(kRelaxed);
     s.envelope_max = envelope_max.load(kRelaxed);
+    s.speech_probability_max = speech_probability_max.load(kRelaxed);
   }
+  s.speech_detection = speech_detection.load(kRelaxed);
+  s.speech_detector_running = speech_detector_running.load(kRelaxed);
+  s.speech = speech.load(kRelaxed);
+  s.speech_frames = speech_frames.load(kRelaxed);
+  s.speech_closed_frames = speech_closed_frames.load(kRelaxed);
+  s.speech_unavailable_frames = speech_unavailable_frames.load(kRelaxed);
   s.aligner_primed = aligner_primed.load(kRelaxed);
   s.aligner_buffered_samples = aligner_buffered_samples.load(kRelaxed);
   s.aligner_underruns = aligner_underruns.load(kRelaxed);
@@ -253,7 +264,11 @@ RootCaptureFormatSnapshot ReadCaptureFormat(const RootCaptureState& state) {
 
 RootCaptureProcessor::RootCaptureProcessor(
     std::shared_ptr<RootCaptureState> state)
-    : state_(std::move(state)), dsp_(new_root_dsp_chain(kMaxRate)) {}
+    : state_(std::move(state)),
+      dsp_(new_root_dsp_chain(kMaxRate)),
+      speech_(std::make_unique<RootSpeechDetector>()) {}
+
+RootCaptureProcessor::~RootCaptureProcessor() = default;
 
 void RootCaptureProcessor::Initialize(int sample_rate_hz, int num_channels) {
   state_->init_rate.store(sample_rate_hz, std::memory_order_relaxed);
@@ -309,6 +324,8 @@ void RootCaptureProcessor::Process(webrtc::AudioBuffer* audio) {
   // Without a slot no denoiser can run, so the chain never waits for one.
   settings.denoiser_wanted =
       slot != nullptr && state.denoiser_wanted.load(kRelaxed);
+  settings.speech_detection = state.speech_detection.load(kRelaxed);
+  settings.speech_probability = -1.0f;
   const float power = state.denoise_power.load(kRelaxed);
 
   // The gain reset first: a session reset stored before it is then seen in
@@ -334,6 +351,19 @@ void RootCaptureProcessor::Process(webrtc::AudioBuffer* audio) {
   const rust::Slice<float> frame(samples, frames);
   RootDspOutputs outputs{};
   const RootDspPre pre = dsp_->pre_denoise(frame, settings, commands, outputs);
+
+  // On the frame pre_denoise sanitised, before the denoiser: one probability
+  // per frame for the chain's speech gate (-1 at a rate it does not run at).
+  // It also runs while muted or with push-to-talk, so it is warm when they
+  // end.
+  const bool detect = pre.supported && settings.speech_detection != 0;
+  if (detect) {
+    if (pre.flush_denoiser || !speech_running_) {
+      speech_->Reset();
+    }
+    settings.speech_probability = speech_->Analyze(samples, frames, rate);
+  }
+  speech_running_ = detect;
 
   RootDenoiseResult denoised;
   if (pre.supported && settings.denoiser_wanted) {
@@ -362,15 +392,16 @@ void RootCaptureProcessor::Process(webrtc::AudioBuffer* audio) {
   for (size_t c = 1; c < channels; ++c) {
     std::copy(samples, samples + frames, data[c]);
   }
-  Publish(outputs, frames, settings.denoiser_wanted);
+  Publish(outputs, settings, frames);
   if (RootAudioMonitor* monitor = state.monitor.get()) {
     monitor->Push(samples, frames, rate);
   }
 }
 
 void RootCaptureProcessor::Publish(const RootDspOutputs& outputs,
-                                   size_t frames,
-                                   bool denoiser_wanted) {
+                                   const RootDspSettings& settings,
+                                   size_t frames) {
+  const bool denoiser_wanted = settings.denoiser_wanted;
   RootCaptureState& state = *state_;
   constexpr auto kRelaxed = std::memory_order_relaxed;
   const bool supported = !outputs.unsupported;
@@ -411,6 +442,17 @@ void RootCaptureProcessor::Publish(const RootDspOutputs& outputs,
   if (outputs.non_finite_samples > 0) {
     state.non_finite_samples.fetch_add(outputs.non_finite_samples, kRelaxed);
   }
+  const bool speech = supported && outputs.speech;
+  CountIf(state.speech_frames, speech);
+  CountIf(state.speech_closed_frames, supported && outputs.speech_closed);
+  CountIf(state.speech_unavailable_frames,
+          settings.speech_detection != 0 && !(settings.speech_probability >= 0));
+  if (settings.speech_probability >= 0) {
+    RaiseTo(state.speech_probability_max, settings.speech_probability);
+  }
+  state.speech_detector_running.store(
+      supported && outputs.speech_probability >= 0, kRelaxed);
+  state.speech.store(speech, kRelaxed);
 
   state.threshold.store(outputs.threshold, kRelaxed);
   state.voice_gain_db.store(outputs.voice_gain_db, kRelaxed);
@@ -983,6 +1025,10 @@ void RootProcessorHarness::set_dsp(bool auto_gain,
   SetDsp(*state_, auto_gain, auto_sensitivity, gate_threshold);
 }
 
+void RootProcessorHarness::set_speech_detection(uint32_t mode) const {
+  state_->speech_detection.store(mode);
+}
+
 void RootProcessorHarness::set_denoiser_wanted(bool wanted) const {
   state_->denoiser_wanted.store(wanted);
 }
@@ -1049,9 +1095,11 @@ RootProcessorStats RootProcessorHarness::stats() const {
   return stats;
 }
 
-RootProcessorDsp RootProcessorHarness::dsp(bool take_maxima) const {
-  const RootDspStatsSnapshot s = state_->ReadDspStats(take_maxima);
-  const RootSpeakingSnapshot published = state_->ReadSpeaking();
+namespace {
+
+RootProcessorDsp DspProbe(RootCaptureState& state, bool take_maxima) {
+  const RootDspStatsSnapshot s = state.ReadDspStats(take_maxima);
+  const RootSpeakingSnapshot published = state.ReadSpeaking();
   RootProcessorDsp dsp{};
   dsp.processed_frames = s.processed_frames;
   dsp.stage_samples = s.stage_samples;
@@ -1087,7 +1135,20 @@ RootProcessorDsp RootProcessorHarness::dsp(bool take_maxima) const {
   dsp.aligner_latency_ms = s.aligner_latency_ms;
   dsp.published_speaking = published.speaking;
   dsp.published_seq = published.seq;
+  dsp.speech_detection = s.speech_detection;
+  dsp.speech_probability_max = s.speech_probability_max;
+  dsp.speech_detector_running = s.speech_detector_running;
+  dsp.speech = s.speech;
+  dsp.speech_frames = s.speech_frames;
+  dsp.speech_closed_frames = s.speech_closed_frames;
+  dsp.speech_unavailable_frames = s.speech_unavailable_frames;
   return dsp;
+}
+
+}  // namespace
+
+RootProcessorDsp RootProcessorHarness::dsp(bool take_maxima) const {
+  return DspProbe(*state_, take_maxima);
 }
 
 bool RootProcessorHarness::install_fake_denoiser(uint32_t rate,
@@ -1503,6 +1564,14 @@ void RootApmHarness::set_dsp(bool auto_gain,
                              bool auto_sensitivity,
                              float gate_threshold) const {
   SetDsp(*capture_, auto_gain, auto_sensitivity, gate_threshold);
+}
+
+void RootApmHarness::set_speech_detection(uint32_t mode) const {
+  capture_->speech_detection.store(mode);
+}
+
+RootProcessorDsp RootApmHarness::dsp(bool take_maxima) const {
+  return DspProbe(*capture_, take_maxima);
 }
 
 bool RootApmHarness::speaking() const {
