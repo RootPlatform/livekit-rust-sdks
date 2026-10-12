@@ -703,5 +703,12 @@ RootSpeechDetectorProbe root_speech_detector_probe(uint32_t signal,
 rust::Vec<float> root_speech_detector_probabilities(
     int32_t rate,
     rust::Slice<const float> input);
+// RootSpeechDetector over `frames` frames of white noise at -60 dBFS,
+// generated frame by frame (no warm-up skipped, nothing compared).
+RootSpeechDetectorProbe root_speech_detector_hiss(int32_t rate,
+                                                  uint32_t frames);
+// A 16 kHz vowel, a 48 kHz vowel, then a frame of 16 kHz silence: its
+// probability (0 once the rate change flushed the 16 kHz resampler).
+float root_speech_detector_rate_switch_for_test();
 
 }  // namespace livekit_ffi

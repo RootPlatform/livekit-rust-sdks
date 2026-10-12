@@ -22,6 +22,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 
 #if defined(_MSC_VER)
 #pragma warning(push)
@@ -39,10 +40,12 @@
 namespace livekit_ffi {
 
 // libwebrtc's AGC2 speech detector (modules/audio_processing/agc2/rnn_vad, as
-// VoiceActivityDetectorWrapper runs it, without the 1.5 s periodic reset) on
-// the capture thread. Built off the audio thread with a resampler for each
-// rate the APM's capture post-processor runs at (16, 32 and 48 kHz) to the
-// detector's 24 kHz; Analyze and Reset never allocate, lock or log.
+// VoiceActivityDetectorWrapper runs it, without the 1.5 s periodic reset: the
+// RNN starts over only after 1 s in a row at p >= 0.3, which white hiss can
+// otherwise hold) on the capture thread. Built off the audio thread with a
+// resampler for each rate the APM's capture post-processor runs at (16, 32 and
+// 48 kHz) to the detector's 24 kHz; Analyze and Reset never allocate, lock or
+// log. The AVX2 code path needs FMA3 as well.
 class RootSpeechDetector {
  public:
   RootSpeechDetector();
@@ -53,10 +56,12 @@ class RootSpeechDetector {
   // probability 0..1, or -1 for a rate or length it cannot analyze. A rate
   // change resets the detector first.
   float Analyze(const float* frame, size_t samples, int rate);
+  // Starts over: resamplers, features and RNN.
   void Reset();
 
  private:
   webrtc::PushResampler<float>* ResamplerFor(int rate, size_t samples);
+  static uint32_t ResamplerBit(int rate);
 
   webrtc::PushResampler<float> from16_;
   webrtc::PushResampler<float> from32_;
@@ -66,6 +71,10 @@ class RootSpeechDetector {
   webrtc::rnn_vad::FeaturesExtractor extractor_;
   webrtc::rnn_vad::RnnVad rnn_;
   int rate_ = 0;
+  // Frames in a row at p >= 0.3.
+  int speech_like_ = 0;
+  // ResamplerBit of each resampler used since the last Reset.
+  uint32_t used_ = 0;
 };
 
 }  // namespace livekit_ffi

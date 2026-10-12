@@ -25,6 +25,7 @@
 
 #include "api/audio/audio_view.h"
 #include "livekit/root_audio_processing.h"
+#include "rtc_base/cpu_info.h"
 #if defined(_MSC_VER)
 #pragma warning(push)
 #pragma warning(disable : 4244 4267)
@@ -39,6 +40,19 @@ namespace livekit_ffi {
 namespace {
 
 constexpr size_t kFrame24 = webrtc::rnn_vad::kFrameSize10ms24kHz;
+// Without AGC2's periodic reset, flat white hiss can hold the RNN at speech:
+// it starts over after this many frames in a row at kLatchProbability or above.
+constexpr int kLatchFrames = 100;
+constexpr float kLatchProbability = 0.3f;
+constexpr std::array<float, 480> kZeros{};
+
+webrtc::AvailableCpuFeatures CpuFeatures() {
+  webrtc::AvailableCpuFeatures features = webrtc::GetAvailableCpuFeatures();
+  // rnn_vad's AVX2 code is built with FMA, which a VM can mask.
+  features.avx2 = features.avx2 && webrtc::cpu_info::Supports(
+                                        webrtc::cpu_info::ISA::kFMA3);
+  return features;
+}
 
 }  // namespace
 
@@ -46,8 +60,8 @@ RootSpeechDetector::RootSpeechDetector()
     : from16_(160, kFrame24, 1),
       from32_(320, kFrame24, 1),
       from48_(480, kFrame24, 1),
-      extractor_(webrtc::GetAvailableCpuFeatures()),
-      rnn_(webrtc::GetAvailableCpuFeatures()) {}
+      extractor_(CpuFeatures()),
+      rnn_(CpuFeatures()) {}
 
 webrtc::PushResampler<float>* RootSpeechDetector::ResamplerFor(
     int rate,
@@ -75,16 +89,39 @@ float RootSpeechDetector::Analyze(const float* frame,
     rate_ = rate;
     Reset();
   }
+  if (speech_like_ >= kLatchFrames) {
+    rnn_.Reset();
+    speech_like_ = 0;
+  }
   resampler->Resample(webrtc::MonoView<const float>(frame, samples),
                       webrtc::MonoView<float>(frame24_.data(), kFrame24));
+  used_ |= ResamplerBit(rate);
   const bool silence = extractor_.CheckSilenceComputeFeatures(
       std::span<const float, kFrame24>(frame24_), features_);
-  return rnn_.ComputeVadProbability(features_, silence);
+  const float p = rnn_.ComputeVadProbability(features_, silence);
+  speech_like_ = p >= kLatchProbability ? speech_like_ + 1 : 0;
+  return p;
 }
 
 void RootSpeechDetector::Reset() {
+  // A frame of zeros through each resampler used since the last reset drops
+  // that stream's history (an unused one is as built).
+  for (int rate : {16000, 32000, 48000}) {
+    if ((used_ & ResamplerBit(rate)) != 0) {
+      const size_t samples = static_cast<size_t>(rate / 100);
+      ResamplerFor(rate, samples)
+          ->Resample(webrtc::MonoView<const float>(kZeros.data(), samples),
+                     webrtc::MonoView<float>(frame24_.data(), kFrame24));
+    }
+  }
+  used_ = 0;
   extractor_.Reset();
   rnn_.Reset();
+  speech_like_ = 0;
+}
+
+uint32_t RootSpeechDetector::ResamplerBit(int rate) {
+  return rate == 16000 ? 1u : rate == 32000 ? 2u : 4u;
 }
 
 // =============================================================================
@@ -291,6 +328,8 @@ RootSpeechDetectorProbe root_speech_detector_probe(uint32_t signal,
   constexpr uint32_t kWarmup = 20;
   double sum = 0;
   uint32_t run = 0;
+  // The wrapper has no latch reset: compared until the detector's first.
+  int speech_like = 0;
   for (uint32_t i = 0; i < frames; ++i) {
     const float* f = x.data() + static_cast<size_t>(i) * frame;
     const float p = detector.Analyze(f, frame, rate);
@@ -302,9 +341,64 @@ RootSpeechDetectorProbe root_speech_detector_probe(uint32_t signal,
     if (reference) {
       const float expected =
           reference->Analyze(webrtc::DeinterleavedView<const float>(f, frame, 1));
-      probe.max_diff = std::max(probe.max_diff, std::fabs(expected - p));
+      if (speech_like < kLatchFrames) {
+        probe.max_diff = std::max(probe.max_diff, std::fabs(expected - p));
+      }
     }
+    speech_like = p >= kLatchProbability ? speech_like + 1 : 0;
     if (i < kWarmup) {
+      continue;
+    }
+    ++probe.judged;
+    sum += p;
+    probe.max = std::max(probe.max, p);
+    run = p >= 0.5f ? run + 1 : 0;
+    probe.above += p >= 0.5f ? 1 : 0;
+    probe.longest_run = std::max(probe.longest_run, run);
+  }
+  probe.mean =
+      probe.judged > 0 ? static_cast<float>(sum / probe.judged) : 0.0f;
+  return probe;
+}
+
+float root_speech_detector_rate_switch_for_test() {
+  RootSpeechDetector detector;
+  const std::vector<float> vowel16 =
+      TestSignal(RootSpeechTestSignal::kVowel, 16000, 160 * 50);
+  const std::vector<float> vowel48 =
+      TestSignal(RootSpeechTestSignal::kVowel, 48000, 480 * 50);
+  for (size_t i = 0; i < 50; ++i) {
+    detector.Analyze(vowel16.data() + i * 160, 160, 16000);
+  }
+  for (size_t i = 0; i < 50; ++i) {
+    detector.Analyze(vowel48.data() + i * 480, 480, 48000);
+  }
+  const std::array<float, 160> silence{};
+  return detector.Analyze(silence.data(), silence.size(), 16000);
+}
+
+RootSpeechDetectorProbe root_speech_detector_hiss(int32_t rate,
+                                                  uint32_t frames) {
+  RootSpeechDetectorProbe probe{};
+  if (rate <= 0) {
+    return probe;
+  }
+  const size_t frame = static_cast<size_t>(rate / 100);
+  // Uniform white noise at -60 dBFS RMS.
+  const double amplitude = 32768.0 * std::sqrt(3.0) * 0.001;
+  Noise noise;
+  std::vector<float> x(frame);
+  RootSpeechDetector detector;
+  double sum = 0;
+  uint32_t run = 0;
+  for (uint32_t i = 0; i < frames; ++i) {
+    for (float& v : x) {
+      v = static_cast<float>(noise.Next() * amplitude);
+    }
+    const float p = detector.Analyze(x.data(), frame, rate);
+    ++probe.frames;
+    if (p < 0) {
+      ++probe.unsupported;
       continue;
     }
     ++probe.judged;

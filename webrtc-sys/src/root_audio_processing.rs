@@ -216,7 +216,8 @@ pub mod ffi {
         /// Frames the detector returned -1 for (a rate it does not run at).
         pub unsupported: u32,
         /// Largest difference from libwebrtc's VoiceActivityDetectorWrapper
-        /// on the same frames (0 at rates the wrapper is not compared at).
+        /// on the same frames, until the detector's first latch reset (0 at
+        /// rates the wrapper is not compared at).
         pub max_diff: f32,
         pub judged: u32,
         pub mean: f32,
@@ -378,6 +379,11 @@ pub mod ffi {
         ) -> RootSpeechDetectorProbe;
         /// A fresh detector's probability for each whole 10 ms frame of `input`.
         fn root_speech_detector_probabilities(rate: i32, input: &[f32]) -> Vec<f32>;
+        /// The detector over `frames` frames of white noise at -60 dBFS.
+        fn root_speech_detector_hiss(rate: i32, frames: u32) -> RootSpeechDetectorProbe;
+        /// A 16 kHz vowel, a 48 kHz vowel, then 16 kHz silence: its first
+        /// frame's probability.
+        fn root_speech_detector_rate_switch_for_test() -> f32;
     }
 }
 
@@ -1293,8 +1299,9 @@ mod processor_tests {
 #[cfg(test)]
 mod speech_tests {
     use super::ffi::{
-        new_root_apm_harness, new_root_processor_harness, root_speech_detector_probabilities,
-        root_speech_detector_probe, root_speech_test_signal, RootProcessorHarness,
+        new_root_apm_harness, new_root_processor_harness, root_speech_detector_hiss,
+        root_speech_detector_probabilities, root_speech_detector_probe,
+        root_speech_detector_rate_switch_for_test, root_speech_test_signal, RootProcessorHarness,
     };
 
     const VOWEL: u32 = 0;
@@ -1366,6 +1373,22 @@ mod speech_tests {
                 .expect("confirmed");
             assert!(confirmed <= 43, "{rate}: confirmed {} ms in: {p:?}", (confirmed - 40) * 10);
         }
+    }
+
+    /// Flat white hiss can hold the RNN at speech without AGC2's periodic
+    /// reset (97% of 10 min at -60 dBFS, 48 kHz): it starts over after 1 s.
+    #[test]
+    fn root_speech_detector_starts_over_when_white_hiss_holds_it() {
+        let hiss = root_speech_detector_hiss(48000, 60_000);
+        assert_eq!(hiss.judged, 60_000);
+        assert!(hiss.above * 4 < hiss.judged, "{hiss:?}");
+        let vowel = root_speech_detector_probe(VOWEL, 48000, 1000);
+        assert!(vowel.above * 10 >= vowel.judged * 8, "a long voice still scores: {vowel:?}");
+    }
+
+    #[test]
+    fn root_speech_detector_rate_change_drops_the_resamplers_history() {
+        assert_eq!(root_speech_detector_rate_switch_for_test(), 0.0);
     }
 
     #[test]
