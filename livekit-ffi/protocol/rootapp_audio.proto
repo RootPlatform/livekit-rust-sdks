@@ -56,19 +56,23 @@ message RootAudioSetPlayoutHoldResponse {
 // What the native speech detector's verdict qualifies (capability SPEECH_DETECTION). The detector is
 // libwebrtc's AGC2 speech detector (rnn_vad) on the APM output at 16, 32 and 48 kHz. Speech is
 // confirmed after 3 frames in a row at a probability of 0.5 or more and ends 300 ms after the last
-// frame at 0.3 or more. Push-to-talk, mute, other rates and frames without a probability leave the
-// noise gate exactly as with OFF.
+// frame at 0.3 or more. Push-to-talk, other rates and frames without a probability leave the noise
+// gate exactly as with OFF. Mute does not: the detector and the speech gate keep running (warm at
+// unmute), while nothing is sent and no speaking is reported.
 enum RootAudioSpeechDetection {
   // The noise gate alone decides (the managed engine's behaviour).
   ROOT_AUDIO_SPEECH_DETECTION_OFF = 0;
   // The speaking state (RootAudioEvent.speaking) needs confirmed speech; the audio follows the noise
   // gate.
   ROOT_AUDIO_SPEECH_DETECTION_RING = 1;
-  // As RING, and the noise gate also closes on what the detector rejects: an open it has not confirmed
-  // within 200 ms, or confirmed speech that ended while the level still holds the gate, is released
-  // over 50 ms and stays shut until the detector confirms speech or the input stays under the
-  // threshold for 100 ms. Automatic sensitivity then learns the noise floor only from what the
-  // detector did not confirm.
+  // As RING, and the noise gate also closes on what the detector rejects. An open it has not
+  // confirmed within 200 ms of frames under 0.3, or confirmed speech whose 300 ms ran out while the
+  // input still holds the gate, is released over 50 ms (40 ms at full gain, then a 10 ms ramp; about
+  // 260 ms of a rejected open is sent) and held shut until a frame at 0.3 or more, an input 6 dB
+  // louder than what was rejected, an onset that stays above the threshold for 30 ms, or 100 ms under
+  // the threshold. When the 300 ms run out in a pause, only the gate's release is shortened to 50 ms.
+  // The threshold is OFF's (automatic sensitivity follows the noise gate alone), so GATE never sends
+  // more than OFF.
   ROOT_AUDIO_SPEECH_DETECTION_GATE = 2;
 }
 
@@ -110,7 +114,8 @@ message RootAudioControl {
   // The host's noise suppression mode is the Effects SDK: a stream's startup hold waits for the
   // denoiser (at most 1 s), and native WebRTC NS covers a denoiser that stops or does not arrive.
   optional bool denoiser_wanted = 13;
-  // OFF until set, and again after every session start (as the other DSP settings).
+  // OFF until set, and again when the first platform audio handle opens and when the last one
+  // closes (as the other DSP settings).
   optional RootAudioSpeechDetection speech_detection = 14;
 }
 message RootAudioSetControlRequest {
