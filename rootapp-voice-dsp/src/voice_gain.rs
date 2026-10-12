@@ -1,4 +1,4 @@
-use crate::clamp_f64;
+use crate::{clamp_f64, pow10};
 
 const FRAME_MS: f64 = 10.0;
 
@@ -83,7 +83,7 @@ pub struct VoiceGain {
 
 impl VoiceGain {
     pub fn new(start_gain_db: f64, options: VoiceGainOptions) -> Self {
-        let foreground_ratio = 10f64.powf(-options.foreground_margin_db / 10.0);
+        let foreground_ratio = pow10(-options.foreground_margin_db / 10.0);
         let pending = ((options.room_guard_ms / FRAME_MS) as usize).max(1);
         let mut gain = Self {
             options,
@@ -361,5 +361,5 @@ impl VoiceGain {
 }
 
 fn to_linear(db: f64) -> f32 {
-    10f64.powf(db / 20.0) as f32
+    pow10(db / 20.0) as f32
 }

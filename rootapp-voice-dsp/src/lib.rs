@@ -13,6 +13,13 @@ pub mod voice_gain;
 pub use chain::{DspChain, AUTO_MIN_OPEN_BLOCKS};
 pub use speech_gate::SpeechDetection;
 
+/// Managed `Math.Pow(10, x)`: libm's pow. The base goes through black_box because LLVM turns a
+/// constant base of 10 into exp10 where libm has one (macOS, glibc), which can round 1 ulp away
+/// from the pow .NET calls on the same platform.
+pub(crate) fn pow10(x: f64) -> f64 {
+    std::hint::black_box(10f64).powf(x)
+}
+
 /// Managed `Math.Clamp(double, min, max)` without the throw on inverted bounds.
 pub(crate) fn clamp_f64(value: f64, min: f64, max: f64) -> f64 {
     if value < min {

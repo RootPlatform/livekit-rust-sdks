@@ -137,5 +137,5 @@ pub fn to_db(rms: f32) -> f64 {
 }
 
 pub fn to_rms(db: f64) -> f32 {
-    10f64.powf(db / 20.0) as f32
+    crate::pow10(db / 20.0) as f32
 }
