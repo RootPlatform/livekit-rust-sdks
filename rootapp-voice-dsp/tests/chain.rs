@@ -204,6 +204,32 @@ fn auto_sensitivity_gates_room_noise_but_sends_speech() {
     }
 }
 
+/// Managed AVoiceGainJumpDoesNotOpenTheAutoGateOnRoomNoise: the floor is learned before the voice
+/// gain and the threshold moves with the gain the same frame.
+#[test]
+fn a_voice_gain_jump_does_not_open_the_auto_gate_on_room_noise() {
+    let mut h = Harness::new(48000);
+    let mut rng = Rng::new(2);
+    let amplitude = (10f64.powf(-70.0 / 20.0) * 3f64.sqrt()) as f32 * 32768.0;
+    let mut noise =
+        |n: usize| -> Vec<f32> { (0..n).map(|_| amplitude * rng.symmetric()).collect() };
+    for _ in 0..600 {
+        let input = noise(480);
+        h.run_input(&input);
+    }
+    assert_eq!(h.out.voice_gain_db, 0.0);
+    h.commands.gain_reset = true;
+    h.commands.gain_reset_db = 15.0;
+    for _ in 0..300 {
+        let input = noise(480);
+        assert!(silent(&h.run_input(&input)));
+    }
+    assert_eq!(h.out.voice_gain_db, 15.0);
+    assert!(!h.out.speaking && !h.out.gate_open);
+    let expected = 10f64.powf((-60.0 + 15.0) / 20.0) as f32;
+    assert!((h.out.threshold - expected).abs() < 1e-6, "{}", h.out.threshold);
+}
+
 #[test]
 fn auto_sensitivity_starts_over_when_switched_back_on() {
     let mut h = Harness::new(48000);

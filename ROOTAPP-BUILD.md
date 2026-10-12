@@ -868,7 +868,8 @@ managed engine's `NativeAudioSource` tracks, which bypass it):
   unchanged (the crate scales FloatS16 by 2^-15 on entry); other rates scale the gate block by time
   (128 samples at 48 kHz, 43 at 16 kHz).
 - With no `RootAudioSetControl` the chain runs on its defaults: noise gate in auto sensitivity
-  (threshold from the noise floor, 5 blocks to open), voice gain on from 0 dB (it only boosts, up to
+  (threshold from the noise floor of the denoised voice before the voice gain, 8 dB over it but never
+  below -60 dBFS, plus the frame's voice gain; 5 blocks to open), voice gain on from 0 dB (it only boosts, up to
   18 dB), no denoiser. Every recording start silences its first 20 frames (200 ms, the startup
   hold), and with `denoiser_wanted` up to 100 frames until the denoiser runs. Mute and push-to-talk
   key up silence after the 5 ms fade; the gate, voice gain and auto sensitivity keep running.

@@ -397,9 +397,12 @@ impl DspChain {
         out.denoiser_ran = ran;
         out.denoiser_stalled = *empty_outputs >= DENOISER_STALL_FRAMES;
 
+        let denoised_rms = rms(w);
+        let mut gain_db = 0.0;
         if *voice_gain_enabled {
             voice_gain.process(w);
-            *voice_gain_db = voice_gain.gain_db() as f32;
+            gain_db = voice_gain.gain_db();
+            *voice_gain_db = gain_db as f32;
             *voice_gain_settled = voice_gain.is_settled();
         }
 
@@ -409,7 +412,11 @@ impl DspChain {
                 auto_sensitivity.reset();
                 *auto_sensitivity_active = true;
             }
-            gate.set_threshold(auto_sensitivity.update(input_rms, gate.envelope() > 0.0));
+            gate.set_threshold(auto_sensitivity.update(
+                denoised_rms,
+                gain_db,
+                gate.envelope() > 0.0,
+            ));
             gate.set_min_open_blocks(AUTO_MIN_OPEN_BLOCKS);
         } else {
             *auto_sensitivity_active = false;

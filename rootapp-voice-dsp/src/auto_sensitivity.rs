@@ -25,7 +25,7 @@ impl Default for AutoSensitivityOptions {
             floor_minimum_db: -90.0,
             floor_maximum_db: -35.0,
             open_margin_db: 8.0,
-            open_minimum_db: -58.0,
+            open_minimum_db: -60.0,
             hysteresis_db: 3.0,
             fall_time_constant_ms: 1000.0,
             rise_db_per_second: 1.0,
@@ -37,7 +37,8 @@ impl Default for AutoSensitivityOptions {
 }
 
 /// Managed `AutoSensitivity`: the gate threshold follows the mic's noise floor, one `update` per
-/// 10 ms frame.
+/// 10 ms frame. The floor and the thresholds are in dB of the denoised voice before the voice gain;
+/// `update` adds the frame's gain to the threshold it returns.
 #[derive(Clone, Debug)]
 pub struct AutoSensitivity {
     options: AutoSensitivityOptions,
@@ -84,9 +85,10 @@ impl AutoSensitivity {
         self.recent_next = 0;
     }
 
-    /// Returns the RMS threshold the gate should use for this frame.
-    pub fn update(&mut self, frame_rms: f32, gate_open: bool) -> f32 {
-        let level_db = to_db(frame_rms);
+    /// input_rms: the frame before the voice gain; gain_db: the voice gain applied to it (0 without
+    /// one). Returns the RMS threshold the gate should use for the frame after the gain.
+    pub fn update(&mut self, input_rms: f32, gain_db: f64, gate_open: bool) -> f32 {
+        let level_db = to_db(input_rms);
         let len = self.recent_db.len();
         if let Some(slot) = self.recent_db.get_mut(self.recent_next) {
             *slot = level_db;
@@ -117,7 +119,8 @@ impl AutoSensitivity {
         self.floor_db =
             clamp_f64(self.floor_db, self.options.floor_minimum_db, self.options.floor_maximum_db);
         self.elapsed_ms += FRAME_MS;
-        to_rms(if gate_open { self.close_db() } else { self.open_db() })
+        let gain_db = if gain_db.is_finite() { gain_db } else { 0.0 };
+        to_rms(if gate_open { self.close_db() } else { self.open_db() } + gain_db)
     }
 
     fn recent_minimum(&self) -> f64 {
