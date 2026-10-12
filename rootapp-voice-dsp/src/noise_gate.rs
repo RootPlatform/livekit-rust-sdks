@@ -1,3 +1,5 @@
+use crate::speech_gate::{GateControl, FAST_RELEASE_SECONDS};
+
 pub const DEFAULT_THRESHOLD: f32 = 0.025;
 pub const FULL_ON_ENVELOPE: f32 = 0.2;
 pub const ATTACK_SECONDS: f64 = 0.02;
@@ -105,12 +107,19 @@ impl NoiseGate {
 
     /// `apply` false: the state advances exactly as `process`, the samples are left alone.
     pub fn process_gated(&mut self, samples: &mut [f32], apply: bool) {
+        self.process_controlled(samples, apply, GateControl::LEVEL);
+    }
+
+    /// `process_gated` with the speech gate's controls: `allow_open` false keeps a closed gate
+    /// closed; `fast_close` releases over FAST_RELEASE_SECONDS whatever the level and skips the
+    /// speaking hold. GateControl::LEVEL is exactly `process_gated`.
+    pub fn process_controlled(&mut self, samples: &mut [f32], apply: bool, control: GateControl) {
         for block in samples.chunks_mut(self.block_samples) {
-            self.process_block(block, apply);
+            self.process_block(block, apply, control);
         }
     }
 
-    fn process_block(&mut self, block: &mut [f32], apply: bool) {
+    fn process_block(&mut self, block: &mut [f32], apply: bool, control: GateControl) {
         let block_seconds = block.len() as f64 / f64::from(self.sample_rate);
         let rms = match self.push_to_talk {
             None => compute_rms(block),
@@ -119,7 +128,16 @@ impl NoiseGate {
         };
         let above = rms > self.threshold;
         self.above_blocks = if above { self.above_blocks.saturating_add(1) } else { 0 };
-        if above && (self.envelope > 0.0 || self.above_blocks >= self.min_open_blocks) {
+        if control.fast_close {
+            self.envelope =
+                (f64::from(self.envelope) - block_seconds / FAST_RELEASE_SECONDS).max(0.0) as f32;
+            if self.envelope <= 0.0 {
+                self.hold_end = self.position;
+            }
+        } else if above
+            && (self.envelope > 0.0
+                || (control.allow_open && self.above_blocks >= self.min_open_blocks))
+        {
             self.envelope =
                 (f64::from(self.envelope) + block_seconds / ATTACK_SECONDS).min(1.0) as f32;
         } else if !above {
@@ -140,7 +158,9 @@ impl NoiseGate {
 
         if self.envelope > 0.0 {
             self.is_speaking = true;
-            self.hold_end = self.position.saturating_add(self.hold_samples);
+            if !control.fast_close {
+                self.hold_end = self.position.saturating_add(self.hold_samples);
+            }
         } else if self.is_speaking && self.position >= self.hold_end {
             self.is_speaking = false;
         }

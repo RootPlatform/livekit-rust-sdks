@@ -3,6 +3,7 @@ use crate::auto_sensitivity::{AutoSensitivity, AutoSensitivityOptions};
 use crate::gain_ramp::GainRamp;
 use crate::noise_gate::{block_samples_for, NoiseGate};
 use crate::sanitize::{self, FULL_SCALE};
+use crate::speech_gate::{self, GateControl, SpeechDetection, SpeechGate};
 use crate::transmit_gate::TransmitGate;
 use crate::voice_gain::{VoiceGain, VoiceGainOptions};
 use crate::{
@@ -122,6 +123,7 @@ pub struct DspChain {
     /// A pipeline ran or was installed (Ran or Missed) since the last reset or rate change: the
     /// startup hold no longer waits for the denoiser.
     denoiser_seen: bool,
+    speech: SpeechGate,
 }
 
 impl DspChain {
@@ -157,6 +159,7 @@ impl DspChain {
             empty_outputs: 0,
             frames_since_open: 0,
             denoiser_seen: false,
+            speech: SpeechGate::default(),
         }
     }
 
@@ -177,6 +180,7 @@ impl DspChain {
         self.aligner_in_use = false;
         self.empty_outputs = 0;
         self.frames_since_open = 0;
+        self.speech.reset();
     }
 
     /// A new rate (or a reset): flush, a fresh noise gate, ramps and fade at their targets. The
@@ -345,6 +349,7 @@ impl DspChain {
             empty_outputs,
             frames_since_open,
             denoiser_seen,
+            speech,
             ..
         } = self;
         let Some(w) = work.get_mut(..len) else {
@@ -407,16 +412,32 @@ impl DspChain {
         }
 
         let input_rms = rms(w);
+        let detection = if gate.push_to_talk().is_none() {
+            settings.speech_detection
+        } else {
+            SpeechDetection::Off
+        };
+        let probability = match detection {
+            SpeechDetection::Off => None,
+            SpeechDetection::Ring | SpeechDetection::Gate => {
+                speech_gate::probability(settings.speech_probability)
+            }
+        };
+        let gate_audio = probability.is_some() && detection == SpeechDetection::Gate;
+        let level_open = gate.envelope() > 0.0;
+        let auto_open = match probability {
+            Some(p) => speech.observe(p, level_open, gate_audio),
+            None => {
+                speech.reset();
+                level_open
+            }
+        };
         if settings.auto_sensitivity {
             if !*auto_sensitivity_active {
                 auto_sensitivity.reset();
                 *auto_sensitivity_active = true;
             }
-            gate.set_threshold(auto_sensitivity.update(
-                denoised_rms,
-                gain_db,
-                gate.envelope() > 0.0,
-            ));
+            gate.set_threshold(auto_sensitivity.update(denoised_rms, gain_db, auto_open));
             gate.set_min_open_blocks(AUTO_MIN_OPEN_BLOCKS);
         } else {
             *auto_sensitivity_active = false;
@@ -434,7 +455,15 @@ impl DspChain {
         out.gate_in_sumsq = sanitize::sum_squares(w) * SUMSQ_TO_S16;
 
         let released = gate.push_to_talk() == Some(false);
-        gate.process_gated(w, !released);
+        let above = input_rms > gate.threshold();
+        let control = match probability {
+            Some(p) if gate_audio => speech.control(p, above, level_open),
+            _ => GateControl::LEVEL,
+        };
+        gate.process_controlled(w, !released, control);
+        if gate_audio {
+            speech.after_gate(gate.envelope());
+        }
 
         ramp.set_target(sanitize::input_volume(settings.input_volume));
         ramp.apply(w);
@@ -449,12 +478,18 @@ impl DspChain {
         let threshold = gate.threshold();
         let envelope = gate.envelope();
         let gate_speaking = gate.is_speaking();
+        let speech_confirmed = probability.is_some() && speech.confirmed();
+        let speaking =
+            if probability.is_some() { gate_speaking && speech_confirmed } else { gate_speaking };
         out.sent_sumsq = sanitize::sum_squares(frame);
         out.gate_in_rms = input_rms;
         out.threshold = threshold;
         out.envelope = envelope;
         out.gate_speaking = gate_speaking;
-        out.speaking = gate_speaking && open;
+        out.speaking = speaking && open;
+        out.speech_probability = probability.unwrap_or(-1.0);
+        out.speech = speech_confirmed;
+        out.speech_closed = control.fast_close || (!control.allow_open && above);
         out.gate_open = envelope > 0.0;
         out.gate_input_above = input_rms > threshold;
         out.held = held;
@@ -494,8 +529,12 @@ impl DspChain {
         out.gate_in_block_peak_db = f32::NEG_INFINITY;
         out.threshold = self.gate.threshold();
         out.envelope = self.gate.envelope();
+        self.speech.reset();
         out.gate_speaking = self.gate.is_speaking();
         out.speaking = out.gate_speaking && open;
+        out.speech_probability = -1.0;
+        out.speech = false;
+        out.speech_closed = false;
         out.gate_open = false;
         out.gate_input_above = false;
         out.held = false;

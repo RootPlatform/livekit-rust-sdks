@@ -11,7 +11,8 @@ mod support;
 
 use rootapp_voice_dsp::voice_gain::{VoiceGain, VoiceGainOptions};
 use rootapp_voice_dsp::{
-    DenoiserOutput, DspChain, DspCommands, DspOutputs, DspSettings, PushToTalk, MAX_FRAME,
+    DenoiserOutput, DspChain, DspCommands, DspOutputs, DspSettings, PushToTalk, SpeechDetection,
+    MAX_FRAME,
 };
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -111,6 +112,8 @@ fn the_chain_never_allocates_or_frees_after_new() {
                 gate_threshold: [0.025, 0.0, 0.3][(f / 90) % 3],
                 auto_sensitivity: f % 300 < 200,
                 denoiser_wanted: f % 1000 < 600,
+                speech_detection: SpeechDetection::from_wire((f / 53 % 3) as u32),
+                speech_probability: [0.9, 0.1, -1.0, 0.6, 0.0][(f / 7) % 5],
             };
             let commands = DspCommands {
                 reset: f % 997 == 3,

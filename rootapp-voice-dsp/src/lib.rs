@@ -6,10 +6,12 @@ mod chain;
 pub mod gain_ramp;
 pub mod noise_gate;
 pub mod sanitize;
+pub mod speech_gate;
 pub mod transmit_gate;
 pub mod voice_gain;
 
 pub use chain::{DspChain, AUTO_MIN_OPEN_BLOCKS};
+pub use speech_gate::SpeechDetection;
 
 /// Managed `Math.Clamp(double, min, max)` without the throw on inverted bounds.
 pub(crate) fn clamp_f64(value: f64, min: f64, max: f64) -> f64 {
@@ -69,6 +71,11 @@ pub struct DspSettings {
     pub auto_sensitivity: bool,
     /// The host's NS mode is the Effects SDK: the startup hold waits for the denoiser (≤ 100 frames).
     pub denoiser_wanted: bool,
+    /// Off, or what the speech detector's verdict qualifies (push-to-talk ignores it).
+    pub speech_detection: SpeechDetection,
+    /// The speech detector's probability for this frame's pre-denoise input, 0..1; negative or
+    /// non-finite when it did not run (the level gate alone decides, as with Off).
+    pub speech_probability: f32,
 }
 
 impl Default for DspSettings {
@@ -82,6 +89,8 @@ impl Default for DspSettings {
             gate_threshold: 0.025,
             auto_sensitivity: true,
             denoiser_wanted: false,
+            speech_detection: SpeechDetection::Off,
+            speech_probability: -1.0,
         }
     }
 }
@@ -187,4 +196,10 @@ pub struct DspOutputs {
     pub reset: bool,
     /// A flush ran this frame (command, rate change or reset).
     pub flushed: bool,
+    /// The probability the speech gate used this frame; -1 when it did not judge the frame.
+    pub speech_probability: f32,
+    /// Speech confirmed after this frame (speech detection on and judging).
+    pub speech: bool,
+    /// The speech gate kept the gate from opening or forced its release this frame.
+    pub speech_closed: bool,
 }

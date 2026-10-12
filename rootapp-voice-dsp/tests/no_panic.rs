@@ -9,7 +9,7 @@
 mod support;
 
 use rootapp_voice_dsp::{
-    DenoiserOutput, DspChain, DspCommands, DspOutputs, DspSettings, PushToTalk,
+    DenoiserOutput, DspChain, DspCommands, DspOutputs, DspSettings, PushToTalk, SpeechDetection,
 };
 use support::Rng;
 
@@ -106,6 +106,9 @@ fn any_shape_settings_input_and_denoiser_output_leaves_finite_full_scale_audio()
                             gate_threshold: FLOATS[(step / 3) % FLOATS.len()],
                             auto_sensitivity: step % 5 < 3,
                             denoiser_wanted: step % 4 < 2,
+                            speech_detection: SpeechDetection::from_wire((step % 3) as u32),
+                            speech_probability: [f32::NAN, 0.9, -1.0, 2.0, f32::INFINITY, 0.2]
+                                [step % 6],
                         };
                         let commands = DspCommands {
                             reset: step % 29 == 0,
@@ -177,6 +180,8 @@ fn abrupt_changes_and_commands_in_every_state_never_panic() {
             gate_threshold: [0.025, 0.0, 1.0, 0.5][((v >> 32) % 4) as usize],
             auto_sensitivity: (v >> 34) % 3 != 0,
             denoiser_wanted: (v >> 36) % 2 == 0,
+            speech_detection: SpeechDetection::from_wire(((v >> 38) % 3) as u32),
+            speech_probability: [f32::NAN, 0.95, 0.05, -0.5, 1.5][((v >> 40) % 5) as usize],
         };
         let commands = DspCommands {
             reset: (v >> 38) % 40 == 0,

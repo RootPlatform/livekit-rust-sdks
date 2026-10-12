@@ -168,6 +168,7 @@ fn parse(bytes: &[u8]) -> Result<(Header, Vec<Record>), String> {
                 gate_threshold,
                 auto_sensitivity: b[3] != 0,
                 denoiser_wanted: b[4] != 0,
+                ..DspSettings::default()
             },
             commands: DspCommands {
                 reset: b[5] != 0,
