@@ -791,6 +791,9 @@ What changes for every user of the library on Windows, macOS and Linux, the mana
   ignores a device track's `auto_gain_control=true` and `highpass_filter=false`: AGC1 and AGC2 stay
   off and the high-pass filter stays on for every desktop user.
 - `RootAudioMixer` replaces `AudioMixerImpl`: fixed 48 kHz, no limiter, float mix, soft clip.
+- libwebrtc's `Terminate` (m150: the voice engine's, with the last PeerConnection) only ends
+  libwebrtc's own playout, recording and transport; both ADMs stay up until the factory goes, so the
+  next PeerConnection gets audio again (see "The voice engine without a call").
 - A transport tap counts the platform ADM's callbacks (`RootAudioStats`; `GetStats` only while
   platform audio is in use). In every build, locks taken and libwebrtc log lines raised (and
   dropped) on device threads are counted; `RootAudioStats` fields 70-73 report them with the
@@ -1105,6 +1108,57 @@ Tests: `adm_proxy_playout_opens_stereo_*`, `adm_proxy_never_touches_the_speaker_
 Tests: `adm_proxy_device_plays_silence_until_libwebrtc_has_a_transport` (hold, no transport, a
 full-scale stale buffer: silence; then the chime through the mixer: the device plays exactly the
 mixer's metered output), `adm_proxy_mic_test_device_plays_silence_without_libwebrtcs_transport`.
+
+### The voice engine without a call (2026-10-12, after hw.6)
+
+- m150 initializes the voice engine (`WebRtcVoiceEngine::Init`: `adm_helpers::Init`, the APM options,
+  then `RegisterAudioCallback` with AudioState's `AudioTransportImpl`, which runs the APM and so the
+  capture processor and the monitor on capture, and the playout mixer on render) only when a
+  PeerConnection takes its reference to the `ConnectionContext` (`PeerConnection::Initialize`,
+  `ConnectionContext::AddRefMediaEngine`), and terminates it when the last one drops it
+  (`~PeerConnection`, `ReleaseMediaEngine`, `WebRtcVoiceEngine::Terminate`). Without a PeerConnection
+  the Settings mic test's capture never reached the APM (the monitor played the tap's silence and the
+  desktop fell back to the managed test after 3 s), and the hold played no mixer (no effects) before
+  the first PeerConnection or after the last.
+- `WebRtcVoiceEngine::Terminate` ends with `adm->Terminate()`, which shut the proxy and both ADMs
+  down for good; the next PeerConnection's engine init only calls `Init` (a no-op), so a factory that
+  outlived its last PeerConnection had no audio from then on: no device opened for a platform call
+  or the mic test, and no synthetic pump for a managed call (remote audio stops reaching its sinks).
+  A factory outlives its PeerConnections while anything holds the runtime, e.g. a call's lease kept
+  past the room's end (the leave chime, the desktop's up to 5 s), a call joined within that time, or
+  the mic test on the same runtime.
+- The factory now builds its `PeerConnectionFactory` as `CreateModularPeerConnectionFactory` does
+  (`ConnectionContext::Create`, `PeerConnectionFactory`, `PeerConnectionFactoryProxy`) but keeps the
+  context. `RootVoiceEngineHold` takes a `ConnectionContext::MediaEngineReference` of its own, as a
+  PeerConnection does, on the worker thread while a platform reference is held: every
+  `AudioDeviceController::acquire_platform_adm` posts one up, every release one down (never waiting),
+  and `~PeerConnectionFactory` shuts it down before letting go of the context. Desktop only; mobile
+  takes no reference.
+- `AdmProxy::Terminate` now only ends what libwebrtc itself asked for (its playout, recording and
+  transport); the hold, the app and the monitor keep theirs, a held device plays the tap's silence
+  (never a stale buffer), and only the destructor shuts the ADMs down. The next engine init, from a
+  PeerConnection or a platform reference, finds the proxy working.
+- Consequences: the voice engine initializes when the first `PlatformAudio` handle is created, so
+  effects (the join chime) play as soon as the lease's hold opens the device, before the room
+  connects, and after the last PeerConnection while the lease is held; the mic test hears what a call
+  would send with no call ever made. The managed engine (no platform reference) takes no engine
+  reference, opens no platform device, and gets its synthetic pump again in every call.
+
+Tests (`root_engine_*`, `RootEngineHarness`: libwebrtc's own `WebRtcVoiceEngine` in a
+`ConnectionContext` over `AdmProxy` and the fake platform ADM, wired as the factory wires it, with the
+hold; PeerConnections are stood in for by their `MediaEngineReference`s, none is created):
+`root_engine_mic_test_plays_processed_capture_before_any_call` (every frame through the APM and the
+processor, every render through libwebrtc's transport and the mixer, the device plays exactly what a
+call would send; muted, silence), `root_engine_mic_test_works_again_after_the_engine_terminated`,
+`root_engine_a_call_ending_under_a_lease_leaves_the_device_working` (join chime before the
+PeerConnection, leave chime after the last, the next call plays and captures),
+`root_engine_mic_test_runs_on_across_a_call_ending`,
+`root_engine_managed_calls_never_open_the_device_and_each_gets_the_pump`;
+`adm_proxy_engine_terminate_under_the_hold_plays_silence_until_the_next_init`,
+`adm_proxy_shutdown_stops_the_devices_before_clearing_the_callback`. Without the hold the first four
+fail (nothing processed, no mix); with the old `Terminate` the second, the fifth and the
+`adm_proxy_engine_terminate_*` test fail. The `adm_proxy_device_plays_silence_*` and
+`adm_proxy_mic_test_device_plays_silence_*` tests still cover the time before the posted engine init.
 
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
