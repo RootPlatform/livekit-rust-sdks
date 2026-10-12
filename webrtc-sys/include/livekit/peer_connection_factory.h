@@ -33,6 +33,7 @@ class AudioDeviceController;
 class PeerConnectionObserverWrapper;
 class RootAudioMixer;
 class RootApmDecorator;
+class RootVoiceEngineHold;
 struct RootCaptureState;
 }  // namespace livekit_ffi
 #include "webrtc-sys/src/peer_connection_factory.rs.h"
@@ -89,6 +90,8 @@ class PeerConnectionFactory {
   std::shared_ptr<RootCaptureState> capture_state_;
   webrtc::scoped_refptr<RootApmDecorator> apm_;
   webrtc::scoped_refptr<AdmProxy> adm_proxy_;
+  // Desktop: holds libwebrtc's voice engine while platform audio is in use.
+  std::shared_ptr<RootVoiceEngineHold> engine_hold_;
   std::shared_ptr<AudioDeviceController> audio_device_;
   webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> peer_factory_;
   webrtc::Environment env_;

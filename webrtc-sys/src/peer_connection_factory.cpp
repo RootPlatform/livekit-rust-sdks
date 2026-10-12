@@ -17,13 +17,13 @@
 #include "livekit/peer_connection_factory.h"
 
 #include <memory>
+#include <optional>
 #include <utility>
 #include <vector>
 
 #include "api/audio_codecs/builtin_audio_decoder_factory.h"
 #include "api/audio_codecs/builtin_audio_encoder_factory.h"
 #include "api/audio/builtin_audio_processing_builder.h"
-#include "api/create_modular_peer_connection_factory.h"
 #include "api/environment/environment_factory.h"
 #include "api/field_trials_view.h"
 #include "api/peer_connection_interface.h"
@@ -42,11 +42,15 @@
 #include "livekit/root_audio_monitor.h"
 #include "livekit/root_audio_processing.h"
 #include "livekit/root_denoiser.h"
+#include "livekit/root_voice_engine_hold.h"
 #include "livekit/rtc_error.h"
 #include "livekit/rtp_parameters.h"
 #include "livekit/video_decoder_factory.h"
 #include "livekit/video_encoder_factory.h"
 #include "livekit/webrtc.h"
+#include "pc/connection_context.h"
+#include "pc/peer_connection_factory.h"
+#include "pc/peer_connection_factory_proxy.h"
 #include "rtc_base/thread.h"
 #include "webrtc-sys/src/peer_connection.rs.h"
 #include "webrtc-sys/src/peer_connection_factory.rs.h"
@@ -142,6 +146,30 @@ webrtc::Environment CreateEnvironment(bool zero_playout_delay,
       std::make_unique<CompositeFieldTrials>(std::move(views)));
 }
 
+// CreateModularPeerConnectionFactory (m150), keeping the ConnectionContext so
+// platform audio can hold the voice engine as a PeerConnection does.
+webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface>
+CreateFactoryKeepingContext(
+    webrtc::PeerConnectionFactoryDependencies dependencies,
+    webrtc::scoped_refptr<webrtc::ConnectionContext>* context) {
+  webrtc::Thread* signaling_thread = dependencies.signaling_thread;
+  return signaling_thread->BlockingCall(
+      [&]() -> webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> {
+        webrtc::Environment env = dependencies.env.has_value()
+                                      ? *std::move(dependencies.env)
+                                      : webrtc::CreateEnvironment();
+        dependencies.env = std::nullopt;
+        *context = webrtc::ConnectionContext::Create(env, &dependencies);
+        if (!*context) {
+          return nullptr;
+        }
+        auto factory = webrtc::make_ref_counted<webrtc::PeerConnectionFactory>(
+            env, *context, &dependencies);
+        return webrtc::PeerConnectionFactoryProxy::Create(
+            factory->signaling_thread(), factory->worker_thread(), factory);
+      });
+}
+
 }  // namespace
 
 class PeerConnectionObserver;
@@ -205,8 +233,6 @@ PeerConnectionFactory::PeerConnectionFactory(
   }
   adm_proxy_->SetCaptureState(capture_state_);
 #endif
-  audio_device_ = std::make_shared<AudioDeviceController>(
-      adm_proxy_, audio_mixer_, apm_, capture_state_);
 
   dependencies.adm = adm_proxy_;
   dependencies.audio_mixer = audio_mixer_;
@@ -225,8 +251,18 @@ PeerConnectionFactory::PeerConnectionFactory(
   }
 
   webrtc::EnableMedia(dependencies);
+  webrtc::scoped_refptr<webrtc::ConnectionContext> context;
   peer_factory_ =
-      webrtc::CreateModularPeerConnectionFactory(std::move(dependencies));
+      CreateFactoryKeepingContext(std::move(dependencies), &context);
+
+#if !LK_ADM_MOBILE
+  if (context) {
+    engine_hold_ = std::make_shared<RootVoiceEngineHold>(
+        rtc_runtime_->worker_thread(), context);
+  }
+#endif
+  audio_device_ = std::make_shared<AudioDeviceController>(
+      adm_proxy_, audio_mixer_, apm_, capture_state_, engine_hold_);
 
   if (peer_factory_.get() == nullptr) {
     RTC_LOG_ERR(LS_ERROR) << "Failed to create PeerConnectionFactory";
@@ -237,6 +273,9 @@ PeerConnectionFactory::PeerConnectionFactory(
 PeerConnectionFactory::~PeerConnectionFactory() {
   RTC_LOG(LS_VERBOSE) << "PeerConnectionFactory::~PeerConnectionFactory()";
 
+  if (engine_hold_) {
+    engine_hold_->Shutdown();
+  }
   peer_factory_ = nullptr;
   audio_device_ = nullptr;
   rtc_runtime_->worker_thread()->BlockingCall(

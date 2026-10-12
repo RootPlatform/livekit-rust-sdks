@@ -99,6 +99,7 @@ fn main() {
         "src/root_audio_monitor.cpp",
         "src/root_audio_processing.cpp",
         "src/root_denoiser.cpp",
+        "src/root_voice_engine_hold.cpp",
         "src/audio_resampler.cpp",
         "src/frame_cryptor.cpp",
         "src/global_task_queue.cpp",

@@ -25,6 +25,7 @@
 #include "livekit/root_audio_monitor.h"
 #include "livekit/root_audio_processing.h"
 #include "livekit/root_denoiser.h"
+#include "livekit/root_voice_engine_hold.h"
 #include "rust/cxx.h"
 
 namespace webrtc {
@@ -36,6 +37,7 @@ namespace livekit_ffi {
 class AudioDeviceController;
 class AdmProxyHarness;
 class RootVoiceHarness;
+class RootEngineHarness;
 class RootMonitorHarness;
 struct RootMonitorStats;
 struct RootVoiceFakeCounts;
@@ -63,10 +65,14 @@ class AudioDeviceController {
  public:
   explicit AudioDeviceController(webrtc::scoped_refptr<AdmProxy> adm_proxy);
   // The native audio engine's pieces; any of them may be null (mobile, tests).
-  AudioDeviceController(webrtc::scoped_refptr<AdmProxy> adm_proxy,
-                        webrtc::scoped_refptr<RootAudioMixer> mixer,
-                        webrtc::scoped_refptr<RootApmDecorator> apm,
-                        std::shared_ptr<RootCaptureState> capture);
+  // `engine_hold` keeps libwebrtc's voice engine initialized while a platform
+  // reference is held.
+  AudioDeviceController(
+      webrtc::scoped_refptr<AdmProxy> adm_proxy,
+      webrtc::scoped_refptr<RootAudioMixer> mixer,
+      webrtc::scoped_refptr<RootApmDecorator> apm,
+      std::shared_ptr<RootCaptureState> capture,
+      std::shared_ptr<RootVoiceEngineHold> engine_hold = nullptr);
 
   // Device enumeration
   int16_t playout_devices() const;
@@ -176,6 +182,7 @@ class AudioDeviceController {
   webrtc::scoped_refptr<RootAudioMixer> mixer_;
   webrtc::scoped_refptr<RootApmDecorator> apm_;
   std::shared_ptr<RootCaptureState> capture_;
+  std::shared_ptr<RootVoiceEngineHold> engine_hold_;
   // With the capture state's slot: the rootapp-effects thread.
   std::unique_ptr<RootDenoiserControl> denoiser_;
 };
@@ -292,7 +299,11 @@ class AdmProxyHarness {
   int32_t engine_set_speaker_volume(uint32_t volume) const;
   int32_t engine_set_speaker_mute(bool mute) const;
   void register_transport() const;
-  void terminate() const;
+  // WebRtcVoiceEngine::Terminate on the proxy: StopPlayout, StopRecording,
+  // RegisterAudioCallback(nullptr), Terminate.
+  void engine_terminate() const;
+  // What the proxy's destructor does to the devices.
+  void shutdown() const;
   AudioDeviceRequestOutcome select(const AudioDeviceSelection& recording,
                                    bool set_recording,
                                    const AudioDeviceSelection& playout,
@@ -423,5 +434,50 @@ class RootVoiceHarness {
 };
 
 std::unique_ptr<RootVoiceHarness> new_root_voice_harness();
+
+// libwebrtc's own voice engine (WebRtcVoiceEngine in a ConnectionContext, with
+// its AudioState and AudioTransportImpl) over AdmProxy and a fake platform
+// ADM, with the factory's APM, capture processor, monitor, mixer, controller
+// and voice engine hold. A PeerConnection is stood in for by the reference it
+// takes to the ConnectionContext (PeerConnection::Initialize, and its
+// destructor), a call's streams by AudioState's StartPlayout/StartRecording.
+// Tests only; no audio device is opened and no PeerConnection is created.
+class RootEngineHarness {
+ public:
+  RootEngineHarness();
+  ~RootEngineHarness();
+
+  const AudioDeviceController& controller() const;
+  // As a PlatformAudio handle's creation (a platform reference, both
+  // directions enabled, a session start) and its drop (the session's reset
+  // with the gate closed, then the reference).
+  bool acquire() const;
+  void release() const;
+  void open_peer_connection() const;
+  void close_peer_connection() const;
+  void engine_playout(bool start) const;
+  void engine_recording(bool start) const;
+  void hold(bool hold) const;
+  uint8_t monitor(bool enabled) const;
+  // Returns once the worker and device threads ran what was posted to them.
+  void flush() const;
+  // One 10 ms frame of interleaved channels from the device's capture thread.
+  void capture(int32_t rate,
+               size_t channels,
+               rust::Slice<const int16_t> input) const;
+  // One 10 ms render callback from the device's render thread; returns what
+  // the device plays.
+  rust::Vec<int16_t> render(int32_t rate, size_t channels) const;
+  bool platform_playing() const;
+  bool platform_recording() const;
+  bool synthetic_playing() const;
+  rust::Vec<rust::String> take_calls() const;
+
+ private:
+  struct Parts;
+  std::unique_ptr<Parts> parts_;
+};
+
+std::unique_ptr<RootEngineHarness> new_root_engine_harness();
 
 }  // namespace livekit_ffi

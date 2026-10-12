@@ -393,8 +393,9 @@ class AdmProxy : public webrtc::AudioDeviceModule {
   bool AcquirePlatformAdm();
 
   /// Releases a reference to the Platform ADM. At zero the proxy returns to
-  /// synthetic mode and the playout hold and app requests are dropped.
-  void ReleasePlatformAdm();
+  /// synthetic mode and the playout hold and app requests are dropped. False
+  /// when there was no reference to release.
+  bool ReleasePlatformAdm();
 
   int platform_adm_ref_count() const;
   bool is_platform_adm_active() const;
@@ -448,6 +449,8 @@ class AdmProxy : public webrtc::AudioDeviceModule {
 
   /// Returns once every device task posted before the call has run.
   void FlushDeviceTasksForTest();
+  /// The destructor's shutdown of both ADMs.
+  void ShutdownForTest();
   bool SyntheticPlayingForTest() const;
   /// Replaces the UID translation (CoreAudio on macOS, none elsewhere).
   void SetUidTranslatorForTest(AdmUidTranslator translator);
@@ -462,6 +465,11 @@ class AdmProxy : public webrtc::AudioDeviceModule {
   int32_t ActiveAudioLayer(AudioLayer* audioLayer) const override;
   int32_t RegisterAudioCallback(webrtc::AudioTransport* transport) override;
 
+  // Both ADMs are initialized when created and terminated by the destructor.
+  // libwebrtc's Terminate (m150: the voice engine's, with the last
+  // PeerConnection) only ends what libwebrtc itself asked for, so a held
+  // device keeps running on the tap's silence and the next Init (the next
+  // PeerConnection, or a platform reference) finds the proxy working.
   int32_t Init() override;
   int32_t Terminate() override;
   bool Initialized() const override;

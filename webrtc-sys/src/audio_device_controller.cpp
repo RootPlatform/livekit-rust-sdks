@@ -89,11 +89,13 @@ AudioDeviceController::AudioDeviceController(
     webrtc::scoped_refptr<AdmProxy> adm_proxy,
     webrtc::scoped_refptr<RootAudioMixer> mixer,
     webrtc::scoped_refptr<RootApmDecorator> apm,
-    std::shared_ptr<RootCaptureState> capture)
+    std::shared_ptr<RootCaptureState> capture,
+    std::shared_ptr<RootVoiceEngineHold> engine_hold)
     : adm_proxy_(std::move(adm_proxy)),
       mixer_(std::move(mixer)),
       apm_(std::move(apm)),
-      capture_(std::move(capture)) {
+      capture_(std::move(capture)),
+      engine_hold_(std::move(engine_hold)) {
   if (!capture_ || !capture_->denoiser_slot) {
     return;
   }
@@ -774,12 +776,23 @@ bool AudioDeviceController::adm_playout_enabled() const {
   return adm_proxy_->playout_enabled();
 }
 
+// The engine reference follows each platform reference, so libwebrtc's
+// transport is registered (or about to be) whenever a device may open for the
+// hold, the app or the monitor; until then the transport tap plays silence.
 bool AudioDeviceController::acquire_platform_adm() const {
-  return adm_proxy_->AcquirePlatformAdm();
+  if (!adm_proxy_->AcquirePlatformAdm()) {
+    return false;
+  }
+  if (engine_hold_) {
+    engine_hold_->Acquire();
+  }
+  return true;
 }
 
 void AudioDeviceController::release_platform_adm() const {
-  adm_proxy_->ReleasePlatformAdm();
+  if (adm_proxy_->ReleasePlatformAdm() && engine_hold_) {
+    engine_hold_->Release();
+  }
 }
 
 int AudioDeviceController::platform_adm_ref_count() const {

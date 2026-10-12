@@ -29,14 +29,23 @@
 #include <vector>
 
 #include "api/audio/audio_frame.h"
+#include "api/audio/audio_processing.h"
+#include "api/audio_codecs/builtin_audio_decoder_factory.h"
+#include "api/audio_codecs/builtin_audio_encoder_factory.h"
+#include "api/enable_media.h"
 #include "api/environment/environment_factory.h"
 #include "api/make_ref_counted.h"
+#include "api/peer_connection_interface.h"
+#include "api/video_codecs/video_decoder_factory.h"
+#include "api/video_codecs/video_encoder_factory.h"
 #include "livekit/adm_proxy.h"
 #include "livekit/audio_device_controller.h"
 #include "livekit/audio_thread.h"
 #include "livekit/root_audio_mixer.h"
+#include "livekit/root_voice_engine_hold.h"
 #include "modules/audio_device/audio_device_buffer.h"
 #include "modules/audio_device/include/audio_device_default.h"
+#include "pc/connection_context.h"
 #include "rtc_base/event.h"
 #include "rtc_base/thread.h"
 
@@ -728,8 +737,15 @@ void AdmProxyHarness::register_transport() const {
   proxy_->RegisterAudioCallback(transport_.get());
 }
 
-void AdmProxyHarness::terminate() const {
+void AdmProxyHarness::engine_terminate() const {
+  proxy_->StopPlayout();
+  proxy_->StopRecording();
+  proxy_->RegisterAudioCallback(nullptr);
   proxy_->Terminate();
+}
+
+void AdmProxyHarness::shutdown() const {
+  proxy_->ShutdownForTest();
 }
 
 namespace {
@@ -1264,6 +1280,266 @@ bool RootVoiceHarness::webrtc_ns_applied() const {
 
 std::unique_ptr<RootVoiceHarness> new_root_voice_harness() {
   return std::make_unique<RootVoiceHarness>();
+}
+
+namespace {
+
+class NoVideoEncoderFactory : public webrtc::VideoEncoderFactory {
+ public:
+  std::vector<webrtc::SdpVideoFormat> GetSupportedFormats() const override {
+    return {};
+  }
+  std::unique_ptr<webrtc::VideoEncoder> Create(
+      const webrtc::Environment&,
+      const webrtc::SdpVideoFormat&) override {
+    return nullptr;
+  }
+};
+
+class NoVideoDecoderFactory : public webrtc::VideoDecoderFactory {
+ public:
+  std::vector<webrtc::SdpVideoFormat> GetSupportedFormats() const override {
+    return {};
+  }
+  std::unique_ptr<webrtc::VideoDecoder> Create(
+      const webrtc::Environment&,
+      const webrtc::SdpVideoFormat&) override {
+    return nullptr;
+  }
+};
+
+}  // namespace
+
+struct RootEngineHarness::Parts {
+  std::unique_ptr<webrtc::Thread> network;
+  std::unique_ptr<webrtc::Thread> worker;
+  std::unique_ptr<webrtc::Thread> signaling;
+  webrtc::scoped_refptr<FakePlatformAdm> fake;
+  webrtc::scoped_refptr<RootAudioMixer> mixer;
+  std::shared_ptr<RootCaptureState> capture;
+  webrtc::scoped_refptr<RootApmDecorator> apm;
+  webrtc::scoped_refptr<AdmProxy> proxy;
+  webrtc::scoped_refptr<webrtc::ConnectionContext> context;
+  std::shared_ptr<RootVoiceEngineHold> hold;
+  std::unique_ptr<AudioDeviceController> controller;
+  // Worker thread only.
+  std::vector<std::unique_ptr<webrtc::ConnectionContext::MediaEngineReference>>
+      peer_connections;
+};
+
+// Wired as PeerConnectionFactory wires it, with fakes for the platform ADM
+// and the video codecs.
+RootEngineHarness::RootEngineHarness() : parts_(std::make_unique<Parts>()) {
+  Parts& p = *parts_;
+  p.network = webrtc::Thread::CreateWithSocketServer();
+  p.network->SetName("engine-network", nullptr);
+  p.network->Start();
+  p.worker = webrtc::Thread::Create();
+  p.worker->SetName("engine-worker", nullptr);
+  p.worker->Start();
+  p.signaling = webrtc::Thread::Create();
+  p.signaling->SetName("engine-signaling", nullptr);
+  p.signaling->Start();
+
+  const webrtc::Environment env = webrtc::CreateEnvironment();
+  p.fake = webrtc::make_ref_counted<FakePlatformAdm>();
+  p.fake->SetDevices({"{spk}"}, {"{mic}"});
+  p.mixer = webrtc::make_ref_counted<RootAudioMixer>();
+  p.capture = std::make_shared<RootCaptureState>();
+  if constexpr (kRootDenoiserSupported) {
+    p.capture->denoiser_slot = std::make_shared<RootDenoiserSlot>();
+  }
+  p.capture->monitor = std::make_shared<RootAudioMonitor>();
+  p.apm = CreateRootAudioProcessing(env, p.capture, p.worker.get());
+  p.proxy = p.worker->BlockingCall([&] {
+    return webrtc::make_ref_counted<AdmProxy>(env, p.worker.get(), p.mixer,
+                                              p.fake);
+  });
+  p.proxy->SetCaptureState(p.capture);
+
+  webrtc::PeerConnectionFactoryDependencies dependencies;
+  dependencies.network_thread = p.network.get();
+  dependencies.worker_thread = p.worker.get();
+  dependencies.signaling_thread = p.signaling.get();
+  dependencies.socket_factory = p.network->socketserver();
+  dependencies.adm = p.proxy;
+  dependencies.audio_mixer = p.mixer;
+  dependencies.audio_encoder_factory =
+      webrtc::CreateBuiltinAudioEncoderFactory();
+  dependencies.audio_decoder_factory =
+      webrtc::CreateBuiltinAudioDecoderFactory();
+  dependencies.video_encoder_factory =
+      std::make_unique<NoVideoEncoderFactory>();
+  dependencies.video_decoder_factory =
+      std::make_unique<NoVideoDecoderFactory>();
+  dependencies.audio_processing_builder = webrtc::CustomAudioProcessing(p.apm);
+  webrtc::EnableMedia(dependencies);
+  p.context = p.signaling->BlockingCall([&] {
+    return webrtc::ConnectionContext::Create(env, &dependencies);
+  });
+  p.hold = std::make_shared<RootVoiceEngineHold>(p.worker.get(), p.context);
+  p.controller = std::make_unique<AudioDeviceController>(
+      p.proxy, p.mixer, p.apm, p.capture, p.hold);
+}
+
+RootEngineHarness::~RootEngineHarness() {
+  Parts& p = *parts_;
+  p.controller = nullptr;
+  p.worker->BlockingCall([&p] { p.peer_connections.clear(); });
+  p.hold->Shutdown();
+  p.hold = nullptr;
+  p.signaling->BlockingCall([&p] { p.context = nullptr; });
+  // The media engine is destroyed on the worker after the context.
+  p.worker->BlockingCall([] {});
+  p.proxy = nullptr;
+  p.signaling->Stop();
+  p.worker->Stop();
+  p.network->Stop();
+  p.apm = nullptr;
+}
+
+const AudioDeviceController& RootEngineHarness::controller() const {
+  return *parts_->controller;
+}
+
+bool RootEngineHarness::acquire() const {
+  Parts& p = *parts_;
+  if (!p.controller->acquire_platform_adm()) {
+    return false;
+  }
+  p.controller->set_adm_recording_enabled(true);
+  p.controller->set_adm_playout_enabled(true);
+  p.controller->reset_root_audio(false);
+  flush();
+  return true;
+}
+
+void RootEngineHarness::release() const {
+  parts_->controller->reset_root_audio(true);
+  parts_->controller->release_platform_adm();
+  flush();
+}
+
+void RootEngineHarness::open_peer_connection() const {
+  Parts& p = *parts_;
+  p.worker->BlockingCall([&p] {
+    p.peer_connections.push_back(
+        std::make_unique<webrtc::ConnectionContext::MediaEngineReference>(
+            p.context));
+  });
+  flush();
+}
+
+void RootEngineHarness::close_peer_connection() const {
+  Parts& p = *parts_;
+  p.worker->BlockingCall([&p] {
+    if (!p.peer_connections.empty()) {
+      p.peer_connections.pop_back();
+    }
+  });
+  flush();
+}
+
+void RootEngineHarness::engine_playout(bool start) const {
+  if (start) {
+    parts_->proxy->StartPlayout();
+  } else {
+    parts_->proxy->StopPlayout();
+  }
+  flush();
+}
+
+void RootEngineHarness::engine_recording(bool start) const {
+  if (start) {
+    parts_->proxy->StartRecording();
+  } else {
+    parts_->proxy->StopRecording();
+  }
+  flush();
+}
+
+void RootEngineHarness::hold(bool hold) const {
+  parts_->controller->set_playout_hold(hold);
+  flush();
+}
+
+uint8_t RootEngineHarness::monitor(bool enabled) const {
+  const uint8_t result = parts_->controller->set_root_audio_monitor(enabled);
+  flush();
+  return result;
+}
+
+void RootEngineHarness::flush() const {
+  parts_->worker->BlockingCall([] {});
+  parts_->proxy->FlushDeviceTasksForTest();
+}
+
+void RootEngineHarness::capture(int32_t rate,
+                                size_t channels,
+                                rust::Slice<const int16_t> input) const {
+  webrtc::AudioTransport* device = parts_->fake->callback();
+  if (device == nullptr || rate < 100 || channels == 0) {
+    return;
+  }
+  const size_t frames = static_cast<size_t>(rate / 100);
+  std::vector<int16_t> samples(frames * channels, 0);
+  std::copy_n(input.data(), std::min(input.size(), samples.size()),
+              samples.begin());
+  std::thread device_thread([&] {
+    uint32_t new_mic_level = 0;
+    device->RecordedDataIsAvailable(samples.data(), frames, 2 * channels,
+                                    channels, static_cast<uint32_t>(rate), 0,
+                                    0, 0, false, new_mic_level);
+  });
+  device_thread.join();
+}
+
+rust::Vec<int16_t> RootEngineHarness::render(int32_t rate,
+                                             size_t channels) const {
+  rust::Vec<int16_t> result;
+  webrtc::AudioTransport* device = parts_->fake->callback();
+  if (device == nullptr || rate < 100 || channels == 0) {
+    return result;
+  }
+  const size_t frames = static_cast<size_t>(rate / 100);
+  std::vector<int16_t> samples(frames * channels, 0);
+  std::thread device_thread([&] {
+    size_t samples_out = 0;
+    int64_t elapsed_time_ms = 0;
+    int64_t ntp_time_ms = 0;
+    device->NeedMorePlayData(frames, 2 * channels, channels,
+                             static_cast<uint32_t>(rate), samples.data(),
+                             samples_out, &elapsed_time_ms, &ntp_time_ms);
+  });
+  device_thread.join();
+  for (int16_t sample : samples) {
+    result.push_back(sample);
+  }
+  return result;
+}
+
+bool RootEngineHarness::platform_playing() const {
+  return parts_->fake->Playing();
+}
+
+bool RootEngineHarness::platform_recording() const {
+  return parts_->fake->Recording();
+}
+
+bool RootEngineHarness::synthetic_playing() const {
+  return parts_->proxy->SyntheticPlayingForTest();
+}
+
+rust::Vec<rust::String> RootEngineHarness::take_calls() const {
+  rust::Vec<rust::String> calls;
+  for (const std::string& call : parts_->fake->TakeCalls()) {
+    calls.push_back(rust::String(call));
+  }
+  return calls;
+}
+
+std::unique_ptr<RootEngineHarness> new_root_engine_harness() {
+  return std::make_unique<RootEngineHarness>();
 }
 
 RootMonitorHarness::RootMonitorHarness()

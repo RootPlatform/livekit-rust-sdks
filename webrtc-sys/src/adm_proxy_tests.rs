@@ -352,19 +352,58 @@ fn adm_proxy_never_forwards_mute_or_builtin_effects() {
 }
 
 #[test]
-fn adm_proxy_terminate_stops_the_devices_before_clearing_the_callback() {
+fn adm_proxy_shutdown_stops_the_devices_before_clearing_the_callback() {
     let h = platform(&["{spk}"], &["{mic}"]);
     h.register_transport();
     h.engine_start_playout();
     h.engine_start_recording();
     calls(&h);
 
-    h.terminate();
+    h.shutdown();
     assert_eq!(
         h.take_calls(),
         ["StopPlayout", "StopRecording", "RegisterAudioCallback(null)", "Terminate"]
     );
     assert!(!h.playing() && !h.recording() && !h.synthetic_playing());
+}
+
+/// m150 terminates the voice engine with the last PeerConnection, also while
+/// the hold keeps playout open, and initializes it again (Init, then the
+/// transport) with the next one. libwebrtc's own playout and recording end;
+/// the held device plays the tap's silence, never the buffer's stale samples,
+/// and neither ADM is terminated, so the next transport plays at once.
+#[test]
+fn adm_proxy_engine_terminate_under_the_hold_plays_silence_until_the_next_init() {
+    let h = platform(&["{spk}"], &["{mic}"]);
+    h.stale_device_buffer(i16::MAX);
+    h.hold(true);
+    h.engine_plays_mixer();
+    h.register_transport();
+    h.engine_start_playout();
+    h.engine_start_recording();
+    calls(&h);
+    assert!(h.controller().register_root_audio_effect(1, &vec![8000i16; 4800]));
+
+    h.engine_terminate();
+    assert_eq!(calls(&h), ["StopRecording"], "the hold keeps playout, nothing is terminated");
+    assert!(h.platform_playing() && !h.platform_recording());
+    assert!(!h.playing() && !h.recording() && !h.synthetic_playing());
+    assert_eq!(h.controller().play_root_audio_effect(1, 0.5), 0);
+    let render = h.device_render();
+    assert_eq!(render.frames, 480, "the tap answered");
+    assert!(render.samples.iter().all(|&s| s == 0), "{:?}", &render.samples[..4]);
+
+    // The next PeerConnection: engine init, then libwebrtc's transport.
+    assert_eq!(h.engine_adm_init(), [0, 0, 0, 0]);
+    h.register_transport();
+    let render = h.device_render();
+    assert!(render.samples.iter().all(|&s| (3999..=4000).contains(&s)), "the chime plays");
+    h.engine_start_recording();
+    assert_eq!(
+        calls(&h),
+        [default_device("Recording"), "InitRecording".into(), "StartRecording".into()]
+    );
+    assert!(h.recording());
 }
 
 #[test]

@@ -1192,13 +1192,13 @@ bool AdmProxy::AcquirePlatformAdm() {
   return true;
 }
 
-void AdmProxy::ReleasePlatformAdm() {
+bool AdmProxy::ReleasePlatformAdm() {
   {
     AdmLock lock(&state_mutex_);
     if (desired_.ref_count <= 0) {
       RTC_LOG(LS_WARNING) << "AdmProxy::ReleasePlatformAdm() called with ref_count="
                           << desired_.ref_count;
-      return;
+      return false;
     }
     // The Platform ADM is not terminated here; it stays alive until the
     // destructor, which avoids iOS KVO races from re-creating it.
@@ -1217,6 +1217,7 @@ void AdmProxy::ReleasePlatformAdm() {
     }
   }
   RequestReconcile();
+  return true;
 }
 
 int AdmProxy::platform_adm_ref_count() const {
@@ -1377,6 +1378,13 @@ void AdmProxy::FlushDeviceTasksForTest() {
   RunDeviceTaskAndWait([] {});
 }
 
+void AdmProxy::ShutdownForTest() {
+  RunDeviceTaskAndWait([this] {
+    AdmLock lock(&mutex_);
+    ShutdownLocked();
+  });
+}
+
 bool AdmProxy::SyntheticPlayingForTest() const {
   return synthetic_adm_ && synthetic_adm_->Playing();
 }
@@ -1446,15 +1454,18 @@ int32_t AdmProxy::RegisterAudioCallback(webrtc::AudioTransport* transport) {
 }
 
 int32_t AdmProxy::Init() {
-  // Init is a no-op: both ADMs are initialized when they are created.
   return 0;
 }
 
+// WebRtcVoiceEngine::Terminate has already stopped libwebrtc's playout and
+// recording and cleared its transport; repeated here for any other caller.
+// Shutting the ADMs down here left the factory without audio: m150 terminates
+// the engine whenever its last PeerConnection goes and initializes it again
+// with the next one, which only calls Init.
 int32_t AdmProxy::Terminate() {
-  RunDeviceTaskAndWait([this] {
-    AdmLock lock(&mutex_);
-    ShutdownLocked();
-  });
+  StopPlayout();
+  StopRecording();
+  RegisterAudioCallback(nullptr);
   return 0;
 }
 

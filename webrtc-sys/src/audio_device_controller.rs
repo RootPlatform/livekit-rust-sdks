@@ -312,6 +312,7 @@ pub mod ffi {
         type AudioDeviceController;
         type AdmProxyHarness;
         type RootVoiceHarness;
+        type RootEngineHarness;
         type RootMonitorHarness;
         type PeerConnectionFactory = crate::peer_connection_factory::ffi::PeerConnectionFactory;
 
@@ -526,7 +527,12 @@ pub mod ffi {
         fn engine_set_speaker_volume(self: &AdmProxyHarness, volume: u32) -> i32;
         fn engine_set_speaker_mute(self: &AdmProxyHarness, mute: bool) -> i32;
         fn register_transport(self: &AdmProxyHarness);
-        fn terminate(self: &AdmProxyHarness);
+        /// WebRtcVoiceEngine::Terminate on the proxy (m150: the last
+        /// PeerConnection went): StopPlayout, StopRecording,
+        /// RegisterAudioCallback(nullptr), Terminate.
+        fn engine_terminate(self: &AdmProxyHarness);
+        /// What the proxy's destructor does to the devices.
+        fn shutdown(self: &AdmProxyHarness);
         fn select(
             self: &AdmProxyHarness,
             recording: &AudioDeviceSelection,
@@ -610,6 +616,43 @@ pub mod ffi {
         fn hold_worker(self: &RootVoiceHarness, hold: bool);
         /// What the decorator applied, as the capture processor reads it.
         fn webrtc_ns_applied(self: &RootVoiceHarness) -> bool;
+
+        /// libwebrtc's own voice engine (WebRtcVoiceEngine in a
+        /// ConnectionContext) over AdmProxy and a fake platform ADM, wired as
+        /// the factory does, with the voice engine hold. PeerConnections are
+        /// stood in for by their references to the context (tests only; no
+        /// device, no PeerConnection).
+        fn new_root_engine_harness() -> UniquePtr<RootEngineHarness>;
+        fn controller(self: &RootEngineHarness) -> &AudioDeviceController;
+        /// As a PlatformAudio handle's creation: a platform reference, both
+        /// directions enabled, a session start.
+        fn acquire(self: &RootEngineHarness) -> bool;
+        /// As its drop: the session's reset with the gate closed, then the
+        /// reference.
+        fn release(self: &RootEngineHarness);
+        /// A PeerConnection takes its reference to the ConnectionContext
+        /// (m150 initializes the voice engine with the first one).
+        fn open_peer_connection(self: &RootEngineHarness);
+        /// One is destroyed (the last one terminates the voice engine).
+        fn close_peer_connection(self: &RootEngineHarness);
+        /// AudioState starts or stops a call's receive streams' playout.
+        fn engine_playout(self: &RootEngineHarness, start: bool);
+        /// AudioState starts or stops a call's send streams' recording.
+        fn engine_recording(self: &RootEngineHarness, start: bool);
+        fn hold(self: &RootEngineHarness, hold: bool);
+        fn monitor(self: &RootEngineHarness, enabled: bool) -> u8;
+        /// Returns once the worker and device threads ran what was posted.
+        fn flush(self: &RootEngineHarness);
+        /// One 10 ms frame of interleaved channels from the device's capture
+        /// thread.
+        fn capture(self: &RootEngineHarness, rate: i32, channels: usize, input: &[i16]);
+        /// One 10 ms render callback from the device's render thread; returns
+        /// what the device plays.
+        fn render(self: &RootEngineHarness, rate: i32, channels: usize) -> Vec<i16>;
+        fn platform_playing(self: &RootEngineHarness) -> bool;
+        fn platform_recording(self: &RootEngineHarness) -> bool;
+        fn synthetic_playing(self: &RootEngineHarness) -> bool;
+        fn take_calls(self: &RootEngineHarness) -> Vec<String>;
     }
 
     extern "Rust" {
