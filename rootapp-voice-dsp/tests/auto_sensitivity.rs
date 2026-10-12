@@ -120,10 +120,10 @@ fn a_gain_change_moves_the_threshold_at_once() {
     assert!(to_db(threshold) > -50.0 + 15.0, "the boosted noise stays under the threshold");
 }
 
-/// Managed LeakedNoiseStaysUnderTheThresholdAtAnyGain.
+/// Managed LeakedNoiseStaysUnderTheThresholdUpToTheCap.
 #[test]
-fn leaked_noise_stays_under_the_threshold_at_any_gain() {
-    for gain in [0.0, 6.0, 12.0, 18.0] {
+fn leaked_noise_stays_under_the_threshold_up_to_the_cap() {
+    for gain in [0.0, 6.0, AutoSensitivityOptions::default().voice_gain_cap_db] {
         let mut auto = new_auto();
         feed_gain(&mut auto, -100.0, 5.0, false, gain);
         for i in 0..300 {
@@ -136,6 +136,29 @@ fn leaked_noise_stays_under_the_threshold_at_any_gain() {
             );
         }
     }
+}
+
+/// Managed TheMinimumRisesWithAtMostTheCapOfTheGain.
+#[test]
+fn the_minimum_rises_with_at_most_the_cap_of_the_gain() {
+    let options = AutoSensitivityOptions::default();
+    let cap = options.voice_gain_cap_db;
+    for gain in [0.0, 6.0, cap, cap + 1.0, 18.0] {
+        let mut auto = new_auto();
+        let open = feed_gain(&mut auto, -100.0, 5.0, false, gain);
+        let close = auto.update(to_rms(-100.0), gain, true);
+        let expected = options.open_minimum_db + gain.min(cap);
+        assert!(near(to_db(open), expected, 1e-4), "gain {gain}: {}", to_db(open));
+        assert!(near(to_db(close), expected - options.hysteresis_db, 1e-4), "gain {gain}");
+        assert!(near(auto.open_db_at(gain) + gain, expected, 1e-9));
+    }
+    let mut loud = new_auto();
+    let open = feed_gain(&mut loud, -45.0, 10.0, false, 18.0);
+    assert!(
+        near(to_db(open), loud.open_db() + 18.0, 1e-4),
+        "above the minimum the whole gain still applies: {}",
+        to_db(open)
+    );
 }
 
 /// Managed ANonFiniteGainCountsAsNone.

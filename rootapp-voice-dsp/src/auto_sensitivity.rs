@@ -16,6 +16,7 @@ pub struct AutoSensitivityOptions {
     pub startup_rise_db_per_second: f64,
     pub startup_ms: f64,
     pub open_window_ms: f64,
+    pub voice_gain_cap_db: f64,
 }
 
 impl Default for AutoSensitivityOptions {
@@ -32,13 +33,15 @@ impl Default for AutoSensitivityOptions {
             startup_rise_db_per_second: 10.0,
             startup_ms: 2000.0,
             open_window_ms: 2000.0,
+            voice_gain_cap_db: 11.0,
         }
     }
 }
 
 /// Managed `AutoSensitivity`: the gate threshold follows the mic's noise floor, one `update` per
 /// 10 ms frame. The floor and the thresholds are in dB of the denoised voice before the voice gain;
-/// `update` adds the frame's gain to the threshold it returns.
+/// `update` adds the frame's gain to the threshold it returns, and the minimum rises with at most
+/// `voice_gain_cap_db` of that gain.
 #[derive(Clone, Debug)]
 pub struct AutoSensitivity {
     options: AutoSensitivityOptions,
@@ -71,11 +74,22 @@ impl AutoSensitivity {
     }
 
     pub fn open_db(&self) -> f64 {
-        (self.floor_db + self.options.open_margin_db).max(self.options.open_minimum_db)
+        self.open_db_at(0.0)
     }
 
     pub fn close_db(&self) -> f64 {
-        self.open_db() - self.options.hysteresis_db
+        self.close_db_at(0.0)
+    }
+
+    /// Before the voice gain, at `gain_db` of it: the minimum gives way by the gain above the cap.
+    pub fn open_db_at(&self, gain_db: f64) -> f64 {
+        let o = &self.options;
+        let excess = (gain_db - o.voice_gain_cap_db).max(0.0);
+        (self.floor_db + o.open_margin_db).max(o.open_minimum_db - excess)
+    }
+
+    pub fn close_db_at(&self, gain_db: f64) -> f64 {
+        self.open_db_at(gain_db) - self.options.hysteresis_db
     }
 
     pub fn reset(&mut self) {
@@ -120,7 +134,7 @@ impl AutoSensitivity {
             clamp_f64(self.floor_db, self.options.floor_minimum_db, self.options.floor_maximum_db);
         self.elapsed_ms += FRAME_MS;
         let gain_db = if gain_db.is_finite() { gain_db } else { 0.0 };
-        to_rms(if gate_open { self.close_db() } else { self.open_db() } + gain_db)
+        to_rms(if gate_open { self.close_db_at(gain_db) } else { self.open_db_at(gain_db) } + gain_db)
     }
 
     fn recent_minimum(&self) -> f64 {

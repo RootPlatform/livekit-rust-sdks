@@ -8,6 +8,7 @@
 
 mod support;
 
+use rootapp_voice_dsp::auto_sensitivity::AutoSensitivityOptions;
 use rootapp_voice_dsp::{
     DenoiserOutput, DspChain, DspCommands, DspOutputs, DspSettings, PreDenoise, PushToTalk,
     AUTO_MIN_OPEN_BLOCKS, DENOISER_STALL_FRAMES, MAX_DENOISER_WAIT_FRAMES, STARTUP_HOLD_FRAMES,
@@ -226,8 +227,13 @@ fn a_voice_gain_jump_does_not_open_the_auto_gate_on_room_noise() {
     }
     assert_eq!(h.out.voice_gain_db, 15.0);
     assert!(!h.out.speaking && !h.out.gate_open);
-    let expected = 10f64.powf((-60.0 + 15.0) / 20.0) as f32;
-    assert!((h.out.threshold - expected).abs() < 1e-6, "{}", h.out.threshold);
+    let options = AutoSensitivityOptions::default();
+    let threshold_db = 20.0 * f64::from(h.out.threshold).log10();
+    assert!(
+        threshold_db >= options.open_minimum_db + options.voice_gain_cap_db.min(15.0)
+            && threshold_db <= -70.0 + options.open_margin_db + 15.0 + 0.5,
+        "{threshold_db}"
+    );
 }
 
 #[test]
