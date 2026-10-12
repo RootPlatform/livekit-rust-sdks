@@ -950,7 +950,7 @@ Tests that need no device: `cargo test -p webrtc-sys --lib -- adm_proxy root_
 device_selection` (AdmProxy over a fake platform ADM that records its calls, the mixer, the capture
 processor, the decorator over a fake and over the real builtin APM, the denoiser slot and its
 control side, and `root_voice_*`: the whole voice path over one capture state with fake Effects SDK
-pipelines and a worker thread), `cargo test -p rootapp-voice-dsp` (ported managed tests, 22 golden
+pipelines and a worker thread), `cargo test -p rootapp-voice-dsp` (ported managed tests, 25 golden
 vectors from the desktop's reference, no-allocation and no-panic sweeps; `cargo clippy -p
 rootapp-voice-dsp --all-targets -- -D warnings`), `cargo test -p libwebrtc --lib imp::rtp_sender`,
 `cargo test -p livekit platform_audio`, and `cargo test -p livekit-ffi --lib rootapp_audio` and
@@ -1171,42 +1171,71 @@ and evaluation: the desktop's `docs/native-platform-audio.md` ("Speech detection
 - `RootSpeechDetector` (webrtc-sys, `root_speech_detector.{h,cpp}`) runs libwebrtc's AGC2 speech
   detector (`agc2/rnn_vad`, already linked into the library) as `VoiceActivityDetectorWrapper`
   does, without its 1.5 s periodic reset: a `PushResampler` per APM rate (16, 32, 48 kHz) to 24 kHz,
-  the feature extractor and the RNN; any other rate or length gives -1. Built in
+  the feature extractor and the RNN; any other rate or length gives -1. Instead of the periodic
+  reset, the RNN starts over after 100 frames in a row at p >= 0.3 (flat white hiss could hold it at
+  speech). AVX2 is used only with FMA3 (rnn_vad's AVX2 code is built with FMA). Built in
   `RootCaptureProcessor`'s constructor (about 6 KB plus 44 KB of heap); `Analyze` and `Reset` never
   allocate, lock or log. It resets on a DSP reset, flush or rate change, and when it was not running
-  on the previous frame. Its header is included from .cpp files only (the rnn_vad headers raise
-  C4244/C4267 at /W4; the includes are wrapped in `#pragma warning`).
+  on the previous frame; a reset runs a frame of zeros through each resampler used since the last
+  one. Its header is included from .cpp files only (the rnn_vad headers raise C4244/C4267 at /W4;
+  the includes are wrapped in `#pragma warning`).
 - `RootCaptureProcessor` runs it on the frame `pre_denoise` sanitised, before the denoiser, while
   `speech_detection` is not off (also while muted or with push-to-talk, so it is warm when they end),
   and hands the probability to the chain (`RootDspSettings.speech_probability`).
 - `rootapp-voice-dsp`: `SpeechGate` (`speech_gate.rs`) and `NoiseGate::process_controlled`. Speech
   is confirmed after 3 frames in a row at p >= 0.5 and ends 300 ms after the last frame at p >= 0.3.
-  The ring (`speaking`) is the level gate's speaking AND confirmed speech. In `Gate` mode an open the
-  detector has not confirmed within 200 ms, or confirmed speech that ended while the level still
-  holds the gate, is released over 50 ms without the speaking hold, and the gate stays shut until a
-  frame at p >= 0.5 or 100 ms below the threshold; auto sensitivity counts confirmed speech and opens
-  not judged yet as open and rejected opens as closed. Push-to-talk, frames without a probability
-  (off, other rates, NaN or negative) and unsupported frames leave the chain bit for bit as the level
-  gate: the 22 golden vectors are unchanged.
+  The ring (`speaking`) is the level gate's speaking AND confirmed speech. In `Gate` mode:
+  - an open the detector has not confirmed within 200 ms of frames under 0.3 is released over 50 ms
+    (40 ms at full gain, then a 10 ms ramp; about 260 ms of it is sent) without the speaking hold;
+  - when confirmed speech ends, `control` decides with that frame's level: input still held above
+    the threshold is released the same way; a quiet frame only shortens the tail's release to 50 ms
+    (a new onset ends it); a word that began after 30 ms of quiet, or rose 6 dB over what was
+    rejected, keeps its own provisional window;
+  - a released gate is held shut until a frame at p >= 0.3, an input 6 dB louder than the loudest
+    input rejected since the last frame at 0.3, an onset (3 quiet frames, then 6 dB up) that stays
+    above the threshold 3 frames, or 100 ms below the threshold. During an onset it opens on its
+    first block above the threshold while the level gate alone would still be open
+    (`GateControl::eager_open`). At or below -66 dBFS a frame counts as quiet and opens nothing
+    whatever the threshold (a manual 0 still re-arms);
+  - auto sensitivity follows the level gate alone (`NoiseGate::level_envelope`), so the threshold is
+    Off's and Gate never sends a sample louder than Off.
+  Push-to-talk, frames without a probability (off, other rates, NaN or negative) and unsupported
+  frames leave the chain bit for bit as the level gate; mute does not bypass the speech gate (nothing
+  is sent while muted anyway). A change of mode starts the verdict over.
 - Control `RootAudioControl.speech_detection` (`RootAudioSpeechDetection` OFF/RING/GATE; unknown
-  values off), stored in `RootCaptureState::speech_detection`, back to off on every session reset.
+  values off), stored in `RootCaptureState::speech_detection`, back to off when the first handle
+  opens and when the last closes (`reset_root_audio`, as the other DSP settings).
   Stats 107-113: the mode, the highest probability since the previous read (-1 none), whether the
   speech gate judged the last frame and confirmed speech on it, and frames with confirmed speech,
   closed by the speech gate, and with detection on but no probability. Caps bit 12 SPEECH_DETECTION
   wherever DSP is (`rootapp_audio_caps_cover_phase_3` checks 8191 and ties the bit to `root_dsp_supported()`).
 
 Tests: `cargo test -p rootapp-voice-dsp` (`tests/speech_gate.rs`: the state machine, confirmation,
-hang, the forced close and re-arm, auto sensitivity learning only from what the detector rejected,
-the bypasses bit for bit; `no_alloc` and `no_panic` vary the mode and NaN, inf, negative and > 1
-probabilities; the bench runs with detection off and on); webrtc-sys `speech_tests`
-(`root_speech_detector_matches_libwebrtcs_wrapper_at_16_32_and_48_khz`: identical to the wrapper on
-synthetic signals; decisions on a vowel, a tone, white noise, silence, breath, clicks and keys; the
-capture processor in Gate mode never rings on breath, clicks or keys, rings 30 ms into a voice and
-stops 300 ms after it, Ring mode sends what Off sends, 8 and 44.1 kHz pass the level gate bit for
-bit, push-to-talk and mute bypass it, a reset turns it off, the real APM runs it at 16, 32 and
-48 kHz), `adm_proxy_controller_stores_speech_detection_*`,
+hang, the forced close and re-arm, the bypasses bit for bit; Gate never sends a sample louder than
+Off over random scripts with auto and manual thresholds; auto sensitivity in Gate is Off's; words
+where the hang runs out, after soft tails, quiet and noise-filled gaps and held breath; a click or
+flicker never re-arms; a mode change and a threshold of 0; `no_alloc` and `no_panic` vary the mode,
+the input level and NaN, inf, negative and > 1 probabilities; the golden vectors also hold in Ring
+mode and in Gate mode with constant speech; the bench runs with detection off and on); webrtc-sys
+`speech_tests` (`root_speech_detector_matches_libwebrtcs_wrapper_at_16_32_and_48_khz`: identical to
+the wrapper on synthetic signals until its first latch reset; decisions on a vowel, a tone, white
+noise, silence, breath, clicks and keys; 10 min of white hiss at -60 dBFS under 25% at p >= 0.5
+(75% without the latch reset); a rate change drops the resamplers' history; the capture processor
+in Gate mode never rings on breath, clicks or keys, rings 30 ms into a voice and stops 300 ms after
+it, Ring mode sends what Off sends, 8 and 44.1 kHz pass the level gate bit for bit, push-to-talk
+bypasses it and the detector keeps judging while muted, a reset turns it off, the real APM runs it
+at 16, 32 and 48 kHz), `adm_proxy_controller_stores_speech_detection_*`,
 `root_voice_speech_detection_keeps_keys_off_the_ring_and_rings_for_a_voice`, and the livekit and
 livekit-ffi conversions.
+
+Review fixes (2026-10-12; the desktop's `docs/native-platform-audio.md` has the replays): Gate no
+longer lowers the threshold for confirmed speech (it sent background speech Off never sends) and no
+longer mutes a word that starts where the hang runs out; held word starts lose 70/30 ms max/median
+after a breath (was 170/50) and none of the speech energy after noise-filled pauses (was up to 80 ms).
+Auto sensitivity's minimum rises with at most 11 dB of the voice gain (`voice_gain_cap_db`; desktop
+e435c4dc2, golden vectors regenerated: 25 vectors, two new at the cap). Powers of 10 go through
+`pow10` (libm's pow with an opaque base), so LLVM cannot turn them into exp10 on macOS and Linux;
+golden vectors written on Windows may still need `ROOTAPP_DSP_GOLDEN_LOOSE=1` on another libm.
 
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
