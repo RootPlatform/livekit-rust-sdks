@@ -116,6 +116,38 @@ impl PushToTalk {
     }
 }
 
+/// What the native speech detector's verdict qualifies (DSP chain; push-to-talk
+/// ignores it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeechDetection {
+    /// The noise gate alone decides (the managed engine's behaviour).
+    Off,
+    /// The ring and the speaking flag need confirmed speech; the audio follows
+    /// the noise gate.
+    Ring,
+    /// As `Ring`, and the noise gate also closes on what the detector rejects.
+    Gate,
+}
+
+impl SpeechDetection {
+    /// The wire value (0, 1, 2). Unknown values are off.
+    pub fn from_wire(value: u32) -> Self {
+        match value {
+            1 => Self::Ring,
+            2 => Self::Gate,
+            _ => Self::Off,
+        }
+    }
+
+    pub fn to_wire(self) -> u32 {
+        match self {
+            Self::Off => 0,
+            Self::Ring => 1,
+            Self::Gate => 2,
+        }
+    }
+}
+
 /// Live control of the native audio engine. `None` leaves a setting as it is.
 ///
 /// Take effect now: `mic_muted` and `push_to_talk` (the capture gate fades
@@ -132,7 +164,8 @@ impl PushToTalk {
 /// `auto_sensitivity`, the `gain_reset_db` command and `denoiser_wanted` (the
 /// host's noise suppression mode is the Effects SDK: the startup hold waits
 /// for the denoiser and native WebRTC NS covers a denoiser that stops or does
-/// not arrive). Builds without the chain only store them.
+/// not arrive) and `speech_detection` (off until set, and after every session
+/// start). Builds without the chain only store them.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct RootAudioControl {
     pub mic_muted: Option<bool>,
@@ -154,6 +187,7 @@ pub struct RootAudioControl {
     /// 0..[`MAX_VOICE_GAIN_DB`].
     pub gain_reset_db: Option<f32>,
     pub denoiser_wanted: Option<bool>,
+    pub speech_detection: Option<SpeechDetection>,
 }
 
 impl RootAudioControl {
@@ -203,6 +237,8 @@ impl RootAudioControl {
             gain_reset_db: c.gain_reset_db.unwrap_or_default(),
             has_denoiser_wanted: c.denoiser_wanted.is_some(),
             denoiser_wanted: c.denoiser_wanted.unwrap_or_default(),
+            has_speech_detection: c.speech_detection.is_some(),
+            speech_detection: c.speech_detection.map(SpeechDetection::to_wire).unwrap_or_default(),
         }
     }
 }
@@ -523,6 +559,19 @@ pub struct RootAudioStats {
     pub monitor_active: Option<bool>,
     pub monitor_frames: Option<u64>,
     pub monitor_dropped_frames: Option<u64>,
+
+    // Speech detector (with the DSP chain). The setting native applies; the
+    // highest probability since the previous read (-1 when it judged no frame);
+    // whether the speech gate judged the last frame and found it speech; and
+    // frames with confirmed speech, frames it held the noise gate shut or
+    // forced it closed, and frames with detection on but no probability.
+    pub speech_detection: Option<SpeechDetection>,
+    pub speech_probability: Option<f32>,
+    pub speech_detector_running: Option<bool>,
+    pub speech: Option<bool>,
+    pub speech_frames: Option<u64>,
+    pub speech_closed_frames: Option<u64>,
+    pub speech_unavailable_frames: Option<u64>,
 }
 
 impl Default for RootAudioStats {
@@ -620,6 +669,13 @@ impl Default for RootAudioStats {
             monitor_active: None,
             monitor_frames: None,
             monitor_dropped_frames: None,
+            speech_detection: None,
+            speech_probability: None,
+            speech_detector_running: None,
+            speech: None,
+            speech_frames: None,
+            speech_closed_frames: None,
+            speech_unavailable_frames: None,
         }
     }
 }
@@ -630,7 +686,15 @@ impl RootAudioStats {
         let denoiser = native.denoiser_available;
         let policy = native.policy_available;
         let monitor = native.monitor_available;
+        let speech = native.speech_available;
         Self {
+            speech_detection: speech.then(|| SpeechDetection::from_wire(native.speech_detection)),
+            speech_probability: speech.then_some(native.speech_probability),
+            speech_detector_running: speech.then_some(native.speech_detector_running),
+            speech: speech.then_some(native.speech),
+            speech_frames: speech.then_some(native.speech_frames),
+            speech_closed_frames: speech.then_some(native.speech_closed_frames),
+            speech_unavailable_frames: speech.then_some(native.speech_unavailable_frames),
             monitor_active: monitor.then_some(native.monitor_active),
             monitor_frames: monitor.then_some(native.monitor_frames),
             monitor_dropped_frames: monitor.then_some(native.monitor_dropped_frames),
@@ -1066,6 +1130,51 @@ mod tests {
             ..Default::default()
         });
         assert_eq!((idle.monitor_active, idle.monitor_frames), (Some(false), Some(0)));
+    }
+
+    #[test]
+    fn root_audio_stats_fill_the_speech_fields_only_with_the_detector() {
+        let native = NativeAudioStats {
+            speech_available: true,
+            speech_detection: 2,
+            speech_probability: 0.75,
+            speech_detector_running: true,
+            speech: true,
+            speech_frames: 40,
+            speech_closed_frames: 7,
+            speech_unavailable_frames: 3,
+            ..Default::default()
+        };
+        let stats = RootAudioStats::from_native(native);
+        assert_eq!(stats.speech_detection, Some(SpeechDetection::Gate));
+        assert_eq!(stats.speech_probability, Some(0.75));
+        assert_eq!((stats.speech_detector_running, stats.speech), (Some(true), Some(true)));
+        assert_eq!(
+            (stats.speech_frames, stats.speech_closed_frames, stats.speech_unavailable_frames),
+            (Some(40), Some(7), Some(3))
+        );
+        let without = RootAudioStats::from_native(NativeAudioStats {
+            speech_detection: 2,
+            speech_frames: 40,
+            ..Default::default()
+        });
+        assert_eq!((without.speech_detection, without.speech_frames), (None, None));
+        assert_eq!((without.speech_probability, without.speech), (None, None));
+    }
+
+    #[test]
+    fn speech_detection_maps_unknown_wire_values_to_off() {
+        for mode in [SpeechDetection::Off, SpeechDetection::Ring, SpeechDetection::Gate] {
+            assert_eq!(SpeechDetection::from_wire(mode.to_wire()), mode);
+        }
+        assert_eq!(SpeechDetection::from_wire(3), SpeechDetection::Off);
+        let native = RootAudioControl {
+            speech_detection: Some(SpeechDetection::Ring),
+            ..Default::default()
+        }
+        .to_native();
+        assert!(native.has_speech_detection && native.speech_detection == 1);
+        assert!(!RootAudioControl::default().to_native().has_speech_detection);
     }
 
     #[test]
