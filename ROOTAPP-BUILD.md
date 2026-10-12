@@ -1082,6 +1082,30 @@ Tests: `adm_proxy_playout_opens_stereo_*`, `adm_proxy_never_touches_the_speaker_
 `root_audio_mixer_source_added_again_*`, `root_audio_stats_carry_per_source_levels_*`,
 `rootapp_audio_source_levels_*`.
 
+### Noise at join (2026-10-12, hw.6)
+
+- The first platform call of a session played loud noise from the lease until libwebrtc registered
+  its transport about 0.65 s later. m150 initializes the voice engine (`adm_helpers::Init`, then
+  `RegisterAudioCallback`) with the first PeerConnection (`ConnectionContext::AddRefMediaEngine`),
+  after SessionCreate and the room connect; the lease's playout hold had opened the device first.
+  `AdmProxy` registered its tap with the platform ADM only with libwebrtc's transport, so the
+  device pulled an `AudioDeviceBuffer` without one: `RequestPlayoutData` resizes its playout buffer
+  (`new int16_t[]`, uninitialized) and returns 0, and `GetPlayoutData` copies that buffer to the
+  device every 10 ms ("Invalid audio transport", "nSamples(0) != _playBlockSize480", then "Setting
+  audio transport while media is active"). The mixer's meter never saw it. Later calls in the
+  session had the transport already. The Settings mic test (the monitor) opened the device the same
+  way.
+- The tap is now registered with the platform ADM when the ADM is created (and on Android when it is
+  created on the first acquire) and stays until shutdown; it plays silence while libwebrtc has no
+  transport. Not caused by the stereo change (8ea2a3b8 is inert on Windows, whose ADM already
+  prefers stereo); by its voice trace the 10-10 run's window was at most about 0.1 s.
+- The harness's fake ADM now plays through libwebrtc's own `AudioDeviceBuffer` as the Windows render
+  thread does (`device_render`, `stale_device_buffer`), and its transport can play the mixer.
+
+Tests: `adm_proxy_device_plays_silence_until_libwebrtc_has_a_transport` (hold, no transport, a
+full-scale stale buffer: silence; then the chime through the mixer: the device plays exactly the
+mixer's metered output), `adm_proxy_mic_test_device_plays_silence_without_libwebrtcs_transport`.
+
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
 | Commit | Change |
