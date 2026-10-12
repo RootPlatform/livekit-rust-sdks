@@ -629,6 +629,11 @@ AdmProxy::AdmProxy(
         webrtc::AudioDeviceModule::kDefaultDevice);
 #endif
 #endif
+    // From the start: the hold, the app or the monitor can open the device
+    // before libwebrtc registers its transport (m150 does that with the first
+    // PeerConnection), and AudioDeviceBuffer with no transport plays its
+    // playout samples as they are, uninitialized on the first pull.
+    platform_adm_->RegisterAudioCallback(&tap_);
     platform_raw_.store(platform_adm_.get(), std::memory_order_release);
   }
 
@@ -1117,7 +1122,6 @@ void AdmProxy::ShutdownLocked() {
     synthetic_adm_->Terminate();
   }
   tap_.set_transport(nullptr);
-  audio_transport_ = nullptr;
   PublishStateLocked(Desired());
 }
 
@@ -1151,9 +1155,7 @@ bool AdmProxy::EnsurePlatformAdmCreated() {
     return false;
   }
 
-  if (audio_transport_) {
-    platform_adm_->RegisterAudioCallback(&tap_);
-  }
+  platform_adm_->RegisterAudioCallback(&tap_);
   platform_raw_.store(platform_adm_.get(), std::memory_order_release);
   return true;
 }
@@ -1433,14 +1435,12 @@ int32_t AdmProxy::ActiveAudioLayer(AudioLayer* audioLayer) const {
   return 0;
 }
 
+// The platform ADM keeps the tap registered (until shutdown), which plays
+// silence while libwebrtc has no transport.
 int32_t AdmProxy::RegisterAudioCallback(webrtc::AudioTransport* transport) {
   RunDeviceTaskAndWait([this, transport] {
     AdmLock lock(&mutex_);
-    audio_transport_ = transport;
     tap_.set_transport(transport);
-    if (webrtc::AudioDeviceModule* platform_adm = platform()) {
-      platform_adm->RegisterAudioCallback(transport ? &tap_ : nullptr);
-    }
   });
   return 0;
 }

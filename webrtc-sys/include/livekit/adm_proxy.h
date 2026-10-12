@@ -166,9 +166,12 @@ struct AdmNativeStats {
   uint64_t device_stop_failures = 0;
 };
 
-// Registered with the platform ADM in place of libwebrtc's AudioTransport. It
-// runs on the device's capture and render threads: it forwards, counts and
-// keeps the last-callback times, using only its own atomics.
+// Registered with the platform ADM in place of libwebrtc's AudioTransport, from
+// the ADM's creation, so a device never pulls an AudioDeviceBuffer that has no
+// transport (it plays its stale or uninitialized samples); while libwebrtc has
+// none the tap plays silence. It runs on the device's capture and render
+// threads: it forwards, counts and keeps the last-callback times, using only
+// its own atomics.
 //
 // One capture and one render callback reach libwebrtc at a time. A callback
 // that starts while another one of its direction is in flight (a device thread
@@ -627,7 +630,6 @@ class AdmProxy : public webrtc::AudioDeviceModule {
   std::atomic<webrtc::AudioDeviceModule*> platform_raw_{nullptr};
   AdmTransportTap tap_;
   AdmSyntheticTransport synthetic_transport_{&tap_};
-  webrtc::AudioTransport* audio_transport_ = nullptr;
 
   uint64_t playout_opened_selection_gen_ = 0;
   uint64_t playout_opened_restart_gen_ = 0;

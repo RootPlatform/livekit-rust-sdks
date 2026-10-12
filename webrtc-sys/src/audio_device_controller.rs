@@ -60,6 +60,17 @@ pub mod ffi {
         pub playout: AudioDeviceOutcome,
     }
 
+    /// One render callback of the harness's fake device (tests only).
+    #[derive(Debug, Clone, Default)]
+    pub struct AdmDeviceRender {
+        /// AudioDeviceBuffer::RequestPlayoutData's result: the frames
+        /// libwebrtc's side produced, 0 when it had no transport; -1 when the
+        /// device does not play.
+        pub frames: i32,
+        /// What the device plays, interleaved.
+        pub samples: Vec<i16>,
+    }
+
     /// One playout mixer source (a remote audio stream): its audio as it
     /// reached the mixer, before its gain (a muted frame counts as silence),
     /// cumulative since it was added; `source_id` tells a stream added again
@@ -489,6 +500,17 @@ pub mod ffi {
         /// through the transport tap (libwebrtc's side plays silence);
         /// returns what the device plays.
         fn render_frame(self: &AdmProxyHarness) -> Vec<i16>;
+        /// The fake's AudioDeviceBuffer (libwebrtc's own) holds `level` in its
+        /// playout samples, standing in for the uninitialized heap block it
+        /// allocates on its first pull.
+        fn stale_device_buffer(self: &AdmProxyHarness, level: i16);
+        /// One 10 ms render callback from a device thread as the Windows ADM's
+        /// render thread makes it: AudioDeviceBuffer::RequestPlayoutData, then
+        /// GetPlayoutData into the device.
+        fn device_render(self: &AdmProxyHarness) -> AdmDeviceRender;
+        /// libwebrtc's transport plays the mixer from now on, as
+        /// AudioTransportImpl does.
+        fn engine_plays_mixer(self: &AdmProxyHarness);
         fn engine_start_playout(self: &AdmProxyHarness);
         fn engine_stop_playout(self: &AdmProxyHarness);
         fn engine_start_recording(self: &AdmProxyHarness);

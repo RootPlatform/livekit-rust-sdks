@@ -41,6 +41,7 @@ struct RootMonitorStats;
 struct RootVoiceFakeCounts;
 struct AudioDeviceSelection;
 struct AudioDeviceRequestOutcome;
+struct AdmDeviceRender;
 struct RootAudioNativeStats;
 struct RootAudioControlUpdate;
 struct RootAudioCaptureFormat;
@@ -270,6 +271,13 @@ class AdmProxyHarness {
   // One 10 ms 48 kHz stereo render callback through the tap from a device
   // thread; returns what the device plays.
   rust::Vec<int16_t> render_frame() const;
+  // The fake's AudioDeviceBuffer holds `level` in its playout samples.
+  void stale_device_buffer(int16_t level) const;
+  // One 10 ms render callback from a device thread through the fake's
+  // AudioDeviceBuffer, as the Windows ADM's render thread makes it.
+  AdmDeviceRender device_render() const;
+  // libwebrtc's transport plays the mixer from now on.
+  void engine_plays_mixer() const;
   void engine_start_playout() const;
   void engine_stop_playout() const;
   void engine_start_recording() const;

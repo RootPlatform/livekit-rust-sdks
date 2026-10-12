@@ -1148,6 +1148,64 @@ fn adm_proxy_playout_opens_stereo_and_takes_libwebrtcs_channels_at_the_next_open
     assert_eq!(h.take_channel_calls(), ["SetStereoPlayout(on)", "InitPlayout stereo"]);
 }
 
+/// The 2026-10-12 live test's blast: the first platform call of a session
+/// played loud noise from the lease until libwebrtc registered its transport
+/// about 0.65 s later (m150 initializes the voice engine with the first
+/// PeerConnection, after SessionCreate and the room connect). The hold had
+/// opened the device, and with no transport AudioDeviceModuleImpl's buffer
+/// plays its playout samples as they are, every 10 ms: on the first pull an
+/// uninitialized heap block ("Invalid audio transport", "nSamples(0) !=
+/// _playBlockSize480"). The fake device pulls through libwebrtc's own
+/// AudioDeviceBuffer, its samples left full scale in place of that block.
+#[test]
+fn adm_proxy_device_plays_silence_until_libwebrtc_has_a_transport() {
+    let h = platform(&["{spk}"], &["{mic}"]);
+    h.stale_device_buffer(i16::MAX);
+    h.hold(true);
+    calls(&h);
+    assert!(h.platform_playing());
+    for _ in 0..3 {
+        let render = h.device_render();
+        assert_eq!(render.samples.len(), 960, "stereo");
+        assert!(
+            render.samples.iter().all(|&s| s == 0),
+            "silence, never the buffer's stale samples: {:?}",
+            &render.samples[..4]
+        );
+        assert_eq!(render.frames, 480, "the device's buffer has a transport to pull");
+    }
+    assert_eq!(h.stats().render_callbacks, 3, "the tap answered them");
+
+    // Engine init registers libwebrtc's transport, then the join chime plays.
+    assert_eq!(h.engine_adm_init(), [0, 0, 0, 0]);
+    h.engine_plays_mixer();
+    h.register_transport();
+    assert!(h.controller().register_root_audio_effect(1, &vec![8000i16; 4800]));
+    assert_eq!(h.controller().play_root_audio_effect(1, 0.5), 0);
+    let before = h.stats();
+    let render = h.device_render();
+    let after = h.stats();
+    assert_eq!(render.frames, 480);
+    assert!(render.samples.iter().all(|&s| (3999..=4000).contains(&s)), "the chime, both channels");
+    let sumsq: f64 = render.samples.iter().map(|&s| f64::from(s) * f64::from(s)).sum();
+    assert_eq!(sumsq, after.mix_out_sumsq - before.mix_out_sumsq, "exactly the mixer's output");
+    assert_eq!(after.mix_out_samples - before.mix_out_samples, 960);
+}
+
+/// The Settings mic test opens the devices through the monitor, where no call
+/// may have initialized libwebrtc's voice engine yet.
+#[test]
+fn adm_proxy_mic_test_device_plays_silence_without_libwebrtcs_transport() {
+    let h = platform(&["{spk}"], &["{mic}"]);
+    h.stale_device_buffer(i16::MAX);
+    assert_eq!(h.monitor(true), MONITOR_APPLIED);
+    calls(&h);
+    assert!(h.platform_playing());
+    let render = h.device_render();
+    assert!(render.samples.iter().all(|&s| s == 0), "{:?}", &render.samples[..4]);
+    assert_eq!(render.frames, 480);
+}
+
 /// The speaker's volume and mute are the session or endpoint volume: the
 /// proxy never sets them, and engine init's speaker and microphone access
 /// never reaches the device.

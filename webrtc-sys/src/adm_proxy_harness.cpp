@@ -28,12 +28,14 @@
 #include <utility>
 #include <vector>
 
+#include "api/audio/audio_frame.h"
 #include "api/environment/environment_factory.h"
 #include "api/make_ref_counted.h"
 #include "livekit/adm_proxy.h"
 #include "livekit/audio_device_controller.h"
 #include "livekit/audio_thread.h"
 #include "livekit/root_audio_mixer.h"
+#include "modules/audio_device/audio_device_buffer.h"
 #include "modules/audio_device/include/audio_device_default.h"
 #include "rtc_base/event.h"
 #include "rtc_base/thread.h"
@@ -62,10 +64,57 @@ void CopyDevice(const std::vector<std::string>& guids,
   std::strncpy(guid, guids[index].c_str(), webrtc::kAdmMaxGuidSize - 1);
 }
 
+// Plays a constant level.
+class LevelTransport : public webrtc::AudioTransport {
+ public:
+  explicit LevelTransport(int16_t level) : level_(level) {}
+
+  using webrtc::AudioTransport::RecordedDataIsAvailable;
+  int32_t RecordedDataIsAvailable(const void*,
+                                  size_t,
+                                  size_t,
+                                  size_t,
+                                  uint32_t,
+                                  uint32_t,
+                                  int32_t,
+                                  uint32_t,
+                                  bool,
+                                  uint32_t&) override {
+    return 0;
+  }
+
+  int32_t NeedMorePlayData(size_t samples_per_channel,
+                           size_t,
+                           size_t channels,
+                           uint32_t,
+                           void* audio_samples,
+                           size_t& samples_out,
+                           int64_t* elapsed_time_ms,
+                           int64_t* ntp_time_ms) override {
+    samples_out = samples_per_channel * channels;
+    std::fill_n(static_cast<int16_t*>(audio_samples), samples_out, level_);
+    *elapsed_time_ms = -1;
+    *ntp_time_ms = -1;
+    return 0;
+  }
+
+  void PullRenderData(int,
+                      int,
+                      size_t,
+                      size_t,
+                      void*,
+                      int64_t*,
+                      int64_t*) override {}
+
+ private:
+  const int16_t level_;
+};
+
 }  // namespace
 
 // Records the state-changing calls it gets and behaves like a platform ADM:
-// Start needs Init, Stop closes the device.
+// Start needs Init, Stop closes the device. Its playout runs through
+// libwebrtc's own AudioDeviceBuffer, as AudioDeviceModuleImpl's does.
 class FakePlatformAdm
     : public webrtc::webrtc_impl::AudioDeviceModuleDefault<
           webrtc::AudioDeviceModule> {
@@ -108,10 +157,40 @@ class FakePlatformAdm
   }
   void ReleaseStartPlayout() { start_release_.Set(); }
 
+  // One 10 ms render callback as the Windows ADM's render thread makes it
+  // (audio_device_core_win.cc): RequestPlayoutData, then GetPlayoutData into
+  // the device's buffer. Returns what RequestPlayoutData returned (the frames
+  // the transport produced, 0 without a transport), -1 when not playing.
+  int32_t DeviceRender(std::vector<int16_t>* samples) {
+    samples->clear();
+    if (!playing_.load()) {
+      return -1;
+    }
+    const int32_t frames = buffer_.RequestPlayoutData(kDeviceFrames);
+    std::vector<int16_t> device(webrtc::kMaxBufferSizeBytes / sizeof(int16_t));
+    buffer_.GetPlayoutData(device.data());
+    device.resize(kDeviceFrames * buffer_.PlayoutChannels());
+    *samples = std::move(device);
+    return frames;
+  }
+
+  // Leaves `level` in the buffer's stereo playout samples, as an earlier pull
+  // would. It stands in for the uninitialized heap block the buffer allocates
+  // on its first pull and plays as it is when no transport is registered.
+  void StaleBuffer(int16_t level) {
+    LevelTransport stale(level);
+    buffer_.SetPlayoutSampleRate(48000);
+    buffer_.SetPlayoutChannels(2);
+    buffer_.RegisterAudioCallback(&stale);
+    buffer_.RequestPlayoutData(kDeviceFrames);
+    buffer_.RegisterAudioCallback(callback_.load());
+  }
+
   int32_t Init() override { return Record("Init"); }
   int32_t Terminate() override { return Record("Terminate"); }
   int32_t RegisterAudioCallback(webrtc::AudioTransport* transport) override {
     callback_.store(transport);
+    buffer_.RegisterAudioCallback(transport);
     return Record(transport ? "RegisterAudioCallback(set)"
                             : "RegisterAudioCallback(null)");
   }
@@ -160,6 +239,8 @@ class FakePlatformAdm
 
   int32_t InitPlayout() override {
     playout_initialized_.store(true);
+    buffer_.SetPlayoutSampleRate(48000);
+    buffer_.SetPlayoutChannels(stereo_playout_.load() ? 2 : 1);
     RecordChannel(stereo_playout_.load() ? "InitPlayout stereo"
                                          : "InitPlayout mono",
                   0);
@@ -221,6 +302,7 @@ class FakePlatformAdm
     if (!playout_initialized_.load()) {
       return -1;
     }
+    buffer_.StartPlayout();
     playing_.store(true);
     return 0;
   }
@@ -228,6 +310,7 @@ class FakePlatformAdm
     Record("StopPlayout");
     const bool open = playout_initialized_.exchange(false);
     playing_.store(false);
+    buffer_.StopPlayout();
     return open ? next_stop_playout_result_.exchange(0) : 0;
   }
   bool Playing() const override { return playing_.load(); }
@@ -289,6 +372,9 @@ class FakePlatformAdm
     return result;
   }
 
+  static constexpr size_t kDeviceFrames = 480;
+
+  webrtc::AudioDeviceBuffer buffer_{webrtc::CreateEnvironment(), true};
   std::mutex mutex_;
   std::vector<std::string> calls_;
   std::vector<std::string> channel_calls_;
@@ -309,7 +395,9 @@ class FakePlatformAdm
 };
 
 // libwebrtc's side of the device callbacks. With a re-entry target it calls
-// the device side again from inside its own callback, once.
+// the device side again from inside its own callback, once. It plays silence,
+// or the mixer as AudioTransportImpl does (the device runs at the mixer's
+// 48 kHz, so there is nothing to resample).
 class HarnessTransport : public webrtc::AudioTransport {
  public:
   void Reset(webrtc::AudioTransport* reenter) {
@@ -317,6 +405,7 @@ class HarnessTransport : public webrtc::AudioTransport {
     reenter_.store(reenter);
   }
   uint32_t entries() const { return entries_.load(); }
+  void PlayMixer(RootAudioMixer* mixer) { mixer_.store(mixer); }
 
   using webrtc::AudioTransport::RecordedDataIsAvailable;
   int32_t RecordedDataIsAvailable(const void* audio_samples,
@@ -358,7 +447,18 @@ class HarnessTransport : public webrtc::AudioTransport {
                                sample_rate, nested.data(), nested_out,
                                &nested_elapsed, &nested_ntp);
     }
-    std::memset(audio_samples, 0, samples_per_channel * bytes_per_frame);
+    RootAudioMixer* mixer = mixer_.load();
+    if (mixer != nullptr) {
+      mixer->Mix(channels, &mixed_);
+    }
+    if (mixer != nullptr &&
+        mixed_.samples_per_channel() == samples_per_channel &&
+        mixed_.num_channels() == channels) {
+      std::memcpy(audio_samples, mixed_.data(),
+                  samples_per_channel * bytes_per_frame);
+    } else {
+      std::memset(audio_samples, 0, samples_per_channel * bytes_per_frame);
+    }
     samples_out = samples_per_channel * channels;
     *elapsed_time_ms = -1;
     *ntp_time_ms = -1;
@@ -376,6 +476,8 @@ class HarnessTransport : public webrtc::AudioTransport {
  private:
   std::atomic<uint32_t> entries_{0};
   std::atomic<webrtc::AudioTransport*> reenter_{nullptr};
+  std::atomic<RootAudioMixer*> mixer_{nullptr};
+  webrtc::AudioFrame mixed_;
 };
 
 AdmProxyHarness::AdmProxyHarness(
@@ -547,6 +649,27 @@ rust::Vec<int16_t> AdmProxyHarness::render_frame() const {
     result.push_back(sample);
   }
   return result;
+}
+
+void AdmProxyHarness::stale_device_buffer(int16_t level) const {
+  fake_->StaleBuffer(level);
+}
+
+AdmDeviceRender AdmProxyHarness::device_render() const {
+  AdmDeviceRender result{};
+  std::vector<int16_t> samples;
+  std::thread device_thread([this, &samples, &result] {
+    result.frames = fake_->DeviceRender(&samples);
+  });
+  device_thread.join();
+  for (int16_t sample : samples) {
+    result.samples.push_back(sample);
+  }
+  return result;
+}
+
+void AdmProxyHarness::engine_plays_mixer() const {
+  transport_->PlayMixer(mixer_.get());
 }
 
 void AdmProxyHarness::engine_start_playout() const {
