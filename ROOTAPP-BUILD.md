@@ -754,10 +754,11 @@ denoiser hand-off, and (Phase 3) the mic test monitor in native code.
 
 `livekit_ffi_rootapp_audio_caps()` is a zero-protobuf export (every target) returning the native audio
 features the build implements: bit 0 SELECT_DEVICES, 1 PLAYOUT_HOLD, 2 STATS, 3 ADM_HARDENED, 4 MIXER,
-5 TRACK_GAINS, 6 EFFECTS, 7 CONTROL, 8 DSP, 9 DENOISER, 10 MONITOR, 11 APM_DECORATOR. This branch
-reports `0b111111111111` (4095: bits 0-11) on 64-bit desktop, `0b110111111111` (3583, no DENOISER)
-on 32-bit desktop and 0 on mobile; Phase 2 builds reported 3071 (no MONITOR) and Phase 1 builds
-`0b100011111111` (2303). The
+5 TRACK_GAINS, 6 EFFECTS, 7 CONTROL, 8 DSP, 9 DENOISER, 10 MONITOR, 11 APM_DECORATOR, 12
+SPEECH_DETECTION. This branch reports `0b1111111111111` (8191: bits 0-12) on 64-bit desktop,
+`0b1110111111111` (7679, no DENOISER) on 32-bit desktop and 0 on mobile; builds up to hw.7 reported
+4095 (no SPEECH_DETECTION), Phase 2 builds 3071 (no MONITOR) and Phase 1 builds `0b100011111111`
+(2303). The
 `RootAudio*` requests (`rootapp_audio.proto`, oneof cases from 1000) that a build does not implement
 answer "not supported by this build"; an older library rejects them as an empty request, so hosts
 check the export first.
@@ -1160,6 +1161,52 @@ PeerConnection, leave chime after the last, the next call plays and captures),
 fail (nothing processed, no mix); with the old `Terminate` the second, the fifth and the
 `adm_proxy_engine_terminate_*` test fail. The `adm_proxy_device_plays_silence_*` and
 `adm_proxy_mic_test_device_plays_silence_*` tests still cover the time before the posted engine init.
+
+### Speech detection (2026-10-12, lingering ring step 2)
+
+The noise gate alone kept the speaking ring on 0.7 s after speech at best, and for seconds on breath,
+keys and room noise above its threshold (desktop `docs/voice-live-test.md`, the 10/12 trace). Design
+and evaluation: the desktop's `docs/native-platform-audio.md` ("Speech detection").
+
+- `RootSpeechDetector` (webrtc-sys, `root_speech_detector.{h,cpp}`) runs libwebrtc's AGC2 speech
+  detector (`agc2/rnn_vad`, already linked into the library) as `VoiceActivityDetectorWrapper`
+  does, without its 1.5 s periodic reset: a `PushResampler` per APM rate (16, 32, 48 kHz) to 24 kHz,
+  the feature extractor and the RNN; any other rate or length gives -1. Built in
+  `RootCaptureProcessor`'s constructor (about 6 KB plus 44 KB of heap); `Analyze` and `Reset` never
+  allocate, lock or log. It resets on a DSP reset, flush or rate change, and when it was not running
+  on the previous frame. Its header is included from .cpp files only (the rnn_vad headers raise
+  C4244/C4267 at /W4; the includes are wrapped in `#pragma warning`).
+- `RootCaptureProcessor` runs it on the frame `pre_denoise` sanitised, before the denoiser, while
+  `speech_detection` is not off (also while muted or with push-to-talk, so it is warm when they end),
+  and hands the probability to the chain (`RootDspSettings.speech_probability`).
+- `rootapp-voice-dsp`: `SpeechGate` (`speech_gate.rs`) and `NoiseGate::process_controlled`. Speech
+  is confirmed after 3 frames in a row at p >= 0.5 and ends 300 ms after the last frame at p >= 0.3.
+  The ring (`speaking`) is the level gate's speaking AND confirmed speech. In `Gate` mode an open the
+  detector has not confirmed within 200 ms, or confirmed speech that ended while the level still
+  holds the gate, is released over 50 ms without the speaking hold, and the gate stays shut until a
+  frame at p >= 0.5 or 100 ms below the threshold; auto sensitivity counts confirmed speech and opens
+  not judged yet as open and rejected opens as closed. Push-to-talk, frames without a probability
+  (off, other rates, NaN or negative) and unsupported frames leave the chain bit for bit as the level
+  gate: the 22 golden vectors are unchanged.
+- Control `RootAudioControl.speech_detection` (`RootAudioSpeechDetection` OFF/RING/GATE; unknown
+  values off), stored in `RootCaptureState::speech_detection`, back to off on every session reset.
+  Stats 107-113: the mode, the highest probability since the previous read (-1 none), whether the
+  speech gate judged the last frame and confirmed speech on it, and frames with confirmed speech,
+  closed by the speech gate, and with detection on but no probability. Caps bit 12 SPEECH_DETECTION
+  wherever DSP is (`rootapp_audio_caps_cover_phase_3` checks 8191 and ties the bit to `root_dsp_supported()`).
+
+Tests: `cargo test -p rootapp-voice-dsp` (`tests/speech_gate.rs`: the state machine, confirmation,
+hang, the forced close and re-arm, auto sensitivity learning only from what the detector rejected,
+the bypasses bit for bit; `no_alloc` and `no_panic` vary the mode and NaN, inf, negative and > 1
+probabilities; the bench runs with detection off and on); webrtc-sys `speech_tests`
+(`root_speech_detector_matches_libwebrtcs_wrapper_at_16_32_and_48_khz`: identical to the wrapper on
+synthetic signals; decisions on a vowel, a tone, white noise, silence, breath, clicks and keys; the
+capture processor in Gate mode never rings on breath, clicks or keys, rings 30 ms into a voice and
+stops 300 ms after it, Ring mode sends what Off sends, 8 and 44.1 kHz pass the level gate bit for
+bit, push-to-talk and mute bypass it, a reset turns it off, the real APM runs it at 16, 32 and
+48 kHz), `adm_proxy_controller_stores_speech_detection_*`,
+`root_voice_speech_detection_keeps_keys_off_the_ring_and_rings_for_a_voice`, and the livekit and
+livekit-ffi conversions.
 
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
