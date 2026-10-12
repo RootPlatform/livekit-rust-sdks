@@ -12,7 +12,7 @@
 //! ROOTAPP_DSP_GOLDEN_REPORT=1 prints the largest deviation of every field per vector.
 
 use rootapp_voice_dsp::{
-    DenoiserOutput, DspChain, DspCommands, DspOutputs, DspSettings, PushToTalk,
+    DenoiserOutput, DspChain, DspCommands, DspOutputs, DspSettings, PushToTalk, SpeechDetection,
 };
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -278,7 +278,11 @@ struct Outcome {
     transitions_moved: Vec<String>,
 }
 
-fn run_vector(records: &[Record], tolerance: Tolerance) -> Outcome {
+fn run_vector(
+    records: &[Record],
+    tolerance: Tolerance,
+    speech: impl Fn(usize, &mut DspSettings),
+) -> Outcome {
     let mut chain = DspChain::new(48_000);
     let mut out = DspOutputs::default();
     let mut failures = Vec::new();
@@ -289,13 +293,15 @@ fn run_vector(records: &[Record], tolerance: Tolerance) -> Outcome {
 
     for (index, record) in records.iter().enumerate() {
         let mut frame = record.input.clone();
-        let pre = chain.pre_denoise(&mut frame, &record.settings, &record.commands, &mut out);
+        let mut settings = record.settings;
+        speech(index, &mut settings);
+        let pre = chain.pre_denoise(&mut frame, &settings, &record.commands, &mut out);
         let denoised = match record.kind {
             0 => DenoiserOutput::NotInUse,
             1 => DenoiserOutput::Missed,
             _ => DenoiserOutput::Ran { samples: &record.denoised, restart: record.restart },
         };
-        chain.post_denoise(&mut frame, denoised, &record.settings, &mut out);
+        chain.post_denoise(&mut frame, denoised, &settings, &mut out);
 
         let unsupported = !pre.supported;
         let edge = record.flags & 0x80 != 0;
@@ -468,7 +474,7 @@ fn golden_vectors_match_the_managed_reference() {
                 records.len()
             ));
         }
-        let outcome = run_vector(&records, tolerance);
+        let outcome = run_vector(&records, tolerance, |_, _| {});
         let d = &outcome.deviation;
         if report {
             println!(
@@ -507,4 +513,38 @@ fn golden_vectors_match_the_managed_reference() {
         files.len(),
         failed.join("\n")
     );
+}
+
+/// The speech detector's paths leave the managed reference's audio as it is when they change
+/// nothing: Ring mode with any probability (it qualifies the ring only), and Gate mode with a
+/// probability that never stops being speech (it never closes).
+#[test]
+fn golden_vectors_hold_where_speech_detection_changes_no_audio() {
+    let tolerance =
+        Tolerance { loose: std::env::var("ROOTAPP_DSP_GOLDEN_LOOSE").is_ok_and(|v| v == "1") };
+    const ANY: [f32; 8] = [0.9, 0.1, -1.0, f32::NAN, 0.6, 0.0, 0.35, 2.0];
+    let mut failed = Vec::new();
+    for path in vector_files() {
+        let name = path.file_stem().unwrap().to_string_lossy().to_string();
+        let (_, records) = parse(&std::fs::read(&path).unwrap()).unwrap();
+        let ring = run_vector(&records, tolerance, |f, s| {
+            s.speech_detection = SpeechDetection::Ring;
+            s.speech_probability = ANY[(f / 3) % ANY.len()];
+        });
+        let gate = run_vector(&records, tolerance, |_, s| {
+            s.speech_detection = SpeechDetection::Gate;
+            s.speech_probability = 0.9;
+        });
+        for (mode, outcome) in [("ring", ring), ("gate", gate)] {
+            if outcome.failed_frames > 0 {
+                failed.push(format!(
+                    "{name} ({mode}): {} of {} frames differ\n    {}",
+                    outcome.failed_frames,
+                    outcome.frames,
+                    outcome.failures.join("\n    ")
+                ));
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
 }

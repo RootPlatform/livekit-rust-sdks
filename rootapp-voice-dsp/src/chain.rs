@@ -124,6 +124,8 @@ pub struct DspChain {
     /// startup hold no longer waits for the denoiser.
     denoiser_seen: bool,
     speech: SpeechGate,
+    /// The detection mode the speech gate last ran in: a change starts its verdict over.
+    speech_mode: SpeechDetection,
 }
 
 impl DspChain {
@@ -160,6 +162,7 @@ impl DspChain {
             frames_since_open: 0,
             denoiser_seen: false,
             speech: SpeechGate::default(),
+            speech_mode: SpeechDetection::Off,
         }
     }
 
@@ -350,6 +353,7 @@ impl DspChain {
             frames_since_open,
             denoiser_seen,
             speech,
+            speech_mode,
             ..
         } = self;
         let Some(w) = work.get_mut(..len) else {
@@ -417,6 +421,10 @@ impl DspChain {
         } else {
             SpeechDetection::Off
         };
+        if detection != *speech_mode {
+            speech.reset();
+            *speech_mode = detection;
+        }
         let probability = match detection {
             SpeechDetection::Off => None,
             SpeechDetection::Ring | SpeechDetection::Gate => {
@@ -425,18 +433,17 @@ impl DspChain {
         };
         let gate_audio = probability.is_some() && detection == SpeechDetection::Gate;
         let level_open = gate.envelope() > 0.0;
-        let auto_open = match probability {
+        match probability {
             Some(p) => speech.observe(p, level_open, gate_audio),
-            None => {
-                speech.reset();
-                level_open
-            }
-        };
+            None => speech.reset(),
+        }
         if settings.auto_sensitivity {
             if !*auto_sensitivity_active {
                 auto_sensitivity.reset();
                 *auto_sensitivity_active = true;
             }
+            // The level gate's own state: the speech gate never moves the threshold.
+            let auto_open = gate.level_envelope() > 0.0;
             gate.set_threshold(auto_sensitivity.update(denoised_rms, gain_db, auto_open));
             gate.set_min_open_blocks(AUTO_MIN_OPEN_BLOCKS);
         } else {
@@ -457,7 +464,7 @@ impl DspChain {
         let released = gate.push_to_talk() == Some(false);
         let above = input_rms > gate.threshold();
         let control = match probability {
-            Some(p) if gate_audio => speech.control(p, above, level_open),
+            Some(p) if gate_audio => speech.control(p, input_rms, gate.threshold(), level_open),
             _ => GateControl::LEVEL,
         };
         gate.process_controlled(w, !released, control);

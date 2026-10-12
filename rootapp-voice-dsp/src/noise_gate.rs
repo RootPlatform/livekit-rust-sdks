@@ -24,6 +24,9 @@ pub struct NoiseGate {
     block_samples: usize,
     hold_samples: i64,
     envelope: f32,
+    /// The envelope the level alone would give (GateControl::LEVEL on every block); equal to
+    /// `envelope` unless the speech gate intervened.
+    level_envelope: f32,
     above_blocks: u32,
     position: i64,
     hold_end: i64,
@@ -41,6 +44,7 @@ impl NoiseGate {
             block_samples: block_samples.max(1),
             hold_samples: (VAD_HOLD_SECONDS * f64::from(sample_rate)).round_ties_even() as i64,
             envelope: 0.0,
+            level_envelope: 0.0,
             above_blocks: 0,
             position: 0,
             hold_end: 0,
@@ -88,6 +92,12 @@ impl NoiseGate {
         self.envelope
     }
 
+    /// The envelope without the speech gate's controls: what the level gate alone would have.
+    /// Never below `envelope`.
+    pub fn level_envelope(&self) -> f32 {
+        self.level_envelope
+    }
+
     pub fn push_to_talk(&self) -> Option<bool> {
         self.push_to_talk
     }
@@ -96,6 +106,7 @@ impl NoiseGate {
         self.push_to_talk = push_to_talk;
         if push_to_talk == Some(false) {
             self.envelope = 0.0;
+            self.level_envelope = 0.0;
             self.hold_end = 0;
             self.is_speaking = false;
         }
@@ -112,7 +123,9 @@ impl NoiseGate {
 
     /// `process_gated` with the speech gate's controls: `allow_open` false keeps a closed gate
     /// closed; `fast_close` releases over FAST_RELEASE_SECONDS whatever the level and skips the
-    /// speaking hold. GateControl::LEVEL is exactly `process_gated`.
+    /// speaking hold; `eager_open` skips the min_open_blocks wait while `level_envelope` is open.
+    /// The envelope never exceeds `level_envelope`. GateControl::LEVEL is exactly
+    /// `process_gated`.
     pub fn process_controlled(&mut self, samples: &mut [f32], apply: bool, control: GateControl) {
         for block in samples.chunks_mut(self.block_samples) {
             self.process_block(block, apply, control);
@@ -128,21 +141,22 @@ impl NoiseGate {
         };
         let above = rms > self.threshold;
         self.above_blocks = if above { self.above_blocks.saturating_add(1) } else { 0 };
+        let level_open = self.level_envelope > 0.0;
+        let level_attack = above && (level_open || self.above_blocks >= self.min_open_blocks);
+        self.level_envelope = step(self.level_envelope, block_seconds, level_attack, above);
         if control.fast_close {
             self.envelope =
                 (f64::from(self.envelope) - block_seconds / FAST_RELEASE_SECONDS).max(0.0) as f32;
             if self.envelope <= 0.0 {
                 self.hold_end = self.position;
             }
-        } else if above
-            && (self.envelope > 0.0
-                || (control.allow_open && self.above_blocks >= self.min_open_blocks))
-        {
-            self.envelope =
-                (f64::from(self.envelope) + block_seconds / ATTACK_SECONDS).min(1.0) as f32;
-        } else if !above {
-            self.envelope =
-                (f64::from(self.envelope) - block_seconds / RELEASE_SECONDS).max(0.0) as f32;
+        } else {
+            let attack = above
+                && (self.envelope > 0.0
+                    || (control.allow_open
+                        && (self.above_blocks >= self.min_open_blocks
+                            || (control.eager_open && level_open))));
+            self.envelope = step(self.envelope, block_seconds, attack, above);
         }
 
         let multiplier = (self.envelope / FULL_ON_ENVELOPE).min(1.0);
@@ -166,6 +180,18 @@ impl NoiseGate {
         }
 
         self.position = self.position.saturating_add(block.len() as i64);
+    }
+}
+
+/// One block of the envelope: up over ATTACK_SECONDS, down over RELEASE_SECONDS below the
+/// threshold, else held.
+fn step(envelope: f32, block_seconds: f64, attack: bool, above: bool) -> f32 {
+    if attack {
+        (f64::from(envelope) + block_seconds / ATTACK_SECONDS).min(1.0) as f32
+    } else if !above {
+        (f64::from(envelope) - block_seconds / RELEASE_SECONDS).max(0.0) as f32
+    } else {
+        envelope
     }
 }
 

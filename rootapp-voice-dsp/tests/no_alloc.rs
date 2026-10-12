@@ -127,6 +127,10 @@ fn the_chain_never_allocates_or_frees_after_new() {
             }
             frame.copy_from_slice(&input[position..position + len]);
             position += len;
+            let level = [1.0, 0.0005, 0.03, 1.0, 0.0, 0.003][(f / 13) % 6];
+            for s in frame.iter_mut() {
+                *s *= level;
+            }
             let output = match f % 11 {
                 0 | 1 => DenoiserOutput::NotInUse,
                 2 => DenoiserOutput::Missed,
