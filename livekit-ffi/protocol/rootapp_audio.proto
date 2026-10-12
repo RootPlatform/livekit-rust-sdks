@@ -53,10 +53,30 @@ message RootAudioSetPlayoutHoldResponse {
   optional string error = 1;
 }
 
+// What the native speech detector's verdict qualifies (capability SPEECH_DETECTION). The detector is
+// libwebrtc's AGC2 speech detector (rnn_vad) on the APM output at 16, 32 and 48 kHz. Speech is
+// confirmed after 3 frames in a row at a probability of 0.5 or more and ends 300 ms after the last
+// frame at 0.3 or more. Push-to-talk, mute, other rates and frames without a probability leave the
+// noise gate exactly as with OFF.
+enum RootAudioSpeechDetection {
+  // The noise gate alone decides (the managed engine's behaviour).
+  ROOT_AUDIO_SPEECH_DETECTION_OFF = 0;
+  // The speaking state (RootAudioEvent.speaking) needs confirmed speech; the audio follows the noise
+  // gate.
+  ROOT_AUDIO_SPEECH_DETECTION_RING = 1;
+  // As RING, and the noise gate also closes on what the detector rejects: an open it has not confirmed
+  // within 200 ms, or confirmed speech that ended while the level still holds the gate, is released
+  // over 50 ms and stays shut until the detector confirms speech or the input stays under the
+  // threshold for 100 ms. Automatic sensitivity then learns the noise floor only from what the
+  // detector did not confirm.
+  ROOT_AUDIO_SPEECH_DETECTION_GATE = 2;
+}
+
 // Live control. Only the fields that are set change. Values are sanitised natively (finite, clamped).
 // The response's error says "not supported by this build" when a set field has nothing to act on
-// (the other fields are applied). Fields 8-13 act with the DSP chain (capability DSP; denoise_power
-// and denoiser_wanted with DENOISER) and are only stored by builds without it.
+// (the other fields are applied). Fields 8-14 act with the DSP chain (capability DSP; denoise_power
+// and denoiser_wanted with DENOISER, speech_detection with SPEECH_DETECTION) and are only stored by
+// builds without it.
 message RootAudioControl {
   // Transmit gate: no audio leaves and no speaking is reported while muted. It fades over 5 ms each
   // way; mic_muted and push_to_talk of one control change together.
@@ -90,6 +110,8 @@ message RootAudioControl {
   // The host's noise suppression mode is the Effects SDK: a stream's startup hold waits for the
   // denoiser (at most 1 s), and native WebRTC NS covers a denoiser that stops or does not arrive.
   optional bool denoiser_wanted = 13;
+  // OFF until set, and again after every session start (as the other DSP settings).
+  optional RootAudioSpeechDetection speech_detection = 14;
 }
 message RootAudioSetControlRequest {
   required uint64 platform_audio_handle = 1;
@@ -308,7 +330,8 @@ message RootAudioStats {
 
   // DSP chain (capability DSP; absent from builds without it).
   // What RootAudioEvent.speaking reports, on the last frame: gate_speaking while the transmit gate is
-  // open (not muted, push-to-talk key not up).
+  // open (not muted, push-to-talk key not up), and with speech detection judging the frame also
+  // `speech`.
   optional bool speaking = 74;
   // Frames whose gate input RMS was above the threshold (the input duty cycle).
   optional uint64 gate_input_above_frames = 75;
@@ -393,6 +416,22 @@ message RootAudioStats {
   // build counts them, so an empty list then means no remote stream reaches the mixer.
   repeated RootAudioSourceLevel mix_source_levels = 105;
   optional bool mix_source_levels_counted = 106;
+
+  // Speech detector (capability SPEECH_DETECTION; absent without it). speech_detection is the
+  // setting native applies. speech_probability is the highest probability the detector gave since
+  // the previous read (reset on read; -1 when it judged no frame since: detection off or a rate it
+  // does not run at). speech_detector_running: the speech gate judged the last frame (detection on,
+  // a probability, push-to-talk not in use). speech: it had confirmed speech on the last frame
+  // (muted or not). speech_frames counts frames with confirmed speech; speech_closed_frames frames
+  // in which the speech gate kept the noise gate from opening or forced it to close (GATE only);
+  // speech_unavailable_frames frames with detection on but no probability.
+  optional RootAudioSpeechDetection speech_detection = 107;
+  optional float speech_probability = 108;
+  optional bool speech_detector_running = 109;
+  optional bool speech = 110;
+  optional uint64 speech_frames = 111;
+  optional uint64 speech_closed_frames = 112;
+  optional uint64 speech_unavailable_frames = 113;
 }
 // One playout mixer source (a remote audio stream): its audio as it reached the mixer, decoded and
 // before its gain (tile volume, master volume, deafen; a muted frame counts as silence), as a sum of
@@ -416,7 +455,8 @@ message RootAudioStatsResponse {
 }
 
 // The local user's speaking state (capability DSP): the noise gate's speaking while the transmit gate
-// is open. Sent when it differs from the last value sent to this handle (polled every 10 ms, so
+// is open (with speech detection RING or GATE, and push-to-talk not in use, also only while the
+// detector confirms speech). Sent when it differs from the last value sent to this handle (polled every 10 ms, so
 // transitions shorter than that are merged); seq is RootAudioStats.speaking_seq at that time.
 message RootAudioSpeaking {
   required bool speaking = 1;

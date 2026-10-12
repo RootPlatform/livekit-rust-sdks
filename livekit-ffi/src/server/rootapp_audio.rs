@@ -41,7 +41,7 @@ use std::{
 use livekit::{
     prelude::*, sanitize_volume, webrtc::stats::RtcStats, AudioDeviceResults, AudioDeviceSelection,
     CaptureFormat, DenoiserCompletion, DenoiserState, EffectPlay, LocalSpeaking, PlatformAudio,
-    PushToTalk, ReturnedPipeline, RootAudioControl, RootAudioStats,
+    PushToTalk, ReturnedPipeline, RootAudioControl, RootAudioStats, SpeechDetection,
 };
 use parking_lot::Mutex;
 use tokio::time::MissedTickBehavior;
@@ -65,12 +65,14 @@ pub const CAP_DSP: u64 = 1 << 8;
 pub const CAP_DENOISER: u64 = 1 << 9;
 pub const CAP_MONITOR: u64 = 1 << 10;
 pub const CAP_APM_DECORATOR: u64 = 1 << 11;
+pub const CAP_SPEECH_DETECTION: u64 = 1 << 12;
 
 /// What `livekit_ffi_rootapp_audio_caps` reports. The ADM hardening is desktop
-/// only, so mobile builds report nothing. The voice chain (DSP) and the mic
-/// test monitor (MONITOR, fed by the chain's capture processor) run wherever
-/// the factory builds its APM (webrtc-sys `kRootDspSupported`); the Effects SDK
-/// slot (DENOISER) only where the SDK's x64/arm64 calling convention holds
+/// only, so mobile builds report nothing. The voice chain (DSP), the mic test
+/// monitor (MONITOR, fed by the chain's capture processor) and the speech
+/// detector the chain gates with (SPEECH_DETECTION) run wherever the factory
+/// builds its APM (webrtc-sys `kRootDspSupported`); the Effects SDK slot
+/// (DENOISER) only where the SDK's x64/arm64 calling convention holds
 /// (`kRootDenoiserSupported`).
 pub const ROOTAPP_AUDIO_CAPS: u64 = if cfg!(any(target_os = "ios", target_os = "android")) {
     0
@@ -87,6 +89,7 @@ pub const ROOTAPP_AUDIO_CAPS: u64 = if cfg!(any(target_os = "ios", target_os = "
         | if cfg!(target_pointer_width = "64") { CAP_DENOISER } else { 0 }
         | CAP_MONITOR
         | CAP_APM_DECORATOR
+        | CAP_SPEECH_DETECTION
 };
 
 const NOT_SUPPORTED: &str = "not supported by this build";
@@ -881,8 +884,14 @@ pub fn root_audio_control(control: &proto::RootAudioControl) -> RootAudioControl
         auto_sensitivity: control.auto_sensitivity,
         gain_reset_db: control.gain_reset_db,
         denoiser_wanted: control.denoiser_wanted,
+        speech_detection: control.speech_detection.map(speech_detection),
     }
     .sanitized()
+}
+
+/// The proto's RootAudioSpeechDetection; a value this build does not know is off.
+fn speech_detection(value: i32) -> SpeechDetection {
+    u32::try_from(value).map_or(SpeechDetection::Off, SpeechDetection::from_wire)
 }
 
 /// An effect clip from the host's memory: `sample_count` int16 samples at
@@ -1279,6 +1288,13 @@ impl From<RootAudioStats> for proto::RootAudioStats {
             monitor_active: stats.monitor_active,
             monitor_frames: stats.monitor_frames,
             monitor_dropped_frames: stats.monitor_dropped_frames,
+            speech_detection: stats.speech_detection.map(|mode| mode.to_wire() as i32),
+            speech_probability: stats.speech_probability,
+            speech_detector_running: stats.speech_detector_running,
+            speech: stats.speech,
+            speech_frames: stats.speech_frames,
+            speech_closed_frames: stats.speech_closed_frames,
+            speech_unavailable_frames: stats.speech_unavailable_frames,
             mix_source_levels_counted: stats.mix_source_levels.as_ref().map(|_| true),
             mix_source_levels: stats
                 .mix_source_levels
@@ -1304,11 +1320,14 @@ mod tests {
     fn rootapp_audio_caps_cover_phase_3() {
         let mobile = cfg!(any(target_os = "ios", target_os = "android"));
         if !mobile {
-            let expected =
-                if cfg!(target_pointer_width = "64") { 0b1111_1111_1111 } else { 0b1101_1111_1111 };
+            let expected = if cfg!(target_pointer_width = "64") {
+                0b1_1111_1111_1111
+            } else {
+                0b1_1101_1111_1111
+            };
             assert_eq!(ROOTAPP_AUDIO_CAPS, expected);
             if cfg!(target_pointer_width = "64") {
-                assert_eq!(ROOTAPP_AUDIO_CAPS, 4095);
+                assert_eq!(ROOTAPP_AUDIO_CAPS, 8191);
             }
         }
         assert_eq!(crate::cabi::livekit_ffi_rootapp_audio_caps(), ROOTAPP_AUDIO_CAPS);
@@ -1319,6 +1338,10 @@ mod tests {
         );
         assert_eq!(
             ROOTAPP_AUDIO_CAPS & CAP_MONITOR != 0,
+            webrtc_sys::root_audio_processing::ffi::root_dsp_supported()
+        );
+        assert_eq!(
+            ROOTAPP_AUDIO_CAPS & CAP_SPEECH_DETECTION != 0,
             webrtc_sys::root_audio_processing::ffi::root_dsp_supported()
         );
         assert_eq!(
@@ -1365,8 +1388,10 @@ mod tests {
             auto_sensitivity: Some(true),
             gain_reset_db: Some(f32::NAN),
             denoiser_wanted: Some(true),
+            speech_detection: Some(proto::RootAudioSpeechDetection::Gate as i32),
         });
         assert_eq!(control.denoiser_wanted, Some(true));
+        assert_eq!(control.speech_detection, Some(SpeechDetection::Gate));
         assert_eq!(control.push_to_talk, Some(PushToTalk::Released));
         assert_eq!(control.input_volume, Some(0.0));
         assert_eq!(control.master_volume, Some(2.0));
@@ -1392,6 +1417,57 @@ mod tests {
         assert_eq!(push_to_talk(0), Some(PushToTalk::VoiceActivity));
         assert_eq!(push_to_talk(1), Some(PushToTalk::Held));
         assert_eq!(push_to_talk(2), Some(PushToTalk::Released));
+    }
+
+    #[test]
+    fn rootapp_audio_control_maps_speech_detection_and_turns_unknown_modes_off() {
+        let mode = |value: Option<i32>| {
+            root_audio_control(&proto::RootAudioControl {
+                speech_detection: value,
+                ..Default::default()
+            })
+            .speech_detection
+        };
+        assert_eq!(mode(None), None);
+        assert_eq!(
+            mode(Some(proto::RootAudioSpeechDetection::Off as i32)),
+            Some(SpeechDetection::Off)
+        );
+        assert_eq!(
+            mode(Some(proto::RootAudioSpeechDetection::Ring as i32)),
+            Some(SpeechDetection::Ring)
+        );
+        assert_eq!(
+            mode(Some(proto::RootAudioSpeechDetection::Gate as i32)),
+            Some(SpeechDetection::Gate)
+        );
+        assert_eq!(mode(Some(3)), Some(SpeechDetection::Off));
+        assert_eq!(mode(Some(-1)), Some(SpeechDetection::Off));
+    }
+
+    #[test]
+    fn rootapp_audio_speech_stats_convert_and_stay_absent_without_the_detector() {
+        let stats = RootAudioStats {
+            speech_detection: Some(SpeechDetection::Ring),
+            speech_probability: Some(0.5),
+            speech_detector_running: Some(true),
+            speech: Some(false),
+            speech_frames: Some(12),
+            speech_closed_frames: Some(3),
+            speech_unavailable_frames: Some(1),
+            ..Default::default()
+        };
+        let p: proto::RootAudioStats = stats.into();
+        assert_eq!(p.speech_detection, Some(proto::RootAudioSpeechDetection::Ring as i32));
+        assert_eq!((p.speech_probability, p.speech_detector_running), (Some(0.5), Some(true)));
+        assert_eq!(p.speech, Some(false));
+        assert_eq!(
+            (p.speech_frames, p.speech_closed_frames, p.speech_unavailable_frames),
+            (Some(12), Some(3), Some(1))
+        );
+        let absent: proto::RootAudioStats = RootAudioStats::default().into();
+        assert_eq!((absent.speech_detection, absent.speech_probability), (None, None));
+        assert_eq!((absent.speech, absent.speech_frames), (None, None));
     }
 
     fn effect_request(data_ptr: u64, sample_count: u32) -> proto::RootAudioRegisterEffectRequest {
