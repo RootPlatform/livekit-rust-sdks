@@ -245,13 +245,13 @@ fn hostile_input_never_panics_and_keeps_the_estimate_in_range() {
 /// The authors' published outputs of DTLN-aec-512 (the only size they
 /// published outputs for), through this executor: within 1 LSB except where
 /// their output clipped. Needs `ROOTAPP_DTLN_REFERENCE_DIR`, a checkout of
-/// the DTLN-aec repository (`pretrained_models/`, `audio_samples/`); skipped
-/// without it.
+/// the DTLN-aec repository (`pretrained_models/`, `audio_samples/`):
+/// `cargo test -- --ignored` with it set.
 #[test]
+#[ignore = "needs ROOTAPP_DTLN_REFERENCE_DIR (a DTLN-aec checkout)"]
 fn executor_matches_the_authors_outputs_within_one_lsb() {
-    let Some(dir) = std::env::var_os("ROOTAPP_DTLN_REFERENCE_DIR") else {
-        return;
-    };
+    let dir = std::env::var_os("ROOTAPP_DTLN_REFERENCE_DIR")
+        .expect("ROOTAPP_DTLN_REFERENCE_DIR is not set: this test cannot run without it");
     let dir = std::path::PathBuf::from(dir);
     let read = |name: &str| std::fs::read(dir.join(name)).unwrap();
     let model = Arc::new(
