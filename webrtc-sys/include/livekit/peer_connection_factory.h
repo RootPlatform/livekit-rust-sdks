@@ -83,6 +83,7 @@ class PeerConnectionFactory {
   std::shared_ptr<RtcRuntime> rtc_runtime() const { return rtc_runtime_; }
   std::shared_ptr<AudioDeviceController> audio_device() const;
   bool zero_playout_delay_enabled() const;
+  rust::String field_trial(rust::Str key) const;
 
  private:
   std::shared_ptr<RtcRuntime> rtc_runtime_;

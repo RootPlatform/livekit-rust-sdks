@@ -96,6 +96,7 @@ pub mod ffi {
         ) -> SharedPtr<PeerConnectionFactory>;
 
         fn zero_playout_delay_enabled(self: &PeerConnectionFactory) -> bool;
+        fn field_trial(self: &PeerConnectionFactory, key: &str) -> String;
 
         fn create_peer_connection(
             self: &PeerConnectionFactory,

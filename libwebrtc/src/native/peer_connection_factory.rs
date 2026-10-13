@@ -265,6 +265,11 @@ impl PeerConnectionFactory {
         self.sys_handle.zero_playout_delay_enabled()
     }
 
+    #[cfg(test)]
+    pub(crate) fn field_trial(&self, key: &str) -> String {
+        self.sys_handle.field_trial(key)
+    }
+
     pub fn create_peer_connection(
         &self,
         config: RtcConfiguration,

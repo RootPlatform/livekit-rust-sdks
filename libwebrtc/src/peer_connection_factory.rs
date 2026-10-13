@@ -136,6 +136,20 @@ mod tests {
         let low_latency_factory = PeerConnectionFactory::with_zero_playout_delay();
         assert!(low_latency_factory.handle.zero_playout_delay_enabled());
     }
+
+    #[test]
+    fn every_factory_keeps_the_bundle_payload_type_collision_check_off() {
+        const CHECK: &str = "WebRTC-SdpBundlePayloadTypeCollisionCheck";
+        let default_factory = PeerConnectionFactory::default();
+        assert_eq!(default_factory.handle.field_trial(CHECK), "Disabled");
+        assert_eq!(default_factory.handle.field_trial("WebRTC-IceHandshakeDtls"), "");
+        drop(default_factory);
+
+        let factory = PeerConnectionFactory::with_options(true, true);
+        assert_eq!(factory.handle.field_trial(CHECK), "Disabled");
+        assert_eq!(factory.handle.field_trial("WebRTC-ForcePlayoutDelay"), "min_ms:0,max_ms:0");
+        assert_eq!(factory.handle.field_trial("WebRTC-IceHandshakeDtls"), "Enabled");
+    }
 }
 
 pub mod native {

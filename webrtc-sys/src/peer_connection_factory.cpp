@@ -95,6 +95,23 @@ class EnableWarpFieldTrials final : public webrtc::FieldTrialsView {
   }
 };
 
+// LiveKit server's answers give one Opus payload type different fmtp in each
+// BUNDLEd section. m150 only logs that collision unless this trial is enabled,
+// and then fails SetRemoteDescription; it stays off whatever the default.
+constexpr char kSdpBundlePayloadTypeCollisionCheck[] =
+    "WebRTC-SdpBundlePayloadTypeCollisionCheck";
+
+class RootAppFieldTrials final : public webrtc::FieldTrialsView {
+ public:
+  std::string Lookup(absl::string_view key) const override {
+    return key == kSdpBundlePayloadTypeCollisionCheck ? "Disabled" : "";
+  }
+
+  std::unique_ptr<webrtc::FieldTrialsView> CreateCopy() const override {
+    return std::make_unique<RootAppFieldTrials>();
+  }
+};
+
 // An Environment accepts a single FieldTrialsView, so to enable several
 // independent trial groups (e.g. zero-playout-delay AND WARP) we combine their
 // views into one: Lookup delegates to each sub-view and returns the first
@@ -129,10 +146,11 @@ class CompositeFieldTrials final : public webrtc::FieldTrialsView {
 };
 
 // zero_playout_delay and enable_warp are independent and may both be enabled;
-// their field-trial views are composed into one.
+// their field-trial views are composed into one with RootApp's own.
 webrtc::Environment CreateEnvironment(bool zero_playout_delay,
                                       bool enable_warp) {
   std::vector<std::unique_ptr<webrtc::FieldTrialsView>> views;
+  views.push_back(std::make_unique<RootAppFieldTrials>());
   if (zero_playout_delay) {
     views.push_back(std::make_unique<ZeroPlayoutDelayFieldTrials>());
   }
@@ -140,9 +158,6 @@ webrtc::Environment CreateEnvironment(bool zero_playout_delay,
     views.push_back(std::make_unique<EnableWarpFieldTrials>());
   }
 
-  if (views.empty()) {
-    return webrtc::CreateEnvironment();
-  }
   return webrtc::CreateEnvironment(
       std::make_unique<CompositeFieldTrials>(std::move(views)));
 }
@@ -385,6 +400,11 @@ std::shared_ptr<AudioDeviceController> PeerConnectionFactory::audio_device() con
 bool PeerConnectionFactory::zero_playout_delay_enabled() const {
   return env_.field_trials().Lookup("WebRTC-ForcePlayoutDelay") ==
          kForcePlayoutDelayValue;
+}
+
+rust::String PeerConnectionFactory::field_trial(rust::Str key) const {
+  return rust::String(env_.field_trials().Lookup(
+      absl::string_view(key.data(), key.size())));
 }
 
 std::shared_ptr<PeerConnectionFactory> create_peer_connection_factory() {
