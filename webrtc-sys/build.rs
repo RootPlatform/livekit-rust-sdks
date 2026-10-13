@@ -123,6 +123,9 @@ fn main() {
     // (include/livekit/root_screen_audio_backend.h).
     builder.file(match target_os.as_str() {
         "windows" => "src/screen_audio/root_screen_audio_win.cpp",
+        // Its frameworks are linked below; ScreenCaptureKit references are
+        // weak (newer than the deployment target).
+        "macos" => "src/screen_audio/root_screen_audio_mac.mm",
         _ => "src/screen_audio/root_screen_audio_none.cpp",
     });
 

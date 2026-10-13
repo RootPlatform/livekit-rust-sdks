@@ -70,7 +70,7 @@ pub const CAP_SCREEN_AUDIO: u64 = 1 << 13;
 
 /// Target OSes whose native screen-audio backend is built (webrtc-sys
 /// `root_screen_audio_backend.h`; one backend file per OS in its build.rs).
-const SCREEN_AUDIO_OS: bool = cfg!(target_os = "windows");
+const SCREEN_AUDIO_OS: bool = cfg!(any(target_os = "windows", target_os = "macos"));
 
 /// What `livekit_ffi_rootapp_audio_caps` reports. The ADM hardening is desktop
 /// only, so mobile builds report nothing. The voice chain (DSP), the mic test
