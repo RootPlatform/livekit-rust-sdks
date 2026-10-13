@@ -222,13 +222,14 @@ bool DeviceLost(HRESULT hr) {
 
 // A failed activation, Initialize or client start. Only "not supported" codes
 // are UNSUPPORTED (the build was checked before); anything else can pass (the
-// audio service restarting) and stays restartable.
-ScreenAudioError OpenError(HRESULT hr) {
+// audio service restarting) and stays restartable. On a restart the same
+// capture already ran, so a "not supported" code is passing too.
+ScreenAudioError OpenError(HRESULT hr, bool restart) {
   if (hr == E_ACCESSDENIED)
     return ScreenAudioError::kPermissionDenied;
   if (hr == E_NOTIMPL || hr == HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED) ||
       hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND))
-    return ScreenAudioError::kUnsupported;
+    return restart ? ScreenAudioError::kStartFailed : ScreenAudioError::kUnsupported;
   if (DeviceLost(hr))
     return ScreenAudioError::kDeviceLost;
   return ScreenAudioError::kStartFailed;
@@ -372,6 +373,7 @@ class WasapiProcessLoopbackBackend final : public ScreenAudioBackend {
       return result;
     }
     resolved_ = ResolveTarget(target);
+    restart_ = target.restart;
     if (resolved_.ancestor) {
       RTC_LOG(LS_WARNING) << "Screen audio: " << resolved_.detail;
       result.format = ScreenAudioFormat{kSampleRate, kChannels};
@@ -575,7 +577,7 @@ class WasapiProcessLoopbackBackend final : public ScreenAudioBackend {
         continue;
       }
       if (hr != E_UNEXPECTED || attempt == kInitializeAttempts || Remaining() == 0) {
-        Fail(OpenError(hr), "process loopback " + step + " failed (" + Hex(hr) + ")");
+        Fail(OpenError(hr, restart_), "process loopback " + step + " failed (" + Hex(hr) + ")");
         return false;
       }
       DWORD delay = std::min<DWORD>(kRetryDelayMs * static_cast<DWORD>(attempt), Remaining());
@@ -598,7 +600,7 @@ class WasapiProcessLoopbackBackend final : public ScreenAudioBackend {
     if (SUCCEEDED(hr))
       hr = client_->Start();
     if (FAILED(hr)) {
-      Fail(OpenError(hr), "process loopback start failed (" + Hex(hr) + ")");
+      Fail(OpenError(hr, restart_), "process loopback start failed (" + Hex(hr) + ")");
       return false;
     }
     return true;
@@ -742,6 +744,7 @@ class WasapiProcessLoopbackBackend final : public ScreenAudioBackend {
   }
 
   Resolved resolved_;
+  bool restart_ = false;
   ScreenAudioSink* sink_ = nullptr;
   ScreenAudioStartResult start_result_;
   ULONGLONG open_deadline_ = 0;
