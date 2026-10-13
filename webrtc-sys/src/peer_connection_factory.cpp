@@ -42,6 +42,7 @@
 #include "livekit/root_audio_monitor.h"
 #include "livekit/root_audio_processing.h"
 #include "livekit/root_denoiser.h"
+#include "livekit/root_echo_model.h"
 #include "livekit/root_voice_engine_hold.h"
 #include "livekit/rtc_error.h"
 #include "livekit/rtp_parameters.h"
@@ -232,6 +233,15 @@ PeerConnectionFactory::PeerConnectionFactory(
     capture_state_ = nullptr;
   }
   adm_proxy_->SetCaptureState(capture_state_);
+  if (apm_ && apm_->echo_model()) {
+    adm_proxy_->SetPlayoutOpenedSink(
+        [apm = apm_](const AdmPlayoutOpened& opened) {
+          if (RootEchoModelController* echo_model = apm->echo_model()) {
+            echo_model->OnPlayoutOpened(
+                {opened.system_default, opened.guid, opened.name});
+          }
+        });
+  }
 #endif
 
   dependencies.adm = adm_proxy_;

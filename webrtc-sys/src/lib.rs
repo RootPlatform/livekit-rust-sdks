@@ -37,6 +37,7 @@ pub mod prohibit_libsrtp_initialization;
 pub mod root_audio_mixer;
 pub mod root_audio_processing;
 pub mod root_denoiser;
+pub mod root_echo_model;
 
 #[cfg(test)]
 mod adm_proxy_tests;
@@ -46,6 +47,8 @@ mod root_engine_tests;
 mod root_monitor_tests;
 #[cfg(all(test, not(any(target_os = "ios", target_os = "android"))))]
 mod root_voice_tests;
+#[cfg(all(test, not(any(target_os = "ios", target_os = "android"))))]
+mod root_echo_model_tests;
 pub mod rtc_error;
 pub mod rtp_parameters;
 pub mod rtp_receiver;

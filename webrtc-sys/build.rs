@@ -58,6 +58,7 @@ fn main() {
         "src/root_audio_mixer.rs",
         "src/root_audio_processing.rs",
         "src/root_denoiser.rs",
+        "src/root_echo_model.rs",
         "src/packet_trailer.rs",
     ];
 
@@ -99,6 +100,7 @@ fn main() {
         "src/root_audio_monitor.cpp",
         "src/root_audio_processing.cpp",
         "src/root_denoiser.cpp",
+        "src/root_echo_model.cpp",
         "src/root_speech_detector.cpp",
         "src/root_voice_engine_hold.cpp",
         "src/audio_resampler.cpp",
@@ -153,6 +155,7 @@ fn main() {
             println!("cargo:rustc-link-lib=dylib=crypt32");
             println!("cargo:rustc-link-lib=dylib=iphlpapi");
             println!("cargo:rustc-link-lib=dylib=ole32");
+            println!("cargo:rustc-link-lib=dylib=cfgmgr32");
             println!("cargo:rustc-link-lib=dylib=secur32");
             println!("cargo:rustc-link-lib=dylib=winmm");
             println!("cargo:rustc-link-lib=dylib=ws2_32");

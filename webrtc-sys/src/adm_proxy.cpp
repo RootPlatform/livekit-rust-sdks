@@ -710,8 +710,11 @@ void AdmProxy::RequestReconcile() {
   PostDeviceTask([this] {
     // An RMW, so a request that found the flag set is seen by this pass.
     reconcile_posted_.exchange(false, std::memory_order_acq_rel);
-    AdmLock lock(&mutex_);
-    ReconcileLocked(nullptr);
+    {
+      AdmLock lock(&mutex_);
+      ReconcileLocked(nullptr);
+    }
+    NotifyPlayoutOpened();
   });
 }
 
@@ -726,10 +729,29 @@ void AdmProxy::PostRequest(bool recording,
       AdmLock lock(&mutex_);
       ReconcileLocked(&outcome);
     }
+    NotifyPlayoutOpened();
     if (done) {
       done(outcome);
     }
   });
+}
+
+void AdmProxy::NotifyPlayoutOpened() {
+  std::optional<AdmPlayoutOpened> opened;
+  AdmPlayoutOpenedSink sink;
+  {
+    AdmLock lock(&mutex_);
+    opened = std::exchange(playout_opened_, std::nullopt);
+    sink = playout_opened_sink_;
+  }
+  if (opened.has_value() && sink) {
+    sink(*opened);
+  }
+}
+
+void AdmProxy::SetPlayoutOpenedSink(AdmPlayoutOpenedSink sink) {
+  AdmLock lock(&mutex_);
+  playout_opened_sink_ = std::move(sink);
 }
 
 void AdmProxy::ReconcileLocked(AdmRequestOutcome* outcome) {
@@ -846,6 +868,24 @@ void AdmProxy::ReconcilePlayoutLocked(const DesiredState& desired,
       RTC_LOG(LS_WARNING) << "AdmProxy: InitPlayout failed: " << result;
       return;
     }
+#if !LK_ADM_MOBILE
+    if (playout_opened_sink_) {
+      AdmPlayoutOpened opened;
+      opened.system_default = last_playout_index_ == kAdmResolveDefault;
+      const int index = opened.system_default ? 0 : last_playout_index_;
+      AdmNameBuffers buffers;
+      if (index >= 0 && platform_adm->PlayoutDeviceName(
+                            static_cast<uint16_t>(index), buffers.name,
+                            buffers.guid) == 0) {
+        opened.name = buffers.Name();
+        opened.guid = buffers.Guid();
+      }
+      if (opened.system_default) {
+        opened.guid.clear();
+      }
+      playout_opened_ = std::move(opened);
+    }
+#endif
   }
 
   if (!platform_adm->Playing()) {
@@ -1036,6 +1076,9 @@ int32_t AdmProxy::ApplySelectionLocked(
     return -1;
   }
   const int index = ResolveSelectionLocked(playout, selection);
+  if (playout) {
+    last_playout_index_ = index;
+  }
   if (index == kAdmResolveNotFound) {
     RTC_LOG(LS_WARNING) << "AdmProxy: the selected "
                         << (playout ? "playout" : "recording")
@@ -1093,9 +1136,12 @@ void AdmProxy::ScheduleRetryLocked() {
   retry_scheduled_ = true;
   device_thread_->PostDelayedTask(
       [this] {
-        AdmLock lock(&mutex_);
-        retry_scheduled_ = false;
-        ReconcileLocked(nullptr);
+        {
+          AdmLock lock(&mutex_);
+          retry_scheduled_ = false;
+          ReconcileLocked(nullptr);
+        }
+        NotifyPlayoutOpened();
       },
       kStopFailureRetry);
 #endif

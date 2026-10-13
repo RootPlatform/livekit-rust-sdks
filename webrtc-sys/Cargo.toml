@@ -15,6 +15,9 @@ cxx = "1.0"
 log = { workspace = true }
 rootapp-voice-dsp = { path = "../rootapp-voice-dsp" }
 
+[target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
+rootapp-echo-model = { path = "../rootapp-echo-model" }
+
 [build-dependencies]
 webrtc-sys-build = { workspace = true }
 cxx-build = "1.0"

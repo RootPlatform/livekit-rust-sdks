@@ -511,8 +511,25 @@ AdmProxyHarness::AdmProxyHarness(
       with_platform ? webrtc::scoped_refptr<webrtc::AudioDeviceModule>(fake_)
                     : nullptr);
   proxy_->SetCaptureState(capture_);
+  proxy_->SetPlayoutOpenedSink(
+      [log = opened_](const AdmPlayoutOpened& opened) {
+        webrtc::MutexLock lock(&log->mutex);
+        log->entries.push_back(opened.system_default
+                                   ? std::string("default")
+                                   : opened.guid + "|" + opened.name);
+      });
   controller_ = std::make_unique<AudioDeviceController>(proxy_, mixer_, apm_,
                                                         capture_);
+}
+
+rust::Vec<rust::String> AdmProxyHarness::take_playout_opened() const {
+  rust::Vec<rust::String> entries;
+  webrtc::MutexLock lock(&opened_->mutex);
+  for (const std::string& entry : opened_->entries) {
+    entries.push_back(rust::String(entry));
+  }
+  opened_->entries.clear();
+  return entries;
 }
 
 AdmProxyHarness::~AdmProxyHarness() {
