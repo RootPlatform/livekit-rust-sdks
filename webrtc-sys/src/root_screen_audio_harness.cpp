@@ -473,4 +473,17 @@ rust::String capture_error_for_source(int32_t sample_rate,
   return rust::String::lossy(error.data(), error.size());
 }
 
+rust::Vec<uint32_t> screen_audio_ancestors(uint32_t self_pid,
+                                           rust::Slice<const uint32_t> pids,
+                                           rust::Slice<const uint32_t> parents,
+                                           rust::Slice<const uint64_t> created) {
+  std::vector<ScreenAudioProcessEntry> processes;
+  for (size_t i = 0; i < pids.size() && i < parents.size(); ++i)
+    processes.push_back({pids[i], parents[i], i < created.size() ? created[i] : 0});
+  rust::Vec<uint32_t> out;
+  for (uint32_t pid : ScreenAudioAncestors(self_pid, processes))
+    out.push_back(pid);
+  return out;
+}
+
 }  // namespace livekit_ffi

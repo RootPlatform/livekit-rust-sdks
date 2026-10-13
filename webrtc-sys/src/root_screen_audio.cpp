@@ -21,6 +21,8 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <map>
+#include <set>
 #include <utility>
 
 #include "api/audio/audio_view.h"
@@ -86,6 +88,31 @@ std::atomic<bool> g_fake_backend{false};
 const ScreenAudioClock* ScreenAudioSteadyClock() {
   static const SteadyClock* clock = new SteadyClock();
   return clock;
+}
+
+std::vector<uint32_t> ScreenAudioAncestors(
+    uint32_t self,
+    const std::vector<ScreenAudioProcessEntry>& processes) {
+  constexpr size_t kMaxDepth = 64;
+  std::map<uint32_t, const ScreenAudioProcessEntry*> by_pid;
+  for (const ScreenAudioProcessEntry& process : processes)
+    by_pid[process.pid] = &process;
+  std::vector<uint32_t> ancestors;
+  std::set<uint32_t> seen{self};
+  auto child = by_pid.find(self);
+  while (child != by_pid.end() && ancestors.size() < kMaxDepth) {
+    uint32_t parent_pid = child->second->parent;
+    auto parent = by_pid.find(parent_pid);
+    if (parent_pid == 0 || parent == by_pid.end() || !seen.insert(parent_pid).second)
+      break;
+    uint64_t child_created = child->second->created;
+    uint64_t parent_created = parent->second->created;
+    if (child_created != 0 && parent_created != 0 && parent_created > child_created)
+      break;
+    ancestors.push_back(parent_pid);
+    child = parent;
+  }
+  return ancestors;
 }
 
 // ScreenAudioRing

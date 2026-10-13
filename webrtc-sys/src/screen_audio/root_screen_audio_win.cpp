@@ -27,15 +27,18 @@
 #include <mmdeviceapi.h>
 #include <objidl.h>
 #include <propidl.h>
+#include <tlhelp32.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <iterator>
 #include <string>
+#include <vector>
 
 #include "livekit/audio_thread.h"
 #include "livekit/root_screen_audio_backend.h"
+#include "rtc_base/logging.h"
 
 namespace livekit_ffi {
 
@@ -170,6 +173,47 @@ bool ProcessRunning(DWORD pid) {
   return running;
 }
 
+uint64_t CreationTime(DWORD pid) {
+  HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+  if (!process)
+    return 0;
+  FILETIME created{};
+  FILETIME exited{};
+  FILETIME kernel{};
+  FILETIME user{};
+  uint64_t time = 0;
+  if (GetProcessTimes(process, &created, &exited, &kernel, &user))
+    time = (uint64_t{created.dwHighDateTime} << 32) | created.dwLowDateTime;
+  CloseHandle(process);
+  return time;
+}
+
+// This process's ancestors, from a process snapshot (creation times only
+// along the parent chain).
+std::vector<uint32_t> OwnAncestors() {
+  std::vector<ScreenAudioProcessEntry> processes;
+  HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+  if (snapshot == INVALID_HANDLE_VALUE)
+    return {};
+  PROCESSENTRY32W entry{};
+  entry.dwSize = sizeof(entry);
+  for (BOOL more = Process32FirstW(snapshot, &entry); more;
+       more = Process32NextW(snapshot, &entry))
+    processes.push_back({entry.th32ProcessID, entry.th32ParentProcessID, 0});
+  CloseHandle(snapshot);
+  const DWORD self = GetCurrentProcessId();
+  DWORD current = self;
+  for (int depth = 0; depth < 64 && current != 0; ++depth) {
+    auto it = std::find_if(processes.begin(), processes.end(),
+                           [current](const ScreenAudioProcessEntry& p) { return p.pid == current; });
+    if (it == processes.end() || it->created != 0)
+      break;
+    it->created = CreationTime(current);
+    current = it->parent;
+  }
+  return ScreenAudioAncestors(self, processes);
+}
+
 bool DeviceLost(HRESULT hr) {
   return hr == AUDCLNT_E_DEVICE_INVALIDATED || hr == AUDCLNT_E_SERVICE_NOT_RUNNING ||
          hr == AUDCLNT_E_RESOURCES_INVALIDATED || hr == RPC_E_DISCONNECTED ||
@@ -253,6 +297,10 @@ struct Resolved {
   DWORD mode = kLoopbackExcludeTree;
   ScreenAudioScope scope = ScreenAudioScope::kSystem;
   std::string detail;
+  // The target is an ancestor of this process: its tree holds this process's
+  // own playout, and all audio would be wider than the user's pick, so nothing
+  // is captured.
+  bool ancestor = false;
 };
 
 Resolved ResolveTarget(const ScreenAudioTarget& target) {
@@ -288,8 +336,17 @@ Resolved ResolveTarget(const ScreenAudioTarget& target) {
   include.mode = kLoopbackIncludeTree;
   include.scope = ScreenAudioScope::kProcess;
   std::string name = ProcessName(pid);
-  include.detail = "process " + std::to_string(pid) +
-                   (name.empty() ? std::string() : " (" + name + ")") + " and its children";
+  std::string process =
+      "process " + std::to_string(pid) + (name.empty() ? std::string() : " (" + name + ")");
+  std::vector<uint32_t> ancestors = OwnAncestors();
+  if (std::find(ancestors.begin(), ancestors.end(), pid) != ancestors.end()) {
+    include.ancestor = true;
+    include.detail = process +
+                     " is an ancestor of this process, so its tree holds this process's own "
+                     "playout; nothing is captured for it";
+    return include;
+  }
+  include.detail = process + " and its children";
   return include;
 }
 
@@ -315,6 +372,14 @@ class WasapiProcessLoopbackBackend final : public ScreenAudioBackend {
       return result;
     }
     resolved_ = ResolveTarget(target);
+    if (resolved_.ancestor) {
+      RTC_LOG(LS_WARNING) << "Screen audio: " << resolved_.detail;
+      result.format = ScreenAudioFormat{kSampleRate, kChannels};
+      result.scope = resolved_.scope;
+      result.process_id = resolved_.pid;
+      result.detail = resolved_.detail;
+      return result;
+    }
     sink_ = sink;
     open_deadline_ = GetTickCount64() + kOpenBudgetMs;
     stop_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);

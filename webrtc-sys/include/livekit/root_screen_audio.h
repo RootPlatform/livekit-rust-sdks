@@ -539,4 +539,9 @@ rust::String capture_error_for_source(int32_t sample_rate,
                                       int32_t channels,
                                       int32_t queue_size_ms);
 
+rust::Vec<uint32_t> screen_audio_ancestors(uint32_t self_pid,
+                                           rust::Slice<const uint32_t> pids,
+                                           rust::Slice<const uint32_t> parents,
+                                           rust::Slice<const uint64_t> created);
+
 }  // namespace livekit_ffi

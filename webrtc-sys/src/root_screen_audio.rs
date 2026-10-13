@@ -185,6 +185,13 @@ pub mod ffi {
         fn second_capture_error(self: &RootScreenAudioCaptureHarness) -> String;
         /// The capture error for a source made with these parameters.
         fn capture_error_for_source(sample_rate: i32, channels: i32, queue_size_ms: i32) -> String;
+        /// ScreenAudioAncestors over (pid, parent, created) rows.
+        fn screen_audio_ancestors(
+            self_pid: u32,
+            pids: &[u32],
+            parents: &[u32],
+            created: &[u64],
+        ) -> Vec<u32>;
     }
 }
 

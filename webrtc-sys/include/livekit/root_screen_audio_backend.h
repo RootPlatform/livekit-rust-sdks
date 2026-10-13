@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 // The per-OS half of native screen-share audio. RootScreenAudioCapture (the
 // shared core, root_screen_audio.h) owns one backend, starts and stops it on
@@ -165,6 +166,21 @@ class ScreenAudioBackend {
   // Idempotent.
   virtual bool Stop() = 0;
 };
+
+// A process as a snapshot lists it.
+struct ScreenAudioProcessEntry {
+  uint32_t pid = 0;
+  uint32_t parent = 0;
+  // Creation time in any monotonic unit; 0 when unknown.
+  uint64_t created = 0;
+};
+
+// The ancestors of `self`, its parent first. The walk stops at a parent that
+// is missing, already seen, or created after its child (its pid was reused by
+// a newer process).
+std::vector<uint32_t> ScreenAudioAncestors(
+    uint32_t self,
+    const std::vector<ScreenAudioProcessEntry>& processes);
 
 // Defined by the one backend file of the target OS.
 // True when this build has a backend for the target OS (compile time; the OS

@@ -22,8 +22,8 @@ use cxx::UniquePtr;
 
 use crate::root_screen_audio::ffi::{
     capture_error_for_source, new_root_screen_audio_capture_harness,
-    new_root_screen_audio_pipe_harness, RootScreenAudioCaptureHarness, RootScreenAudioEventData,
-    RootScreenAudioPipeHarness, RootScreenAudioTargetSpec,
+    new_root_screen_audio_pipe_harness, screen_audio_ancestors, RootScreenAudioCaptureHarness,
+    RootScreenAudioEventData, RootScreenAudioPipeHarness, RootScreenAudioTargetSpec,
 };
 
 const FRAME: usize = 480;
@@ -898,4 +898,39 @@ fn screen_audio_capture_converts_a_44100_mono_backend() {
     assert_eq!(stats.capture_rate, 44_100);
     assert_eq!(stats.capture_channels, 1);
     assert_eq!(stats.scope, 2);
+}
+
+// The parent chain the Windows backend checks a target against (a window of
+// File Explorer belongs to explorer.exe, which started Root).
+
+fn ancestors(self_pid: u32, rows: &[(u32, u32, u64)]) -> Vec<u32> {
+    let pids: Vec<u32> = rows.iter().map(|r| r.0).collect();
+    let parents: Vec<u32> = rows.iter().map(|r| r.1).collect();
+    let created: Vec<u64> = rows.iter().map(|r| r.2).collect();
+    screen_audio_ancestors(self_pid, &pids, &parents, &created)
+}
+
+#[test]
+fn screen_audio_ancestors_follow_the_parent_chain() {
+    // winlogon 500 -> userinit 600 (exited) ... explorer 700 -> launcher 800 -> Root 900.
+    let rows = [(500, 4, 10), (700, 600, 30), (800, 700, 40), (900, 800, 50), (950, 900, 60)];
+    assert_eq!(ancestors(900, &rows), vec![800, 700]);
+    // Root's own child is not an ancestor.
+    assert_eq!(ancestors(950, &rows), vec![900, 800, 700]);
+    // Unknown creation times do not break the chain.
+    let unknown = [(700, 1, 0), (900, 700, 50)];
+    assert_eq!(ancestors(900, &unknown), vec![700]);
+    // A process that is not listed has no chain.
+    assert!(ancestors(42, &rows).is_empty());
+}
+
+#[test]
+fn screen_audio_ancestors_stop_at_a_reused_pid_and_a_cycle() {
+    // Root's parent exited and its pid now belongs to a newer process.
+    let reused = [(700, 1, 30), (800, 700, 90), (900, 800, 50)];
+    assert!(ancestors(900, &reused).is_empty());
+    let cycle = [(1, 2, 0), (2, 1, 0), (900, 1, 0)];
+    assert_eq!(ancestors(900, &cycle), vec![1, 2]);
+    let to_self = [(900, 900, 0)];
+    assert!(ancestors(900, &to_self).is_empty());
 }
