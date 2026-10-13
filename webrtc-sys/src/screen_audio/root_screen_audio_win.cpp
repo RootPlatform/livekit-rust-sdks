@@ -71,6 +71,7 @@ constexpr DWORD kStartTimeoutMs = 5000;
 constexpr DWORD kOpenBudgetMs = 4800;
 constexpr DWORD kStopTimeoutMs = 2000;
 constexpr DWORD kWaitTimeoutMs = 200;
+constexpr ULONGLONG kExitPollMs = 500;
 constexpr int kInitializeAttempts = 3;
 constexpr DWORD kRetryDelayMs = 200;
 
@@ -155,6 +156,18 @@ std::string ProcessName(DWORD pid) {
   }
   CloseHandle(process);
   return name;
+}
+
+// Whether `pid` names a process that runs. Access denied (a protected or
+// elevated process) still means it runs.
+bool ProcessRunning(DWORD pid) {
+  HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+  if (!process)
+    return GetLastError() == ERROR_ACCESS_DENIED;
+  DWORD code = 0;
+  bool running = !GetExitCodeProcess(process, &code) || code == STILL_ACTIVE;
+  CloseHandle(process);
+  return running;
 }
 
 bool DeviceLost(HRESULT hr) {
@@ -266,12 +279,10 @@ Resolved ResolveTarget(const ScreenAudioTarget& target) {
                     "; " + system.detail;
     return system;
   }
-  HANDLE process = OpenProcess(SYNCHRONIZE, FALSE, pid);
-  if (!process) {
+  if (!ProcessRunning(pid)) {
     system.detail = missing + "; " + system.detail;
     return system;
   }
-  CloseHandle(process);
   Resolved include;
   include.pid = pid;
   include.mode = kLoopbackIncludeTree;
@@ -385,10 +396,14 @@ class WasapiProcessLoopbackBackend final : public ScreenAudioBackend {
     HANDLE mmcss = exports.mmcss_set ? exports.mmcss_set(L"Audio", &task_index) : nullptr;
 
     start_result_ = ScreenAudioStartResult();
+    watch_ = Watch::kNone;
+    watch_note_.clear();
     if (Open(exports)) {
       start_result_.format = ScreenAudioFormat{kSampleRate, kChannels};
       start_result_.scope = resolved_.scope;
-      start_result_.detail = resolved_.detail;
+      start_result_.detail = resolved_.detail + watch_note_;
+      if (resolved_.scope == ScreenAudioScope::kProcess)
+        start_result_.process_id = resolved_.pid;
       SetEvent(started_event_);
       MarkAudioThread();
       Loop();
@@ -510,11 +525,11 @@ class WasapiProcessLoopbackBackend final : public ScreenAudioBackend {
       Fail(ScreenAudioError::kInternal, "CreateEvent failed");
       return false;
     }
+    if (resolved_.mode == kLoopbackIncludeTree && !WatchTarget())
+      return false;
     hr = client_->SetEventHandle(audio_event_);
     if (SUCCEEDED(hr))
       hr = client_->GetService(__uuidof(IAudioCaptureClient), reinterpret_cast<void**>(&capture_));
-    if (SUCCEEDED(hr) && resolved_.mode == kLoopbackIncludeTree)
-      target_process_ = OpenProcess(SYNCHRONIZE, FALSE, resolved_.pid);
     if (SUCCEEDED(hr))
       hr = client_->Start();
     if (FAILED(hr)) {
@@ -522,6 +537,59 @@ class WasapiProcessLoopbackBackend final : public ScreenAudioBackend {
       return false;
     }
     return true;
+  }
+
+  // The captured process's exit ends the capture (TARGET_GONE). Its handle is
+  // waited on, or its exit code polled where the handle cannot be waited on
+  // (an anti-cheat driver may strip SYNCHRONIZE from it).
+  bool WatchTarget() {
+    const DWORD pid = resolved_.pid;
+    HANDLE process = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process)
+      process = OpenProcess(SYNCHRONIZE, FALSE, pid);
+    if (!process)
+      process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process) {
+      DWORD error = GetLastError();
+      if (error == ERROR_INVALID_PARAMETER) {
+        Fail(ScreenAudioError::kTargetGone,
+             "process " + std::to_string(pid) + " exited while starting");
+        return false;
+      }
+      watch_note_ =
+          "; its exit is not watched (OpenProcess failed, error " + std::to_string(error) + ")";
+      return true;
+    }
+    target_process_ = process;
+    DWORD state = WaitForSingleObject(process, 0);
+    DWORD code = 0;
+    bool queried = GetExitCodeProcess(process, &code) != 0;
+    if (state == WAIT_OBJECT_0 || (queried && code != STILL_ACTIVE)) {
+      Fail(ScreenAudioError::kTargetGone,
+           "process " + std::to_string(pid) + " exited while starting");
+      return false;
+    }
+    if (state == WAIT_TIMEOUT)
+      watch_ = Watch::kWait;
+    else if (queried)
+      watch_ = Watch::kPoll;
+    else
+      watch_note_ = "; its exit is not watched (no SYNCHRONIZE or query access)";
+    return true;
+  }
+
+  // Polled at most every kExitPollMs.
+  bool TargetExited(ULONGLONG* next_poll) {
+    ULONGLONG now = GetTickCount64();
+    if (now < *next_poll)
+      return false;
+    *next_poll = now + kExitPollMs;
+    DWORD code = 0;
+    if (!GetExitCodeProcess(target_process_, &code)) {
+      watch_ = Watch::kNone;
+      return false;
+    }
+    return code != STILL_ACTIVE;
   }
 
   // Wait-free per packet: the packet goes to the sink straight from the
@@ -558,17 +626,27 @@ class WasapiProcessLoopbackBackend final : public ScreenAudioBackend {
 
   void Loop() {
     HANDLE waits[3] = {stop_event_, audio_event_, target_process_};
-    DWORD count = target_process_ ? 3 : 2;
+    DWORD count = watch_ == Watch::kWait ? 3 : 2;
+    ULONGLONG next_poll = 0;
     while (true) {
       DWORD signaled = WaitForMultipleObjects(count, waits, FALSE, kWaitTimeoutMs);
       if (signaled == WAIT_OBJECT_0)
         return;
-      if (signaled == WAIT_OBJECT_0 + 2) {
+      if (count == 3 && signaled == WAIT_OBJECT_0 + 2) {
         sink_->ReportError(ScreenAudioError::kTargetGone, "the captured process exited");
         break;
       }
       if (signaled == WAIT_FAILED) {
+        if (count == 3) {
+          count = 2;
+          watch_ = Watch::kPoll;
+          continue;
+        }
         sink_->ReportError(ScreenAudioError::kInternal, "WaitForMultipleObjects failed");
+        break;
+      }
+      if (watch_ == Watch::kPoll && TargetExited(&next_poll)) {
+        sink_->ReportError(ScreenAudioError::kTargetGone, "the captured process exited");
         break;
       }
       HRESULT hr = Drain();
@@ -608,10 +686,13 @@ class WasapiProcessLoopbackBackend final : public ScreenAudioBackend {
   bool leaked_ = false;
 
   // Capture thread only.
+  enum class Watch { kNone, kWait, kPoll };
   IAudioClient* client_ = nullptr;
   IAudioCaptureClient* capture_ = nullptr;
   HANDLE audio_event_ = nullptr;
   HANDLE target_process_ = nullptr;
+  Watch watch_ = Watch::kNone;
+  std::string watch_note_;
 };
 
 }  // namespace
