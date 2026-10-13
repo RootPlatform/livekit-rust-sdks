@@ -325,10 +325,33 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use parking_lot::Mutex;
+    use parking_lot::{Mutex, MutexGuard};
 
     use super::*;
     use crate::FFI_SERVER;
+
+    /// Captures made while it lives use the fake tone backend; tests that hold
+    /// one run one at a time, and dropping it switches the fake off again, so
+    /// no other test can open a real OS capture.
+    struct FakeScreenAudioBackend {
+        _serial: MutexGuard<'static, ()>,
+    }
+
+    static FAKE_BACKEND_USERS: Mutex<()> = Mutex::new(());
+
+    impl FakeScreenAudioBackend {
+        fn install() -> Self {
+            let serial = FAKE_BACKEND_USERS.lock();
+            sys::root_screen_audio_use_fake_backend(true);
+            Self { _serial: serial }
+        }
+    }
+
+    impl Drop for FakeScreenAudioBackend {
+        fn drop(&mut self) {
+            sys::root_screen_audio_use_fake_backend(false);
+        }
+    }
 
     #[derive(Default)]
     struct Recorder {
@@ -656,14 +679,13 @@ mod tests {
         }
     }
 
-    // The real request path end to end with the fake tone backend (the only
-    // test here that uses it).
+    // The real request path end to end with the fake tone backend.
     #[test]
     fn screen_audio_native_capture_runs_end_to_end_with_a_fake_backend() {
         if ROOTAPP_AUDIO_CAPS & CAP_SCREEN_AUDIO == 0 {
             return;
         }
-        sys::root_screen_audio_use_fake_backend(true);
+        let _fake = FakeScreenAudioBackend::install();
         let source = new_source(48_000, 2, 1000);
         let capture = new_capture(&FFI_SERVER, source).unwrap();
         let (tx, rx) = mpsc::channel();
