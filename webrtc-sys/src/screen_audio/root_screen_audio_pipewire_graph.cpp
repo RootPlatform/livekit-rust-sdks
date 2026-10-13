@@ -20,13 +20,8 @@
 
 namespace livekit_ffi {
 
-PipeWireGraphPlan pipewire_graph_plan(rust::Slice<const PipeWireGraphNode> nodes,
-                                      rust::Slice<const PipeWireGraphClient> clients,
-                                      rust::Slice<const PipeWireGraphPort> ports,
-                                      rust::Slice<const PipeWireGraphLink> links,
-                                      rust::Slice<const int64_t> own_pids,
-                                      uint32_t capture_node) {
-  pipewire_graph::Graph graph;
+static std::vector<pipewire_graph::Node> GraphNodes(rust::Slice<const PipeWireGraphNode> nodes) {
+  std::vector<pipewire_graph::Node> out;
   for (const PipeWireGraphNode& source : nodes) {
     pipewire_graph::Node node;
     node.id = source.id;
@@ -34,8 +29,20 @@ PipeWireGraphPlan pipewire_graph_plan(rust::Slice<const PipeWireGraphNode> nodes
     node.pid = source.pid;
     node.client_id = source.client_id;
     node.link_group = std::string(source.link_group);
-    graph.nodes.push_back(std::move(node));
+    node.device = source.device;
+    out.push_back(std::move(node));
   }
+  return out;
+}
+
+PipeWireGraphPlan pipewire_graph_plan(rust::Slice<const PipeWireGraphNode> nodes,
+                                      rust::Slice<const PipeWireGraphClient> clients,
+                                      rust::Slice<const PipeWireGraphPort> ports,
+                                      rust::Slice<const PipeWireGraphLink> links,
+                                      rust::Slice<const int64_t> own_pids,
+                                      uint32_t capture_node) {
+  pipewire_graph::Graph graph;
+  graph.nodes = GraphNodes(nodes);
   for (const PipeWireGraphClient& source : clients) {
     pipewire_graph::Client client;
     client.id = source.id;
@@ -82,6 +89,10 @@ PipeWireGraphPlan pipewire_graph_plan(rust::Slice<const PipeWireGraphNode> nodes
     result.links.push_back(out);
   }
   return result;
+}
+
+bool pipewire_graph_handles_audio(rust::Slice<const PipeWireGraphNode> nodes) {
+  return pipewire_graph::HandlesAudio(GraphNodes(nodes));
 }
 
 bool pipewire_graph_parse_int(rust::Str text, int64_t& value) {

@@ -29,6 +29,8 @@ pub mod ffi {
         pub client_id: u32,
         /// node.link-group
         pub link_group: String,
+        /// The node has a device.id (hardware, not virtual).
+        pub device: bool,
     }
 
     #[derive(Debug, Clone, Copy, Default)]
@@ -75,6 +77,7 @@ pub mod ffi {
             own_pids: &[i64],
             capture_node: u32,
         ) -> PipeWireGraphPlan;
+        fn pipewire_graph_handles_audio(nodes: &[PipeWireGraphNode]) -> bool;
         fn pipewire_graph_parse_int(text: &str, value: &mut i64) -> bool;
         fn pipewire_graph_stat_parent(stat: &str) -> i64;
         fn pipewire_graph_process_tree(self_pid: i64, pids: &[i64], parents: &[i64]) -> Vec<i64>;
@@ -127,7 +130,14 @@ mod tests {
                 pid,
                 client_id: client,
                 link_group: group.into(),
+                device: false,
             });
+            self
+        }
+
+        /// Marks node `id` as a hardware device's.
+        fn device(&mut self, id: u32) -> &mut Self {
+            self.nodes.iter_mut().filter(|n| n.id == id).for_each(|n| n.device = true);
             self
         }
 
@@ -404,6 +414,87 @@ mod tests {
         let plan = graph.plan(&[ROOT]);
         assert_eq!(plan.reemitters, vec![51]);
         assert!(plan.links.is_empty());
+    }
+
+    #[test]
+    fn a_virtual_sink_nothing_captures_taints_its_own_client() {
+        // A combine-style sink without a link group: Root plays into it, nothing
+        // captures it, its client plays a stream of its own (fed inside the
+        // client, no link to see).
+        let mut graph = Graph::new();
+        sink(&mut graph, 21, 2, "");
+        graph.node(22, OUTPUT, 50, 2, "");
+        graph.ports(22, true, &["FL", "FR"]);
+        graph.app(30, ROOT, 3).app(40, 500, 6);
+        graph.connect(30, 21);
+        let plan = graph.plan(&[ROOT]);
+        assert_eq!(plan.reemitters, vec![22]);
+        assert_eq!(plan.linked, vec![40]);
+        assert_eq!(sorted(plan.links), stereo(40));
+    }
+
+    #[test]
+    fn a_hardware_sink_never_taints_its_client() {
+        // The sink Root plays into is a device: its session manager client's
+        // other streams stay linked.
+        let mut graph = Graph::new();
+        sink(&mut graph, 21, 2, "");
+        graph.device(21);
+        graph.node(22, OUTPUT, 50, 2, "");
+        graph.ports(22, true, &["FL", "FR"]);
+        graph.app(30, ROOT, 3);
+        graph.connect(30, 21);
+        let plan = graph.plan(&[ROOT]);
+        assert!(plan.reemitters.is_empty());
+        assert_eq!(plan.linked, vec![22]);
+    }
+
+    #[test]
+    fn a_captured_virtual_sink_taints_only_its_capturers() {
+        let mut graph = Graph::new();
+        sink(&mut graph, 21, 2, "");
+        graph.node(22, OUTPUT, 50, 2, "");
+        graph.ports(22, true, &["FL", "FR"]);
+        graph.node(50, INPUT, 700, 5, "");
+        graph.ports(50, false, &["FL", "FR"]);
+        graph.app(51, 700, 5).app(30, ROOT, 3);
+        graph.connect(30, 21).connect(21, 50);
+        let plan = graph.plan(&[ROOT]);
+        assert_eq!(plan.reemitters, vec![51]);
+        assert_eq!(plan.linked, vec![22]);
+    }
+
+    #[test]
+    fn a_surround_stream_links_only_its_front_pair() {
+        // A stream with a 5.1 sink's layout: FC, LFE and the rears are not
+        // folded in (links have no gain; see MakePlan).
+        let mut graph = Graph::new();
+        graph.node(40, OUTPUT, 500, NONE, "");
+        graph.ports(40, true, &["FL", "FR", "FC", "LFE", "RL", "RR"]);
+        let plan = graph.plan(&[ROOT]);
+        assert_eq!(plan.linked, vec![40]);
+        assert_eq!(sorted(plan.links), stereo(40));
+    }
+
+    #[test]
+    fn pipewire_handles_audio_only_with_a_sink_or_a_playback_stream() {
+        let node = |id: u32, class: &str| PipeWireGraphNode {
+            id,
+            media_class: class.into(),
+            pid: -1,
+            client_id: NONE,
+            ..Default::default()
+        };
+        // PulseAudio plays the audio; PipeWire has the camera and Root's own
+        // capture node.
+        let video_only = [node(1, "Video/Source"), node(2, INPUT), node(3, "Audio/Source")];
+        assert!(!pipewire_graph_handles_audio(&video_only));
+        assert!(!pipewire_graph_handles_audio(&[]));
+        for class in [SINK, "Audio/Sink/Virtual", "Audio/Duplex", OUTPUT] {
+            let mut nodes = video_only.to_vec();
+            nodes.push(node(4, class));
+            assert!(pipewire_graph_handles_audio(&nodes), "{class}");
+        }
     }
 
     #[test]

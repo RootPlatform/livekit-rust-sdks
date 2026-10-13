@@ -39,6 +39,7 @@ namespace pipewire_graph {
 constexpr uint32_t kNoId = 0xffffffffu;
 constexpr std::string_view kOutputStream = "Stream/Output/Audio";
 constexpr std::string_view kInputStreamPrefix = "Stream/Input";
+constexpr std::string_view kSinkPrefix = "Audio/Sink";
 
 struct Node {
   uint32_t id = kNoId;
@@ -48,6 +49,7 @@ struct Node {
   std::string link_group;       // node.link-group
   std::string name;             // node.name
   std::string app_name;         // application.name
+  bool device = false;          // has a device.id (hardware), not virtual
 };
 
 struct Client {
@@ -263,6 +265,18 @@ inline const Port* PickChannel(const std::vector<const Port*>& ports, std::strin
 
 }  // namespace internal
 
+// Whether PipeWire plays this system's audio: its graph has an audio sink or
+// an application playback stream. Where PulseAudio is the sound server and
+// PipeWire runs for video only it has neither, and a capture stays silent.
+inline bool HandlesAudio(const std::vector<Node>& nodes) {
+  for (const Node& node : nodes) {
+    if (node.media_class == kOutputStream || node.media_class == "Audio/Duplex" ||
+        node.media_class.compare(0, kSinkPrefix.size(), kSinkPrefix) == 0)
+      return true;
+  }
+  return false;
+}
+
 // Output streams that carry this process tree's audio although their process
 // is another one: effects apps (EasyEffects, JamesDSP), loopbacks and
 // filter-chains capture a sink this tree plays into and play the result as a
@@ -270,7 +284,10 @@ inline const Port* PickChannel(const std::vector<const Port*>& ports, std::strin
 // feeds; a capture stream fed directly, or whatever captures a sink it feeds,
 // taints its producer (ClientKey), a node with a link group is tainted as it
 // is reached, and every output stream of a tainted producer is excluded and
-// walked in turn (chained effects). The capture node never counts.
+// walked in turn (chained effects). A virtual sink (no device, no link group)
+// that nothing captures can only pass the audio on inside its own client (a
+// combine-style sink), so it taints its own producer. The capture node never
+// counts.
 inline std::set<uint32_t> DownstreamReemitters(const Graph& graph,
                                                const std::set<int64_t>& own_tree,
                                                uint32_t capture_node) {
@@ -318,14 +335,21 @@ inline std::set<uint32_t> DownstreamReemitters(const Graph& graph,
         tainted.insert(internal::ClientKey(node));
       if (node.media_class.compare(0, kInputStreamPrefix.size(), kInputStreamPrefix) == 0) {
         tainted.insert(internal::ClientKey(node));
-      } else if (auto capturers = feeds.find(target); capturers != feeds.end()) {
+        continue;
+      }
+      bool captured = false;
+      if (auto capturers = feeds.find(target); capturers != feeds.end()) {
         for (uint32_t capturer : capturers->second) {
           auto capturer_node = index.nodes.find(capturer);
           if (capturer == capture_node || capturer_node == index.nodes.end())
             continue;
           tainted.insert(internal::ClientKey(*capturer_node->second));
+          captured = true;
         }
       }
+      if (!captured && !node.device && node.link_group.empty() &&
+          node.media_class.compare(0, kSinkPrefix.size(), kSinkPrefix) == 0)
+        tainted.insert(internal::ClientKey(node));
     }
 
     for (const auto& [node_id, node] : index.nodes) {
@@ -346,8 +370,11 @@ inline std::set<uint32_t> DownstreamReemitters(const Graph& graph,
 // that is not of this process tree and does not re-emit its audio. Channels:
 // FL to FL, FR to FR, MONO to both, other layouts alternately left and right;
 // port names ending in _FL/_FR/_MONO stand in for a missing audio.channel.
-// The capture node's inputs are FL and FR, else its first and second ports
-// (one port takes both).
+// A surround stream (a 5.1/7.1 sink's layout) links only FL and FR: links have
+// no gain, so folding FC, LFE and the rears in would double an upmixed stereo
+// stream and comb-filter its delayed rears, and the graph cannot tell upmixed
+// stereo from real surround. The capture node's inputs are FL and FR, else its
+// first and second ports (one port takes both).
 inline Plan MakePlan(const Graph& graph, const std::set<int64_t>& own_tree, uint32_t capture_node) {
   Plan plan;
   std::vector<const Port*> inputs;
@@ -430,6 +457,7 @@ PipeWireGraphPlan pipewire_graph_plan(rust::Slice<const PipeWireGraphNode> nodes
                                       rust::Slice<const PipeWireGraphLink> links,
                                       rust::Slice<const int64_t> own_pids,
                                       uint32_t capture_node);
+bool pipewire_graph_handles_audio(rust::Slice<const PipeWireGraphNode> nodes);
 bool pipewire_graph_parse_int(rust::Str text, int64_t& value);
 int64_t pipewire_graph_stat_parent(rust::Str stat);
 rust::Vec<int64_t> pipewire_graph_process_tree(int64_t self_pid,

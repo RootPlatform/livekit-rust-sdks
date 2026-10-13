@@ -188,6 +188,7 @@ pwg::Node ReadNode(uint32_t id, const spa_dict* props) {
   node.link_group = std::string(Lookup(props, "node.link-group"));
   node.name = std::string(Lookup(props, "node.name"));
   node.app_name = std::string(Lookup(props, "application.name"));
+  node.device = !Lookup(props, "device.id").empty();
   return node;
 }
 
