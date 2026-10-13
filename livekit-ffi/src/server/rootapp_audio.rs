@@ -66,16 +66,16 @@ pub const CAP_DENOISER: u64 = 1 << 9;
 pub const CAP_MONITOR: u64 = 1 << 10;
 pub const CAP_APM_DECORATOR: u64 = 1 << 11;
 pub const CAP_SPEECH_DETECTION: u64 = 1 << 12;
-/// Bit 13 is SCREEN_AUDIO (`rootapp/native-screen-audio`). ECHO_MODEL is not
-/// reported until the native echo model exists (`livekit::ECHO_MODEL_AVAILABLE`).
+/// Bit 13 is SCREEN_AUDIO (`rootapp/native-screen-audio`).
 pub const CAP_ECHO_MODEL: u64 = 1 << 14;
 
 /// What `livekit_ffi_rootapp_audio_caps` reports. The ADM hardening is desktop
 /// only, so mobile builds report nothing. The voice chain (DSP), the mic test
-/// monitor (MONITOR, fed by the chain's capture processor) and the speech
-/// detector the chain gates with (SPEECH_DETECTION) run wherever the factory
-/// builds its APM (webrtc-sys `kRootDspSupported`); the Effects SDK slot
-/// (DENOISER) only where the SDK's x64/arm64 calling convention holds
+/// monitor (MONITOR, fed by the chain's capture processor), the speech
+/// detector the chain gates with (SPEECH_DETECTION) and the echo model the
+/// APM switches to (ECHO_MODEL) run wherever the factory builds its APM
+/// (webrtc-sys `kRootDspSupported`, `kRootEchoModelSupported`); the Effects
+/// SDK slot (DENOISER) only where the SDK's x64/arm64 calling convention holds
 /// (`kRootDenoiserSupported`).
 pub const ROOTAPP_AUDIO_CAPS: u64 = if cfg!(any(target_os = "ios", target_os = "android")) {
     0
@@ -93,6 +93,7 @@ pub const ROOTAPP_AUDIO_CAPS: u64 = if cfg!(any(target_os = "ios", target_os = "
         | CAP_MONITOR
         | CAP_APM_DECORATOR
         | CAP_SPEECH_DETECTION
+        | if livekit::ECHO_MODEL_AVAILABLE { CAP_ECHO_MODEL } else { 0 }
 };
 
 const NOT_SUPPORTED: &str = "not supported by this build";
@@ -1342,13 +1343,13 @@ mod tests {
         let mobile = cfg!(any(target_os = "ios", target_os = "android"));
         if !mobile {
             let expected = if cfg!(target_pointer_width = "64") {
-                0b1_1111_1111_1111
+                0b101_1111_1111_1111
             } else {
-                0b1_1101_1111_1111
+                0b101_1101_1111_1111
             };
             assert_eq!(ROOTAPP_AUDIO_CAPS, expected);
             if cfg!(target_pointer_width = "64") {
-                assert_eq!(ROOTAPP_AUDIO_CAPS, 8191);
+                assert_eq!(ROOTAPP_AUDIO_CAPS, 24575);
             }
         }
         assert_eq!(crate::cabi::livekit_ffi_rootapp_audio_caps(), ROOTAPP_AUDIO_CAPS);
@@ -1376,11 +1377,18 @@ mod tests {
     }
 
     #[test]
-    fn rootapp_audio_echo_model_bit_is_14_and_unreported_until_the_model_exists() {
+    fn rootapp_audio_echo_model_bit_is_14_where_the_native_model_is() {
         assert_eq!(CAP_ECHO_MODEL, 1 << 14);
         assert_eq!(CAP_ECHO_MODEL & (CAP_SPEECH_DETECTION | (1 << 13)), 0);
         assert_eq!(ROOTAPP_AUDIO_CAPS & CAP_ECHO_MODEL != 0, livekit::ECHO_MODEL_AVAILABLE);
-        assert_eq!(ROOTAPP_AUDIO_CAPS & CAP_ECHO_MODEL, 0);
+        assert_eq!(
+            ROOTAPP_AUDIO_CAPS & CAP_ECHO_MODEL != 0,
+            webrtc_sys::root_echo_model::ffi::root_echo_model_supported()
+        );
+        assert_eq!(
+            ROOTAPP_AUDIO_CAPS & CAP_ECHO_MODEL != 0,
+            webrtc_sys::root_audio_processing::ffi::root_dsp_supported()
+        );
     }
 
     #[test]
@@ -1401,7 +1409,7 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(control.mic_muted, Some(true));
-        assert!(!control.supported_by_this_build());
+        assert_eq!(control.supported_by_this_build(), livekit::ECHO_MODEL_AVAILABLE);
     }
 
     #[test]

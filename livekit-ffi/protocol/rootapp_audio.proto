@@ -125,7 +125,7 @@ enum RootAudioEchoModelReason {
 // Windows: the endpoint's form factor, Bluetooth from its device's enumerator. macOS: the transport type, then the
 // data source (built-in) or the output stream's terminal type. Linux: UNKNOWN.
 enum RootAudioOutputDeviceKind {
-  // No platform playout device opened since the session started.
+  // No platform playout device opened yet.
   ROOT_AUDIO_OUTPUT_DEVICE_KIND_NONE = 0;
   // Opened, and the OS does not say what it is.
   ROOT_AUDIO_OUTPUT_DEVICE_KIND_UNKNOWN = 1;
@@ -510,7 +510,7 @@ message RootAudioStats {
 
   // Echo model (capability ECHO_MODEL; absent without it). echo_model is the mode native applies,
   // echo_model_state what the APM runs and echo_model_reason why. output_device_kind is the platform
-  // playout device's kind from its last open in this session, in every mode.
+  // playout device's kind from its last open (kept across sessions), in every mode.
   optional RootAudioEchoModel echo_model = 114;
   optional RootAudioEchoModelState echo_model_state = 115;
   optional RootAudioEchoModelReason echo_model_reason = 116;

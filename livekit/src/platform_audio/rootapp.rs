@@ -148,10 +148,12 @@ impl SpeechDetection {
     }
 }
 
-/// Whether this build's native engine runs the echo model. Until it does, a
-/// control that sets [`RootAudioControl::echo_model`] is answered as not
-/// supported and [`RootAudioStats::echo_model`] stays `None`.
-pub const ECHO_MODEL_AVAILABLE: bool = false;
+/// Whether this build's native engine has the echo model (desktop, where the
+/// factory builds its APM). Without it a control that sets
+/// [`RootAudioControl::echo_model`] is answered as not supported and
+/// [`RootAudioStats::echo_model`] stays `None`; with it native still refuses
+/// the field when the factory's APM could not be built.
+pub const ECHO_MODEL_AVAILABLE: bool = cfg!(not(any(target_os = "ios", target_os = "android")));
 
 /// The echo model (DTLN-aec-128 as AEC3's neural residual echo estimator):
 /// which of the APM's two variants runs.
@@ -257,7 +259,7 @@ impl EchoModelReason {
 /// The platform playout device's kind, read from the OS when it opens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputDeviceKind {
-    /// No platform playout device opened since the session started.
+    /// No platform playout device opened yet.
     NoDevice,
     Unknown,
     Speakers,
@@ -426,6 +428,8 @@ impl RootAudioControl {
             denoiser_wanted: c.denoiser_wanted.unwrap_or_default(),
             has_speech_detection: c.speech_detection.is_some(),
             speech_detection: c.speech_detection.map(SpeechDetection::to_wire).unwrap_or_default(),
+            has_echo_model: c.echo_model.is_some(),
+            echo_model: c.echo_model.map(EchoModel::to_wire).unwrap_or_default(),
         }
     }
 }
@@ -886,6 +890,19 @@ impl RootAudioStats {
             speech_frames: speech.then_some(native.speech_frames),
             speech_closed_frames: speech.then_some(native.speech_closed_frames),
             speech_unavailable_frames: speech.then_some(native.speech_unavailable_frames),
+            echo_model: native.echo_model_available.then(|| EchoModelStats {
+                mode: EchoModel::from_wire(native.echo_model),
+                state: EchoModelState::from_wire(native.echo_model_state),
+                reason: EchoModelReason::from_wire(native.echo_model_reason),
+                output_device_kind: OutputDeviceKind::from_wire(native.output_device_kind),
+                swaps: native.echo_model_swaps,
+                inferences: native.echo_model_inferences,
+                inference_mean_us: native.echo_model_inference_mean_us,
+                inference_max_us: native.echo_model_inference_max_us,
+                inference_p99_us: native.echo_model_inference_p99_us,
+                measured_echo: native.echo_model_measured_echo,
+                kill_switch: native.echo_model_kill_switch,
+            }),
             monitor_active: monitor.then_some(native.monitor_active),
             monitor_frames: monitor.then_some(native.monitor_frames),
             monitor_dropped_frames: monitor.then_some(native.monitor_dropped_frames),
@@ -985,7 +1002,6 @@ impl RootAudioStats {
             audio_thread_logs_dropped: native.audio_thread_logs_dropped,
             overlapping_callbacks: native.overlapping_callbacks,
             device_stop_failures: native.device_stop_failures,
-            ..Self::default()
         }
     }
 }
@@ -1424,9 +1440,45 @@ mod tests {
         for mode in [EchoModel::Off, EchoModel::On, EchoModel::Auto] {
             let control = RootAudioControl { echo_model: Some(mode), ..Default::default() };
             assert_eq!(control.supported_by_this_build(), ECHO_MODEL_AVAILABLE);
-            assert_eq!(control.to_native(), RootAudioControl::default().to_native());
+            let native = control.to_native();
+            assert!(native.has_echo_model);
+            assert_eq!(native.echo_model, mode.to_wire());
         }
-        assert_eq!(RootAudioStats::from_native(NativeAudioStats::default()).echo_model, None);
+        assert!(!RootAudioControl::default().to_native().has_echo_model);
+        assert_eq!(ECHO_MODEL_AVAILABLE, !cfg!(any(target_os = "ios", target_os = "android")));
+    }
+
+    #[test]
+    fn root_audio_stats_fill_the_echo_model_only_where_it_exists() {
+        let native = NativeAudioStats {
+            echo_model_available: true,
+            echo_model: 2,
+            echo_model_state: 2,
+            echo_model_reason: 3,
+            output_device_kind: 8,
+            echo_model_swaps: 4,
+            echo_model_inferences: 1500,
+            echo_model_inference_mean_us: 120.5,
+            echo_model_inference_max_us: 900,
+            echo_model_inference_p99_us: 250.0,
+            echo_model_measured_echo: true,
+            echo_model_kill_switch: false,
+            ..Default::default()
+        };
+        let stats = RootAudioStats::from_native(native).echo_model.unwrap();
+        assert_eq!(stats.mode, EchoModel::Auto);
+        assert_eq!(stats.state, EchoModelState::Starting);
+        assert_eq!(stats.reason, EchoModelReason::MeasuredEcho);
+        assert_eq!(stats.output_device_kind, OutputDeviceKind::Bluetooth);
+        assert_eq!((stats.swaps, stats.inferences, stats.inference_max_us), (4, 1500, 900));
+        assert_eq!((stats.inference_mean_us, stats.inference_p99_us), (120.5, 250.0));
+        assert_eq!((stats.measured_echo, stats.kill_switch), (true, false));
+        let without = RootAudioStats::from_native(NativeAudioStats {
+            echo_model: 2,
+            echo_model_swaps: 4,
+            ..Default::default()
+        });
+        assert_eq!(without.echo_model, None);
     }
 
     #[test]
