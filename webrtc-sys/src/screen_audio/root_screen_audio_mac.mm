@@ -72,8 +72,8 @@ constexpr int kCompletionDone = 1;
 constexpr int kCompletionAbandoned = 2;
 
 // The rate ScreenCaptureKit delivered when it was not the one a start reported
-// (0: as asked). The next start reports it, so the restart that follows the
-// mismatch converts instead of failing again.
+// (0: as asked). The restart that follows the mismatch reports it, so it
+// converts instead of failing again; a start the host asked for forgets it.
 std::atomic<int> g_delivered_rate{0};
 
 int StartRate() {
@@ -307,6 +307,13 @@ class SckAudioTap {
     }
     int rate = static_cast<int>(format->mSampleRate + 0.5);
     if (rate != sample_rate_) {
+      if (rate % 100 != 0) {
+        NoteFormat(*format, false);
+        Report(ScreenAudioError::kUnsupported,
+               "ScreenCaptureKit delivers a sample rate that is not a multiple of 100 Hz, which "
+               "cannot be converted");
+        return;
+      }
       NoteFormat(*format, true);
       g_delivered_rate.store(rate, std::memory_order_relaxed);
       Report(ScreenAudioError::kStreamFailed,
@@ -668,6 +675,8 @@ class SckScreenAudioBackend final : public ScreenAudioBackend {
     if (!filter)
       return Fail(ScreenAudioError::kStartFailed, "SCContentFilter could not be created");
 
+    if (!target.restart)
+      g_delivered_rate.store(0, std::memory_order_relaxed);
     const int rate = StartRate();
     SCStreamConfiguration* config = [[SCStreamConfiguration alloc] init];
     config.capturesAudio = YES;
