@@ -1260,21 +1260,43 @@ audio").
   corrects drift on the exact ring level with the desktop's DriftResampler (6-point Lagrange, 32.32
   phase; 2 ms deadband, 0.2 % at 12 ms, up to 1 % beyond 40 ms), counts underruns and tells capture
   pauses (gaps) from late deliveries (jitter: +10 ms margin up to 200 ms, -10 ms after 60 s), fades
-  3 ms at every edge and splices a level 30 ms or more above the margin out WSOLA-style (the desktop's
+  3 ms at every edge (an underrun with less than 3 ms left continues that audio mirrored around its
+  last frame, into the previous pull's kept tail, so the fade-out never cuts short) and splices a
+  level 30 ms or more above the margin out WSOLA-style (the desktop's
   AudioSplice; the largest recent OS delivery decays by 1/64 per delivery, so a backlog in the first
   packet costs one splice, not 20 s of 0.2 % drain). Neither
   side locks, allocates or logs. A control thread per capture runs the backend's Start/Stop and the
   restarts (backoff 0.2, 1, 3, 3, 3 s, 5 per minute; none for permission or a gone target) and queues
-  events; dropping the handle detaches at once and leaves the backend stop to that thread. A gate in
-  front of every backend drops late calls, so a backend whose Stop could not join is leaked safely.
+  events; dropping the handle detaches at once and leaves the backend stop to that thread. A restart
+  never widens: backends report the captured process (`ScreenAudioStartResult::process_id`), and when
+  the first start captured one process or application, a restart that resolves to all audio or to
+  another process ends the capture as TARGET_GONE before any of its audio reaches the source
+  (`ScreenAudioTarget::restart` tells a backend it restarts the same capture). A gate in
+  front of every backend drops late calls, so a backend whose Stop could not join is leaked safely;
+  a stop that leaks it says so in `RootScreenAudioStopped.error` (additive field 2) and in the stats'
+  last_error (INTERNAL).
 - **Windows backend**: `ActivateAudioInterfaceAsync(VAD\Process_Loopback)` with
   `AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK` (structs declared locally; Mmdevapi and avrt loaded
-  at run time, so nothing new is linked), EXCLUDE (own pid) or INCLUDE (target pid) tree, an agile
+  at run time from System32 only, so nothing new is linked), EXCLUDE (own pid) or INCLUDE (target
+  pid) tree, an agile
   completion handler, shared LOOPBACK | EVENTCALLBACK at 48 kHz float32 stereo with a 100 ms buffer
   (20 ms if refused), E_UNEXPECTED retried with re-activation; an MMCSS "Audio" thread owns every COM
   object, writes packets straight from `GetBuffer` (SILENT as silence, DATA_DISCONTINUITY counted) and
-  reports device loss, stream failures and an exited target (its process handle in the wait set).
-  Before build 20348 activation fails as UNSUPPORTED.
+  reports device loss, stream failures and an exited target. Process loopback exists from Windows 10
+  2004 (build 19041; the SDK header's 20348 is only its documented minimum): below that the start is
+  UNSUPPORTED without trying. E_NOTIMPL, ERROR_NOT_SUPPORTED and ERROR_FILE_NOT_FOUND are
+  UNSUPPORTED, E_ACCESSDENIED PERMISSION_DENIED, device-lost codes DEVICE_LOST and anything else
+  START_FAILED (both restartable, so an audio-service restart recovers on Windows 10 too). The open
+  (activations, retries, Initialize) has one 4.8 s budget inside Start's 5 s, and the activation wait
+  also wakes on the stop event, so a timed-out start joins its thread. A target counts as running
+  when `PROCESS_QUERY_LIMITED_INFORMATION` opens it or is denied; include mode watches its exit with
+  a SYNCHRONIZE handle, or polls its exit code every 500 ms where SYNCHRONIZE is stripped (an
+  anti-cheat driver) or a wait fails; a target gone while starting is TARGET_GONE, and where neither
+  works the started description says the exit is not watched. A target that is an ancestor of Root
+  (a File Explorer window: explorer.exe started Root) captures nothing, at process scope, as the
+  started description says and the log warns: its tree holds Root's own playout, and all audio would
+  be wider than the user's pick (`ScreenAudioAncestors` walks a Toolhelp snapshot; a parent created
+  after its child is a reused pid).
 - **macOS backend** (macOS 13+, else UNSUPPORTED): the desktop's managed `SckLoopbackCaptureService` in
   native code. An audio-only `SCStream` on the main display (capturesAudio, 48 kHz, 2 channels,
   excludesCurrentProcessAudio, 2x2 px, 1 s frame interval, queue depth 3); a window target resolves
@@ -1285,13 +1307,27 @@ audio").
   SCStreamErrorUserDeclined is PERMISSION_DENIED (it never prompts; the video share does). The audio
   queue reads the buffer list into a preallocated 8-buffer list and interleaves planar audio into a
   preallocated 4096-frame buffer; a wrong format is noted there and logged once off the audio queue,
-  a different rate restarts at that rate. A stop from the menu bar is PERMISSION_DENIED, a lost
-  display (-3815) DEVICE_LOST. Manual reference counting; every ScreenCaptureKit reference is newer
+  a different rate restarts at that rate (remembered for that share only: a start the host asks for
+  forgets it; a rate that is not a multiple of 100 Hz is UNSUPPORTED). A stop from the menu bar is
+  PERMISSION_DENIED, a lost display (-3815) DEVICE_LOST; the codes count only in
+  SCStreamErrorDomain. A buffer whose presentation time is more than 2 ms from where the previous one
+  ended (SCK dropped audio) counts as a discontinuity. A start past its 5 s budget is abandoned to its
+  completion handler, which stops the stream as soon as SCK finishes starting it (an atomic
+  handshake decides who was first), and nothing is stopped or removed while that start is
+  outstanding; start and stop completion blocks hold the stream, output and queues until they run;
+  a close whose callback outlives 2 s still sends stopCapture and keeps every object alive. Manual
+  reference counting; every ScreenCaptureKit reference is newer
   than the deployment target, so it is weak and the library still loads on macOS 10.15-12.
 - **Linux backend**: the desktop's managed `PipeWireLoopbackCaptureService` in native code, without
-  pw-dump/pw-link. libpipewire-0.3 is dlopened (nothing new in NEEDED; no library: UNSUPPORTED, no
-  daemon: UNSUPPORTED, EACCES: PERMISSION_DENIED); only the exported functions come from it, the
-  registry, bind and link-factory calls are the headers' inline interface calls. The headers are the
+  pw-dump/pw-link. libpipewire-0.3 is dlopened (nothing new in NEEDED; no library: UNSUPPORTED; no
+  daemon, no socket or a refused connection: START_FAILED, restartable; EACCES: PERMISSION_DENIED);
+  only the exported functions come from it, the
+  registry, bind, link-factory and loop-timer calls are the headers' inline interface calls. A first
+  start waits for the daemon to list its graph and fails as UNSUPPORTED, with a message that says
+  so, when it has no audio sink and no playback stream: PulseAudio plays the audio and PipeWire runs
+  for video only (Ubuntu 22.04, Debian 12 KDE/Xfce), so a capture would stay silent. Restarts skip
+  that check (a restarted daemon lists its devices late). During a start only EPIPE and EACCES/EPERM
+  core errors fail it; other core errors are logged. The headers are the
   libwebrtc sysroot's (`debian_bullseye_*-sysroot/usr/include/{pipewire-0.3,spa-0.2}`, PipeWire
   0.3.65), else the host's `libpipewire-0.3-dev`. A `pw_thread_loop` runs a `pw_stream` capture node
   (F32LE 48 kHz FL/FR, MAP_BUFFERS | RT_PROCESS, never autoconnected; node.name
@@ -1300,32 +1336,52 @@ audio").
   links die with the client) to every Stream/Output/Audio node not in this process tree (node or
   client `application.process.id`, a /proc walk from `getpid()`) and not a downstream re-emitter of its
   audio (effects apps, loopbacks, filter-chains: the managed `PipeWireGraph.DownstreamReemitters` taint
-  walk), FL to FL, FR to FR, MONO to both, other layouts alternately. Graph changes are coalesced by a
+  walk; PipeWire's loopback, filter-chain and echo-cancel modules set node.link-group, which the
+  walk follows; a virtual sink without a device.id or a link group that Root feeds and nothing
+  captures taints its own client, the one way such a sink, a combine-style sink that sets no link
+  group for example, can pass Root on unseen), FL to FL, FR to
+  FR, MONO to both, other layouts alternately. A surround stream (an app stream on a 5.1/7.1 sink
+  takes the sink's layout) links only FL and FR: links have no gain, so folding FC, LFE and the rears
+  in would double an upmixed stereo stream and comb-filter its delayed rears, and the graph cannot
+  tell upmixed stereo from real surround; dialogue mixed only into FC is lost on such sinks (managed
+  parity). Graph changes are coalesced by a
   core sync and planned on the loop (`root_screen_audio_pipewire_graph.h`, platform-free), so new
   streams are linked as they appear and a stream that turns into a re-emitter is unlinked; a link the
-  daemon refuses or removes 3 times is left alone. The process callback (data loop) only dequeues,
-  writes into the sink and queues. A stream error, a disconnect or the daemon closing the connection
-  is DEVICE_LOST (restart). Window and process targets capture everything but Root (the portal never
-  names the window), said in the started event's description.
+  daemon refuses or removes is made again at once twice, then after 1 s and every 5 s while the plan
+  wants it (failures 10 s apart start over), woken by a one-shot loop timer. The process callback
+  (data loop) only dequeues, writes into the sink and queues; it also compares the driver's
+  `spa_io_position` cycle (kept from io_changed) with the end of the previous one and counts a
+  missed cycle (an xrun) as a discontinuity. A stream error, a disconnect or the daemon closing the
+  connection is DEVICE_LOST (restart). Window and process targets capture everything but Root (the
+  portal never names the window), said in the started event's description.
 - **FFI** (`livekit-ffi/src/server/rootapp_screen_audio.rs`): `RootScreenAudioStart/Stop/Stats`
   (requests 1012-1014), `RootScreenAudioEvent` (event 1001, polled every 20 ms from 100 ms after the
   start); an owned capture handle. Caps bit 13 SCREEN_AUDIO where an OS backend is built (Windows,
   macOS and Linux: 16383 on 64 bit). `NativeAudioSource::attach_screen_audio` (libwebrtc) keeps cxx
   types out of the FFI crate.
+- **Upstream fixes** the review found: `~InternalSource` resets its task queue first, so the 10 ms
+  task never runs on members already destroyed (on GCD queues only tasks not yet started are
+  stopped); `NativeAudioSource::capture_frame` drops its completion box when C++ refuses the frame
+  (an attached puller refuses every host frame).
 
 Tests (device-free): webrtc-sys `root_screen_audio_tests` (the pipe on a manual clock: pass-through
 bit for bit, downmix, 44.1 kHz conversion, ±100-2000 ppm drift without underruns, gaps vs jitter,
 target decay, backlog skip, large packets, phase-aligned trim, overflow, clipping and non-finite
-samples; the capture against a real queued source with scripted fake backends: events, restarts and
-their budget, stop, a shutdown that never waits, a backend that cannot stop, refused second captures
-and host frames, source checks, a 44.1 kHz mono backend); livekit-ffi `rootapp_screen_audio` (mapping,
-routing and handle lifetime, refusals, and the real request path with the fake tone backend that
-`root_screen_audio_use_fake_backend` installs); webrtc-sys `root_screen_audio_pipewire_graph` (the
-Linux backend's graph rules on every OS: channel mapping, client pids, own streams, effects apps,
-loopback link groups, chained effects, direct captures, the capture node itself, /proc stat parsing
-and the process tree). The OS backends themselves only run live; the macOS and Linux ones were
-written on Windows and only syntax-checked there (against stub SDK and PipeWire headers), so their
-first macOS and Linux builds are their first real compiles.
+samples, a 3 ms fade-out at every underrun whatever is left; the capture against a real queued
+source with scripted fake backends: events, restarts and their budget, a restart that would widen a
+window share or switch process (TARGET_GONE) and one that narrows a system start, stop, a stop whose
+backend cannot stop, a shutdown that never waits, a backend that cannot stop, refused second
+captures and host frames, source checks, a 44.1 kHz mono backend; `ScreenAudioAncestors`: the
+parent chain, reused pids, cycles); livekit-ffi `rootapp_screen_audio` (mapping, the stopped error,
+routing and handle lifetime, refusals, and the real request path with the fake tone backend, which
+a scoped guard installs and switches off again); webrtc-sys `root_screen_audio_pipewire_graph` (the
+Linux backend's graph rules on every OS: channel mapping, a 5.1 stream, client pids, own streams,
+effects apps, loopback link groups, virtual and hardware sinks, chained effects, direct captures,
+the capture node itself, PulseAudio-only graphs, /proc stat parsing and the process tree). The OS
+backends themselves only run live. CI run 38356219034 compiled the macOS and Linux backends (at
+1ad39ef9) for osx-arm64/x64 and linux-x64/arm64; the 2026-10-13 review fixes to them were written on
+Windows and only syntax-checked there (clang-cl against stub SDK and PipeWire headers), so the next
+CI build is their first real compile.
 
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 

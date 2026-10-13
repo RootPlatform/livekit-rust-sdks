@@ -521,7 +521,12 @@ message RootAudioEvent {
 // Independent of PlatformAudio: it works with the platform and the host-driven call audio alike.
 
 // What to capture. Absent or `system`: everything the machine plays except this process and its
-// children (the call's own playout, so remote voices are never sent back).
+// children (the call's own playout, so remote voices are never sent back). Windows: a process (or a
+// window's owner) that is an ancestor of this process, such as explorer.exe for a File Explorer
+// window, captures nothing (its tree holds this process's playout); the started description says
+// so. A restart never widens: when the first start captured one process or application and a
+// restart resolves to all audio or to another process, the capture ends with failed (TARGET_GONE,
+// retrying false).
 message RootScreenAudioTarget {
   oneof target {
     bool system = 1;
@@ -557,7 +562,8 @@ enum RootScreenAudioError {
   ROOT_SCREEN_AUDIO_ERROR_DEVICE_LOST = 4;
   // Any other failure of a running capture.
   ROOT_SCREEN_AUDIO_ERROR_STREAM_FAILED = 5;
-  // The captured process or application exited.
+  // The captured process or application exited, or a restart no longer finds what the first start
+  // captured (the capture never widens).
   ROOT_SCREEN_AUDIO_ERROR_TARGET_GONE = 6;
   ROOT_SCREEN_AUDIO_ERROR_TIMEOUT = 7;
   ROOT_SCREEN_AUDIO_ERROR_INTERNAL = 8;
@@ -615,7 +621,8 @@ message RootScreenAudioStats {
   required uint32 capture_rate = 3;
   required uint32 capture_channels = 4;
   // OS side: frames delivered (at capture_rate), of those flagged silent by the OS, OS-reported lost
-  // audio (WASAPI data discontinuity, a PipeWire xrun), 48 kHz frames dropped because the ring was
+  // audio (WASAPI data discontinuity, a PipeWire cycle the capture missed, a ScreenCaptureKit buffer
+  // that does not follow the previous one), 48 kHz frames dropped because the ring was
   // full, the longest wait between two deliveries (µs, reset on read), and deliveries after a wait of
   // 60 ms or more (or twice the largest delivery, at most 500 ms).
   required uint64 captured_frames = 5;
