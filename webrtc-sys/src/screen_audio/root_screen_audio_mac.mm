@@ -397,7 +397,8 @@ class SckAudioTap {
   }
 
   // A buffer that does not start where the previous one ended follows audio
-  // ScreenCaptureKit dropped (its handler queue backed up).
+  // ScreenCaptureKit dropped (its handler queue backed up). A forward gap of
+  // kScreenAudioIdleGapSeconds or more is delivery paused while nothing played.
   void NoteTimestamp(CMSampleBufferRef buffer, double rate) {
     const CMTime start = CMSampleBufferGetPresentationTimeStamp(buffer);
     const CMItemCount frames = CMSampleBufferGetNumSamples(buffer);
@@ -406,7 +407,9 @@ class SckAudioTap {
       return;
     }
     const double seconds = CMTimeGetSeconds(start);
-    if (have_expected_ && std::fabs(seconds - expected_seconds_) > kDiscontinuitySeconds)
+    const double gap = seconds - expected_seconds_;
+    if (have_expected_ && std::fabs(gap) > kDiscontinuitySeconds &&
+        gap < kScreenAudioIdleGapSeconds)
       sink_->MarkDiscontinuity();
     expected_seconds_ = seconds + static_cast<double>(frames) / rate;
     have_expected_ = true;

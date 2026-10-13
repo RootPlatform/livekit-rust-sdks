@@ -1042,13 +1042,17 @@ class PipeWireScreenAudioBackend final : public ScreenAudioBackend {
   }
 
   // Data loop. A cycle that starts after the end of the previous one this
-  // node ran in means it missed cycles (an xrun).
+  // node ran in means it missed cycles (an xrun). A node with nothing linked
+  // is not scheduled, so a gap of kScreenAudioIdleGapSeconds or more is idle
+  // time, not lost audio.
   void NoteCycle(const spa_io_clock& clock) {
     const uint64_t position = clock.position;
     const uint64_t duration = clock.duration;
     const uint32_t id = clock.id;
     const uint32_t rate = clock.rate.denom;
-    if (cycle_valid_ && id == cycle_clock_ && rate == cycle_rate_ && position > cycle_next_)
+    const uint64_t idle = static_cast<uint64_t>(rate * kScreenAudioIdleGapSeconds);
+    if (cycle_valid_ && id == cycle_clock_ && rate == cycle_rate_ && position > cycle_next_ &&
+        position - cycle_next_ < idle)
       sink_->MarkDiscontinuity();
     cycle_next_ = position + duration;
     cycle_clock_ = id;

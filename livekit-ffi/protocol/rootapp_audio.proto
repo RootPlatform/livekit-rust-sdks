@@ -623,7 +623,8 @@ message RootScreenAudioStats {
   required uint32 capture_channels = 4;
   // OS side: frames delivered (at capture_rate), of those flagged silent by the OS, OS-reported lost
   // audio (WASAPI data discontinuity, a PipeWire cycle the capture missed, a ScreenCaptureKit buffer
-  // that does not follow the previous one), 48 kHz frames dropped because the ring was
+  // that does not follow the previous one; PipeWire and ScreenCaptureKit gaps of 0.5 s or more are
+  // idle time, nothing playing, and not counted), 48 kHz frames dropped because the ring was
   // full, the longest wait between two deliveries (µs, reset on read), and deliveries after a wait of
   // 60 ms or more (or twice the largest delivery, at most 500 ms).
   required uint64 captured_frames = 5;

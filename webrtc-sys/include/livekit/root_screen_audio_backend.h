@@ -90,6 +90,8 @@ enum class ScreenAudioError : int32_t {
   kInternal = 8,
 };
 
+constexpr double kScreenAudioIdleGapSeconds = 0.5;
+
 // What Write delivers: interleaved float32, full scale ±1 (louder samples are
 // clipped later and counted). The core converts any rate to the source's
 // 48 kHz and downmixes to the source's channels (first two channels; mono is
@@ -144,7 +146,9 @@ class ScreenAudioSink {
   virtual void WriteSilence(size_t frames) = 0;
   // The OS reported audio lost before the next Write (WASAPI
   // DATA_DISCONTINUITY, a PipeWire xrun). Counted only: the ring level
-  // already shows what is missing.
+  // already shows what is missing. Backends that infer a loss from timing
+  // (PipeWire, ScreenCaptureKit) take a gap of kScreenAudioIdleGapSeconds or
+  // more for idle time (nothing was playing) and do not report it.
   virtual void MarkDiscontinuity() = 0;
   virtual void ReportError(ScreenAudioError error, const char* detail) = 0;
 
