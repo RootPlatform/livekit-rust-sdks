@@ -6404,6 +6404,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rootapp-echo-model"
+version = "0.1.0"
+dependencies = [
+ "rustfft",
+ "sha2",
+]
+
+[[package]]
 name = "rootapp-voice-dsp"
 version = "0.1.0"
 
@@ -8693,6 +8701,7 @@ dependencies = [
  "glob",
  "log",
  "pkg-config",
+ "rootapp-echo-model",
  "rootapp-voice-dsp",
  "webrtc-sys-build",
 ]

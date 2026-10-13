@@ -2,3 +2,5 @@
 livekit-protocol/src/livekit.rs linguist-generated=true
 livekit-protocol/src/livekit.serde.rs linguist-generated=true
 *.sh text eol=lf
+rootapp-echo-model/weights/*.tflite binary
+rootapp-echo-model/tests/data/*.f32 binary
