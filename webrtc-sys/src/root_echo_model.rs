@@ -16,6 +16,7 @@
 //! and test hooks for the native decisions. Mobile builds carry no model: the
 //! session is never valid there.
 
+#[allow(clippy::too_many_arguments)]
 #[cxx::bridge(namespace = "livekit_ffi")]
 pub mod ffi {
     /// A policy script's outcome.
@@ -65,6 +66,12 @@ pub mod ffi {
         pub pending_tasks: u32,
         /// Measured-echo evidence samples in the current window.
         pub evidence: u32,
+        /// The estimator's far-end view at the last capture frame: active,
+        /// the hold, the onset guard and the delay D they follow.
+        pub far_end_active: bool,
+        pub far_end_hold_ms: i64,
+        pub onset_guard_blocks: u32,
+        pub far_end_delay_ms: i32,
     }
 
     #[derive(Debug, Clone, Copy, Default)]
@@ -108,13 +115,32 @@ pub mod ffi {
         fn new_root_echo_model_session() -> Box<RootEchoModelSession>;
         fn valid(self: &RootEchoModelSession) -> bool;
         fn reset(self: &mut RootEchoModelSession);
-        /// One AEC3 block (64 samples of band 0); writes 65 residual
-        /// fractions. True when it ran an inference. Never allocates.
-        fn estimate_block(
+        /// Today's enr_suppress per state, from the config AdjustConfig gets.
+        fn set_today_masks(
+            self: &mut RootEchoModelSession,
+            normal_lf: f32,
+            normal_hf: f32,
+            nearend_lf: f32,
+            nearend_hf: f32,
+            last_lf_band: usize,
+            first_hf_band: usize,
+        );
+        /// One AEC3 block (estimator-spec.md): render, capture and linear
+        /// output channel 0 (64 samples of band 0), and S2, Y2, E2 and R2 of
+        /// every capture channel (65 bins each). True when it ran an
+        /// inference. Never allocates.
+        fn estimate(
             self: &mut RootEchoModelSession,
             render: &[f32],
-            linear_out: &[f32],
-            fraction: &mut [f32],
+            y: &[f32],
+            e: &[f32],
+            s2: &[f32],
+            y2: &[f32],
+            e2: &[f32],
+            dominant_nearend: bool,
+            far_end_active: bool,
+            onset_guard_blocks: u32,
+            r2: &mut [f32],
         ) -> bool;
     }
 
@@ -158,6 +184,7 @@ pub mod ffi {
             capture: &[f32],
         ) -> Vec<f32>;
         fn initialize(self: &RootEchoHarness, rate: i32, render_channels: u32);
+        fn set_stream_delay(self: &RootEchoHarness, delay_ms: i32);
         fn open_dsp_chain(self: &RootEchoHarness);
         fn prepare_model(self: &RootEchoHarness);
         fn set_mode(self: &RootEchoHarness, mode: u32);
@@ -174,9 +201,22 @@ pub mod ffi {
     }
 }
 
+/// What the C++ estimator passes for one block.
+struct Block<'a> {
+    render: &'a [f32],
+    y: &'a [f32],
+    e: &'a [f32],
+    s2: &'a [f32],
+    y2: &'a [f32],
+    e2: &'a [f32],
+    dominant_nearend: bool,
+    far_end_active: bool,
+    onset_guard_blocks: u32,
+}
+
 #[cfg(not(any(target_os = "ios", target_os = "android")))]
 mod imp {
-    use rootapp_echo_model::{Estimator, Tuning};
+    use rootapp_echo_model::{Estimator, Hook, TodayMasks};
 
     pub struct Session(Option<Estimator>);
 
@@ -189,7 +229,7 @@ mod imp {
     }
 
     pub fn session() -> Session {
-        Session(rootapp_echo_model::shared().map(|model| Estimator::new(model, Tuning::default())))
+        Session(rootapp_echo_model::shared().map(Estimator::new))
     }
 
     impl Session {
@@ -203,26 +243,49 @@ mod imp {
             }
         }
 
-        pub fn estimate_block(
-            &mut self,
-            render: &[f32],
-            linear_out: &[f32],
-            fraction: &mut [f32],
-        ) -> bool {
-            match &mut self.0 {
-                Some(estimator) => estimator.estimate_block(render, linear_out, fraction),
-                None => {
-                    fraction.iter_mut().for_each(|f| *f = 1.0);
-                    false
-                }
+        pub fn set_today_masks(&mut self, masks: TodayMasks) {
+            if let Some(estimator) = &mut self.0 {
+                estimator.set_today_masks(&masks);
             }
         }
+
+        pub fn estimate(&mut self, b: &super::Block, r2: &mut [f32]) -> bool {
+            let Some(estimator) = &mut self.0 else {
+                super::copy_floor(b.s2, r2);
+                return false;
+            };
+            let hook = Hook {
+                render: b.render,
+                y: b.y,
+                e: b.e,
+                s2: b.s2,
+                y2: b.y2,
+                e2: b.e2,
+                dominant_nearend: b.dominant_nearend,
+                far_end_active: b.far_end_active,
+                onset_guard_blocks: b.onset_guard_blocks,
+            };
+            estimator.estimate(&hook, r2)
+        }
+    }
+
+    pub fn masks(
+        normal_lf: f32,
+        normal_hf: f32,
+        nearend_lf: f32,
+        nearend_hf: f32,
+        last_lf_band: usize,
+        first_hf_band: usize,
+    ) -> TodayMasks {
+        TodayMasks { normal_lf, normal_hf, nearend_lf, nearend_hf, last_lf_band, first_hf_band }
     }
 }
 
 #[cfg(any(target_os = "ios", target_os = "android"))]
 mod imp {
     pub struct Session;
+
+    pub struct TodayMasks;
 
     pub fn prepare() -> bool {
         false
@@ -243,15 +306,23 @@ mod imp {
 
         pub fn reset(&mut self) {}
 
-        pub fn estimate_block(
-            &mut self,
-            _render: &[f32],
-            _linear_out: &[f32],
-            fraction: &mut [f32],
-        ) -> bool {
-            fraction.iter_mut().for_each(|f| *f = 1.0);
+        pub fn set_today_masks(&mut self, _masks: TodayMasks) {}
+
+        pub fn estimate(&mut self, b: &super::Block, r2: &mut [f32]) -> bool {
+            super::copy_floor(b.s2, r2);
             false
         }
+    }
+
+    pub fn masks(_: f32, _: f32, _: f32, _: f32, _: usize, _: usize) -> TodayMasks {
+        TodayMasks
+    }
+}
+
+/// Without a model: AEC3's own linear echo estimate.
+fn copy_floor(s2: &[f32], r2: &mut [f32]) {
+    for (r, s) in r2.iter_mut().zip(s2) {
+        *r = *s;
     }
 }
 
@@ -278,7 +349,50 @@ impl RootEchoModelSession {
         self.0.reset()
     }
 
-    fn estimate_block(&mut self, render: &[f32], linear_out: &[f32], fraction: &mut [f32]) -> bool {
-        self.0.estimate_block(render, linear_out, fraction)
+    fn set_today_masks(
+        &mut self,
+        normal_lf: f32,
+        normal_hf: f32,
+        nearend_lf: f32,
+        nearend_hf: f32,
+        last_lf_band: usize,
+        first_hf_band: usize,
+    ) {
+        self.0.set_today_masks(imp::masks(
+            normal_lf,
+            normal_hf,
+            nearend_lf,
+            nearend_hf,
+            last_lf_band,
+            first_hf_band,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn estimate(
+        &mut self,
+        render: &[f32],
+        y: &[f32],
+        e: &[f32],
+        s2: &[f32],
+        y2: &[f32],
+        e2: &[f32],
+        dominant_nearend: bool,
+        far_end_active: bool,
+        onset_guard_blocks: u32,
+        r2: &mut [f32],
+    ) -> bool {
+        let block = Block {
+            render,
+            y,
+            e,
+            s2,
+            y2,
+            e2,
+            dominant_nearend,
+            far_end_active,
+            onset_guard_blocks,
+        };
+        self.0.estimate(&block, r2)
     }
 }

@@ -15,11 +15,12 @@
 //! The RootApp echo model: DTLN-aec-128 (Westhausen 2021, MIT) as AEC3's
 //! neural residual echo estimator. A TFLite reader and an allocation-free
 //! executor for its two float graphs, the streaming model, and the 4 ms block
-//! adapter AEC3 calls. The weights are embedded ([`weights`]).
+//! estimator AEC3 calls (estimator-spec.md). The weights are embedded
+//! ([`weights`]).
 //!
 //! [`prepare`] decodes them once per process (off the audio threads); every
 //! [`Estimator`] shares that [`Model`] and allocates its own state when it is
-//! built. `Estimator::estimate_block` and `Estimator::reset` never allocate,
+//! built. `Estimator::estimate` and `Estimator::reset` never allocate,
 //! lock, log or panic.
 
 use std::sync::{Arc, OnceLock};
@@ -32,7 +33,9 @@ mod plan;
 mod tflite;
 pub mod weights;
 
-pub use estimator::{Estimator, Tuning, AEC3_BINS, AEC3_BLOCK};
+pub use estimator::{
+    Estimator, Hook, ModelFraction, Rule, TodayMasks, AEC3_BINS, AEC3_BLOCK, SCALE,
+};
 pub use kernels::Kernel;
 
 use dtln::{BINS, BLOCK};

@@ -8703,6 +8703,7 @@ dependencies = [
  "pkg-config",
  "rootapp-echo-model",
  "rootapp-voice-dsp",
+ "rustfft",
  "webrtc-sys-build",
 ]
 

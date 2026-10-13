@@ -1408,26 +1408,48 @@ What runs:
 
 - `rootapp-echo-model` (new crate, rustfft only): a bounds-checked TFLite reader and an
   allocation-free executor for DTLN-aec's two float graphs, the streaming model (512 window, 128 hop,
-  16 kHz) and `Estimator`, AEC3's 4 ms block adapter. Every second block it runs the full model on
-  AEC3's band-0 linear output and the render (both averaged over their channels) and turns the per-bin
-  power gain it applied (`GainTracker`, 24 ms old) into `R2 = E2 * min(1, scale * (1 - gain))`, scale 2
-  (the research's `aec3+nree128-full-x2`). `Tuning` also has a render gate (off). `estimate_block` and
-  `reset` never allocate, lock, log or panic (non-finite state resets the model). Dot products: AVX2
-  with FMA when the CPU has both (`is_x86_feature_detected!`), SSE2 otherwise, NEON on aarch64, a
-  scalar fallback. The workspace builds this crate and rustfft at opt-level 3 (the release profile is
-  `z`).
+  16 kHz) and `Estimator`, the research's estimator spec (scratchpad `echo/estimator-spec.md`, same
+  arithmetic in the same order as its reference `echo_model_estimator.h`), per 4 ms AEC3 block:
+  - `ModelFraction`: every second block DTLN-aec runs on AEC3's band-0 linear output and render
+    (channel 0) and the per-bin power gain it applied (`GainTracker`, 24 ms old) becomes
+    `fraction = min(1, 1.5 * (1 - gain))`, held until the next hop (a non-finite gain resets the
+    model, fraction 1);
+  - `Rule`: `R2 = R2_unbounded = max(model, floor)` per bin and capture channel, with
+    `model = far end active ? E2 * fraction : 0` and `floor = S2 / ERLE / today's enr_suppress`
+    (ERLE tracked like AEC3's subband ERLE on capture channel 0, the render spectrum a 128-point
+    sqrt-Hann DFT; the enr_suppress per bin and state comes from the config AdjustConfig receives),
+    raised to Y2 in a block whose capture peaks at 32000 while y - e peaks over 20000 (saturated
+    echo) and to E2 for 5 blocks after the linear output carried 1.5x the mic power with the far end
+    active outside dominant nearend (diverged filter), and for the onset guard's blocks after the far
+    end turns active outside dominant nearend. The x2 baseline's render gate is gone.
+  `estimate` and `reset` never allocate, lock, log or panic. Dot products: AVX2 with FMA when the CPU
+  has both (`is_x86_feature_detected!`), SSE2 otherwise, NEON on aarch64, a scalar fallback (which
+  keeps the reference's summation order). The workspace builds this crate and rustfft at opt-level 3
+  (the release profile is `z`).
+- Far-end activity (`RootEchoFarEnd`, one per decorator, both variants): every render entry point
+  stores the decorator clock's time of a frame whose mean square over all channels is over 1e-6
+  (-60 dBFS; 1073.74 in int16 units); every capture entry point stores its time in the variant in
+  use before calling it, and the estimator reads both (relaxed atomics): active while the capture
+  frame is at most `max(100 ms, D + 60 ms)` after the last active render frame; onset guard
+  `max(60 ms, D + 40 ms)` in 4 ms blocks, rounded up. D is the stream delay the voice engine sets
+  when above 0, else AEC3's own estimate (`GetStatistics().delay_ms`, read by the controller on the
+  worker thread every run while the mode is not OFF), else 0. The warm-up replay leaves the render
+  time alone and gives each replayed capture frame its kept time.
 - Weights: `rootapp-echo-model/weights/dtln_aec_128_{1,2}.tflite`, float32, from
   `https://github.com/breizhn/DTLN-aec` at 9d24e128b4f409db18227b8babb343016625921f
   (`pretrained_models/`), embedded with `include_bytes!` (7.27 MB; the library grows by about that):
   `_1` 1,996,600 bytes, sha256 `8d241b3a732af8ca140b2e30043e56a6c3c7800c46e22c26f4eea2f70974ad1e`;
   `_2` 5,277,012 bytes, sha256 `350bb01a1152ae3cabe09fe5e868ef2f7d8b988a9f22aae44f140195f6493126`
   (equal to the research copies). Decoded once per process (`prepare`, about 10 ms, on a thread of
-  its own the first time a mode other than OFF is set). No f16: the estimator spec has no verdict yet.
-  webrtc-sys depends on the crate on desktop targets only.
-- `RootResidualEchoEstimator` (webrtc-sys `root_echo_model.{h,cpp}`) wraps a model session; its
-  `AdjustConfig` sets Google's suppressor tuning for its estimator (masks 0/1/0.3, max_inc 100,
-  max_dec_lf 0, nearend_average_blocks 1, dominant-nearend 0.5/2, high-frequency limiting 24/3). Each
-  inference is timed (steady clock) for the stats and the kill switch.
+  its own the first time a decision wants the model). f32, as the spec recommends (f16 would save
+  3.6 MB and move 4-5% of bins). webrtc-sys depends on the crate on desktop targets only.
+- `RootResidualEchoEstimator` (webrtc-sys `root_echo_model.{h,cpp}`) wraps a model session and
+  passes it render, y and e of channel 0, S2, Y2 and E2 of every capture channel, the dominant
+  nearend flag and the far end's state; its `AdjustConfig` first hands the session the config's own
+  enr_suppress per state, then sets Google's suppressor tuning for its estimator (masks 0/1/0.3,
+  max_inc 100, max_dec_lf 0, nearend_average_blocks 1, dominant-nearend 0.5/2, high-frequency
+  limiting 24/3; AEC3 applies it only while it consults the estimator). Each inference block is timed
+  (steady clock) for the stats and the kill switch.
 - Two APMs: `RootApmDecorator` runs either the factory's APM exactly as before (`BuildRootApmVariant`
   without an estimator) or the same with the model; both share one `RootCaptureProcessor` through a
   forwarder (`RootCaptureProcessorRef`), so the voice chain, denoiser, speech detector and monitor
@@ -1479,14 +1501,17 @@ Env override: none natively. The desktop reads `ROOTAPP_ECHO_MODEL=off|on|auto` 
 `RootAudioControl.echo_model` (its default is AUTO); an old desktop never sets the field, and native
 then runs exactly the APM of builds without the model.
 
-Measured on this machine (Ryzen 9 9950X3D, Windows, release, one thread): one inference 103 µs mean,
-115 µs p99 with AVX2+FMA (136 µs scalar, 139 µs SSE2; `cargo run --release -p rootapp-echo-model
---example bench`); the APM at 48 kHz, stereo render and mono capture per 10 ms: 49 µs without the
-model, 184-193 µs mean, 159-162 µs median, 277-375 µs p99 with it (`root_echo_apm_cpu_per_10_ms`).
-The capture callback (render and capture of one frame) on the frame a switch happens, over 8
-switches with echo present (`root_echo_switch_capture_cost`): worst 1.58 ms while the warm-up ran
-there, 164-172 µs since it runs on the worker thread (steady frames: median 150-157 µs, p99 370-405
-µs).
+Measured on this machine (Ryzen 9 9950X3D, Windows, release, one thread; `cargo run --release -p
+rootapp-echo-model --example bench`): a block that runs the model 105 µs mean, 117 µs p99 with
+AVX2+FMA (136 scalar, 136 SSE2), a block that only runs the rule 2.8 µs mean, 7 µs max (almost all
+the 65 x 128 render DFT), so 135 µs of estimator per 10 ms with AVX2+FMA, 174 µs with SSE2. The APM
+at 48 kHz, stereo render and mono capture per 10 ms (`root_echo_apm_cpu_per_10_ms`): 49 µs without
+the model, 188-192 µs mean, 164-168 µs median, 282-291 µs p99 with it (the x2 baseline: 184-193 /
+159-162 / 277-375). The capture callback (render and capture of one frame) on the frame a switch
+happens, over 8 switches with echo present (`root_echo_switch_capture_cost`): worst 1.58 ms while the
+warm-up ran there (stage 2), 164-172 µs since it runs on the worker thread, 186-294 µs with the spec
+estimator (steady frames: median 161-166 µs, p99 368-728 µs, the first blocks of a fresh estimator
+included).
 
 Measured-echo calibration (review m12), on the AEC Challenge's real recordings (16 kHz, 24 far-end
 single-talk clips with their loopback as the render, 24 near-end single-talk clips under another
@@ -1499,25 +1524,59 @@ leaks on 5 of them (15-91% of far-end windows in the research's measurements), a
 (10.3 s; after 12 s). No ERLE threshold can see the first 6; that needs another signal (the
 reviewer's nonlinear-loudspeaker case).
 
-Baseline, not the estimator spec: `<scratchpad>\echo\estimator-spec.md` (the music never-worse rule,
-the far-end activity rule for near-only voice, the f16 verdict, pass bars) did not exist when this was
-built. The x2 baseline is worse than AEC3 alone on purely tonal render: on the synthesized two-tone
-beeps the loudest leaking window rises from 23 to 56 dB over the floor (`root_echo_model_is_never_
-worse_on_tonal_render`, ignored until the spec lands), the research's music result.
+The estimator spec against AEC3 alone and the x2 baseline it replaced, measured in this harness
+(leak share / worst 50 ms window in dB over the mic noise floor; the x2 column with a temporary
+switch that ran the old estimator in the same build, not committed):
+
+| scene (test) | AEC3 alone | x2 baseline | spec |
+|---|---|---|---|
+| two-tone beeps (`is_never_worse_on_tonal_render`) | 8.3% / 23.1 | 8.3% / 55.6 | 0.0% / -3.1 |
+| beeps, mic noise x5 (`on_beeps_in_a_noisier_room`, worst) | 23.6 | 52.1 | 8.6 |
+| call-start bells (`on_call_start_bells`) | 88.9% / 64.4 | 44.4% / 64.3 | 38.9% / 64.3 |
+| loud laptop (`on_the_loud_laptop`) | 10.0% / 35.0 | 2.5% / 34.7 | 2.5% / 22.7 |
+| loud laptop: double talk / near only level (dB) | 106.0 / 110.6 | 110.3 / 109.9 | 108.2 / 110.6 |
+| 48 kHz call-start chimes (research scene, `on_the_48_khz_chime_scene`) | 7.7% / 47.9 | 1.3% / 16.8 | 0.0% / 5.4 |
+| 16 kHz fresh chimes (`on_the_16_khz_speech_scenes`) | 43.6% / 44.3 | 8.9% / 44.3 | 7.9% / 44.3 |
+| same: far end silent 1 s, near SNR (dB) | 24.5 | 21.8 | 24.5 |
+| 16 kHz music | 33.2% / 26.2 | 8.4% / 29.5 | 1.0% / 15.3 |
+| 16 kHz skipped cycles | 5.9% / 20.4 | 1.2% / 37.3 | 0.0% / -0.2 |
+| 16 kHz double-talk laptop: near kept (dB) / STOI | 4.3% / 35.9; -2.7 / 0.806 | 0.0% / 5.4; -1.7 / 0.832 | 0.0% / 2.9; -1.8 / 0.838 |
+| 16 kHz drift 100 ppm | 7.0% / 43.3 | 0.0% / 2.1 | 0.0% / 5.1 |
+| 16 kHz loud and distorted: near kept (dB) | 5.2% / 13.7; -3.3 | 0.9% / 13.9; -3.1 | 0.0% / 4.9; -3.7 |
+| 16 kHz near after far: far quiet SNR (dB) | 5.0% / 20.6; 23.0 | 0.0% / -0.2; 12.5 | 0.0% / -0.8; 23.0 |
+
+Every leak and worst-window number the spec lists for its research probe (the native scenes at 48
+kHz, the 16 kHz scenes)
+comes out the same here, to 0.1 dB. The bells' worst window stays: it falls where AEC3's delay
+estimate jumps on tonal render and AEC3 does not consult the estimator (spec 2.2). The x2 column's
+idle noise dropped 2.1-3.0 dB under AEC3's on the 16 kHz scenes; the spec's stays within 1 dB.
 
 Tests (device-free; no FFI server; LK_HW_AUDIO_TESTS unset):
 
-- `cargo test -p rootapp-echo-model --release` (10, 1 ignored): the weights' hashes and sizes,
-  DTLN-aec-128's parameter count, malformed models as errors, the estimator against the research
-  runtime's x2 fractions on a synthesized scene (`tests/data/golden-x2.f32`: max 2e-3, mean 1e-5),
-  every kernel against the scalar one, dot products against f64, reset repeats bit for bit, the render
-  gate, hostile input, no allocation or free in 4000 blocks (counting allocator). Ignored unless asked
-  for (`-- --ignored` with `ROOTAPP_DTLN_REFERENCE_DIR`, a DTLN-aec checkout; it fails without it):
-  the executor on the authors' published outputs (DTLN-aec-512, the only size they published): within
-  1 LSB on all three clips, one reference sample that clipped excluded (soundfile writes x * 32768).
-  `cargo clippy -p rootapp-echo-model --all-targets --release -- -D warnings`, also for
-  `aarch64-pc-windows-msvc` (the NEON path).
-- `cargo test -p webrtc-sys --lib --release root_echo` (26, 2 ignored): Windows and macOS
+- `cargo test -p rootapp-echo-model --release` (17, 2 ignored): the weights' hashes and sizes,
+  DTLN-aec-128's parameter count, malformed models as errors, the model's fraction against the
+  research runtime's x2 fractions on a synthesized scene (`tests/data/golden-x2.f32`: max 2e-3, mean
+  1e-5), every kernel against the scalar one, dot products against f64, reset repeats bit for bit,
+  hostile input, no allocation or free in 4000 blocks with resets and hostile blocks (counting
+  allocator); the spec's unit tests on synthetic hook inputs with a fixed fraction (`tests/rule.rs`:
+  no far end and no linear estimate is no residual, the model only while the far end is active,
+  saturated echo for its block only, a diverged filter for that block and the next four and not in
+  dominant nearend, the onset guard for exactly its blocks outside dominant nearend, the floor's
+  scale X / 0.4 and X / 1.1 in bin 3, X / 0.1 and X / 0.3 in bin 10, per capture channel); the port
+  check (`tests/golden.rs`): the research probe's recorded trace of the native beeps scene
+  (`tests/data/native-beeps.emr`, 3.6 MB, synthesized, sha256 `fdc9cc2b...ce036a6d`; 1998 calls, 4
+  far-end onsets, 147 in dominant nearend, 11 divergence triggers) replayed with its far-end flags:
+  R2 bit-exact on every bin with the portable kernel, 96.3% bit-exact and all bins within the spec's
+  1e-3 (min(Y2, E2) + 1) with AVX2+FMA. Ignored unless asked for (`-- --ignored`; each fails without
+  its data): the double-talk laptop trace (`ROOTAPP_ECHO_GOLDEN_DIR`, the research's
+  `echo/out/golden`; derived from the AEC Challenge's synthetic set, so not committed; sha256
+  `51cd911f...c29e271f`; 1250 calls, 333 in dominant nearend, 41 divergence triggers: bit-exact with
+  the portable kernel, 91.5% bit-exact and all within the tolerance with AVX2+FMA), and the executor
+  on the authors' published outputs (`ROOTAPP_DTLN_REFERENCE_DIR`, a DTLN-aec checkout; DTLN-aec-512,
+  the only size they published): within 1 LSB on all three clips, one reference sample that clipped
+  excluded (soundfile writes x * 32768). `cargo clippy -p rootapp-echo-model --all-targets --release
+  -- -D warnings`, also for `aarch64-pc-windows-msvc` (the NEON path).
+- `cargo test -p webrtc-sys --lib --release root_echo` (30, 3 ignored): Windows and macOS
   classification tables with fake property values and Bluetooth instance ids, the policy (modes,
   kinds, the measured-echo window, frozen statistics, a device without a key), the kill switch's
   windows and a session reset starting them over, AdjustConfig, an unset mode and OFF bit for bit
@@ -1530,12 +1589,20 @@ Tests (device-free; no FFI server; LK_HW_AUDIO_TESTS unset):
   stalled inside the grace period across two switches (the real decorator, the review's interleaving),
   measured echo turning it on (4.3 s into a clipping laptop echo) and keeping it per device, no echo
   path never turning it on, the model off while echo cancellation is, the kill switch, inference stats
-  (p99 NaN after a session reset), a synthesized clipping laptop scene (leaking windows 10% -> 2.5%,
-  worst burst not worse, near voice in double talk 4 dB louder, near-only within 1 dB) and call-start
-  bells (leaking windows 89% -> 44%), switching 40 times under running render and capture threads and
-  a statistics reader, the capture callback's cost on switch frames, playout opens and closes reaching
-  the sink, the control refused without the model, and the APM's CPU per 10 ms. Ignored: the tonal
-  render gap (below) and the measured-echo calibration (needs `ROOTAPP_AEC_REAL_DIR`).
+  (p99 NaN after a session reset), the far end active exactly while a capture frame is within the
+  hold of the last render frame above -60 dBFS (float and int16, stream delay 0 and 80 ms: hold 100
+  and 140 ms, onset guard 15 and 30 blocks), the spec's bars on the native scenes (8.1: loud laptop
+  leak at most half of AEC3 alone's, worst window 5 dB under it, double talk within 3 dB, near only
+  within 0.5 dB; bells leak at most 0.6x, worst at most +1 dB; beeps worst at most +1 dB and 10 dB,
+  leak not above; beeps with 5x the mic noise worst 6 dB under), switching 40 times under running
+  render and capture threads and a statistics reader, the capture callback's cost on switch frames,
+  playout opens and closes reaching the sink, the control refused without the model, and the APM's
+  CPU per 10 ms. Ignored, each failing without its data: the spec's 16 kHz real-speech scenes with
+  their 8.2 bars (`ROOTAPP_ECHO_FIX16_DIR`, the research's `echo/data/fix16`: LibriVox speech from
+  the AEC Challenge's synthetic set, 13.4 MB, not committed; metrics ported from the research's
+  `eval.rs` in `root_echo_metrics.rs`, STOI included), the research's 48 kHz chime scene
+  (`ROOTAPP_ECHO_SIM48X_DIR`, never worse than AEC3 alone), and the measured-echo calibration
+  (`ROOTAPP_AEC_REAL_DIR`).
 - `cargo test -p livekit-ffi --lib --release rootapp_audio` (33), `platform_audio`, `cargo test -p
   livekit --lib --release platform_audio` (29): wire values, control and stats conversions, bit 14
   (caps 24575) tied to `root_echo_model_supported()`.
@@ -1551,7 +1618,8 @@ link (`root_echo_model.cpp` with CoreAudio and CoreFoundation on macOS; only its
 stub CoreAudio/CoreFoundation/pthread headers, and `adm_proxy.cpp`, `audio_device_controller.cpp` and
 `peer_connection_factory.cpp` were not); `cargo test -p
 rootapp-echo-model --release` (the NEON kernel runs nowhere yet; the golden tolerance may need to grow
-on another libm); `cargo test -p webrtc-sys --lib --release root_echo` (the bit-for-bit test assumes
+on another libm, and the beeps trace is held bit-exact only on x86-64 Windows, elsewhere to the
+spec's tolerance); `cargo test -p webrtc-sys --lib --release root_echo` (the bit-for-bit test assumes
 one APM build is deterministic per platform); the CPU test's numbers on an Intel Mac and an older
 Linux laptop. Live (Jesse): the device kinds on real hardware (AirPods, a Bluetooth speaker, a USB
 headset, HDMI audio, a combined laptop jack), a switch mid-call, and the kill switch on a slow machine.

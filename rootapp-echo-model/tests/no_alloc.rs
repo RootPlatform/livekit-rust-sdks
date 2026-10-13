@@ -21,7 +21,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::sync::Arc;
 
-use rootapp_echo_model::{Estimator, Model, Tuning, AEC3_BINS, AEC3_BLOCK};
+use rootapp_echo_model::{Estimator, Hook, Model, TodayMasks, AEC3_BINS, AEC3_BLOCK};
 
 struct Counting;
 
@@ -52,33 +52,52 @@ fn allocations() -> u64 {
 }
 
 #[test]
-fn estimate_block_and_reset_never_allocate_or_free() {
+fn estimate_and_reset_never_allocate_or_free() {
     let model = Arc::new(Model::embedded().unwrap());
     let blocks = 4000;
     let (render, linear) = scene::scene(blocks * AEC3_BLOCK);
-    let tunings = [Tuning::default(), Tuning { render_gate_blocks: 75, ..Tuning::default() }];
-    for tuning in tunings {
-        let mut estimator = Estimator::new(model.clone(), tuning);
-        let mut fraction = [0.0f32; AEC3_BINS];
-        let before = allocations();
-        let mut inferences = 0;
-        for b in 0..blocks {
-            let range = b * AEC3_BLOCK..(b + 1) * AEC3_BLOCK;
-            if estimator.estimate_block(&render[range.clone()], &linear[range], &mut fraction) {
-                inferences += 1;
-            }
-            if b % 1000 == 999 {
-                estimator.reset();
-            }
-            if b == 2000 {
-                estimator.estimate_block(
-                    &[f32::NAN; AEC3_BLOCK],
-                    &[1e30; AEC3_BLOCK],
-                    &mut fraction,
-                );
+    let mut estimator = Estimator::new(model);
+    let mut r2 = [0.0f32; AEC3_BINS * 2];
+    let mut y = [0.0f32; AEC3_BLOCK];
+    let mut spectra = [[0.0f32; AEC3_BINS * 2]; 3];
+    let before = allocations();
+    estimator.set_today_masks(&TodayMasks::default());
+    let mut inferences = 0;
+    for b in 0..blocks {
+        let range = b * AEC3_BLOCK..(b + 1) * AEC3_BLOCK;
+        for (i, v) in y.iter_mut().enumerate() {
+            *v = linear[range.start + i] + 0.3 * render[range.start + i];
+        }
+        for (s, spectrum) in spectra.iter_mut().enumerate() {
+            for (k, v) in spectrum.iter_mut().enumerate() {
+                *v = (1 + s) as f32 * 1e5 * (1.0 + ((b + k) % 7) as f32);
             }
         }
-        assert_eq!(allocations(), before, "{tuning:?}");
-        assert!(inferences >= blocks / 2 - 4);
+        let [s2, y2, e2] = &spectra;
+        let hook = Hook {
+            render: &render[range.clone()],
+            y: &y,
+            e: &linear[range],
+            s2,
+            y2,
+            e2,
+            dominant_nearend: b % 30 < 5,
+            far_end_active: b % 200 > 20,
+            onset_guard_blocks: 15,
+        };
+        if estimator.estimate(&hook, &mut r2) {
+            inferences += 1;
+        }
+        if b % 1000 == 999 {
+            estimator.reset();
+        }
+        if b == 2000 {
+            let nan = [f32::NAN; AEC3_BLOCK];
+            let huge = [1e30f32; AEC3_BLOCK];
+            let hostile = Hook { render: &nan, y: &huge, e: &huge, ..hook };
+            estimator.estimate(&hostile, &mut r2);
+        }
     }
+    assert_eq!(allocations(), before);
+    assert!(inferences >= blocks / 2 - 4);
 }

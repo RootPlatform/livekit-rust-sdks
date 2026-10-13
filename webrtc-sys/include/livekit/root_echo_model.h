@@ -175,14 +175,49 @@ class RootInferenceWindow {
   std::array<uint32_t, kBuckets> histogram_{};
 };
 
-// The estimator AEC3 calls every 4 ms block (capture thread): the Rust model
-// on band 0, the render averaged over its channels and AEC3's linear output
-// over the capture channels; R2 = E2 * fraction on every capture channel.
-// Estimate never allocates, locks or logs.
+// Whether the far end is active, for the estimator (estimator-spec.md 3.2):
+// the APM's reverse stream, which leads the echo, rather than the render
+// block AEC3 hands the hook. The render paths store when (µs) the last frame
+// above -60 dBFS (mean square over its channels) ran; the far end is active
+// while a capture frame comes at most `hold_us` after it. Hold and onset
+// guard follow the render-to-capture delay D. Shared by both APM variants of
+// a decorator; atomics only.
+struct RootEchoFarEnd {
+  static constexpr int64_t kMinHoldMs = 100;
+  static constexpr int64_t kHoldAfterDelayMs = 60;
+  static constexpr int64_t kMinGuardMs = 60;
+  static constexpr int64_t kGuardAfterDelayMs = 40;
+  static constexpr int64_t kBlockMs = 4;
+  // Mean square of a frame in -1..1 (and in int16 units) above -60 dBFS.
+  static constexpr double kActivePower = 1e-6;
+  static constexpr double kActivePowerInt16 = 1e-6 * 32768.0 * 32768.0;
+
+  std::atomic<int64_t> last_active_render_us{
+      std::numeric_limits<int64_t>::min() / 2};
+  std::atomic<int64_t> hold_us{kMinHoldMs * 1000};
+  std::atomic<uint32_t> onset_guard_blocks{
+      static_cast<uint32_t>((kMinGuardMs + kBlockMs - 1) / kBlockMs)};
+  std::atomic<int32_t> delay_ms{0};
+
+  // Hold max(100 ms, D + 60 ms), onset guard max(60 ms, D + 40 ms) in 4 ms
+  // blocks rounded up; a negative D counts as 0.
+  void SetDelayMs(int32_t delay_ms);
+  bool Active(int64_t capture_now_us) const;
+};
+
+// The estimator AEC3 calls every 4 ms block (capture thread):
+// estimator-spec.md through the Rust session (rootapp-echo-model's
+// Estimator) on render, capture and linear output channel 0 and the spectra
+// of every capture channel, the far end's activity read from `far_end` at the
+// capture frame's time (`capture_now_us`, stored by the decorator before each
+// frame). Estimate never allocates, locks or logs.
 class RootResidualEchoEstimator : public webrtc::NeuralResidualEchoEstimator {
  public:
-  RootResidualEchoEstimator(rust::Box<RootEchoModelSession> session,
-                            std::shared_ptr<RootEchoModelCounters> counters);
+  RootResidualEchoEstimator(
+      rust::Box<RootEchoModelSession> session,
+      std::shared_ptr<RootEchoModelCounters> counters,
+      std::shared_ptr<const RootEchoFarEnd> far_end,
+      std::shared_ptr<const std::atomic<int64_t>> capture_now_us);
   ~RootResidualEchoEstimator() override;
 
   void Estimate(const webrtc::Block& render,
@@ -194,6 +229,9 @@ class RootResidualEchoEstimator : public webrtc::NeuralResidualEchoEstimator {
                 bool dominant_nearend,
                 std::span<std::array<float, 65>> R2,
                 std::span<std::array<float, 65>> R2_unbounded) override;
+  // Google's tuning; first hands the config's own enr_suppress per state to
+  // the session (the floor's scale). AEC3 calls it once per EchoRemover,
+  // before any Estimate on it.
   webrtc::EchoCanceller3Config::Suppressor AdjustConfig(
       const webrtc::EchoCanceller3Config::Suppressor& config) const override;
   void Reset() override;
@@ -204,15 +242,20 @@ class RootResidualEchoEstimator : public webrtc::NeuralResidualEchoEstimator {
       const webrtc::EchoCanceller3Config::Suppressor& config);
 
  private:
-  rust::Box<RootEchoModelSession> session_;
+  mutable rust::Box<RootEchoModelSession> session_;
   const std::shared_ptr<RootEchoModelCounters> counters_;
+  const std::shared_ptr<const RootEchoFarEnd> far_end_;
+  const std::shared_ptr<const std::atomic<int64_t>> capture_now_us_;
   RootInferenceWindow window_;
 };
 
 // A new estimator over a fresh model session; null until the model is
-// prepared (root_echo_model_prepare), so never call it before.
+// prepared (root_echo_model_prepare), so never call it before. Without
+// `far_end` the far end is never active.
 std::unique_ptr<webrtc::NeuralResidualEchoEstimator> NewRootResidualEchoEstimator(
-    std::shared_ptr<RootEchoModelCounters> counters);
+    std::shared_ptr<RootEchoModelCounters> counters,
+    std::shared_ptr<const RootEchoFarEnd> far_end,
+    std::shared_ptr<const std::atomic<int64_t>> capture_now_us);
 
 // The decisions, without threads or clocks (RootEchoModelController feeds
 // it). The measured-echo rule samples AEC3's fullband ERLE every
@@ -427,6 +470,9 @@ class RootEchoHarness {
   // first call initializes for its own direction only, and the other
   // direction's first call again).
   void initialize(int32_t rate, uint32_t render_channels) const;
+  // The stream delay process and process_int16 set before each capture
+  // frame (0 until set).
+  void set_stream_delay(int32_t delay_ms) const;
   // The DSP chain passes the APM output on (no voice gain, gate open).
   void open_dsp_chain() const;
   void prepare_model() const;
@@ -459,6 +505,7 @@ class RootEchoHarness {
   void RunDue() const;
 
   std::shared_ptr<int64_t> now_ms_;
+  mutable int stream_delay_ms_ = 0;
   std::shared_ptr<std::vector<Task>> tasks_;
   std::shared_ptr<RootCaptureState> capture_;
   webrtc::scoped_refptr<RootApmDecorator> decorator_;

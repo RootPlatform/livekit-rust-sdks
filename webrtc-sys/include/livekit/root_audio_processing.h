@@ -85,6 +85,18 @@ class RootAudioMonitor;
 class RootDenoiserSlot;
 class RootEchoModelController;
 struct RootEchoModelCounters;
+struct RootEchoFarEnd;
+
+// What an APM variant is wired to: the counters its estimator publishes to,
+// the flag its capture post-processor forwards to the shared processor
+// under, the decorator's far-end activity, and the time (µs) of the capture
+// frame it processes, which the decorator stores before each.
+struct RootVariantLinks {
+  std::shared_ptr<RootEchoModelCounters> counters;
+  std::shared_ptr<std::atomic<bool>> forward;
+  std::shared_ptr<const RootEchoFarEnd> far_end;
+  std::shared_ptr<const std::atomic<int64_t>> capture_now_us;
+};
 class RootFakeFxPipeline;
 class RootSpeechDetector;
 
@@ -451,13 +463,12 @@ class RootApmDecorator : public webrtc::AudioProcessing {
   using Clock = std::function<int64_t()>;
   using Scheduler =
       std::function<void(int64_t delay_ms, absl::AnyInvocable<void() &&>)>;
-  // Builds an APM variant (null when it cannot): with the echo model, whose
-  // estimator publishes to `counters`, or without; its capture post-processor
-  // forwards to the shared processor only while `forward` is set.
-  using VariantBuilder = std::function<webrtc::scoped_refptr<webrtc::AudioProcessing>(
-      bool model,
-      std::shared_ptr<RootEchoModelCounters> counters,
-      std::shared_ptr<std::atomic<bool>> forward)>;
+  // Builds an APM variant (null when it cannot): with the echo model or
+  // without (RootVariantLinks says what it is wired to).
+  using VariantBuilder =
+      std::function<webrtc::scoped_refptr<webrtc::AudioProcessing>(
+          bool model,
+          const RootVariantLinks& links)>;
 
   // Without a scheduler policy changes are applied inline. The capture state
   // (may be null) gives the published speaking flag and receives what NS is
@@ -501,6 +512,10 @@ class RootApmDecorator : public webrtc::AudioProcessing {
   // Releases the APM a switch replaced once no forwarded call can be using
   // it; true when nothing is left to release.
   bool CollectRetired();
+  // AEC3's render-to-capture delay estimate (the controller, off the audio
+  // threads): the far end's hold and onset guard follow it while the voice
+  // engine sets no stream delay above 0.
+  void SetEstimatedDelayMs(int32_t delay_ms);
   // Atomics: whether the APM in use has the model, the staged variant (also
   // while a thread is switching to it; running_model is current once it is
   // gone), and the switches made.
@@ -583,13 +598,28 @@ class RootApmDecorator : public webrtc::AudioProcessing {
  private:
   friend class RootEchoHarness;
 
+  // An APM the decorator owns: the flag its post-processor forwards under
+  // (null for the first one, which always forwards), the time of the capture
+  // frame it processes, whether it has the model, and how many kept frames of
+  // each direction its warm-up replayed up to. Immutable once staged, but for
+  // the atomics.
+  struct Variant {
+    webrtc::scoped_refptr<webrtc::AudioProcessing> apm;
+    std::shared_ptr<std::atomic<bool>> forward;
+    std::shared_ptr<std::atomic<int64_t>> capture_now_us =
+        std::make_shared<std::atomic<int64_t>>(0);
+    bool model = false;
+    uint64_t render_warmed = 0;
+    uint64_t capture_warmed = 0;
+  };
+
   // The grace period's two steps, apart so a test can stall a reader between
   // them: the epoch a reader starts from, then counting itself in that
   // epoch's parity, again in the new one while the epoch moved meanwhile,
-  // and taking the APM in use.
+  // and taking the variant in use.
   struct Entered {
     uint32_t parity;
-    webrtc::AudioProcessing* apm;
+    Variant* variant;
   };
   uint32_t GraceEpoch() const;
   Entered GraceEnter(uint32_t epoch) const;
@@ -602,24 +632,15 @@ class RootApmDecorator : public webrtc::AudioProcessing {
     ~Use();
     Use(const Use&) = delete;
     Use& operator=(const Use&) = delete;
-    webrtc::AudioProcessing* operator->() const { return entered_.apm; }
-    webrtc::AudioProcessing* get() const { return entered_.apm; }
+    webrtc::AudioProcessing* operator->() const {
+      return entered_.variant->apm.get();
+    }
+    webrtc::AudioProcessing* get() const { return entered_.variant->apm.get(); }
+    Variant* variant() const { return entered_.variant; }
 
    private:
     const RootApmDecorator& decorator_;
     Entered entered_;
-  };
-
-  // An APM the decorator owns: the flag its post-processor forwards under
-  // (null for the first one, which always forwards), whether it has the
-  // model, and how many kept frames of each direction its warm-up replayed
-  // up to. Immutable once staged.
-  struct Variant {
-    webrtc::scoped_refptr<webrtc::AudioProcessing> apm;
-    std::shared_ptr<std::atomic<bool>> forward;
-    bool model = false;
-    uint64_t render_warmed = 0;
-    uint64_t capture_warmed = 0;
   };
 
   // The interface a frame came through; a replay goes through the same one
@@ -654,8 +675,9 @@ class RootApmDecorator : public webrtc::AudioProcessing {
   void SwitchIfStaged(bool capture);
   void Switch(Variant* next);
   // Replays kept frames [render_from, render_to) and [capture_from,
-  // capture_to), oldest first and taking turns, into `apm`.
-  void Replay(webrtc::AudioProcessing* apm,
+  // capture_to), oldest first and taking turns, into `variant`, its capture
+  // time set to each capture frame's (the far end's state is left alone).
+  void Replay(Variant* variant,
               uint64_t render_from,
               uint64_t render_to,
               uint64_t capture_from,
@@ -670,7 +692,8 @@ class RootApmDecorator : public webrtc::AudioProcessing {
                      float* samples,
                      int* rate,
                      size_t* channels,
-                     WarmApi* api);
+                     WarmApi* api,
+                     int64_t* when_us);
   void RemoveLiveLocked(webrtc::AudioProcessing* apm);
   // Fill slot `index` before the forwarded call (an in-place call overwrites
   // the input); the kept count moves after it, so a switch never replays a
@@ -686,6 +709,14 @@ class RootApmDecorator : public webrtc::AudioProcessing {
                  const webrtc::StreamConfig& config,
                  int64_t now_us,
                  WarmApi api);
+  // The render paths: a frame above -60 dBFS (mean square over all its
+  // channels) is far-end activity now.
+  void NoteRender(const int16_t* src, const webrtc::StreamConfig& config);
+  void NoteRender(const float* const* src, const webrtc::StreamConfig& config);
+  // Steady clock µs, or the test clock's ms in µs.
+  int64_t NowUs() const;
+  // D: the stream delay when above 0, else AEC3's estimate, else 0.
+  void UpdateFarEndDelay();
   void RecordFormat(std::atomic<uint64_t>& slot,
                     const webrtc::StreamConfig& config);
   webrtc::ProcessingConfig RecordedFormats() const;
@@ -710,14 +741,17 @@ class RootApmDecorator : public webrtc::AudioProcessing {
   void PublishPolicyStatsLocked();
 
   const Scheduler scheduler_;
+  const bool steady_clock_;
   const Clock clock_;
   const std::shared_ptr<RootCaptureState> capture_;
   const VariantBuilder variant_builder_;
+  const std::shared_ptr<RootEchoFarEnd> far_end_;
+  std::atomic<int32_t> estimated_delay_ms_{-1};
 
   // The APM the audio threads use, the variant staged to replace it (taken
   // by the first frame entry point that sees it) and the one a switch
   // replaced, which the scheduler's thread releases after the grace period.
-  std::atomic<webrtc::AudioProcessing*> active_{nullptr};
+  std::atomic<Variant*> active_{nullptr};
   std::atomic<Variant*> pending_{nullptr};
   // What staged_variant reports (the switch reads the Variant's own flag).
   std::atomic<bool> pending_model_{false};
