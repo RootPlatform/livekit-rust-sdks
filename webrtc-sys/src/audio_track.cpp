@@ -196,7 +196,10 @@ AudioTrackSource::InternalSource::InternalSource(
       webrtc::TaskQueueBase::DelayPrecision::kHigh);
 }
 
+// The queue goes first: deleting it joins its thread, so the 10 ms task never
+// runs while the buffers, sinks and puller it uses are being destroyed.
 AudioTrackSource::InternalSource::~InternalSource() {
+  audio_queue_.reset();
 }
 
 bool AudioTrackSource::InternalSource::capture_frame(

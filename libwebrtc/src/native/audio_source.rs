@@ -170,6 +170,8 @@ impl NativeAudioSource {
                     ctx_ptr,
                     sys_at::CompleteCallback(lk_audio_source_complete),
                 ) {
+                    // A refused frame never stores or completes ctx.
+                    drop(Box::from_raw(ctx_ptr as *mut oneshot::Sender<()>));
                     return Err(RtcError {
                         error_type: RtcErrorType::InvalidState,
                         message: "failed to capture frame".to_owned(),
