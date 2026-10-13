@@ -148,6 +148,183 @@ impl SpeechDetection {
     }
 }
 
+/// Whether this build's native engine runs the echo model. Until it does, a
+/// control that sets [`RootAudioControl::echo_model`] is answered as not
+/// supported and [`RootAudioStats::echo_model`] stays `None`.
+pub const ECHO_MODEL_AVAILABLE: bool = false;
+
+/// The echo model (DTLN-aec-128 as AEC3's neural residual echo estimator):
+/// which of the APM's two variants runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EchoModel {
+    /// AEC3 alone, exactly as builds without the model.
+    Off,
+    /// The model on every output device.
+    On,
+    /// The playout device's kind decides at every open; an echo path AEC3
+    /// measures while it runs alone turns the model on for that device.
+    Auto,
+}
+
+impl EchoModel {
+    /// The wire value (0, 1, 2). Unknown values are off.
+    pub fn from_wire(value: u32) -> Self {
+        match value {
+            1 => Self::On,
+            2 => Self::Auto,
+            _ => Self::Off,
+        }
+    }
+
+    pub fn to_wire(self) -> u32 {
+        match self {
+            Self::Off => 0,
+            Self::On => 1,
+            Self::Auto => 2,
+        }
+    }
+}
+
+/// What the APM runs: `Starting` and `Stopping` until the next audio frame
+/// switches to the variant native decided on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EchoModelState {
+    Off,
+    On,
+    Starting,
+    Stopping,
+}
+
+impl EchoModelState {
+    pub fn from_wire(value: u32) -> Self {
+        match value {
+            1 => Self::On,
+            2 => Self::Starting,
+            3 => Self::Stopping,
+            _ => Self::Off,
+        }
+    }
+
+    pub fn to_wire(self) -> u32 {
+        match self {
+            Self::Off => 0,
+            Self::On => 1,
+            Self::Starting => 2,
+            Self::Stopping => 3,
+        }
+    }
+}
+
+/// Why native decided on its echo model state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EchoModelReason {
+    ModeOff,
+    ModeOn,
+    /// Auto, by [`OutputDeviceKind`].
+    DeviceKind,
+    /// Auto: AEC3 measured an echo path on the current output device.
+    MeasuredEcho,
+    /// The CPU kill switch: off until the session ends.
+    KillSwitch,
+    /// The model or its APM could not be built.
+    Unavailable,
+}
+
+impl EchoModelReason {
+    pub fn from_wire(value: u32) -> Self {
+        match value {
+            1 => Self::ModeOn,
+            2 => Self::DeviceKind,
+            3 => Self::MeasuredEcho,
+            4 => Self::KillSwitch,
+            5 => Self::Unavailable,
+            _ => Self::ModeOff,
+        }
+    }
+
+    pub fn to_wire(self) -> u32 {
+        match self {
+            Self::ModeOff => 0,
+            Self::ModeOn => 1,
+            Self::DeviceKind => 2,
+            Self::MeasuredEcho => 3,
+            Self::KillSwitch => 4,
+            Self::Unavailable => 5,
+        }
+    }
+}
+
+/// The platform playout device's kind, read from the OS when it opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputDeviceKind {
+    /// No platform playout device opened since the session started.
+    NoDevice,
+    Unknown,
+    Speakers,
+    LineOut,
+    /// HDMI or DisplayPort audio.
+    DisplayAudio,
+    Headphones,
+    Headset,
+    Handset,
+    /// Any Bluetooth device, whatever its form factor.
+    Bluetooth,
+}
+
+impl OutputDeviceKind {
+    pub fn from_wire(value: u32) -> Self {
+        match value {
+            0 => Self::NoDevice,
+            2 => Self::Speakers,
+            3 => Self::LineOut,
+            4 => Self::DisplayAudio,
+            5 => Self::Headphones,
+            6 => Self::Headset,
+            7 => Self::Handset,
+            8 => Self::Bluetooth,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub fn to_wire(self) -> u32 {
+        match self {
+            Self::NoDevice => 0,
+            Self::Unknown => 1,
+            Self::Speakers => 2,
+            Self::LineOut => 3,
+            Self::DisplayAudio => 4,
+            Self::Headphones => 5,
+            Self::Headset => 6,
+            Self::Handset => 7,
+            Self::Bluetooth => 8,
+        }
+    }
+
+    /// The kinds Auto runs the model on from the device's first frame.
+    pub fn is_loudspeaker(self) -> bool {
+        matches!(self, Self::Speakers | Self::LineOut | Self::DisplayAudio)
+    }
+}
+
+/// The echo model's state and costs (the FFI `RootAudioStats` fields 114-124).
+/// Counters are cumulative for the engine's life; the inference mean and
+/// maximum are since the previous read (NaN and 0 without an inference).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EchoModelStats {
+    pub mode: EchoModel,
+    pub state: EchoModelState,
+    pub reason: EchoModelReason,
+    pub output_device_kind: OutputDeviceKind,
+    pub swaps: u64,
+    pub inferences: u64,
+    pub inference_mean_us: f32,
+    pub inference_max_us: u64,
+    /// The last complete 1000-inference window's 99th percentile; NaN before one.
+    pub inference_p99_us: f32,
+    pub measured_echo: bool,
+    pub kill_switch: bool,
+}
+
 /// Live control of the native audio engine. `None` leaves a setting as it is.
 ///
 /// Take effect now: `mic_muted` and `push_to_talk` (the capture gate fades
@@ -165,7 +342,9 @@ impl SpeechDetection {
 /// host's noise suppression mode is the Effects SDK: the startup hold waits
 /// for the denoiser and native WebRTC NS covers a denoiser that stops or does
 /// not arrive) and `speech_detection` (off until set, and after every session
-/// start). Builds without the chain only store them.
+/// start). Builds without the chain only store them. `echo_model` is off until
+/// set and after every session start; without [`ECHO_MODEL_AVAILABLE`] it is
+/// not supported.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct RootAudioControl {
     pub mic_muted: Option<bool>,
@@ -188,6 +367,7 @@ pub struct RootAudioControl {
     pub gain_reset_db: Option<f32>,
     pub denoiser_wanted: Option<bool>,
     pub speech_detection: Option<SpeechDetection>,
+    pub echo_model: Option<EchoModel>,
 }
 
 impl RootAudioControl {
@@ -206,6 +386,13 @@ impl RootAudioControl {
                 .map(|db| db.clamp(0.0, MAX_VOICE_GAIN_DB)),
             ..*self
         }
+    }
+
+    /// False when a set field has nothing in this build to act on it that the
+    /// native side does not answer for itself: `echo_model` without
+    /// [`ECHO_MODEL_AVAILABLE`].
+    pub fn supported_by_this_build(&self) -> bool {
+        self.echo_model.is_none() || ECHO_MODEL_AVAILABLE
     }
 
     pub(crate) fn to_native(&self) -> NativeAudioControl {
@@ -572,6 +759,9 @@ pub struct RootAudioStats {
     pub speech_frames: Option<u64>,
     pub speech_closed_frames: Option<u64>,
     pub speech_unavailable_frames: Option<u64>,
+
+    // Echo model; `None` without [`ECHO_MODEL_AVAILABLE`].
+    pub echo_model: Option<EchoModelStats>,
 }
 
 impl Default for RootAudioStats {
@@ -676,6 +866,7 @@ impl Default for RootAudioStats {
             speech_frames: None,
             speech_closed_frames: None,
             speech_unavailable_frames: None,
+            echo_model: None,
         }
     }
 }
@@ -1175,6 +1366,67 @@ mod tests {
         .to_native();
         assert!(native.has_speech_detection && native.speech_detection == 1);
         assert!(!RootAudioControl::default().to_native().has_speech_detection);
+    }
+
+    #[test]
+    fn echo_model_wire_values_round_trip_and_unknown_values_are_off() {
+        for mode in [EchoModel::Off, EchoModel::On, EchoModel::Auto] {
+            assert_eq!(EchoModel::from_wire(mode.to_wire()), mode);
+        }
+        assert_eq!(EchoModel::from_wire(3), EchoModel::Off);
+        assert_eq!(EchoModel::from_wire(u32::MAX), EchoModel::Off);
+        for state in [
+            EchoModelState::Off,
+            EchoModelState::On,
+            EchoModelState::Starting,
+            EchoModelState::Stopping,
+        ] {
+            assert_eq!(EchoModelState::from_wire(state.to_wire()), state);
+        }
+        for reason in [
+            EchoModelReason::ModeOff,
+            EchoModelReason::ModeOn,
+            EchoModelReason::DeviceKind,
+            EchoModelReason::MeasuredEcho,
+            EchoModelReason::KillSwitch,
+            EchoModelReason::Unavailable,
+        ] {
+            assert_eq!(EchoModelReason::from_wire(reason.to_wire()), reason);
+        }
+        let kinds = [
+            OutputDeviceKind::NoDevice,
+            OutputDeviceKind::Unknown,
+            OutputDeviceKind::Speakers,
+            OutputDeviceKind::LineOut,
+            OutputDeviceKind::DisplayAudio,
+            OutputDeviceKind::Headphones,
+            OutputDeviceKind::Headset,
+            OutputDeviceKind::Handset,
+            OutputDeviceKind::Bluetooth,
+        ];
+        for (wire, kind) in kinds.into_iter().enumerate() {
+            assert_eq!(kind.to_wire(), wire as u32);
+            assert_eq!(OutputDeviceKind::from_wire(wire as u32), kind);
+        }
+        assert_eq!(OutputDeviceKind::from_wire(9), OutputDeviceKind::Unknown);
+        let loudspeakers: Vec<_> = kinds.into_iter().filter(|k| k.is_loudspeaker()).collect();
+        assert_eq!(
+            loudspeakers,
+            [OutputDeviceKind::Speakers, OutputDeviceKind::LineOut, OutputDeviceKind::DisplayAudio]
+        );
+    }
+
+    #[test]
+    fn echo_model_control_is_supported_exactly_where_the_native_model_is() {
+        assert!(RootAudioControl::default().supported_by_this_build());
+        assert!(RootAudioControl { mic_muted: Some(true), ..Default::default() }
+            .supported_by_this_build());
+        for mode in [EchoModel::Off, EchoModel::On, EchoModel::Auto] {
+            let control = RootAudioControl { echo_model: Some(mode), ..Default::default() };
+            assert_eq!(control.supported_by_this_build(), ECHO_MODEL_AVAILABLE);
+            assert_eq!(control.to_native(), RootAudioControl::default().to_native());
+        }
+        assert_eq!(RootAudioStats::from_native(NativeAudioStats::default()).echo_model, None);
     }
 
     #[test]
