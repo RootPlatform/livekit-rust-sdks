@@ -940,14 +940,43 @@ screen video published right after it, any track change) `maxaveragebitrate=5100
 resolves the track only from the second answer on. That format change while sending registers the
 screen-audio stream with AudioState on the platform engine (the live 10/10 symptom: 100 packets/s
 at ~256 kbps against a 128 kbps cap, mic frames interleaved with the screen audio, garbled at the
-receiver). The publisher transport now keeps every audio send section's payload order and Opus fmtp
-as its first answer gave them (`PeerTransport::pin_send_codecs`, a stereo track's first answer gets
-`stereo=1` if the server left it out) and logs the first change it overrides per section. Device-free
-tests:
-`cargo test -p livekit --lib peer_transport` (string cases, plus a loopback pair whose answer gains
-`maxaveragebitrate`: pinned the send codec stays, unpinned it changes). Against a local server
-(`livekit-server --dev --bind 127.0.0.1`): `cargo test -p livekit --features __lk-e2e-test --test
-screen_audio_codec_test -- --nocapture` (fails without the pin).
+receiver). The publisher transport keeps the payload order and Opus fmtp of every audio send section
+whose track has an external source (`RtcAudioSource::Native`: screen-share audio, which the native
+capture attaches to a NATIVE source, and the managed engine's mic) as its first answer gave
+them (`PeerTransport::pin_send_codecs`, a stereo track's first answer gets `stereo=1` if the server
+left it out) and logs the first change it overrides per section. `create_sender` (`rtc_session.rs`)
+registers each such track's id with the transport (`add_external_audio_track`, next to
+`add_stereo_track`; neither set is cleared on unpublish: a released section no longer carries the
+track's msid, so its pin goes, and a republished track keeps its id and its source).
+
+A device track (`RtcAudioSource::Device`, the platform engine's mic) is not pinned (hw.10): its send
+stream is fed through AudioState anyway, so the codec-change bug never reaches it, and its section
+takes every answer as the server gives it, payload order, RED, DTX and stereo included. Pinned
+(hw.6-hw.9), the mic kept a first answer in which the server, not yet resolving the section, echoed
+the single-PC offer's `stereo=1` munge without `usedtx=1`; the later answers asked for DTX, but the
+mic sent stereo music-mode Opus with DTX off for the whole call, about 50 packets/s while silent
+instead of about 5. The first-answer `stereo=1` fix-up is part of the pin, so it does not reach a
+device track either (the desktop publishes only screen-share audio with `force_stereo`). The managed
+engine's mic is a NATIVE source and keeps the pin.
+
+Device-free tests: `cargo test -p livekit --lib peer_transport` (string cases: an external section
+pinned through a DTX and RED change, a device section never pinned, both in one answer; plus a
+loopback pair whose answer gains `maxaveragebitrate`: a registered external track's send codec stays
+and the same answer applied past the transport changes it, an unregistered track (standing in for a
+device track, which needs the platform ADM) follows the answer through the transport). Against a
+local server (`livekit-server --dev --bind 127.0.0.1`): `cargo test -p livekit --features
+__lk-e2e-test --test screen_audio_codec_test -- --nocapture` (fails without the pin; its tracks are
+all NATIVE sources).
+
+The same answers put one Opus payload type with different fmtp in several BUNDLEd sections. m150's
+`SdpOfferAnswerHandler` (`pc/sdp_offer_answer.cc`) rejects such a payload type collision in
+`SetRemoteDescription` only when the field trial `WebRTC-SdpBundlePayloadTypeCollisionCheck` is
+enabled and only logs it otherwise; the trial is off by default today. Every factory's environment
+now carries `WebRTC-SdpBundlePayloadTypeCollisionCheck/Disabled/` (`RootAppFieldTrials` in
+`webrtc-sys/src/peer_connection_factory.cpp`, composed with the zero-playout-delay and WARP trials),
+so a libwebrtc that turns the check on by default cannot fail every LiveKit answer. Test:
+`cargo test -p libwebrtc --lib peer_connection_factory` (the default factory and one with both
+options both answer `Disabled` for the trial and keep their other trials).
 
 Tests that need no device: `cargo test -p webrtc-sys --lib -- adm_proxy root_
 device_selection` (AdmProxy over a fake platform ADM that records its calls, the mixer, the capture
@@ -1629,6 +1658,14 @@ Building this worktree on Windows: the prebuilt's deepest abseil header
 `livekit-rust-sdks-echo\target\release\build\scratch-*\out\livekit_webrtc\...`, and cl.exe fails with
 C1083. Point `LK_CUSTOM_WEBRTC` at a short junction to the extracted prebuilt (`win-x64-release` with
 `include`, `lib`, `webrtc.ninja`).
+
+## hw.10 (2026-10-13)
+
+Publisher SDP only; caps stay 32767. The send-codec pin covers external-source audio tracks only, so
+the platform engine's mic follows the server's answers again (DTX, channels and payload order as the
+later answers give them; not yet checked in a live call), and every factory's environment turns
+`WebRTC-SdpBundlePayloadTypeCollisionCheck` off. Both are described in Phase 2 of "Native call audio"
+(from "The server's answers change codecs too").
 
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
