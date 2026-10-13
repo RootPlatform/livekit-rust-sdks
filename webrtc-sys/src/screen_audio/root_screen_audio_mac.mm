@@ -61,7 +61,7 @@ constexpr UInt32 kMaxBuffers = 8;
 constexpr size_t kChunkFrames = 4096;
 constexpr size_t kMaxProcessTree = 1024;
 
-// SCStreamErrorCode (SCError.h).
+// SCStreamErrorCode (SCError.h), in SCStreamErrorDomain.
 constexpr NSInteger kErrorUserDeclined = -3801;
 constexpr NSInteger kErrorNoCaptureSource = -3815;
 constexpr NSInteger kErrorUserStopped = -3817;
@@ -99,9 +99,16 @@ std::string Describe(NSError* error) {
          Utf8(error.localizedDescription);
 }
 
+API_AVAILABLE(macos(13.0))
+bool IsSckError(NSError* error, NSInteger code) {
+  return error != nil && error.code == code && error.domain != nil &&
+         [error.domain isEqualToString:SCStreamErrorDomain];
+}
+
+API_AVAILABLE(macos(13.0))
 ScreenAudioError StartError(NSError* error) {
-  return error && error.code == kErrorUserDeclined ? ScreenAudioError::kPermissionDenied
-                                                    : ScreenAudioError::kStartFailed;
+  return IsSckError(error, kErrorUserDeclined) ? ScreenAudioError::kPermissionDenied
+                                               : ScreenAudioError::kStartFailed;
 }
 
 // One completion handler's result, shared with the handler: a completion that
@@ -201,23 +208,22 @@ class SckAudioTap {
   }
 
   // ScreenCaptureKit's delegate queue.
-  void Stopped(NSError* error) {
+  API_AVAILABLE(macos(13.0)) void Stopped(NSError* error) {
     if (!Enter())
       return;
     ScreenAudioError kind = ScreenAudioError::kStreamFailed;
     std::string detail = "ScreenCaptureKit stopped the audio stream (" + Describe(error) + ")";
-    NSInteger code = error ? error.code : 0;
-    if (code == kErrorUserDeclined) {
+    if (IsSckError(error, kErrorUserDeclined)) {
       kind = ScreenAudioError::kPermissionDenied;
       detail = "Screen Recording permission was revoked (" + Describe(error) + ")";
-    } else if (code == kErrorUserStopped) {
+    } else if (IsSckError(error, kErrorUserStopped)) {
       kind = ScreenAudioError::kPermissionDenied;
       detail = "screen capture was stopped from the macOS menu bar (" + Describe(error) + ")";
     } else if (watched_ > 0 && kill(watched_, 0) != 0 && errno == ESRCH) {
       // Gone, not failed: a restart would widen the share to all audio.
       kind = ScreenAudioError::kTargetGone;
       detail = "the captured application exited (" + Describe(error) + ")";
-    } else if (code == kErrorNoCaptureSource) {
+    } else if (IsSckError(error, kErrorNoCaptureSource)) {
       kind = ScreenAudioError::kDeviceLost;
       detail = "the captured display went away (" + Describe(error) + ")";
     }
