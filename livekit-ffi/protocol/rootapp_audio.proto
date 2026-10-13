@@ -76,11 +76,80 @@ enum RootAudioSpeechDetection {
   ROOT_AUDIO_SPEECH_DETECTION_GATE = 2;
 }
 
+// The echo model (capability ECHO_MODEL): DTLN-aec-128 (MIT, Westhausen 2021) as AEC3's neural residual echo
+// estimator in the platform engine's APM (never in the managed engine's AudioProcessingModule). Native runs one of
+// two APMs: AEC3 alone, exactly as builds without the model, or AEC3 with the model. It builds the other one off the
+// audio threads and switches at an audio frame boundary; AEC3 starts over at each switch. In every mode the CPU kill
+// switch (RootAudioStats.echo_model_kill_switch) turns the model off for the rest of the session.
+enum RootAudioEchoModel {
+  // AEC3 alone. Native's value until a control sets another, and again when the first platform audio handle opens
+  // and when the last one closes.
+  ROOT_AUDIO_ECHO_MODEL_OFF = 0;
+  // The model on every output device.
+  ROOT_AUDIO_ECHO_MODEL_ON = 1;
+  // The platform playout device's kind decides at every open: the model for loudspeakers (SPEAKERS, LINE_OUT,
+  // DISPLAY_AUDIO), AEC3 alone for the other kinds. While AEC3 runs alone, an echo path it measures on the device
+  // (fullband ERLE of 3 dB or more in 2 s of capture within 10 s) turns the model on for that device until the session
+  // ends; a measurement never turns it off.
+  ROOT_AUDIO_ECHO_MODEL_AUTO = 2;
+}
+
+// What the APM runs (RootAudioStats.echo_model_state).
+enum RootAudioEchoModelState {
+  ROOT_AUDIO_ECHO_MODEL_STATE_OFF = 0;
+  ROOT_AUDIO_ECHO_MODEL_STATE_ON = 1;
+  // Native decided on the model; AEC3 alone runs until the model's APM is built and, at a pause in the user's
+  // speech (at most 3 s later), the next audio frame (capture or render) switches to it, or native does once no
+  // audio has run for 100 ms.
+  ROOT_AUDIO_ECHO_MODEL_STATE_STARTING = 2;
+  // Native decided against the model; AEC3 with it runs until the switch, as for STARTING.
+  ROOT_AUDIO_ECHO_MODEL_STATE_STOPPING = 3;
+}
+
+// Why native decided as it did (RootAudioStats.echo_model_reason).
+enum RootAudioEchoModelReason {
+  // echo_model is OFF.
+  ROOT_AUDIO_ECHO_MODEL_REASON_MODE_OFF = 0;
+  // echo_model is ON.
+  ROOT_AUDIO_ECHO_MODEL_REASON_MODE_ON = 1;
+  // AUTO, by output_device_kind (NONE and UNKNOWN are off).
+  ROOT_AUDIO_ECHO_MODEL_REASON_DEVICE_KIND = 2;
+  // AUTO: AEC3 measured an echo path on the current output device.
+  ROOT_AUDIO_ECHO_MODEL_REASON_MEASURED_ECHO = 3;
+  // The CPU kill switch tripped: off until the session ends.
+  ROOT_AUDIO_ECHO_MODEL_REASON_KILL_SWITCH = 4;
+  // The model or its APM could not be built, or the APM's echo canceller is off (nothing for the model to run
+  // on): off.
+  ROOT_AUDIO_ECHO_MODEL_REASON_UNAVAILABLE = 5;
+}
+
+// The platform playout device's kind, read natively from the OS when it opens (RootAudioStats.output_device_kind).
+// Windows: the endpoint's form factor, Bluetooth from its device's enumerator. macOS: the transport type, then the
+// data source (built-in) or the output stream's terminal type. Linux: UNKNOWN.
+enum RootAudioOutputDeviceKind {
+  // No platform playout device opened yet.
+  ROOT_AUDIO_OUTPUT_DEVICE_KIND_NONE = 0;
+  // Opened, and the OS does not say what it is.
+  ROOT_AUDIO_OUTPUT_DEVICE_KIND_UNKNOWN = 1;
+  // Built-in, desk or monitor loudspeakers.
+  ROOT_AUDIO_OUTPUT_DEVICE_KIND_SPEAKERS = 2;
+  // Line out, to external speakers or an amplifier.
+  ROOT_AUDIO_OUTPUT_DEVICE_KIND_LINE_OUT = 3;
+  // HDMI or DisplayPort audio: a monitor's or TV's speakers.
+  ROOT_AUDIO_OUTPUT_DEVICE_KIND_DISPLAY_AUDIO = 4;
+  ROOT_AUDIO_OUTPUT_DEVICE_KIND_HEADPHONES = 5;
+  ROOT_AUDIO_OUTPUT_DEVICE_KIND_HEADSET = 6;
+  ROOT_AUDIO_OUTPUT_DEVICE_KIND_HANDSET = 7;
+  // Any Bluetooth device, whatever its form factor.
+  ROOT_AUDIO_OUTPUT_DEVICE_KIND_BLUETOOTH = 8;
+}
+
 // Live control. Only the fields that are set change. Values are sanitised natively (finite, clamped).
 // The response's error says "not supported by this build" when a set field has nothing to act on
 // (the other fields are applied). Fields 8-14 act with the DSP chain (capability DSP; denoise_power
 // and denoiser_wanted with DENOISER, speech_detection with SPEECH_DETECTION) and are only stored by
-// builds without it.
+// builds without it. echo_model acts with ECHO_MODEL; builds without it answer "not supported by this
+// build" when it is set, and libraries that predate it ignore it.
 message RootAudioControl {
   // Transmit gate: no audio leaves and no speaking is reported while muted. It fades over 5 ms each
   // way; mic_muted and push_to_talk of one control change together.
@@ -117,6 +186,9 @@ message RootAudioControl {
   // OFF until set, and again when the first platform audio handle opens and when the last one
   // closes (as the other DSP settings).
   optional RootAudioSpeechDetection speech_detection = 14;
+  // OFF until set, and again when the first platform audio handle opens and when the last one closes (as
+  // the other DSP settings). Values this build does not know are OFF.
+  optional RootAudioEchoModel echo_model = 15;
 }
 message RootAudioSetControlRequest {
   required uint64 platform_audio_handle = 1;
@@ -437,6 +509,30 @@ message RootAudioStats {
   optional uint64 speech_frames = 111;
   optional uint64 speech_closed_frames = 112;
   optional uint64 speech_unavailable_frames = 113;
+
+  // Echo model (capability ECHO_MODEL; absent without it). echo_model is the mode native applies,
+  // echo_model_state what the APM runs and echo_model_reason why. output_device_kind is the platform
+  // playout device's kind from its last open (kept across sessions while that playout stays open, else NONE
+  // after a session reset), in every mode.
+  optional RootAudioEchoModel echo_model = 114;
+  optional RootAudioEchoModelState echo_model_state = 115;
+  optional RootAudioEchoModelReason echo_model_reason = 116;
+  optional RootAudioOutputDeviceKind output_device_kind = 117;
+  // APM switches made (to the model and back counts two).
+  optional uint64 echo_model_swaps = 118;
+  // Model inferences (at most one per 8 ms while the model runs); the mean and the longest of them since
+  // the previous read (µs, wall clock on the capture thread; reset on read: NaN and 0 without one).
+  optional uint64 echo_model_inferences = 119;
+  optional float echo_model_inference_mean_us = 120;
+  optional uint64 echo_model_inference_max_us = 121;
+  // The 99th percentile of the last complete window of 1000 inferences (µs; NaN before one), which the
+  // kill switch judges.
+  optional float echo_model_inference_p99_us = 122;
+  // AUTO: AEC3 measured an echo path on the current output device while it ran alone, in this session.
+  optional bool echo_model_measured_echo = 123;
+  // The CPU kill switch tripped in this session (inference p99 over 2 ms in two windows in a row): the
+  // model stays off until the session ends.
+  optional bool echo_model_kill_switch = 124;
 }
 // One playout mixer source (a remote audio stream): its audio as it reached the mixer, decoded and
 // before its gain (tile volume, master volume, deafen; a muted frame counts as silence), as a sum of

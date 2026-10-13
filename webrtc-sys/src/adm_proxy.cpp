@@ -710,8 +710,11 @@ void AdmProxy::RequestReconcile() {
   PostDeviceTask([this] {
     // An RMW, so a request that found the flag set is seen by this pass.
     reconcile_posted_.exchange(false, std::memory_order_acq_rel);
-    AdmLock lock(&mutex_);
-    ReconcileLocked(nullptr);
+    {
+      AdmLock lock(&mutex_);
+      ReconcileLocked(nullptr);
+    }
+    NotifyPlayoutOpened();
   });
 }
 
@@ -726,10 +729,29 @@ void AdmProxy::PostRequest(bool recording,
       AdmLock lock(&mutex_);
       ReconcileLocked(&outcome);
     }
+    NotifyPlayoutOpened();
     if (done) {
       done(outcome);
     }
   });
+}
+
+void AdmProxy::NotifyPlayoutOpened() {
+  std::optional<AdmPlayoutOpened> opened;
+  AdmPlayoutOpenedSink sink;
+  {
+    AdmLock lock(&mutex_);
+    opened = std::exchange(playout_opened_, std::nullopt);
+    sink = playout_opened_sink_;
+  }
+  if (opened.has_value() && sink) {
+    sink(*opened);
+  }
+}
+
+void AdmProxy::SetPlayoutOpenedSink(AdmPlayoutOpenedSink sink) {
+  AdmLock lock(&mutex_);
+  playout_opened_sink_ = std::move(sink);
 }
 
 void AdmProxy::ReconcileLocked(AdmRequestOutcome* outcome) {
@@ -766,6 +788,14 @@ bool AdmProxy::StopDeviceLocked(bool playout, AdmDirectionOutcome* outcome) {
     capture_state_->ClearSpeaking();
   }
   if (result == 0) {
+#if !LK_ADM_MOBILE
+    if (playout && playout_opened_sink_) {
+      AdmPlayoutOpened closed;
+      closed.open = false;
+      closed.system_default = false;
+      playout_opened_ = std::move(closed);
+    }
+#endif
     return true;
   }
   device_stop_failures_.fetch_add(1, std::memory_order_relaxed);
@@ -846,6 +876,11 @@ void AdmProxy::ReconcilePlayoutLocked(const DesiredState& desired,
       RTC_LOG(LS_WARNING) << "AdmProxy: InitPlayout failed: " << result;
       return;
     }
+#if !LK_ADM_MOBILE
+    if (playout_opened_sink_) {
+      playout_opened_ = last_playout_identity_;
+    }
+#endif
   }
 
   if (!platform_adm->Playing()) {
@@ -981,7 +1016,8 @@ void AdmProxy::PublishStateLocked(const DesiredState& desired) {
 
 int AdmProxy::ResolveSelectionLocked(
     [[maybe_unused]] bool playout,
-    [[maybe_unused]] const AdmDeviceSelection& selection) {
+    [[maybe_unused]] const AdmDeviceSelection& selection,
+    [[maybe_unused]] AdmPlayoutOpened* matched) {
 #if LK_ADM_MOBILE
   return kAdmResolveDefault;
 #else
@@ -1005,23 +1041,51 @@ int AdmProxy::ResolveSelectionLocked(
   }
   const int count = playout ? platform_adm->PlayoutDevices()
                             : platform_adm->RecordingDevices();
-  return ResolveAdmDeviceIndex(
+  auto device_at = [platform_adm, playout](int index, std::string* name,
+                                           std::string* guid) {
+    AdmNameBuffers buffers;
+    const uint16_t device = static_cast<uint16_t>(index);
+    const int32_t result =
+        playout ? platform_adm->PlayoutDeviceName(device, buffers.name,
+                                                  buffers.guid)
+                : platform_adm->RecordingDeviceName(device, buffers.name,
+                                                    buffers.guid);
+    if (result != 0) {
+      return false;
+    }
+    *name = buffers.Name();
+    *guid = buffers.Guid();
+    return true;
+  };
+  int read_index = kAdmResolveNotFound;
+  std::string read_name;
+  std::string read_guid;
+  const int index = ResolveAdmDeviceIndex(
       *wanted, count,
-      [platform_adm, playout](int index, std::string* name, std::string* guid) {
-        AdmNameBuffers buffers;
-        const uint16_t device = static_cast<uint16_t>(index);
-        const int32_t result =
-            playout ? platform_adm->PlayoutDeviceName(device, buffers.name,
-                                                      buffers.guid)
-                    : platform_adm->RecordingDeviceName(device, buffers.name,
-                                                        buffers.guid);
-        if (result != 0) {
+      [&](int at, std::string* name, std::string* guid) {
+        if (!device_at(at, name, guid)) {
           return false;
         }
-        *name = buffers.Name();
-        *guid = buffers.Guid();
+        read_index = at;
+        read_name = *name;
+        read_guid = *guid;
         return true;
       });
+  if (matched != nullptr && index != kAdmResolveNotFound) {
+    *matched = AdmPlayoutOpened{};
+    matched->system_default = index == kAdmResolveDefault;
+    const int at = matched->system_default ? 0 : index;
+    if (at == read_index) {
+      matched->name = std::move(read_name);
+      matched->guid = std::move(read_guid);
+    } else if (at < count) {
+      device_at(at, &matched->name, &matched->guid);
+    }
+    if (matched->system_default) {
+      matched->guid.clear();
+    }
+  }
+  return index;
 #endif
 }
 
@@ -1035,7 +1099,12 @@ int32_t AdmProxy::ApplySelectionLocked(
   if (!platform_adm) {
     return -1;
   }
-  const int index = ResolveSelectionLocked(playout, selection);
+  AdmPlayoutOpened matched;
+  const int index =
+      ResolveSelectionLocked(playout, selection, playout ? &matched : nullptr);
+  if (playout) {
+    last_playout_identity_ = std::move(matched);
+  }
   if (index == kAdmResolveNotFound) {
     RTC_LOG(LS_WARNING) << "AdmProxy: the selected "
                         << (playout ? "playout" : "recording")
@@ -1093,9 +1162,12 @@ void AdmProxy::ScheduleRetryLocked() {
   retry_scheduled_ = true;
   device_thread_->PostDelayedTask(
       [this] {
-        AdmLock lock(&mutex_);
-        retry_scheduled_ = false;
-        ReconcileLocked(nullptr);
+        {
+          AdmLock lock(&mutex_);
+          retry_scheduled_ = false;
+          ReconcileLocked(nullptr);
+        }
+        NotifyPlayoutOpened();
       },
       kStopFailureRetry);
 #endif

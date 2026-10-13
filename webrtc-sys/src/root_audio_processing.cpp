@@ -32,6 +32,7 @@
 #include "api/units/time_delta.h"
 #include "livekit/root_audio_monitor.h"
 #include "livekit/root_denoiser.h"
+#include "livekit/root_echo_model.h"
 #include "livekit/root_speech_detector.h"
 #include "modules/audio_processing/audio_buffer.h"
 #include "modules/audio_processing/include/aec_dump.h"
@@ -82,15 +83,70 @@ int64_t SteadyNowUs() {
 webrtc::scoped_refptr<webrtc::AudioProcessing> BuildRootApm(
     const webrtc::Environment& env,
     std::shared_ptr<RootCaptureState> capture_state) {
-  webrtc::AudioProcessing::Config config;
-  config.high_pass_filter.enabled = true;
-  webrtc::BuiltinAudioProcessingBuilder builder(config);
-  builder.SetCapturePostProcessing(
-      std::make_unique<RootCaptureProcessor>(std::move(capture_state)));
-  return builder.Build(env);
+  return BuildRootApmVariant(
+      env, std::make_shared<RootCaptureProcessor>(std::move(capture_state)),
+      nullptr);
+}
+
+uint64_t PackFormat(int rate, size_t channels) {
+  return (static_cast<uint64_t>(std::max(rate, 0)) << 16) |
+         static_cast<uint64_t>(std::min<size_t>(channels, 0xffff));
+}
+
+webrtc::StreamConfig UnpackFormat(uint64_t packed) {
+  return webrtc::StreamConfig(static_cast<int>(packed >> 16),
+                              static_cast<size_t>(packed & 0xffff));
 }
 
 }  // namespace
+
+webrtc::scoped_refptr<webrtc::AudioProcessing> BuildRootApmVariant(
+    const webrtc::Environment& env,
+    std::shared_ptr<RootCaptureProcessor> processor,
+    std::unique_ptr<webrtc::NeuralResidualEchoEstimator> estimator,
+    std::shared_ptr<std::atomic<bool>> forward) {
+  webrtc::AudioProcessing::Config config;
+  config.high_pass_filter.enabled = true;
+  webrtc::BuiltinAudioProcessingBuilder builder(config);
+  builder.SetCapturePostProcessing(std::make_unique<RootCaptureProcessorRef>(
+      std::move(processor), std::move(forward)));
+  if (estimator) {
+    builder.SetNeuralResidualEchoEstimator(std::move(estimator));
+  }
+  return builder.Build(env);
+}
+
+RootCaptureProcessorRef::RootCaptureProcessorRef(
+    std::shared_ptr<RootCaptureProcessor> processor,
+    std::shared_ptr<std::atomic<bool>> forward)
+    : processor_(std::move(processor)), forward_(std::move(forward)) {}
+
+bool RootCaptureProcessorRef::Forwarding() const {
+  return !forward_ || forward_->load(std::memory_order_acquire);
+}
+
+void RootCaptureProcessorRef::Initialize(int sample_rate_hz, int num_channels) {
+  if (Forwarding()) {
+    processor_->Initialize(sample_rate_hz, num_channels);
+  }
+}
+
+void RootCaptureProcessorRef::Process(webrtc::AudioBuffer* audio) {
+  if (Forwarding()) {
+    processor_->Process(audio);
+  }
+}
+
+std::string RootCaptureProcessorRef::ToString() const {
+  return processor_->ToString();
+}
+
+void RootCaptureProcessorRef::SetRuntimeSetting(
+    webrtc::AudioProcessing::RuntimeSetting setting) {
+  if (Forwarding()) {
+    processor_->SetRuntimeSetting(setting);
+  }
+}
 
 bool root_dsp_supported() {
   return kRootDspSupported;
@@ -531,22 +587,76 @@ bool RootApmConfigsEqual(const webrtc::AudioProcessing::Config& a,
          a.gain_controller2 == b.gain_controller2;
 }
 
+uint32_t RootApmDecorator::GraceEpoch() const {
+  return epoch_.load(std::memory_order_seq_cst);
+}
+
+// A collector flips the epoch after the APM it releases stopped being active,
+// then waits for the old parity to drain. A reader counted in the parity of
+// an epoch it saw again after counting itself is either seen by that wait or
+// read active_ after the flip, so it never holds the released APM. Flips are
+// rare (one per switch), so the retry ends.
+RootApmDecorator::Entered RootApmDecorator::GraceEnter(uint32_t epoch) const {
+  for (;;) {
+    in_flight_[epoch & 1u].fetch_add(1, std::memory_order_seq_cst);
+    const uint32_t now = epoch_.load(std::memory_order_seq_cst);
+    if (now == epoch) {
+      break;
+    }
+    in_flight_[epoch & 1u].fetch_sub(1, std::memory_order_seq_cst);
+    epoch = now;
+  }
+  return Entered{epoch & 1u, active_.load(std::memory_order_seq_cst)};
+}
+
+void RootApmDecorator::GraceLeave(uint32_t parity) const {
+  in_flight_[parity].fetch_sub(1, std::memory_order_release);
+}
+
+RootApmDecorator::Use::Use(const RootApmDecorator& decorator)
+    : decorator_(decorator),
+      entered_(decorator.GraceEnter(decorator.GraceEpoch())) {}
+
+RootApmDecorator::Use::~Use() {
+  decorator_.GraceLeave(entered_.parity);
+}
+
 RootApmDecorator::RootApmDecorator(
     webrtc::scoped_refptr<webrtc::AudioProcessing> inner,
     Scheduler scheduler,
     Clock clock,
-    std::shared_ptr<RootCaptureState> capture_state)
-    : inner_(std::move(inner)),
-      scheduler_(std::move(scheduler)),
+    std::shared_ptr<RootCaptureState> capture_state,
+    VariantBuilder variant_builder)
+    : scheduler_(std::move(scheduler)),
       clock_(clock ? std::move(clock) : Clock(&SteadyNowMs)),
-      capture_(std::move(capture_state)) {
-  webrtc::MutexLock lock(&mutex_);
-  requested_ = inner_->GetConfig();
-  applied_ = requested_;
-  ApplyLocked();
+      capture_(std::move(capture_state)),
+      variant_builder_(std::move(variant_builder)) {
+  active_.store(inner.get(), std::memory_order_seq_cst);
+  if (variant_builder_) {
+    render_ring_ = std::make_unique<WarmRing>();
+    capture_ring_ = std::make_unique<WarmRing>();
+    catch_up_ = std::make_unique<ReplayScratch>();
+  }
+  {
+    webrtc::MutexLock lock(&mutex_);
+    auto first = std::make_unique<Variant>();
+    first->apm = inner;
+    live_.push_back(std::move(first));
+    requested_ = inner->GetConfig();
+    applied_ = requested_;
+    ApplyLocked();
+  }
+  if (variant_builder_ && scheduler_) {
+    echo_model_ = std::make_unique<RootEchoModelController>(
+        this, scheduler_, clock_, capture_, [] {
+          return root_echo_model_prepare();
+        });
+  }
 }
 
-RootApmDecorator::~RootApmDecorator() = default;
+RootApmDecorator::~RootApmDecorator() {
+  echo_model_.reset();
+}
 
 webrtc::AudioProcessing::Config RootApmDecorator::Forced(
     const Config& requested) {
@@ -576,7 +686,9 @@ webrtc::AudioProcessing::Config RootApmDecorator::MergeLocked(
 void RootApmDecorator::ApplyLocked() {
   const Config merged = MergeLocked(requested_);
   if (!RootApmConfigsEqual(merged, applied_)) {
-    inner_->ApplyConfig(merged);
+    for (const auto& variant : live_) {
+      variant->apm->ApplyConfig(merged);
+    }
     applied_ = merged;
     inner_applies_.fetch_add(1, std::memory_order_relaxed);
   }
@@ -742,7 +854,8 @@ void RootApmDecorator::ApplyPolicyNowLocked(int64_t now_ms, bool forced) {
 }
 
 RootApmStats RootApmDecorator::ReadStats() {
-  const webrtc::AudioProcessingStats stats = inner_->GetStatistics();
+  Use apm(*this);
+  const webrtc::AudioProcessingStats stats = apm->GetStatistics();
   RootApmStats result;
   result.erl_db = OrNaN(stats.echo_return_loss);
   result.erle_db = OrNaN(stats.echo_return_loss_enhancement);
@@ -770,13 +883,411 @@ uint64_t RootApmDecorator::swallowed_mute_count() const {
   return swallowed_mutes_.load(std::memory_order_relaxed);
 }
 
+// =============================================================================
+// Variant switching
+// =============================================================================
+
+void RootApmDecorator::SwitchIfStaged(bool capture) {
+  if (pending_.load(std::memory_order_acquire) == nullptr) {
+    return;
+  }
+  if (!capture &&
+      clock_() - last_capture_ms_.load(std::memory_order_relaxed) < kIdleMs) {
+    return;
+  }
+  if (switching_.exchange(true, std::memory_order_acquire)) {
+    return;
+  }
+  Variant* next = retired_.load(std::memory_order_acquire) == nullptr
+                      ? pending_.exchange(nullptr, std::memory_order_acq_rel)
+                      : nullptr;
+  if (next != nullptr) {
+    const uint64_t renders =
+        render_frames_kept_.load(std::memory_order_acquire);
+    const uint64_t captures =
+        capture_frames_kept_.load(std::memory_order_acquire);
+    auto from = [](uint64_t warmed, uint64_t kept) {
+      return std::max(warmed, kept > kMaxCatchUp ? kept - kMaxCatchUp : 0);
+    };
+    Replay(next->apm.get(), from(next->render_warmed, renders), renders,
+           from(next->capture_warmed, captures), captures, *catch_up_,
+           SteadyNowUs());
+    Switch(next);
+  }
+  switching_.store(false, std::memory_order_release);
+}
+
+bool RootApmDecorator::SwitchIfIdle() {
+  if (pending_.load(std::memory_order_acquire) == nullptr) {
+    return false;
+  }
+  const int64_t now = clock_();
+  if (now - last_capture_ms_.load(std::memory_order_relaxed) < kIdleMs ||
+      now - last_render_ms_.load(std::memory_order_relaxed) < kIdleMs ||
+      switching_.exchange(true, std::memory_order_acquire)) {
+    return false;
+  }
+  Variant* next = retired_.load(std::memory_order_acquire) == nullptr
+                      ? pending_.exchange(nullptr, std::memory_order_acq_rel)
+                      : nullptr;
+  if (next != nullptr) {
+    Switch(next);
+  }
+  switching_.store(false, std::memory_order_release);
+  return next != nullptr;
+}
+
+void RootApmDecorator::Switch(Variant* next) {
+  if (next->forward) {
+    next->forward->store(true, std::memory_order_release);
+  }
+  webrtc::AudioProcessing* previous =
+      active_.exchange(next->apm.get(), std::memory_order_seq_cst);
+  running_model_.store(next->model, std::memory_order_release);
+  retired_.store(previous, std::memory_order_release);
+  swaps_.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool RootApmDecorator::ReadWarmFrame(const WarmRing& ring,
+                                     uint64_t index,
+                                     int64_t now_us,
+                                     float* samples,
+                                     int* rate,
+                                     size_t* channels,
+                                     WarmApi* api) {
+  const WarmFrame& slot = ring[index % kWarmFrames];
+  const uint64_t before = slot.seq.load(std::memory_order_acquire);
+  if (before == 0 || (before & 1) != 0) {
+    return false;
+  }
+  const uint64_t held = slot.index;
+  const int64_t when_us = slot.when_us;
+  *api = slot.api;
+  *rate = slot.rate;
+  *channels = slot.channels;
+  const size_t count =
+      static_cast<size_t>(std::max(*rate, 0) / 100) * *channels;
+  if (*rate <= 0 || *channels == 0 || count > kMaxWarmSamples) {
+    return false;
+  }
+  std::copy_n(slot.samples.data(), count, samples);
+  std::atomic_thread_fence(std::memory_order_acquire);
+  return slot.seq.load(std::memory_order_relaxed) == before && held == index &&
+         now_us - when_us <= kWarmMaxAgeUs;
+}
+
+void RootApmDecorator::KeepInt16(WarmRing& ring,
+                                 uint64_t index,
+                                 const int16_t* src,
+                                 const webrtc::StreamConfig& config,
+                                 int64_t now_us) {
+  WarmFrame& slot = ring[index % kWarmFrames];
+  const size_t frames = config.num_frames();
+  const size_t channels = config.num_channels();
+  if (src == nullptr || frames * channels > kMaxWarmSamples) {
+    return;
+  }
+  const uint64_t seq = slot.seq.load(std::memory_order_relaxed);
+  slot.seq.store(seq + 1, std::memory_order_relaxed);
+  std::atomic_thread_fence(std::memory_order_release);
+  slot.index = index;
+  slot.api = WarmApi::kInt16;
+  slot.rate = config.sample_rate_hz();
+  slot.channels = channels;
+  slot.when_us = now_us;
+  for (size_t c = 0; c < channels; ++c) {
+    for (size_t i = 0; i < frames; ++i) {
+      slot.samples[c * frames + i] =
+          static_cast<float>(src[i * channels + c]) * (1.0f / 32768.0f);
+    }
+  }
+  slot.seq.store(seq + 2, std::memory_order_release);
+}
+
+void RootApmDecorator::KeepFloat(WarmRing& ring,
+                                 uint64_t index,
+                                 const float* const* src,
+                                 const webrtc::StreamConfig& config,
+                                 int64_t now_us,
+                                 WarmApi api) {
+  WarmFrame& slot = ring[index % kWarmFrames];
+  const size_t frames = config.num_frames();
+  const size_t channels = config.num_channels();
+  if (src == nullptr || frames * channels > kMaxWarmSamples) {
+    return;
+  }
+  const uint64_t seq = slot.seq.load(std::memory_order_relaxed);
+  slot.seq.store(seq + 1, std::memory_order_relaxed);
+  std::atomic_thread_fence(std::memory_order_release);
+  slot.index = index;
+  slot.api = api;
+  slot.rate = config.sample_rate_hz();
+  slot.channels = channels;
+  slot.when_us = now_us;
+  for (size_t c = 0; c < channels; ++c) {
+    std::copy_n(src[c], frames, slot.samples.data() + c * frames);
+  }
+  slot.seq.store(seq + 2, std::memory_order_release);
+}
+
+// `apm` is in no other thread's hands: not active yet, its post-processor not
+// forwarding, so the chain never sees these frames twice.
+void RootApmDecorator::Replay(webrtc::AudioProcessing* apm,
+                              uint64_t render_from,
+                              uint64_t render_to,
+                              uint64_t capture_from,
+                              uint64_t capture_to,
+                              ReplayScratch& scratch,
+                              int64_t now_us) {
+  if (!render_ring_ || !capture_ring_ ||
+      (render_from >= render_to && capture_from >= capture_to)) {
+    return;
+  }
+  constexpr size_t kMaxChannels = 8;
+  const webrtc::StreamConfig render_out =
+      UnpackFormat(render_out_format_.load(std::memory_order_relaxed));
+  const webrtc::StreamConfig capture_out =
+      UnpackFormat(capture_out_format_.load(std::memory_order_relaxed));
+  if (stream_delay_set_.load(std::memory_order_relaxed)) {
+    apm->set_stream_delay_ms(stream_delay_ms_.load(std::memory_order_relaxed));
+  }
+  std::array<float*, kMaxChannels> in{};
+  std::array<float*, kMaxChannels> out{};
+  auto run = [&](bool render, uint64_t index) {
+    int rate = 0;
+    size_t channels = 0;
+    WarmApi api = WarmApi::kFloat;
+    if (!ReadWarmFrame(render ? *render_ring_ : *capture_ring_, index, now_us,
+                       scratch.in.data(), &rate, &channels, &api) ||
+        channels > kMaxChannels) {
+      return;
+    }
+    const webrtc::StreamConfig input(rate, channels);
+    if (api == WarmApi::kAnalyze) {
+      for (size_t ch = 0; ch < channels; ++ch) {
+        in[ch] = scratch.in.data() + ch * input.num_frames();
+      }
+      apm->AnalyzeReverseStream(in.data(), input);
+      return;
+    }
+    const webrtc::StreamConfig& recorded = render ? render_out : capture_out;
+    const webrtc::StreamConfig output =
+        recorded.sample_rate_hz() == rate && recorded.num_channels() > 0 &&
+                recorded.num_channels() <= kMaxChannels &&
+                recorded.num_frames() * recorded.num_channels() <=
+                    kMaxWarmSamples
+            ? recorded
+            : input;
+    if (api == WarmApi::kInt16) {
+      const size_t frames = input.num_frames();
+      for (size_t c = 0; c < channels; ++c) {
+        for (size_t i = 0; i < frames; ++i) {
+          scratch.in16[i * channels + c] = static_cast<int16_t>(std::clamp(
+              std::lround(scratch.in[c * frames + i] * 32768.0f), -32768L,
+              32767L));
+        }
+      }
+      if (render) {
+        apm->ProcessReverseStream(scratch.in16.data(), input, output,
+                                  scratch.out16.data());
+      } else {
+        apm->ProcessStream(scratch.in16.data(), input, output,
+                           scratch.out16.data());
+      }
+      return;
+    }
+    for (size_t ch = 0; ch < channels; ++ch) {
+      in[ch] = scratch.in.data() + ch * input.num_frames();
+    }
+    for (size_t ch = 0; ch < output.num_channels(); ++ch) {
+      out[ch] = scratch.out.data() + ch * output.num_frames();
+    }
+    if (render) {
+      apm->ProcessReverseStream(in.data(), input, output, out.data());
+    } else {
+      apm->ProcessStream(in.data(), input, output, out.data());
+    }
+  };
+  uint64_t r = render_from;
+  uint64_t c = capture_from;
+  while (r < render_to || c < capture_to) {
+    if (r < render_to) {
+      run(true, r++);
+    }
+    if (c < capture_to) {
+      run(false, c++);
+    }
+  }
+}
+
+void RootApmDecorator::RecordFormat(std::atomic<uint64_t>& slot,
+                                    const webrtc::StreamConfig& config) {
+  const uint64_t packed =
+      PackFormat(config.sample_rate_hz(), config.num_channels());
+  if (slot.load(std::memory_order_relaxed) != packed) {
+    slot.store(packed, std::memory_order_relaxed);
+  }
+}
+
+webrtc::ProcessingConfig RootApmDecorator::RecordedFormats() const {
+  webrtc::ProcessingConfig config;
+  config.input_stream() =
+      UnpackFormat(capture_in_format_.load(std::memory_order_relaxed));
+  config.output_stream() =
+      UnpackFormat(capture_out_format_.load(std::memory_order_relaxed));
+  config.reverse_input_stream() =
+      UnpackFormat(render_in_format_.load(std::memory_order_relaxed));
+  config.reverse_output_stream() =
+      UnpackFormat(render_out_format_.load(std::memory_order_relaxed));
+  return config;
+}
+
+void RootApmDecorator::CarryStreamSettings(webrtc::AudioProcessing* apm) {
+  if (stream_settings_apm_.load(std::memory_order_relaxed) == apm) {
+    return;
+  }
+  stream_settings_apm_.store(apm, std::memory_order_relaxed);
+  if (stream_delay_set_.load(std::memory_order_relaxed)) {
+    apm->set_stream_delay_ms(stream_delay_ms_.load(std::memory_order_relaxed));
+  }
+  apm->set_stream_key_pressed(key_pressed_.load(std::memory_order_relaxed));
+}
+
+bool RootApmDecorator::StageVariant(bool model) {
+  if (!variant_builder_) {
+    return false;
+  }
+  {
+    webrtc::MutexLock lock(&mutex_);
+    if (retired_.load(std::memory_order_acquire) != nullptr ||
+        collecting_ != nullptr) {
+      return false;
+    }
+  }
+  auto forward = std::make_shared<std::atomic<bool>>(false);
+  webrtc::scoped_refptr<webrtc::AudioProcessing> apm = variant_builder_(
+      model, echo_model_ ? echo_model_->counters() : nullptr, forward);
+  if (!apm) {
+    return false;
+  }
+  auto owned = std::make_unique<Variant>();
+  Variant* variant = owned.get();
+  variant->apm = apm;
+  variant->forward = std::move(forward);
+  variant->model = model;
+  {
+    webrtc::MutexLock lock(&mutex_);
+    apm->ApplyConfig(applied_);
+    const webrtc::ProcessingConfig formats = RecordedFormats();
+    if (formats.input_stream().sample_rate_hz() > 0 &&
+        formats.reverse_input_stream().sample_rate_hz() > 0) {
+      apm->Initialize(formats);
+    }
+    live_.push_back(std::move(owned));
+  }
+  if (render_ring_ && capture_ring_) {
+    ReplayScratch scratch;
+    const uint64_t renders =
+        render_frames_kept_.load(std::memory_order_acquire);
+    const uint64_t captures =
+        capture_frames_kept_.load(std::memory_order_acquire);
+    Replay(apm.get(), renders > kWarmFrames ? renders - kWarmFrames : 0,
+           renders, captures > kWarmFrames ? captures - kWarmFrames : 0,
+           captures, scratch, SteadyNowUs());
+    variant->render_warmed = renders;
+    variant->capture_warmed = captures;
+  }
+  webrtc::MutexLock lock(&mutex_);
+  pending_model_.store(model, std::memory_order_release);
+  Variant* replaced = pending_.exchange(variant, std::memory_order_acq_rel);
+  if (replaced != nullptr) {
+    RemoveLiveLocked(replaced->apm.get());
+  }
+  return true;
+}
+
+void RootApmDecorator::CancelStaged() {
+  webrtc::MutexLock lock(&mutex_);
+  Variant* staged = pending_.exchange(nullptr, std::memory_order_acq_rel);
+  if (staged != nullptr) {
+    RemoveLiveLocked(staged->apm.get());
+  }
+}
+
+void RootApmDecorator::RemoveLiveLocked(webrtc::AudioProcessing* apm) {
+  live_.erase(std::remove_if(live_.begin(), live_.end(),
+                             [apm](const std::unique_ptr<Variant>& variant) {
+                               return variant->apm.get() == apm;
+                             }),
+              live_.end());
+}
+
+bool RootApmDecorator::CollectRetired() {
+  webrtc::MutexLock lock(&mutex_);
+  if (collecting_ == nullptr) {
+    collecting_ = retired_.exchange(nullptr, std::memory_order_acq_rel);
+    if (collecting_ == nullptr) {
+      return true;
+    }
+    collecting_parity_ =
+        epoch_.fetch_add(1, std::memory_order_seq_cst) & 1u;
+  }
+  if (in_flight_[collecting_parity_].load(std::memory_order_seq_cst) != 0) {
+    return false;
+  }
+  webrtc::AudioProcessing* done = collecting_;
+  collecting_ = nullptr;
+  RemoveLiveLocked(done);
+  return true;
+}
+
+bool RootApmDecorator::running_model() const {
+  return running_model_.load(std::memory_order_acquire);
+}
+
+std::optional<bool> RootApmDecorator::staged_variant() const {
+  if (pending_.load(std::memory_order_acquire) == nullptr &&
+      !switching_.load(std::memory_order_acquire)) {
+    return std::nullopt;
+  }
+  return pending_model_.load(std::memory_order_acquire);
+}
+
+uint64_t RootApmDecorator::swaps() const {
+  return swaps_.load(std::memory_order_relaxed);
+}
+
+webrtc::AudioProcessing* RootApmDecorator::active_for_test() const {
+  return active_.load(std::memory_order_seq_cst);
+}
+
+// =============================================================================
+// AudioProcessing
+// =============================================================================
+
 int RootApmDecorator::Initialize() {
-  return inner_->Initialize();
+  webrtc::MutexLock lock(&mutex_);
+  int result = 0;
+  for (const auto& variant : live_) {
+    const int r = variant->apm->Initialize();
+    if (variant->apm.get() == active_.load(std::memory_order_seq_cst)) {
+      result = r;
+    }
+  }
+  return result;
 }
 
 int RootApmDecorator::Initialize(
     const webrtc::ProcessingConfig& processing_config) {
-  return inner_->Initialize(processing_config);
+  webrtc::MutexLock lock(&mutex_);
+  int result = 0;
+  for (const auto& variant : live_) {
+    const int r = variant->apm->Initialize(processing_config);
+    if (variant->apm.get() == active_.load(std::memory_order_seq_cst)) {
+      result = r;
+    }
+  }
+  return result;
 }
 
 void RootApmDecorator::ApplyConfig(const Config& config) {
@@ -786,27 +1297,27 @@ void RootApmDecorator::ApplyConfig(const Config& config) {
 }
 
 int RootApmDecorator::proc_sample_rate_hz() const {
-  return inner_->proc_sample_rate_hz();
+  return Use(*this)->proc_sample_rate_hz();
 }
 
 int RootApmDecorator::proc_split_sample_rate_hz() const {
-  return inner_->proc_split_sample_rate_hz();
+  return Use(*this)->proc_split_sample_rate_hz();
 }
 
 size_t RootApmDecorator::num_input_channels() const {
-  return inner_->num_input_channels();
+  return Use(*this)->num_input_channels();
 }
 
 size_t RootApmDecorator::num_proc_channels() const {
-  return inner_->num_proc_channels();
+  return Use(*this)->num_proc_channels();
 }
 
 size_t RootApmDecorator::num_output_channels() const {
-  return inner_->num_output_channels();
+  return Use(*this)->num_output_channels();
 }
 
 size_t RootApmDecorator::num_reverse_channels() const {
-  return inner_->num_reverse_channels();
+  return Use(*this)->num_reverse_channels();
 }
 
 void RootApmDecorator::set_output_will_be_muted(bool /* muted */) {
@@ -814,7 +1325,7 @@ void RootApmDecorator::set_output_will_be_muted(bool /* muted */) {
 }
 
 bool RootApmDecorator::get_output_will_be_muted() {
-  return inner_->get_output_will_be_muted();
+  return Use(*this)->get_output_will_be_muted();
 }
 
 void RootApmDecorator::SetRuntimeSetting(RuntimeSetting setting) {
@@ -822,7 +1333,7 @@ void RootApmDecorator::SetRuntimeSetting(RuntimeSetting setting) {
     swallowed_mutes_.fetch_add(1, std::memory_order_relaxed);
     return;
   }
-  inner_->SetRuntimeSetting(setting);
+  Use(*this)->SetRuntimeSetting(setting);
 }
 
 bool RootApmDecorator::PostRuntimeSetting(RuntimeSetting setting) {
@@ -830,21 +1341,57 @@ bool RootApmDecorator::PostRuntimeSetting(RuntimeSetting setting) {
     swallowed_mutes_.fetch_add(1, std::memory_order_relaxed);
     return true;
   }
-  return inner_->PostRuntimeSetting(setting);
+  return Use(*this)->PostRuntimeSetting(setting);
 }
 
 int RootApmDecorator::ProcessStream(const int16_t* const src,
                                     const webrtc::StreamConfig& input_config,
                                     const webrtc::StreamConfig& output_config,
                                     int16_t* const dest) {
-  return inner_->ProcessStream(src, input_config, output_config, dest);
+  RecordFormat(capture_in_format_, input_config);
+  RecordFormat(capture_out_format_, output_config);
+  SwitchIfStaged(true);
+  if (capture_ring_) {
+    KeepInt16(*capture_ring_,
+              capture_frames_kept_.load(std::memory_order_relaxed), src,
+              input_config, SteadyNowUs());
+    last_capture_ms_.store(clock_(), std::memory_order_relaxed);
+  }
+  int result = 0;
+  {
+    Use apm(*this);
+    CarryStreamSettings(apm.get());
+    result = apm->ProcessStream(src, input_config, output_config, dest);
+  }
+  if (capture_ring_) {
+    capture_frames_kept_.fetch_add(1, std::memory_order_release);
+  }
+  return result;
 }
 
 int RootApmDecorator::ProcessStream(const float* const* src,
                                     const webrtc::StreamConfig& input_config,
                                     const webrtc::StreamConfig& output_config,
                                     float* const* dest) {
-  return inner_->ProcessStream(src, input_config, output_config, dest);
+  RecordFormat(capture_in_format_, input_config);
+  RecordFormat(capture_out_format_, output_config);
+  SwitchIfStaged(true);
+  if (capture_ring_) {
+    KeepFloat(*capture_ring_,
+              capture_frames_kept_.load(std::memory_order_relaxed), src,
+              input_config, SteadyNowUs(), WarmApi::kFloat);
+    last_capture_ms_.store(clock_(), std::memory_order_relaxed);
+  }
+  int result = 0;
+  {
+    Use apm(*this);
+    CarryStreamSettings(apm.get());
+    result = apm->ProcessStream(src, input_config, output_config, dest);
+  }
+  if (capture_ring_) {
+    capture_frames_kept_.fetch_add(1, std::memory_order_release);
+  }
+  return result;
 }
 
 int RootApmDecorator::ProcessReverseStream(
@@ -852,7 +1399,21 @@ int RootApmDecorator::ProcessReverseStream(
     const webrtc::StreamConfig& input_config,
     const webrtc::StreamConfig& output_config,
     int16_t* const dest) {
-  return inner_->ProcessReverseStream(src, input_config, output_config, dest);
+  RecordFormat(render_in_format_, input_config);
+  RecordFormat(render_out_format_, output_config);
+  SwitchIfStaged(false);
+  if (render_ring_) {
+    KeepInt16(*render_ring_,
+              render_frames_kept_.load(std::memory_order_relaxed), src,
+              input_config, SteadyNowUs());
+    last_render_ms_.store(clock_(), std::memory_order_relaxed);
+  }
+  const int result = Use(*this)->ProcessReverseStream(src, input_config,
+                                                      output_config, dest);
+  if (render_ring_) {
+    render_frames_kept_.fetch_add(1, std::memory_order_release);
+  }
+  return result;
 }
 
 int RootApmDecorator::ProcessReverseStream(
@@ -860,71 +1421,106 @@ int RootApmDecorator::ProcessReverseStream(
     const webrtc::StreamConfig& input_config,
     const webrtc::StreamConfig& output_config,
     float* const* dest) {
-  return inner_->ProcessReverseStream(src, input_config, output_config, dest);
+  RecordFormat(render_in_format_, input_config);
+  RecordFormat(render_out_format_, output_config);
+  SwitchIfStaged(false);
+  if (render_ring_) {
+    KeepFloat(*render_ring_,
+              render_frames_kept_.load(std::memory_order_relaxed), src,
+              input_config, SteadyNowUs(), WarmApi::kFloat);
+    last_render_ms_.store(clock_(), std::memory_order_relaxed);
+  }
+  const int result = Use(*this)->ProcessReverseStream(src, input_config,
+                                                      output_config, dest);
+  if (render_ring_) {
+    render_frames_kept_.fetch_add(1, std::memory_order_release);
+  }
+  return result;
 }
 
 int RootApmDecorator::AnalyzeReverseStream(
     const float* const* data,
     const webrtc::StreamConfig& reverse_config) {
-  return inner_->AnalyzeReverseStream(data, reverse_config);
+  RecordFormat(render_in_format_, reverse_config);
+  RecordFormat(render_out_format_, reverse_config);
+  SwitchIfStaged(false);
+  if (render_ring_) {
+    KeepFloat(*render_ring_,
+              render_frames_kept_.load(std::memory_order_relaxed), data,
+              reverse_config, SteadyNowUs(), WarmApi::kAnalyze);
+    last_render_ms_.store(clock_(), std::memory_order_relaxed);
+  }
+  const int result = Use(*this)->AnalyzeReverseStream(data, reverse_config);
+  if (render_ring_) {
+    render_frames_kept_.fetch_add(1, std::memory_order_release);
+  }
+  return result;
 }
 
 bool RootApmDecorator::GetLinearAecOutput(
     std::span<std::array<float, 160>> linear_output) const {
-  return inner_->GetLinearAecOutput(linear_output);
+  return Use(*this)->GetLinearAecOutput(linear_output);
 }
 
 void RootApmDecorator::set_stream_analog_level(int level) {
-  inner_->set_stream_analog_level(level);
+  Use(*this)->set_stream_analog_level(level);
 }
 
 int RootApmDecorator::recommended_stream_analog_level() const {
-  return inner_->recommended_stream_analog_level();
+  return Use(*this)->recommended_stream_analog_level();
 }
 
 int RootApmDecorator::set_stream_delay_ms(int delay) {
-  return inner_->set_stream_delay_ms(delay);
+  stream_delay_ms_.store(delay, std::memory_order_relaxed);
+  stream_delay_set_.store(true, std::memory_order_relaxed);
+  Use apm(*this);
+  stream_settings_apm_.store(apm.get(), std::memory_order_relaxed);
+  return apm->set_stream_delay_ms(delay);
 }
 
 int RootApmDecorator::stream_delay_ms() const {
-  return inner_->stream_delay_ms();
+  return Use(*this)->stream_delay_ms();
 }
 
 void RootApmDecorator::set_stream_key_pressed(bool key_pressed) {
-  inner_->set_stream_key_pressed(key_pressed);
+  key_pressed_.store(key_pressed, std::memory_order_relaxed);
+  Use(*this)->set_stream_key_pressed(key_pressed);
 }
 
 bool RootApmDecorator::CreateAndAttachAecDump(
     absl::string_view file_name,
     int64_t max_log_size_bytes,
     webrtc::TaskQueueBase* worker_queue) {
-  return inner_->CreateAndAttachAecDump(file_name, max_log_size_bytes,
-                                        worker_queue);
+  return Use(*this)->CreateAndAttachAecDump(file_name, max_log_size_bytes,
+                                            worker_queue);
 }
 
 bool RootApmDecorator::CreateAndAttachAecDump(
     FILE* handle,
     int64_t max_log_size_bytes,
     webrtc::TaskQueueBase* worker_queue) {
-  return inner_->CreateAndAttachAecDump(handle, max_log_size_bytes,
-                                        worker_queue);
+  return Use(*this)->CreateAndAttachAecDump(handle, max_log_size_bytes,
+                                            worker_queue);
 }
 
 void RootApmDecorator::AttachAecDump(std::unique_ptr<webrtc::AecDump> aec_dump) {
-  inner_->AttachAecDump(std::move(aec_dump));
+  Use(*this)->AttachAecDump(std::move(aec_dump));
 }
 
 void RootApmDecorator::DetachAecDump() {
-  inner_->DetachAecDump();
+  webrtc::MutexLock lock(&mutex_);
+  for (const auto& variant : live_) {
+    variant->apm->DetachAecDump();
+  }
 }
 
 webrtc::AudioProcessingStats RootApmDecorator::GetStatistics() {
-  return inner_->GetStatistics();
+  return Use(*this)->GetStatistics();
 }
 
 webrtc::AudioProcessingStats RootApmDecorator::GetStatistics(
     bool has_remote_tracks) {
-  return inner_->GetStatistics(has_remote_tracks);
+  return Use(*this)->GetStatistics(has_remote_tracks);
 }
 
 webrtc::AudioProcessing::Config RootApmDecorator::GetConfig() const {
@@ -932,26 +1528,50 @@ webrtc::AudioProcessing::Config RootApmDecorator::GetConfig() const {
   return Forced(requested_);
 }
 
+RootApmDecorator::VariantBuilder NewRootVariantBuilder(
+    const webrtc::Environment& env,
+    std::shared_ptr<RootCaptureProcessor> processor) {
+  return [env, processor](bool model,
+                          std::shared_ptr<RootEchoModelCounters> counters,
+                          std::shared_ptr<std::atomic<bool>> forward)
+             -> webrtc::scoped_refptr<webrtc::AudioProcessing> {
+    std::unique_ptr<webrtc::NeuralResidualEchoEstimator> estimator;
+    if (model) {
+      estimator = NewRootResidualEchoEstimator(std::move(counters));
+      if (!estimator) {
+        return nullptr;
+      }
+    }
+    return BuildRootApmVariant(env, processor, std::move(estimator),
+                               std::move(forward));
+  };
+}
+
 webrtc::scoped_refptr<RootApmDecorator> CreateRootAudioProcessing(
     const webrtc::Environment& env,
     std::shared_ptr<RootCaptureState> capture_state,
     webrtc::TaskQueueBase* policy_queue) {
+  auto processor = std::make_shared<RootCaptureProcessor>(capture_state);
   webrtc::scoped_refptr<webrtc::AudioProcessing> apm =
-      BuildRootApm(env, capture_state);
+      BuildRootApmVariant(env, processor, nullptr);
   if (!apm) {
     return nullptr;
   }
   RootApmDecorator::Scheduler scheduler;
+  RootApmDecorator::VariantBuilder builder;
   if (policy_queue != nullptr) {
     scheduler = [policy_queue](int64_t delay_ms,
                                absl::AnyInvocable<void() &&> task) {
       policy_queue->PostDelayedTask(std::move(task),
                                     webrtc::TimeDelta::Millis(delay_ms));
     };
+    if constexpr (kRootEchoModelSupported) {
+      builder = NewRootVariantBuilder(env, processor);
+    }
   }
   return webrtc::make_ref_counted<RootApmDecorator>(
       std::move(apm), std::move(scheduler), RootApmDecorator::Clock(),
-      std::move(capture_state));
+      std::move(capture_state), std::move(builder));
 }
 
 // =============================================================================

@@ -203,6 +203,24 @@ pub mod ffi {
         pub speech_frames: u64,
         pub speech_closed_frames: u64,
         pub speech_unavailable_frames: u64,
+
+        /// The echo model exists (the factory's APM can switch to it). Its
+        /// mode, state, reason and the playout device's kind (proto wire
+        /// values), APM switches, inferences, the inference mean and maximum
+        /// since the previous read (NaN and 0 without one), the last window's
+        /// p99 (NaN before one), and the measured-echo latch and kill switch.
+        pub echo_model_available: bool,
+        pub echo_model: u32,
+        pub echo_model_state: u32,
+        pub echo_model_reason: u32,
+        pub output_device_kind: u32,
+        pub echo_model_swaps: u64,
+        pub echo_model_inferences: u64,
+        pub echo_model_inference_mean_us: f32,
+        pub echo_model_inference_max_us: u64,
+        pub echo_model_inference_p99_us: f32,
+        pub echo_model_measured_echo: bool,
+        pub echo_model_kill_switch: bool,
     }
 
     /// A RootAudioMonitor's counters (tests).
@@ -245,6 +263,9 @@ pub mod ffi {
         /// 0 off, 1 ring, 2 gate; other values are off.
         pub has_speech_detection: bool,
         pub speech_detection: u32,
+        /// 0 off, 1 on, 2 auto; other values are off.
+        pub has_echo_model: bool,
+        pub echo_model: u32,
     }
 
     /// The stored controls (tests).
@@ -481,6 +502,7 @@ pub mod ffi {
         /// With no platform ADM (one that failed to initialize).
         fn new_adm_proxy_harness_without_platform_adm() -> UniquePtr<AdmProxyHarness>;
         fn take_calls(self: &AdmProxyHarness) -> Vec<String>;
+        fn take_playout_opened(self: &AdmProxyHarness) -> Vec<String>;
         /// The fake's channel, speaker and microphone calls and the channels of
         /// every InitPlayout ("InitPlayout stereo"), kept apart from take_calls.
         fn take_channel_calls(self: &AdmProxyHarness) -> Vec<String>;

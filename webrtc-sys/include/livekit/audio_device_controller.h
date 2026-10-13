@@ -238,6 +238,9 @@ class AdmProxyHarness {
 
   // Calls the fake got since the last take, e.g. "StartPlayout".
   rust::Vec<rust::String> take_calls() const;
+  // The playout opens AdmProxy reported since the last take: "default" or
+  // "<guid>|<name>".
+  rust::Vec<rust::String> take_playout_opened() const;
   // Its channel, speaker and microphone calls since the last take, and the
   // channels of every InitPlayout ("InitPlayout stereo"), kept apart.
   rust::Vec<rust::String> take_channel_calls() const;
@@ -360,6 +363,11 @@ class AdmProxyHarness {
   std::unique_ptr<std::vector<std::unique_ptr<RootFakeFxPipeline>>> fakes_;
   std::unique_ptr<AudioDeviceController> controller_;
   std::unique_ptr<HarnessTransport> transport_;
+  struct OpenedLog {
+    webrtc::Mutex mutex;
+    std::vector<std::string> entries;
+  };
+  std::shared_ptr<OpenedLog> opened_ = std::make_shared<OpenedLog>();
 };
 
 std::unique_ptr<AdmProxyHarness> new_adm_proxy_harness(

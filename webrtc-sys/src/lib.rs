@@ -39,9 +39,12 @@ pub mod root_audio_processing;
 pub mod root_denoiser;
 pub mod root_screen_audio;
 pub mod root_screen_audio_pipewire_graph;
+pub mod root_echo_model;
 
 #[cfg(test)]
 mod adm_proxy_tests;
+#[cfg(all(test, not(any(target_os = "ios", target_os = "android"))))]
+mod root_echo_model_tests;
 #[cfg(all(test, not(any(target_os = "ios", target_os = "android"))))]
 mod root_engine_tests;
 #[cfg(all(test, not(any(target_os = "ios", target_os = "android"))))]

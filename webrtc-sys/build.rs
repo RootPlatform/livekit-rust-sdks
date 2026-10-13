@@ -60,6 +60,7 @@ fn main() {
         "src/root_denoiser.rs",
         "src/root_screen_audio.rs",
         "src/root_screen_audio_pipewire_graph.rs",
+        "src/root_echo_model.rs",
         "src/packet_trailer.rs",
     ];
 
@@ -104,6 +105,7 @@ fn main() {
         "src/root_screen_audio.cpp",
         "src/root_screen_audio_harness.cpp",
         "src/screen_audio/root_screen_audio_pipewire_graph.cpp",
+        "src/root_echo_model.cpp",
         "src/root_speech_detector.cpp",
         "src/root_voice_engine_hold.cpp",
         "src/audio_resampler.cpp",
@@ -170,6 +172,7 @@ fn main() {
             println!("cargo:rustc-link-lib=dylib=crypt32");
             println!("cargo:rustc-link-lib=dylib=iphlpapi");
             println!("cargo:rustc-link-lib=dylib=ole32");
+            println!("cargo:rustc-link-lib=dylib=cfgmgr32");
             println!("cargo:rustc-link-lib=dylib=secur32");
             println!("cargo:rustc-link-lib=dylib=winmm");
             println!("cargo:rustc-link-lib=dylib=ws2_32");

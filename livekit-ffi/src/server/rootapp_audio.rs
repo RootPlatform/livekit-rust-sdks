@@ -40,8 +40,8 @@ use std::{
 
 use livekit::{
     prelude::*, sanitize_volume, webrtc::stats::RtcStats, AudioDeviceResults, AudioDeviceSelection,
-    CaptureFormat, DenoiserCompletion, DenoiserState, EffectPlay, LocalSpeaking, PlatformAudio,
-    PushToTalk, ReturnedPipeline, RootAudioControl, RootAudioStats, SpeechDetection,
+    CaptureFormat, DenoiserCompletion, DenoiserState, EchoModel, EffectPlay, LocalSpeaking,
+    PlatformAudio, PushToTalk, ReturnedPipeline, RootAudioControl, RootAudioStats, SpeechDetection,
 };
 use parking_lot::Mutex;
 use tokio::time::MissedTickBehavior;
@@ -67,6 +67,7 @@ pub const CAP_MONITOR: u64 = 1 << 10;
 pub const CAP_APM_DECORATOR: u64 = 1 << 11;
 pub const CAP_SPEECH_DETECTION: u64 = 1 << 12;
 pub const CAP_SCREEN_AUDIO: u64 = 1 << 13;
+pub const CAP_ECHO_MODEL: u64 = 1 << 14;
 
 /// Target OSes whose native screen-audio backend is built (webrtc-sys
 /// `root_screen_audio_backend.h`; one backend file per OS in its build.rs).
@@ -75,10 +76,11 @@ const SCREEN_AUDIO_OS: bool =
 
 /// What `livekit_ffi_rootapp_audio_caps` reports. The ADM hardening is desktop
 /// only, so mobile builds report nothing. The voice chain (DSP), the mic test
-/// monitor (MONITOR, fed by the chain's capture processor) and the speech
-/// detector the chain gates with (SPEECH_DETECTION) run wherever the factory
-/// builds its APM (webrtc-sys `kRootDspSupported`); the Effects SDK slot
-/// (DENOISER) only where the SDK's x64/arm64 calling convention holds
+/// monitor (MONITOR, fed by the chain's capture processor), the speech
+/// detector the chain gates with (SPEECH_DETECTION) and the echo model the
+/// APM switches to (ECHO_MODEL) run wherever the factory builds its APM
+/// (webrtc-sys `kRootDspSupported`, `kRootEchoModelSupported`); the Effects
+/// SDK slot (DENOISER) only where the SDK's x64/arm64 calling convention holds
 /// (`kRootDenoiserSupported`); native screen audio (SCREEN_AUDIO) where an OS
 /// backend is built (`SCREEN_AUDIO_OS`).
 pub const ROOTAPP_AUDIO_CAPS: u64 = if cfg!(any(target_os = "ios", target_os = "android")) {
@@ -98,6 +100,7 @@ pub const ROOTAPP_AUDIO_CAPS: u64 = if cfg!(any(target_os = "ios", target_os = "
         | CAP_APM_DECORATOR
         | CAP_SPEECH_DETECTION
         | if SCREEN_AUDIO_OS { CAP_SCREEN_AUDIO } else { 0 }
+        | if livekit::ECHO_MODEL_AVAILABLE { CAP_ECHO_MODEL } else { 0 }
 };
 
 const NOT_SUPPORTED: &str = "not supported by this build";
@@ -893,6 +896,7 @@ pub fn root_audio_control(control: &proto::RootAudioControl) -> RootAudioControl
         gain_reset_db: control.gain_reset_db,
         denoiser_wanted: control.denoiser_wanted,
         speech_detection: control.speech_detection.map(speech_detection),
+        echo_model: control.echo_model.map(echo_model),
     }
     .sanitized()
 }
@@ -900,6 +904,11 @@ pub fn root_audio_control(control: &proto::RootAudioControl) -> RootAudioControl
 /// The proto's RootAudioSpeechDetection; a value this build does not know is off.
 fn speech_detection(value: i32) -> SpeechDetection {
     u32::try_from(value).map_or(SpeechDetection::Off, SpeechDetection::from_wire)
+}
+
+/// The proto's RootAudioEchoModel; a value this build does not know is off.
+fn echo_model(value: i32) -> EchoModel {
+    u32::try_from(value).map_or(EchoModel::Off, EchoModel::from_wire)
 }
 
 /// An effect clip from the host's memory: `sample_count` int16 samples at
@@ -1204,7 +1213,19 @@ pub fn on_set_monitor(
 
 impl From<RootAudioStats> for proto::RootAudioStats {
     fn from(stats: RootAudioStats) -> Self {
+        let echo = stats.echo_model;
         Self {
+            echo_model: echo.map(|e| e.mode.to_wire() as i32),
+            echo_model_state: echo.map(|e| e.state.to_wire() as i32),
+            echo_model_reason: echo.map(|e| e.reason.to_wire() as i32),
+            output_device_kind: echo.map(|e| e.output_device_kind.to_wire() as i32),
+            echo_model_swaps: echo.map(|e| e.swaps),
+            echo_model_inferences: echo.map(|e| e.inferences),
+            echo_model_inference_mean_us: echo.map(|e| e.inference_mean_us),
+            echo_model_inference_max_us: echo.map(|e| e.inference_max_us),
+            echo_model_inference_p99_us: echo.map(|e| e.inference_p99_us),
+            echo_model_measured_echo: echo.map(|e| e.measured_echo),
+            echo_model_kill_switch: echo.map(|e| e.kill_switch),
             capture_callbacks: stats.capture_callbacks,
             render_callbacks: stats.render_callbacks,
             capture_max_gap_us: stats.capture_max_gap_us,
@@ -1330,13 +1351,13 @@ mod tests {
         if !mobile {
             let screen = if SCREEN_AUDIO_OS { CAP_SCREEN_AUDIO } else { 0 };
             let expected = if cfg!(target_pointer_width = "64") {
-                0b1_1111_1111_1111
+                0b101_1111_1111_1111
             } else {
-                0b1_1101_1111_1111
+                0b101_1101_1111_1111
             } | screen;
             assert_eq!(ROOTAPP_AUDIO_CAPS, expected);
             if cfg!(all(target_pointer_width = "64", target_os = "windows")) {
-                assert_eq!(ROOTAPP_AUDIO_CAPS, 16383);
+                assert_eq!(ROOTAPP_AUDIO_CAPS, 32767);
             }
         }
         assert_eq!(
@@ -1365,6 +1386,133 @@ mod tests {
             ROOTAPP_AUDIO_CAPS & CAP_DENOISER != 0,
             !crate::cabi::livekit_ffi_rootapp_denoiser_notification_handler().is_null()
         );
+    }
+
+    #[test]
+    fn rootapp_audio_echo_model_bit_is_14_where_the_native_model_is() {
+        assert_eq!(CAP_ECHO_MODEL, 1 << 14);
+        assert_eq!(CAP_ECHO_MODEL & (CAP_SPEECH_DETECTION | (1 << 13)), 0);
+        assert_eq!(ROOTAPP_AUDIO_CAPS & CAP_ECHO_MODEL != 0, livekit::ECHO_MODEL_AVAILABLE);
+        assert_eq!(
+            ROOTAPP_AUDIO_CAPS & CAP_ECHO_MODEL != 0,
+            webrtc_sys::root_echo_model::ffi::root_echo_model_supported()
+        );
+        assert_eq!(
+            ROOTAPP_AUDIO_CAPS & CAP_ECHO_MODEL != 0,
+            webrtc_sys::root_audio_processing::ffi::root_dsp_supported()
+        );
+    }
+
+    #[test]
+    fn rootapp_audio_control_maps_the_echo_model_and_turns_unknown_modes_off() {
+        let mode = |value: Option<i32>| {
+            root_audio_control(&proto::RootAudioControl { echo_model: value, ..Default::default() })
+                .echo_model
+        };
+        assert_eq!(mode(None), None);
+        assert_eq!(mode(Some(proto::RootAudioEchoModel::Off as i32)), Some(EchoModel::Off));
+        assert_eq!(mode(Some(proto::RootAudioEchoModel::On as i32)), Some(EchoModel::On));
+        assert_eq!(mode(Some(proto::RootAudioEchoModel::Auto as i32)), Some(EchoModel::Auto));
+        assert_eq!(mode(Some(3)), Some(EchoModel::Off));
+        assert_eq!(mode(Some(-1)), Some(EchoModel::Off));
+        let control = root_audio_control(&proto::RootAudioControl {
+            mic_muted: Some(true),
+            echo_model: Some(proto::RootAudioEchoModel::Auto as i32),
+            ..Default::default()
+        });
+        assert_eq!(control.mic_muted, Some(true));
+        assert_eq!(control.supported_by_this_build(), livekit::ECHO_MODEL_AVAILABLE);
+    }
+
+    #[test]
+    fn rootapp_audio_echo_model_stats_convert_and_stay_absent_without_the_model() {
+        let stats = RootAudioStats {
+            echo_model: Some(livekit::EchoModelStats {
+                mode: EchoModel::Auto,
+                state: livekit::EchoModelState::Starting,
+                reason: livekit::EchoModelReason::MeasuredEcho,
+                output_device_kind: livekit::OutputDeviceKind::Bluetooth,
+                swaps: 3,
+                inferences: 1250,
+                inference_mean_us: 180.5,
+                inference_max_us: 640,
+                inference_p99_us: 410.0,
+                measured_echo: true,
+                kill_switch: false,
+            }),
+            ..Default::default()
+        };
+        let p: proto::RootAudioStats = stats.into();
+        assert_eq!(p.echo_model, Some(proto::RootAudioEchoModel::Auto as i32));
+        assert_eq!(p.echo_model_state, Some(proto::RootAudioEchoModelState::Starting as i32));
+        assert_eq!(p.echo_model_reason, Some(proto::RootAudioEchoModelReason::MeasuredEcho as i32));
+        assert_eq!(p.output_device_kind, Some(proto::RootAudioOutputDeviceKind::Bluetooth as i32));
+        assert_eq!((p.echo_model_swaps, p.echo_model_inferences), (Some(3), Some(1250)));
+        assert_eq!(p.echo_model_inference_mean_us, Some(180.5));
+        assert_eq!(p.echo_model_inference_max_us, Some(640));
+        assert_eq!(p.echo_model_inference_p99_us, Some(410.0));
+        assert_eq!(
+            (p.echo_model_measured_echo, p.echo_model_kill_switch),
+            (Some(true), Some(false))
+        );
+
+        use livekit::{EchoModelReason as R, EchoModelState as S, OutputDeviceKind as K};
+        use proto::{
+            RootAudioEchoModelReason as PR, RootAudioEchoModelState as PS,
+            RootAudioOutputDeviceKind as PK,
+        };
+        let kinds = [
+            (K::NoDevice, PK::None),
+            (K::Unknown, PK::Unknown),
+            (K::Speakers, PK::Speakers),
+            (K::LineOut, PK::LineOut),
+            (K::DisplayAudio, PK::DisplayAudio),
+            (K::Headphones, PK::Headphones),
+            (K::Headset, PK::Headset),
+            (K::Handset, PK::Handset),
+            (K::Bluetooth, PK::Bluetooth),
+        ];
+        for (kind, wire) in kinds {
+            assert_eq!(kind.to_wire() as i32, wire as i32, "{kind:?}");
+        }
+        let states = [
+            (S::Off, PS::Off),
+            (S::On, PS::On),
+            (S::Starting, PS::Starting),
+            (S::Stopping, PS::Stopping),
+        ];
+        for (state, wire) in states {
+            assert_eq!(state.to_wire() as i32, wire as i32, "{state:?}");
+        }
+        let reasons = [
+            (R::ModeOff, PR::ModeOff),
+            (R::ModeOn, PR::ModeOn),
+            (R::DeviceKind, PR::DeviceKind),
+            (R::MeasuredEcho, PR::MeasuredEcho),
+            (R::KillSwitch, PR::KillSwitch),
+            (R::Unavailable, PR::Unavailable),
+        ];
+        for (reason, wire) in reasons {
+            assert_eq!(reason.to_wire() as i32, wire as i32, "{reason:?}");
+        }
+        for (mode, wire) in [
+            (EchoModel::Off, proto::RootAudioEchoModel::Off),
+            (EchoModel::On, proto::RootAudioEchoModel::On),
+            (EchoModel::Auto, proto::RootAudioEchoModel::Auto),
+        ] {
+            assert_eq!(mode.to_wire() as i32, wire as i32, "{mode:?}");
+        }
+
+        let absent: proto::RootAudioStats = RootAudioStats::default().into();
+        assert_eq!((absent.echo_model, absent.echo_model_state), (None, None));
+        assert_eq!((absent.echo_model_reason, absent.output_device_kind), (None, None));
+        assert_eq!((absent.echo_model_swaps, absent.echo_model_inferences), (None, None));
+        assert_eq!(
+            (absent.echo_model_inference_mean_us, absent.echo_model_inference_p99_us),
+            (None, None)
+        );
+        assert_eq!(absent.echo_model_inference_max_us, None);
+        assert_eq!((absent.echo_model_measured_echo, absent.echo_model_kill_switch), (None, None));
     }
 
     #[test]
@@ -1402,9 +1550,11 @@ mod tests {
             gain_reset_db: Some(f32::NAN),
             denoiser_wanted: Some(true),
             speech_detection: Some(proto::RootAudioSpeechDetection::Gate as i32),
+            echo_model: Some(proto::RootAudioEchoModel::Auto as i32),
         });
         assert_eq!(control.denoiser_wanted, Some(true));
         assert_eq!(control.speech_detection, Some(SpeechDetection::Gate));
+        assert_eq!(control.echo_model, Some(EchoModel::Auto));
         assert_eq!(control.push_to_talk, Some(PushToTalk::Released));
         assert_eq!(control.input_volume, Some(0.0));
         assert_eq!(control.master_volume, Some(2.0));

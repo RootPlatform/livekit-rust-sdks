@@ -24,6 +24,8 @@
 #include <string>
 #include <utility>
 
+#include "livekit/root_echo_model.h"
+
 namespace livekit_ffi {
 namespace {
 
@@ -436,6 +438,22 @@ RootAudioNativeStats AudioDeviceController::root_audio_stats() const {
     stats.apm_policy_forced = policy.forced;
     stats.apm_policy_pending = policy.pending;
   }
+  if (RootEchoModelController* echo_model =
+          apm_ ? apm_->echo_model() : nullptr) {
+    const RootEchoModelStatsSnapshot echo = echo_model->ReadStats();
+    stats.echo_model_available = true;
+    stats.echo_model = static_cast<uint32_t>(echo.mode);
+    stats.echo_model_state = static_cast<uint32_t>(echo.state);
+    stats.echo_model_reason = static_cast<uint32_t>(echo.reason);
+    stats.output_device_kind = static_cast<uint32_t>(echo.kind);
+    stats.echo_model_swaps = echo.swaps;
+    stats.echo_model_inferences = echo.inferences;
+    stats.echo_model_inference_mean_us = echo.inference_mean_us;
+    stats.echo_model_inference_max_us = echo.inference_max_us;
+    stats.echo_model_inference_p99_us = echo.inference_p99_us;
+    stats.echo_model_measured_echo = echo.measured_echo;
+    stats.echo_model_kill_switch = echo.kill_switch;
+  }
   if (capture_ && capture_->monitor) {
     const RootAudioMonitorStats monitor = capture_->monitor->Read();
     stats.monitor_available = true;
@@ -460,6 +478,10 @@ bool AudioDeviceController::set_root_audio_control(
   const bool mixer_fields = control.has_master_volume || control.has_deafened;
   const bool apm_fields =
       control.has_echo_cancellation || control.has_noise_suppression;
+  RootEchoModelController* echo_model = apm_ ? apm_->echo_model() : nullptr;
+  if (control.has_echo_model && echo_model) {
+    echo_model->SetMode(RootEchoModelModeFromWire(control.echo_model));
+  }
   if (capture_) {
     if (control.has_mic_muted || control.has_push_to_talk) {
       capture_->SetGate(control.has_mic_muted
@@ -532,7 +554,7 @@ bool AudioDeviceController::set_root_audio_control(
     capture_->denoiser_wanted.store(false, std::memory_order_relaxed);
   }
   return (capture_ || !capture_fields) && (mixer_ || !mixer_fields) &&
-         (apm_ || !apm_fields);
+         (apm_ || !apm_fields) && (echo_model || !control.has_echo_model);
 }
 
 bool AudioDeviceController::set_root_audio_source_gain(uint32_t ssrc,
@@ -597,6 +619,9 @@ void AudioDeviceController::reset_root_audio(bool close_gate) const {
   }
   if (apm_) {
     apm_->ResetPolicy();
+    if (RootEchoModelController* echo_model = apm_->echo_model()) {
+      echo_model->ResetSession();
+    }
   }
   if (denoiser_ && close_gate) {
     denoiser_->Reset();

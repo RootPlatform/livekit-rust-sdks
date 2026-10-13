@@ -117,8 +117,9 @@ pub use error::{AudioError, AudioResult};
 pub use processing::{AudioProcessingOptions, AudioProcessingType};
 pub use rootapp::{
     sanitize_volume, AudioDeviceResults, AudioDeviceSelection, CaptureFormat, DenoiserCompletion,
-    DenoiserState, EffectPlay, LocalSpeaking, MixSourceLevel, MonitorError, PushToTalk,
-    ReturnedPipeline, ReturnedPipelines, RootAudioControl, RootAudioStats, SpeechDetection,
+    DenoiserState, EchoModel, EchoModelReason, EchoModelState, EchoModelStats, EffectPlay,
+    LocalSpeaking, MixSourceLevel, MonitorError, OutputDeviceKind, PushToTalk, ReturnedPipeline,
+    ReturnedPipelines, RootAudioControl, RootAudioStats, SpeechDetection, ECHO_MODEL_AVAILABLE,
     MAX_VOICE_GAIN_DB, MAX_VOLUME,
 };
 
@@ -1020,7 +1021,8 @@ impl PlatformAudio {
     /// capture processor, as on mobile, or no APM decorator); the other fields
     /// are applied.
     pub fn set_rootapp_control(&self, control: &RootAudioControl) -> AudioResult<()> {
-        if self.handle.runtime.set_root_audio_control(&control.to_native()) {
+        let applied = self.handle.runtime.set_root_audio_control(&control.to_native());
+        if applied && control.supported_by_this_build() {
             Ok(())
         } else {
             Err(AudioError::OperationFailed("a control is not supported by this build".into()))

@@ -23,6 +23,7 @@ members = [
     "webrtc-sys",
     "webrtc-sys/build",
     "rootapp-voice-dsp",
+    "rootapp-echo-model",
 
     "examples/agent_dispatch",
     "examples/api",
@@ -111,3 +112,10 @@ codegen-units = 1
 panic = "abort"
 strip = "symbols"
 debug = false
+
+# The echo model runs about 1.8 M multiply-accumulates every 8 ms on the capture thread.
+[profile.release.package.rootapp-echo-model]
+opt-level = 3
+
+[profile.release.package.rustfft]
+opt-level = 3
