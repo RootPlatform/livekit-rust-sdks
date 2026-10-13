@@ -808,6 +808,7 @@ class SckScreenAudioBackend final : public ScreenAudioBackend {
 
     result.format.sample_rate = rate;
     result.format.channels = kChannels;
+    result.process_id = static_cast<uint32_t>(watched);
     return result;
   }
 
