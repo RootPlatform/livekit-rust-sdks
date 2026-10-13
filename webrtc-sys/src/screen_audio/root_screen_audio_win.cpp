@@ -380,6 +380,7 @@ class WasapiProcessLoopbackBackend final : public ScreenAudioBackend {
       result.scope = resolved_.scope;
       result.process_id = resolved_.pid;
       result.detail = resolved_.detail;
+      result.limitation = ScreenAudioLimitation::kTargetIsRootAncestor;
       return result;
     }
     sink_ = sink;

@@ -1084,6 +1084,7 @@ RootScreenAudioEventData StartedEvent(uint64_t async_id,
   event.channels = static_cast<uint32_t>(result.format.channels);
   event.error = 0;
   event.retrying = false;
+  event.limitation = static_cast<int32_t>(result.limitation);
   return event;
 }
 
@@ -1100,6 +1101,7 @@ RootScreenAudioEventData FailedEvent(uint64_t async_id,
   event.error = static_cast<int32_t>(error);
   event.message = rust::String::lossy(message.data(), message.size());
   event.retrying = retrying;
+  event.limitation = 0;
   return event;
 }
 
@@ -1154,6 +1156,7 @@ void RootScreenAudioCapture::RunStop(uint64_t async_id) {
   event.channels = 0;
   event.error = 0;
   event.retrying = false;
+  event.limitation = 0;
   {
     std::lock_guard<std::mutex> lock(state_mutex_);
     state_ = ScreenAudioState::kStopped;

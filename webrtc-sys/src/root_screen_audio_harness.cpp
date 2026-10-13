@@ -345,6 +345,18 @@ void RootScreenAudioCaptureHarness::script_start_for(int32_t scope,
   backends_->starts.push_back(result);
 }
 
+void RootScreenAudioCaptureHarness::script_start_limited(int32_t scope,
+                                                         uint32_t process_id,
+                                                         int32_t limitation) const {
+  ScreenAudioStartResult result;
+  result.detail = "fake: scripted limited target " + std::to_string(process_id);
+  result.scope = static_cast<ScreenAudioScope>(scope);
+  result.process_id = process_id;
+  result.limitation = static_cast<ScreenAudioLimitation>(limitation);
+  std::lock_guard<std::mutex> lock(backends_->mutex);
+  backends_->starts.push_back(result);
+}
+
 void RootScreenAudioCaptureHarness::script_stop(bool ok, int32_t delay_ms) const {
   std::lock_guard<std::mutex> lock(backends_->mutex);
   backends_->stops.push_back({ok, delay_ms});

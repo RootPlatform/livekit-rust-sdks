@@ -750,6 +750,25 @@ fn screen_audio_capture_restart_keeps_to_the_first_process() {
     assert!(!h.last_target_restart());
 }
 
+/// Windows: a target that started Root captures nothing; the started event
+/// says why, so the host can tell the user.
+#[test]
+fn screen_audio_capture_started_carries_the_limitation() {
+    let h = capture();
+    h.script_start_limited(1, 700, 1);
+    h.start(&RootScreenAudioTargetSpec { kind: 1, process_id: 700, ..Default::default() }, 3);
+    let events = h.wait_events(1, 2000);
+    assert_eq!(kinds(&events), vec![STARTED]);
+    assert_eq!(events[0].async_id, 3);
+    assert_eq!(events[0].scope, 1);
+    assert_eq!(events[0].limitation, 1);
+    // An ordinary start has none.
+    h.start(&system(), 4);
+    let events = h.wait_events(1, 2000);
+    assert_eq!(kinds(&events), vec![STARTED]);
+    assert_eq!(events[0].limitation, 0);
+}
+
 #[test]
 fn screen_audio_capture_restart_may_narrow_a_system_start() {
     let h = capture();

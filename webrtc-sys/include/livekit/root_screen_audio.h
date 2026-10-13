@@ -507,6 +507,9 @@ class RootScreenAudioCaptureHarness {
                     int32_t channels,
                     int32_t scope) const;
   void script_start_for(int32_t scope, uint32_t process_id) const;
+  void script_start_limited(int32_t scope,
+                            uint32_t process_id,
+                            int32_t limitation) const;
   void script_stop(bool ok, int32_t delay_ms) const;
   void fail_running(int32_t error) const;
   void pause_running(bool paused) const;

@@ -523,8 +523,9 @@ message RootAudioEvent {
 // What to capture. Absent or `system`: everything the machine plays except this process and its
 // children (the call's own playout, so remote voices are never sent back). Windows: a process (or a
 // window's owner) that is an ancestor of this process, such as explorer.exe for a File Explorer
-// window, captures nothing (its tree holds this process's playout); the started description says
-// so. A restart never widens: when the first start captured one process or application and a
+// window or the browser that opened a root:// link, captures nothing (its tree holds this process's
+// playout); started.limitation is TARGET_IS_ROOT_ANCESTOR and the description says so. A restart
+// never widens: when the first start captured one process or application and a
 // restart resolves to all audio or to another process, the capture ends with failed (TARGET_GONE,
 // retrying false).
 message RootScreenAudioTarget {
@@ -667,16 +668,29 @@ message RootScreenAudioStatsResponse {
   optional string error = 2;
 }
 
+// Why a started capture captures less than its target (RootScreenAudioStarted.limitation).
+enum RootScreenAudioLimitation {
+  ROOT_SCREEN_AUDIO_LIMITATION_NONE = 0;
+  // Windows: the target process (or the shared window's owner) is an ancestor of this process, such
+  // as File Explorer or the browser that started it. Its tree holds this process's own playout and
+  // all audio would be wider than the pick, so nothing is captured: the stream stays silent (stats:
+  // WAITING) until the handle is dropped. A restart of this process from elsewhere (the Start menu)
+  // lifts it.
+  ROOT_SCREEN_AUDIO_LIMITATION_TARGET_IS_ROOT_ANCESTOR = 1;
+}
+
 // The OS capture runs. async_id is the start request's, 0 for a restart after a failure. description
 // says what it captures, e.g. "process 1234 (chrome.exe) and its children" or "window not found; all
 // audio except process 5678 and its children". sample_rate and channels are the OS capture's (native
-// converts to the source's format).
+// converts to the source's format). limitation: set when the capture knowingly captures less than
+// its target (absent: NONE).
 message RootScreenAudioStarted {
   required uint64 async_id = 1;
   required RootScreenAudioScope scope = 2;
   required string description = 3;
   required uint32 sample_rate = 4;
   required uint32 channels = 5;
+  optional RootScreenAudioLimitation limitation = 6;
 }
 // A start failed (async_id the start request's) or a running capture failed (async_id 0). retrying:
 // native restarts it; false: it gave up and the stream stays silent until the handle is dropped.

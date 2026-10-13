@@ -141,6 +141,7 @@ pub(crate) fn event_message(
                 description: event.description.clone(),
                 sample_rate: event.sample_rate,
                 channels: event.channels,
+                limitation: limitation(event.limitation).map(|l| l as i32),
             }
             .into(),
         ),
@@ -166,6 +167,15 @@ pub(crate) fn event_message(
 
 fn scope(value: i32) -> proto::RootScreenAudioScope {
     proto::RootScreenAudioScope::try_from(value).unwrap_or(proto::RootScreenAudioScope::System)
+}
+
+/// None for NONE and for codes this protocol does not know (the started
+/// event then carries no limitation).
+fn limitation(value: i32) -> Option<proto::RootScreenAudioLimitation> {
+    match proto::RootScreenAudioLimitation::try_from(value) {
+        Ok(proto::RootScreenAudioLimitation::None) | Err(_) => None,
+        Ok(known) => Some(known),
+    }
 }
 
 fn error(value: i32) -> proto::RootScreenAudioError {
@@ -474,8 +484,32 @@ mod tests {
                 description: "application 'Music'".into(),
                 sample_rate: 44_100,
                 channels: 1,
+                limitation: None,
             }))
         );
+        let Some(Message::Started(ancestor)) = event_message(&sys::RootScreenAudioEventData {
+            kind: EVENT_STARTED,
+            scope: 1,
+            description: "process 7 (chrome.exe) is an ancestor of this process".into(),
+            limitation: 1,
+            ..Default::default()
+        }) else {
+            panic!("not a start");
+        };
+        assert_eq!(
+            ancestor.limitation,
+            Some(proto::RootScreenAudioLimitation::TargetIsRootAncestor as i32)
+        );
+        for unknown in [0, 77, -1] {
+            let Some(Message::Started(plain)) = event_message(&sys::RootScreenAudioEventData {
+                kind: EVENT_STARTED,
+                limitation: unknown,
+                ..Default::default()
+            }) else {
+                panic!("not a start");
+            };
+            assert_eq!(plain.limitation, None, "limitation code {unknown}");
+        }
         let failed = event_message(&sys::RootScreenAudioEventData {
             kind: EVENT_FAILED,
             error: 4,

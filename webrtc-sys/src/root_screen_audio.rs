@@ -43,6 +43,8 @@ pub mod ffi {
         pub error: i32,
         pub message: String,
         pub retrying: bool,
+        /// Started: RootScreenAudioLimitation (0 none).
+        pub limitation: i32,
     }
 
     #[derive(Debug, Clone, Default)]
@@ -148,6 +150,14 @@ pub mod ffi {
         /// The next backend start succeeds at 48 kHz stereo and resolves this
         /// scope and process.
         fn script_start_for(self: &RootScreenAudioCaptureHarness, scope: i32, process_id: u32);
+        /// The next backend start succeeds at 48 kHz stereo, resolves this
+        /// scope and process and reports this limitation.
+        fn script_start_limited(
+            self: &RootScreenAudioCaptureHarness,
+            scope: i32,
+            process_id: u32,
+            limitation: i32,
+        );
         /// The next backend stop returns `ok` after `delay_ms`.
         fn script_stop(self: &RootScreenAudioCaptureHarness, ok: bool, delay_ms: i32);
         /// The running backend reports `error` from its audio thread.

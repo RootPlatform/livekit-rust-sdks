@@ -99,6 +99,13 @@ struct ScreenAudioFormat {
   int channels = 2;         // 1..8
 };
 
+// RootScreenAudioLimitation in rootapp_audio.proto, same values.
+enum class ScreenAudioLimitation : int32_t {
+  kNone = 0,
+  // The target is an ancestor of this process (Windows): nothing is captured.
+  kTargetIsRootAncestor = 1,
+};
+
 struct ScreenAudioStartResult {
   ScreenAudioError error = ScreenAudioError::kNone;
   // The error, or on success how the target resolved, for the host's log
@@ -111,6 +118,8 @@ struct ScreenAudioStartResult {
   // 0 for kSystem. A restart that resolves another scope or process than the
   // first start ends the capture with kTargetGone: it never widens.
   uint32_t process_id = 0;
+  // A success that knowingly captures less than the target.
+  ScreenAudioLimitation limitation = ScreenAudioLimitation::kNone;
 };
 
 // The core's side of a running backend.
