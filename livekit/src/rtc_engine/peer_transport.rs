@@ -34,6 +34,7 @@ struct TransportInner {
     single_pc_mode: bool,
     pending_initial_offer: Option<SessionDescription>,
     stereo_track_ids: HashSet<String>,
+    external_track_ids: HashSet<String>,
     last_offer_sdp: Option<String>,
     send_codec_pins: HashMap<String, SendCodecPin>,
 }
@@ -135,6 +136,7 @@ impl PeerTransport {
                 single_pc_mode,
                 pending_initial_offer: None,
                 stereo_track_ids: HashSet::new(),
+                external_track_ids: HashSet::new(),
                 last_offer_sdp: None,
                 send_codec_pins: HashMap::new(),
             })),
@@ -253,6 +255,12 @@ impl PeerTransport {
 
     pub async fn add_stereo_track(&self, track_id: String) {
         self.inner.lock().await.stereo_track_ids.insert(track_id);
+    }
+
+    /// An audio track fed by an external source (`RtcAudioSource::Native`); see
+    /// `pin_send_codecs`.
+    pub async fn add_external_audio_track(&self, track_id: String) {
+        self.inner.lock().await.external_track_ids.insert(track_id);
     }
 
     /// Create an initial offer without setting it as local description.
@@ -582,6 +590,7 @@ impl PeerTransport {
         let pinned = Self::pin_send_codecs(
             offer_sdp,
             &answer_sdp,
+            &inner.external_track_ids,
             &inner.stereo_track_ids,
             &mut inner.send_codec_pins,
         );
@@ -647,23 +656,30 @@ impl PeerTransport {
         }
     }
 
-    /// Keeps each audio send section's codec as the first answer set it.
+    /// Keeps the codec of each audio send section whose track has an external source
+    /// (`external_track_ids`, `RtcAudioSource::Native` tracks) as the first answer set it.
     ///
     /// The pinned libwebrtc prebuilt (external_audio_source.patch without its
     /// StoreEncoderProperties fix) registers an external-source send stream, such as screen-share
-    /// audio, with AudioState when the stream's send codec (format, payload type or RED) changes
-    /// while it sends. With the platform device module recording, the microphone then reaches that
-    /// stream next to the source's own frames: twice the audio rate, garbled at the receiver, and a
-    /// dangling AudioState entry once the track is unpublished. LiveKit server's answers do not
-    /// always give a track the same Opus parameters: it adds `stereo=1;maxaveragebitrate=510000` only
-    /// when it resolves the track for that answer, and with a single peer connection (1.13.7) the
-    /// first answer for a stereo track lacks `maxaveragebitrate` and every later one has it. So later
-    /// answers get the first answer's payload order and Opus fmtp back. A section whose offer no
-    /// longer sends that track drops its pin. A stereo track's first answer gets `stereo=1` when the
-    /// server left it out.
+    /// audio or the managed engine's mic, with AudioState when the stream's send codec (format,
+    /// payload type or RED) changes while it sends. With the platform device module recording, the
+    /// microphone then reaches that stream next to the source's own frames: twice the audio rate,
+    /// garbled at the receiver, and a dangling AudioState entry once the track is unpublished.
+    /// LiveKit server's answers do not always give a track the same Opus parameters: it adds
+    /// `stereo=1;maxaveragebitrate=510000` only when it resolves the track for that answer, and with
+    /// a single peer connection (1.13.7) the first answer for a stereo track lacks
+    /// `maxaveragebitrate` and every later one has it. So later answers get the first answer's
+    /// payload order and Opus fmtp back. A section whose offer no longer sends that track drops its
+    /// pin. A stereo track's first answer gets `stereo=1` when the server left it out.
+    ///
+    /// A device track (`RtcAudioSource::Device`, the platform engine's mic) is fed through AudioState
+    /// anyway, so the bug never reaches it, and its section takes every answer as the server gives
+    /// it. Pinned, it kept a first answer that echoed the single-PC offer's `stereo=1` without
+    /// `usedtx=1`, and the mic sent stereo Opus with DTX off for the whole call.
     fn pin_send_codecs(
         offer_sdp: &str,
         answer_sdp: &str,
+        external_track_ids: &HashSet<String>,
         stereo_track_ids: &HashSet<String>,
         pins: &mut HashMap<String, SendCodecPin>,
     ) -> String {
@@ -678,6 +694,7 @@ impl PeerTransport {
                 let track_id = Self::section_attribute(s, "msid")?.split_whitespace().nth(1)?;
                 Some((mid.to_string(), track_id.to_string()))
             })
+            .filter(|(_, track_id)| external_track_ids.contains(track_id))
             .collect();
         pins.retain(|mid, pin| sending.get(mid) == Some(&pin.track_id));
 
@@ -836,7 +853,7 @@ mod tests {
 
     use libwebrtc::peer_connection::BitrateSettings;
 
-    use super::{BitratePreferences, PeerTransport};
+    use super::{BitratePreferences, PeerTransport, SendCodecPin};
 
     /// Reproduces the publisher-transport self-deadlock.
     ///
@@ -1357,26 +1374,32 @@ a=fmtp:111 minptime=10;useinbandfec=1\n";
         ])
     }
 
+    const EXTERNAL: [&str; 2] = ["screen-audio", "music"];
+
+    fn ids(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    fn pin(
+        offer: &str,
+        answer: &str,
+        stereo: &[&str],
+        pins: &mut HashMap<String, SendCodecPin>,
+    ) -> String {
+        PeerTransport::pin_send_codecs(offer, answer, &ids(&EXTERNAL), &ids(stereo), pins)
+    }
+
     #[test]
     fn later_answers_keep_the_first_answers_opus_fmtp() {
         let offer = screen_audio_offer();
         let mut pins = HashMap::new();
         let first = answer("111 63 9", RESOLVED);
-        assert_eq!(
-            PeerTransport::pin_send_codecs(&offer, &first, &HashSet::new(), &mut pins),
-            first
-        );
+        assert_eq!(pin(&offer, &first, &[], &mut pins), first);
         assert_eq!(pins.keys().collect::<Vec<_>>(), ["1"]);
 
         let flipped = answer("111 63 9", UNRESOLVED);
-        assert_eq!(
-            PeerTransport::pin_send_codecs(&offer, &flipped, &HashSet::new(), &mut pins),
-            first
-        );
-        assert_eq!(
-            PeerTransport::pin_send_codecs(&offer, &first, &HashSet::new(), &mut pins),
-            first
-        );
+        assert_eq!(pin(&offer, &flipped, &[], &mut pins), first);
+        assert_eq!(pin(&offer, &first, &[], &mut pins), first);
     }
 
     #[test]
@@ -1384,79 +1407,50 @@ a=fmtp:111 minptime=10;useinbandfec=1\n";
         let offer = screen_audio_offer();
         let mut pins = HashMap::new();
         let first = answer("111 63 9", RESOLVED);
-        PeerTransport::pin_send_codecs(&offer, &first, &HashSet::new(), &mut pins);
+        pin(&offer, &first, &[], &mut pins);
 
         let red_first = answer("63 111 9", RESOLVED);
-        assert_eq!(
-            PeerTransport::pin_send_codecs(&offer, &red_first, &HashSet::new(), &mut pins),
-            first
-        );
+        assert_eq!(pin(&offer, &red_first, &[], &mut pins), first);
 
         let fewer = answer("9 111", UNRESOLVED);
-        assert_eq!(
-            PeerTransport::pin_send_codecs(&offer, &fewer, &HashSet::new(), &mut pins),
-            answer("111 9", RESOLVED)
-        );
+        assert_eq!(pin(&offer, &fewer, &[], &mut pins), answer("111 9", RESOLVED));
     }
 
     #[test]
     fn only_send_sections_are_pinned_and_a_new_track_is_pinned_again() {
         let offer = screen_audio_offer();
         let mut pins = HashMap::new();
-        PeerTransport::pin_send_codecs(
-            &offer,
-            &answer("111 63 9", RESOLVED),
-            &HashSet::new(),
-            &mut pins,
-        );
+        pin(&offer, &answer("111 63 9", RESOLVED), &[], &mut pins);
 
         let other_track = offer.replace("a=msid:- screen-audio", "a=msid:- music");
         let unresolved = answer("111 63 9", UNRESOLVED);
-        assert_eq!(
-            PeerTransport::pin_send_codecs(&other_track, &unresolved, &HashSet::new(), &mut pins),
-            unresolved
-        );
+        assert_eq!(pin(&other_track, &unresolved, &[], &mut pins), unresolved);
         assert_eq!(pins["1"].track_id, "music");
         assert_eq!(pins["1"].opus_fmtp, [format!("a=fmtp:111 {UNRESOLVED}")]);
 
         let released = offer.replace("a=msid:- screen-audio\n", "");
         let resolved = answer("111 63 9", RESOLVED);
-        assert_eq!(
-            PeerTransport::pin_send_codecs(&released, &resolved, &HashSet::new(), &mut pins),
-            resolved
-        );
+        assert_eq!(pin(&released, &resolved, &[], &mut pins), resolved);
         assert!(pins.is_empty());
 
         let mut recv_only = HashMap::new();
         let swapped = answer("111 63 9", RESOLVED)
             .replace("a=mid:0\na=sendonly", "a=mid:0\na=sendonly\na=msid:- remote");
-        PeerTransport::pin_send_codecs(&offer, &swapped, &HashSet::new(), &mut recv_only);
+        pin(&offer, &swapped, &[], &mut recv_only);
         assert_eq!(recv_only.keys().collect::<Vec<_>>(), ["1"]);
     }
 
     #[test]
     fn a_stereo_tracks_first_answer_gets_stereo() {
         let offer = screen_audio_offer();
-        let stereo: HashSet<String> = ["screen-audio".to_string()].into();
         let mut pins = HashMap::new();
         let mono = answer("111 63 9", "minptime=10;useinbandfec=1");
-        let out = PeerTransport::pin_send_codecs(&offer, &mono, &stereo, &mut pins);
+        let out = pin(&offer, &mono, &["screen-audio"], &mut pins);
         assert_eq!(out, answer("111 63 9", "minptime=10;useinbandfec=1;stereo=1"));
-        assert_eq!(
-            PeerTransport::pin_send_codecs(
-                &offer,
-                &answer("111 63 9", RESOLVED),
-                &stereo,
-                &mut pins
-            ),
-            out
-        );
+        assert_eq!(pin(&offer, &answer("111 63 9", RESOLVED), &["screen-audio"], &mut pins), out);
 
         let mut mono_pins = HashMap::new();
-        assert_eq!(
-            PeerTransport::pin_send_codecs(&offer, &mono, &HashSet::new(), &mut mono_pins),
-            mono
-        );
+        assert_eq!(pin(&offer, &mono, &[], &mut mono_pins), mono);
     }
 
     #[test]
@@ -1464,21 +1458,87 @@ a=fmtp:111 minptime=10;useinbandfec=1\n";
         let offer = screen_audio_offer().replace('\n', "\r\n");
         let first = answer("111 63 9", RESOLVED).replace('\n', "\r\n");
         let mut pins = HashMap::new();
-        assert_eq!(
-            PeerTransport::pin_send_codecs(&offer, &first, &HashSet::new(), &mut pins),
-            first
-        );
+        assert_eq!(pin(&offer, &first, &[], &mut pins), first);
         let flipped = answer("111 63 9", UNRESOLVED).replace('\n', "\r\n");
+        assert_eq!(pin(&offer, &flipped, &[], &mut pins), first);
+    }
+
+    const MIC_FIRST: &str = "minptime=10;useinbandfec=1;stereo=1";
+    const MIC_LATER: &str = "minptime=10;useinbandfec=1;usedtx=1";
+
+    #[test]
+    fn a_device_tracks_section_is_never_pinned() {
+        let offer = screen_audio_offer().replace("a=msid:- screen-audio", "a=msid:- mic");
+        let mut pins = HashMap::new();
+        for server_answer in [
+            answer("111 63 9", MIC_FIRST),
+            answer("111 63 9", MIC_LATER),
+            answer("63 111 9", MIC_LATER),
+            answer("111 9", "minptime=10;useinbandfec=1"),
+        ] {
+            assert_eq!(pin(&offer, &server_answer, &["mic"], &mut pins), server_answer);
+        }
+        assert!(pins.is_empty());
+    }
+
+    #[test]
+    fn an_external_tracks_section_keeps_its_first_answer_through_a_dtx_change() {
+        let offer = screen_audio_offer();
+        let mut pins = HashMap::new();
+        let first = answer("111 63 9", MIC_FIRST);
+        assert_eq!(pin(&offer, &first, &[], &mut pins), first);
+        for later in [answer("111 63 9", MIC_LATER), answer("63 111 9", MIC_LATER)] {
+            assert_eq!(pin(&offer, &later, &[], &mut pins), first);
+        }
+        assert_eq!(pins.keys().collect::<Vec<_>>(), ["1"]);
+    }
+
+    #[test]
+    fn one_answer_pins_the_external_section_and_passes_the_device_section() {
+        let offer = audio_sdp(&[
+            ("0", "recvonly", None, "111 63 9", OFFERED),
+            ("1", "sendonly", Some("mic"), "111 63 9", OFFERED),
+            ("2", "sendonly", Some("screen-audio"), "111 63 9", OFFERED),
+        ]);
+        let mixed = |mic_formats: &str, mic_fmtp: &str, screen_formats: &str, screen_fmtp: &str| {
+            audio_sdp(&[
+                ("0", "sendonly", None, "111 63 9", "minptime=10;useinbandfec=1"),
+                ("1", "recvonly", None, mic_formats, mic_fmtp),
+                ("2", "recvonly", None, screen_formats, screen_fmtp),
+            ])
+        };
+        let mut pins = HashMap::new();
+        let first = mixed("111 63 9", MIC_FIRST, "111 63 9", "minptime=10;useinbandfec=1");
         assert_eq!(
-            PeerTransport::pin_send_codecs(&offer, &flipped, &HashSet::new(), &mut pins),
-            first
+            pin(&offer, &first, &["screen-audio"], &mut pins),
+            mixed("111 63 9", MIC_FIRST, "111 63 9", UNRESOLVED)
         );
+        assert_eq!(pins.keys().collect::<Vec<_>>(), ["2"]);
+
+        let later = mixed("63 111 9", MIC_LATER, "63 111 9", RESOLVED);
+        assert_eq!(
+            pin(&offer, &later, &["screen-audio"], &mut pins),
+            mixed("63 111 9", MIC_LATER, "111 63 9", UNRESOLVED)
+        );
+        let mic_only = mixed("111 63 9", MIC_LATER, "111 63 9", UNRESOLVED);
+        assert_eq!(pin(&offer, &mic_only, &["screen-audio"], &mut pins), mic_only);
     }
 
     /// A real publisher keeps its screen-audio send codec when a later answer changes the Opus
     /// parameters, as LiveKit's do once the server resolves the track.
     #[tokio::test]
-    async fn the_send_codec_survives_an_answer_that_changes_opus_parameters() {
+    async fn an_external_tracks_send_codec_survives_an_answer_that_changes_opus_parameters() {
+        send_codec_across_a_changed_answer(true).await;
+    }
+
+    /// The same track left unregistered stands in for a device track (those need the platform
+    /// ADM): the transport passes the changed answer on and the send codec follows it.
+    #[tokio::test]
+    async fn an_unregistered_tracks_send_codec_follows_an_answer_that_changes_opus_parameters() {
+        send_codec_across_a_changed_answer(false).await;
+    }
+
+    async fn send_codec_across_a_changed_answer(external: bool) {
         use std::{
             sync::{Arc, Mutex},
             time::{Duration, Instant},
@@ -1566,6 +1626,9 @@ a=fmtp:111 minptime=10;useinbandfec=1\n";
         let source = NativeAudioSource::new(AudioSourceOptions::default(), 48_000, 2, 100);
         let track = factory.create_audio_track("screen-audio", source);
         transport.add_stereo_track("screen-audio".to_string()).await;
+        if external {
+            transport.add_external_audio_track("screen-audio".to_string()).await;
+        }
         alice
             .add_transceiver(
                 MediaStreamTrack::Audio(track),
@@ -1582,21 +1645,25 @@ a=fmtp:111 minptime=10;useinbandfec=1\n";
         negotiate(&transport, &offers, &bob, |sdp| sdp, true).await;
         let first = settled_codec(&alice, None).await;
         assert_eq!(first.1, 2, "{first:?}");
-        assert!(
-            first.0.contains("stereo=1") && !first.0.contains("maxaveragebitrate"),
-            "{first:?}"
-        );
+        assert!(!first.0.contains("maxaveragebitrate"), "{first:?}");
 
         negotiate(&transport, &offers, &bob, resolved, true).await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(audio_send_codec(&alice).await.unwrap(), first);
-        let remote = alice.current_remote_description().unwrap().to_string();
-        assert!(!remote.contains("maxaveragebitrate"), "{remote}");
+        if external {
+            assert!(first.0.contains("stereo=1"), "{first:?}");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert_eq!(audio_send_codec(&alice).await.unwrap(), first);
+            let remote = alice.current_remote_description().unwrap().to_string();
+            assert!(!remote.contains("maxaveragebitrate"), "{remote}");
 
-        // The same answer without the pin does change the send codec, so the check above can fail.
-        negotiate(&transport, &offers, &bob, resolved, false).await;
-        let unpinned = settled_codec(&alice, Some(&first)).await;
-        assert!(unpinned.0.contains("maxaveragebitrate=510000"), "{unpinned:?}");
+            // The same answer without the pin does change the send codec, so the check above can
+            // fail.
+            negotiate(&transport, &offers, &bob, resolved, false).await;
+            let unpinned = settled_codec(&alice, Some(&first)).await;
+            assert!(unpinned.0.contains("maxaveragebitrate=510000"), "{unpinned:?}");
+        } else {
+            let followed = settled_codec(&alice, Some(&first)).await;
+            assert!(followed.0.contains("maxaveragebitrate=510000"), "{followed:?}");
+        }
 
         alice.close();
         bob.close();

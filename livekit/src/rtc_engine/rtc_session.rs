@@ -1925,6 +1925,13 @@ impl SessionInner {
             self.publisher_pc.add_stereo_track(track.rtc_track().id()).await;
         }
 
+        #[cfg(not(target_arch = "wasm32"))]
+        if let LocalTrack::Audio(audio) = &track {
+            if matches!(audio.rtc_source(), RtcAudioSource::Native(_)) {
+                self.publisher_pc.add_external_audio_track(track.rtc_track().id()).await;
+            }
+        }
+
         let init = RtpTransceiverInit {
             direction: RtpTransceiverDirection::SendOnly,
             stream_ids: Default::default(),
