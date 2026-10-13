@@ -617,6 +617,7 @@ fn screen_audio_capture_restarts_after_device_lost() {
     assert_eq!(events[1].async_id, 0);
     assert_eq!(h.backend_starts(), 2);
     assert_eq!(h.backend_stops(), 1);
+    assert!(h.last_target_restart());
     let loud = h.sink_loud_frames();
     assert!(wait_for(Duration::from_secs(2), || h.sink_loud_frames() > loud + 9600));
     let stats = h.stats();
@@ -642,6 +643,87 @@ fn screen_audio_capture_gives_up_after_its_restart_budget() {
     assert!(events[1..].iter().all(|e| e.error == 3));
     assert_eq!(h.backend_starts(), 6);
     assert_eq!(h.stats().state, 4);
+}
+
+/// A window share that resolved to one application: a restart that resolves to
+/// all audio (the window is gone) ends the capture instead of widening it.
+#[test]
+fn screen_audio_capture_restart_never_widens_a_window_share() {
+    let h = capture();
+    h.script_start(0, 48_000, 2, 2);
+    h.start(&RootScreenAudioTargetSpec { kind: 2, window_id: 42, ..Default::default() }, 1);
+    let events = h.wait_events(1, 2000);
+    assert_eq!(kinds(&events), vec![STARTED]);
+    assert_eq!(events[0].scope, 2);
+    assert!(!h.last_target_restart());
+    assert!(wait_for(Duration::from_secs(2), || h.sink_loud_frames() > 4800));
+    h.script_start(0, 48_000, 2, 0);
+    h.fail_running(5);
+    let events = h.wait_events(2, 3000);
+    assert_eq!(kinds(&events), vec![FAILED, FAILED]);
+    assert!(events[0].retrying);
+    assert_eq!(events[0].error, 5);
+    assert_eq!(events[1].async_id, 0);
+    assert_eq!(events[1].error, 6);
+    assert!(!events[1].retrying);
+    assert!(events[1].message.contains("not widening"), "{}", events[1].message);
+    assert_eq!(h.backend_starts(), 2);
+    assert!(h.last_target_restart());
+    assert_eq!(h.last_target_kind(), 2);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(h.wait_events(1, 50).is_empty());
+    assert_eq!(h.backend_starts(), 2);
+    let stats = h.stats();
+    assert_eq!(stats.state, 4);
+    assert_eq!(stats.scope, 2);
+    assert_eq!(stats.last_error, 6);
+    // Nothing of the widened capture reached the source.
+    let loud = h.sink_loud_frames();
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(h.sink_loud_frames(), loud);
+}
+
+#[test]
+fn screen_audio_capture_restart_keeps_to_the_first_process() {
+    let h = capture();
+    h.script_start_for(1, 100);
+    h.start(&RootScreenAudioTargetSpec { kind: 1, process_id: 100, ..Default::default() }, 1);
+    assert_eq!(kinds(&h.wait_events(1, 2000)), vec![STARTED]);
+    // The same process again: an ordinary restart.
+    h.script_start_for(1, 100);
+    h.fail_running(4);
+    let events = h.wait_events(2, 3000);
+    assert_eq!(kinds(&events), vec![FAILED, STARTED]);
+    assert_eq!(events[1].scope, 1);
+    // Another process (the window now belongs to someone else): gone.
+    h.script_start_for(1, 200);
+    h.fail_running(4);
+    let events = h.wait_events(2, 3000);
+    assert_eq!(kinds(&events), vec![FAILED, FAILED]);
+    assert!(events[0].retrying);
+    assert_eq!(events[1].error, 6);
+    assert!(!events[1].retrying);
+    assert_eq!(h.backend_starts(), 3);
+    assert_eq!(h.stats().restarts, 1);
+    // A new start from the host may resolve anything.
+    h.script_start_for(1, 200);
+    h.start(&RootScreenAudioTargetSpec { kind: 1, process_id: 200, ..Default::default() }, 2);
+    let events = h.wait_events(1, 2000);
+    assert_eq!(kinds(&events), vec![STARTED]);
+    assert_eq!(events[0].async_id, 2);
+    assert!(!h.last_target_restart());
+}
+
+#[test]
+fn screen_audio_capture_restart_may_narrow_a_system_start() {
+    let h = capture();
+    h.start(&RootScreenAudioTargetSpec { kind: 2, window_id: 42, ..Default::default() }, 1);
+    assert_eq!(kinds(&h.wait_events(1, 2000)), vec![STARTED]);
+    h.script_start_for(1, 300);
+    h.fail_running(4);
+    let events = h.wait_events(2, 3000);
+    assert_eq!(kinds(&events), vec![FAILED, STARTED]);
+    assert_eq!(events[1].scope, 1);
 }
 
 #[test]

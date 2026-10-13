@@ -207,6 +207,7 @@ struct ScriptedScreenAudioBackends {
   uint32_t start_count = 0;
   uint32_t stop_count = 0;
   int32_t last_target_kind = -1;
+  bool last_target_restart = false;
   ToneWriter* running = nullptr;
 
   std::mutex events_mutex;
@@ -228,6 +229,7 @@ class ScriptedBackend final : public ScreenAudioBackend {
       std::lock_guard<std::mutex> lock(script_->mutex);
       ++script_->start_count;
       script_->last_target_kind = static_cast<int32_t>(target.kind);
+      script_->last_target_restart = target.restart;
       if (!script_->starts.empty()) {
         result = script_->starts.front();
         script_->starts.pop_front();
@@ -333,6 +335,16 @@ void RootScreenAudioCaptureHarness::script_start(int32_t error,
   backends_->starts.push_back(result);
 }
 
+void RootScreenAudioCaptureHarness::script_start_for(int32_t scope,
+                                                     uint32_t process_id) const {
+  ScreenAudioStartResult result;
+  result.detail = "fake: scripted target " + std::to_string(process_id);
+  result.scope = static_cast<ScreenAudioScope>(scope);
+  result.process_id = process_id;
+  std::lock_guard<std::mutex> lock(backends_->mutex);
+  backends_->starts.push_back(result);
+}
+
 void RootScreenAudioCaptureHarness::script_stop(bool ok, int32_t delay_ms) const {
   std::lock_guard<std::mutex> lock(backends_->mutex);
   backends_->stops.push_back({ok, delay_ms});
@@ -397,6 +409,11 @@ uint32_t RootScreenAudioCaptureHarness::backend_stops() const {
 int32_t RootScreenAudioCaptureHarness::last_target_kind() const {
   std::lock_guard<std::mutex> lock(backends_->mutex);
   return backends_->last_target_kind;
+}
+
+bool RootScreenAudioCaptureHarness::last_target_restart() const {
+  std::lock_guard<std::mutex> lock(backends_->mutex);
+  return backends_->last_target_restart;
 }
 
 uint64_t RootScreenAudioCaptureHarness::sink_frames() const {

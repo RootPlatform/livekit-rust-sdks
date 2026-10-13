@@ -955,6 +955,15 @@ bool RootScreenAudioCapture::TryStart(const ScreenAudioTarget& target,
                      std::to_string(result->format.sample_rate) + " Hz, " +
                      std::to_string(result->format.channels) + " channels)";
   }
+  if (result->error == ScreenAudioError::kNone && target.restart &&
+      started_scope_ != ScreenAudioScope::kSystem &&
+      (result->scope != started_scope_ ||
+       result->process_id != started_process_id_)) {
+    result->error = ScreenAudioError::kTargetGone;
+    result->detail =
+        "the shared target is gone; not widening the capture to " +
+        result->detail;
+  }
   if (result->error != ScreenAudioError::kNone) {
     gate->Close();
     if (backend->Stop())
@@ -1065,6 +1074,8 @@ void RootScreenAudioCapture::RunStart(const ScreenAudioTarget& target,
   SetState(ScreenAudioState::kStarting);
   ScreenAudioStartResult result;
   if (TryStart(target, &result)) {
+    started_scope_ = result.scope;
+    started_process_id_ = result.process_id;
     Push(StartedEvent(async_id, result));
     return;
   }
@@ -1132,8 +1143,10 @@ void RootScreenAudioCapture::ScheduleRestart(ScreenAudioError error,
 
 void RootScreenAudioCapture::RunRestart() {
   restart_pending_ = false;
+  ScreenAudioTarget target = target_;
+  target.restart = true;
   ScreenAudioStartResult result;
-  if (TryStart(target_, &result)) {
+  if (TryStart(target, &result)) {
     {
       std::lock_guard<std::mutex> lock(state_mutex_);
       ++restarts_;

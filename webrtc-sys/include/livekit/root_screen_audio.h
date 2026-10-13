@@ -401,6 +401,9 @@ class RootScreenAudioCapture final
   Running running_;
   bool have_target_ = false;
   ScreenAudioTarget target_;
+  // What the last successful start (not a restart) captured.
+  ScreenAudioScope started_scope_ = ScreenAudioScope::kSystem;
+  uint32_t started_process_id_ = 0;
   bool restart_pending_ = false;
   int64_t restart_at_ms_ = 0;
   std::deque<int64_t> restart_times_ms_;
@@ -497,6 +500,7 @@ class RootScreenAudioCaptureHarness {
                     int32_t sample_rate,
                     int32_t channels,
                     int32_t scope) const;
+  void script_start_for(int32_t scope, uint32_t process_id) const;
   void script_stop(bool ok, int32_t delay_ms) const;
   void fail_running(int32_t error) const;
   void pause_running(bool paused) const;
@@ -508,6 +512,7 @@ class RootScreenAudioCaptureHarness {
   uint32_t backend_starts() const;
   uint32_t backend_stops() const;
   int32_t last_target_kind() const;
+  bool last_target_restart() const;
   uint64_t sink_frames() const;
   uint64_t sink_loud_frames() const;
   int64_t shutdown(bool wait) const;

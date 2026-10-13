@@ -144,6 +144,9 @@ pub mod ffi {
             channels: i32,
             scope: i32,
         );
+        /// The next backend start succeeds at 48 kHz stereo and resolves this
+        /// scope and process.
+        fn script_start_for(self: &RootScreenAudioCaptureHarness, scope: i32, process_id: u32);
         /// The next backend stop returns `ok` after `delay_ms`.
         fn script_stop(self: &RootScreenAudioCaptureHarness, ok: bool, delay_ms: i32);
         /// The running backend reports `error` from its audio thread.
@@ -167,6 +170,8 @@ pub mod ffi {
         fn backend_starts(self: &RootScreenAudioCaptureHarness) -> u32;
         fn backend_stops(self: &RootScreenAudioCaptureHarness) -> u32;
         fn last_target_kind(self: &RootScreenAudioCaptureHarness) -> i32;
+        /// Whether the last backend start was a restart.
+        fn last_target_restart(self: &RootScreenAudioCaptureHarness) -> bool;
         /// Frames the source's sinks received, and how many of them were not
         /// silent.
         fn sink_frames(self: &RootScreenAudioCaptureHarness) -> u64;

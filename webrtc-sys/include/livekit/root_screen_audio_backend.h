@@ -46,7 +46,8 @@ enum class ScreenAudioTargetKind : int32_t {
   kProcess = 1,
   // Only the application owning window_id (HWND on Windows, CGWindowID on
   // macOS), window_title as a second lookup. A window or owner that cannot be
-  // found, or a platform without window scoping (Linux): kSystem.
+  // found, or a platform without window scoping (Linux): kSystem (the core
+  // accepts that on a first start only).
   kWindow = 2,
 };
 
@@ -55,6 +56,9 @@ struct ScreenAudioTarget {
   uint32_t process_id = 0;
   uint64_t window_id = 0;
   std::string window_title;
+  // The core restarts the same capture after a failure (false for a start
+  // the host asked for).
+  bool restart = false;
 };
 
 // What a started backend captures once it resolved the target.
@@ -102,6 +106,10 @@ struct ScreenAudioStartResult {
   std::string detail;
   ScreenAudioFormat format;
   ScreenAudioScope scope = ScreenAudioScope::kSystem;
+  // The captured process (kProcess) or application's process (kApplication);
+  // 0 for kSystem. A restart that resolves another scope or process than the
+  // first start ends the capture with kTargetGone: it never widens.
+  uint32_t process_id = 0;
 };
 
 // The core's side of a running backend.
