@@ -1237,6 +1237,28 @@ e435c4dc2, golden vectors regenerated: 25 vectors, two new at the cap). Powers o
 `pow10` (libm's pow with an opaque base), so LLVM cannot turn them into exp10 on macOS and Linux;
 golden vectors written on Windows may still need `ROOTAPP_DSP_GOLDEN_LOOSE=1` on another libm.
 
+### Echo model contract (`rootapp/echo-model`, stage 1: no native model yet)
+
+DTLN-aec-128 (MIT, Westhausen) as AEC3's neural residual echo estimator in the platform engine's APM.
+This stage only fixes the FFI contract; nothing native runs the model.
+
+- `RootAudioControl.echo_model` (15, `RootAudioEchoModel` OFF/ON/AUTO; native OFF until set and at
+  every session start and end; unknown values OFF) and `RootAudioStats` 114-124 (mode, state, reason,
+  output device kind, swaps, inferences, inference mean/max since the previous read, the last window's
+  p99, measured echo, kill switch). No new requests or events; nothing collides with the screen-audio
+  branch (bit 13, requests 1012-1014, event 1001).
+- Capability bit 14 `ECHO_MODEL` (`CAP_ECHO_MODEL`) is defined and **not reported**: caps stay 8191.
+  `livekit::ECHO_MODEL_AVAILABLE` is false, so a control that sets `echo_model` is answered "not
+  supported by this build" (the other fields are applied) and `RootAudioStats::echo_model` is `None`.
+- Tests: `cargo test -p livekit-ffi --lib --release rootapp_audio` (`rootapp_audio_echo_model_*`,
+  `rootapp_audio_control_maps_the_echo_model_*`) and `cargo test -p livekit --lib --release
+  platform_audio` (`echo_model_*`).
+- Building this worktree on Windows: the prebuilt's deepest abseil header
+  (`absl/time/internal/cctz/include/cctz/civil_time_detail.h`) passes MAX_PATH under
+  `livekit-rust-sdks-echo\target\release\build\scratch-*\out\livekit_webrtc\...`, and cl.exe fails
+  with C1083. Point `LK_CUSTOM_WEBRTC` at a short junction to the extracted prebuilt
+  (`win-x64-release` with `include`, `lib`, `webrtc.ninja`).
+
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
 | Commit | Change |
