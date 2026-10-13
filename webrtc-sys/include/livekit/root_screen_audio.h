@@ -369,7 +369,9 @@ class RootScreenAudioCapture final
   void RunStart(const ScreenAudioTarget& target, uint64_t async_id);
   void RunStop(uint64_t async_id);
   bool TryStart(const ScreenAudioTarget& target, ScreenAudioStartResult* result);
-  void StopBackend();
+  // False when the backend could not stop: it is leaked and its OS capture
+  // may still run.
+  bool StopBackend();
   void ClearError();
   void HandleError();
   void ScheduleRestart(ScreenAudioError error, const std::string& message);

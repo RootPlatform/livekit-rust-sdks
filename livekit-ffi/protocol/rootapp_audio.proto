@@ -593,7 +593,8 @@ message RootScreenAudioStartResponse {
 }
 
 // Stops the OS capture (the source sends silence until the handle is dropped); completes with
-// RootScreenAudioEvent.stopped carrying async_id, after which no OS capture runs.
+// RootScreenAudioEvent.stopped carrying async_id, after which no OS capture runs unless
+// stopped.error says it could not be stopped.
 message RootScreenAudioStopRequest {
   required uint64 capture_handle = 1;
 }
@@ -678,6 +679,9 @@ message RootScreenAudioFailed {
 }
 message RootScreenAudioStopped {
   required uint64 async_id = 1;
+  // Set when the OS capture could not be stopped in time: it no longer feeds the source but may
+  // run until the process exits (stats: last_error INTERNAL with the same text).
+  optional string error = 2;
 }
 // Events of one capture, polled from 100 ms after the start (so the host listens for its handle
 // first) every 20 ms while the handle lives (none after the drop).

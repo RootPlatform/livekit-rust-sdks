@@ -153,7 +153,13 @@ pub(crate) fn event_message(
             }
             .into(),
         ),
-        EVENT_STOPPED => Some(proto::RootScreenAudioStopped { async_id: event.async_id }.into()),
+        EVENT_STOPPED => Some(
+            proto::RootScreenAudioStopped {
+                async_id: event.async_id,
+                error: (event.error != 0).then(|| event.message.clone()),
+            }
+            .into(),
+        ),
         _ => None,
     }
 }
@@ -469,7 +475,20 @@ mod tests {
                 async_id: 9,
                 ..Default::default()
             }),
-            Some(Message::Stopped(proto::RootScreenAudioStopped { async_id: 9 }))
+            Some(Message::Stopped(proto::RootScreenAudioStopped { async_id: 9, error: None }))
+        );
+        assert_eq!(
+            event_message(&sys::RootScreenAudioEventData {
+                kind: EVENT_STOPPED,
+                async_id: 10,
+                error: 8,
+                message: "the OS capture did not stop in time".into(),
+                ..Default::default()
+            }),
+            Some(Message::Stopped(proto::RootScreenAudioStopped {
+                async_id: 10,
+                error: Some("the OS capture did not stop in time".into()),
+            }))
         );
         assert_eq!(
             event_message(&sys::RootScreenAudioEventData { kind: 77, ..Default::default() }),

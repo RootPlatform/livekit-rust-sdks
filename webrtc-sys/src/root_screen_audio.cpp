@@ -986,11 +986,12 @@ bool RootScreenAudioCapture::TryStart(const ScreenAudioTarget& target,
   return true;
 }
 
-void RootScreenAudioCapture::StopBackend() {
+bool RootScreenAudioCapture::StopBackend() {
   if (!running_.backend)
-    return;
+    return true;
   running_.gate->Close();
-  if (running_.backend->Stop()) {
+  bool stopped = running_.backend->Stop();
+  if (stopped) {
     running_.backend.reset();
     delete running_.gate;
   } else {
@@ -998,6 +999,7 @@ void RootScreenAudioCapture::StopBackend() {
   }
   running_.gate = nullptr;
   ClearError();
+  return stopped;
 }
 
 // Only once the gate is closed: no report can arrive any more.
@@ -1089,10 +1091,9 @@ void RootScreenAudioCapture::RunStart(const ScreenAudioTarget& target,
 }
 
 void RootScreenAudioCapture::RunStop(uint64_t async_id) {
-  StopBackend();
+  bool stopped = StopBackend();
   restart_pending_ = false;
   have_target_ = false;
-  SetState(ScreenAudioState::kStopped);
   RootScreenAudioEventData event;
   event.kind = static_cast<uint32_t>(ScreenAudioEventKind::kStopped);
   event.async_id = async_id;
@@ -1101,6 +1102,19 @@ void RootScreenAudioCapture::RunStop(uint64_t async_id) {
   event.channels = 0;
   event.error = 0;
   event.retrying = false;
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    state_ = ScreenAudioState::kStopped;
+    if (!stopped) {
+      last_error_ = ScreenAudioError::kInternal;
+      last_error_message_ =
+          "the OS capture did not stop in time; it no longer feeds the source "
+          "but may run until the process exits";
+      event.error = static_cast<int32_t>(last_error_);
+      event.message = rust::String::lossy(last_error_message_.data(),
+                                          last_error_message_.size());
+    }
+  }
   Push(std::move(event));
 }
 

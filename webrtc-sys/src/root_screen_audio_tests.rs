@@ -765,6 +765,31 @@ fn screen_audio_capture_stop_reports_and_keeps_the_source_silent() {
 }
 
 #[test]
+fn screen_audio_capture_stop_reports_a_backend_that_could_not_stop() {
+    let h = capture();
+    h.start(&system(), 1);
+    assert_eq!(kinds(&h.wait_events(1, 2000)), vec![STARTED]);
+    h.script_stop(false, 0);
+    h.stop(4);
+    let events = h.wait_events(1, 2000);
+    assert_eq!(kinds(&events), vec![STOPPED]);
+    assert_eq!(events[0].async_id, 4);
+    assert_eq!(events[0].error, 8);
+    assert!(events[0].message.contains("did not stop"), "{}", events[0].message);
+    let stats = h.stats();
+    assert_eq!(stats.state, 5);
+    assert_eq!(stats.last_error, 8);
+    // A stop that worked reports no error.
+    h.start(&system(), 5);
+    assert_eq!(kinds(&h.wait_events(1, 2000)), vec![STARTED]);
+    h.stop(6);
+    let events = h.wait_events(1, 2000);
+    assert_eq!(kinds(&events), vec![STOPPED]);
+    assert_eq!(events[0].error, 0);
+    assert!(events[0].message.is_empty());
+}
+
+#[test]
 fn screen_audio_capture_shutdown_never_waits_for_the_backend() {
     let h = capture();
     h.start(&system(), 1);

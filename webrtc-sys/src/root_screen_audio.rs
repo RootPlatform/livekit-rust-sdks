@@ -30,7 +30,8 @@ pub mod ffi {
         pub window_title: String,
     }
 
-    /// kind: 1 started, 2 failed, 3 stopped.
+    /// kind: 1 started, 2 failed, 3 stopped. A stopped event with an error:
+    /// the OS capture could not be stopped (message says so).
     #[derive(Debug, Clone, Default)]
     pub struct RootScreenAudioEventData {
         pub kind: u32,
