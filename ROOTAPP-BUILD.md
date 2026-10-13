@@ -1249,8 +1249,8 @@ audio").
   `ScreenAudioSink` from its own audio thread. Exactly one file per OS defines
   `RootScreenAudioBackendBuilt()` and `CreateRootScreenAudioBackend()`, chosen in `webrtc-sys/build.rs`:
   `src/screen_audio/root_screen_audio_win.cpp` (WASAPI process loopback) on Windows,
-  `root_screen_audio_none.cpp` elsewhere until the macOS (`root_screen_audio_mac.mm`, ScreenCaptureKit)
-  and Linux (`root_screen_audio_linux.cpp`, PipeWire) backends land. A backend that lands also adds its
+  `root_screen_audio_mac.mm` (ScreenCaptureKit) on macOS, `root_screen_audio_none.cpp` elsewhere until
+  the Linux (`root_screen_audio_linux.cpp`, PipeWire) backend lands. A backend that lands also adds its
   OS to `SCREEN_AUDIO_OS` in `livekit-ffi/src/server/rootapp_audio.rs`.
 - **Core** `root_screen_audio.{h,cpp}`: `RootScreenAudioCapture` attaches to a queued 48 kHz mono or
   stereo `AudioTrackSource` as its `AudioSourcePuller` (`audio_track.{h,cpp}`: the source's 10 ms task
@@ -1275,10 +1275,23 @@ audio").
   object, writes packets straight from `GetBuffer` (SILENT as silence, DATA_DISCONTINUITY counted) and
   reports device loss, stream failures and an exited target (its process handle in the wait set).
   Before build 20348 activation fails as UNSUPPORTED.
+- **macOS backend** (macOS 13+, else UNSUPPORTED): the desktop's managed `SckLoopbackCaptureService` in
+  native code. An audio-only `SCStream` on the main display (capturesAudio, 48 kHz, 2 channels,
+  excludesCurrentProcessAudio, 2x2 px, 1 s frame interval, queue depth 3); a window target resolves
+  by CGWindowID, then title, to its owning application and a process target to the application with
+  that pid (`includingApplications`, scope APPLICATION, its exit watched with `DISPATCH_PROC_EXIT`:
+  TARGET_GONE); anything else, or Root's own window, `excludingApplications` this process tree
+  (`proc_listpids` walk from `getpid()`). `CGPreflightScreenCaptureAccess` false or
+  SCStreamErrorUserDeclined is PERMISSION_DENIED (it never prompts; the video share does). The audio
+  queue reads the buffer list into a preallocated 8-buffer list and interleaves planar audio into a
+  preallocated 4096-frame buffer; a wrong format is noted there and logged once off the audio queue,
+  a different rate restarts at that rate. A stop from the menu bar is PERMISSION_DENIED, a lost
+  display (-3815) DEVICE_LOST. Manual reference counting; every ScreenCaptureKit reference is newer
+  than the deployment target, so it is weak and the library still loads on macOS 10.15-12.
 - **FFI** (`livekit-ffi/src/server/rootapp_screen_audio.rs`): `RootScreenAudioStart/Stop/Stats`
   (requests 1012-1014), `RootScreenAudioEvent` (event 1001, polled every 20 ms from 100 ms after the
-  start); an owned capture handle. Caps bit 13 SCREEN_AUDIO where an OS backend is built (Windows:
-  16383 on 64 bit). `NativeAudioSource::attach_screen_audio` (libwebrtc) keeps cxx types out of the
+  start); an owned capture handle. Caps bit 13 SCREEN_AUDIO where an OS backend is built (Windows and
+  macOS: 16383 on 64 bit). `NativeAudioSource::attach_screen_audio` (libwebrtc) keeps cxx types out of the
   FFI crate.
 
 Tests (device-free): webrtc-sys `root_screen_audio_tests` (the pipe on a manual clock: pass-through
@@ -1288,7 +1301,9 @@ samples; the capture against a real queued source with scripted fake backends: e
 their budget, stop, a shutdown that never waits, a backend that cannot stop, refused second captures
 and host frames, source checks, a 44.1 kHz mono backend); livekit-ffi `rootapp_screen_audio` (mapping,
 routing and handle lifetime, refusals, and the real request path with the fake tone backend that
-`root_screen_audio_use_fake_backend` installs). The Windows backend itself only runs live.
+`root_screen_audio_use_fake_backend` installs). The OS backends themselves only run live; the macOS
+one was written on Windows and only syntax-checked there (Objective-C++ against stub SDK headers), so
+its first macOS build is its first real compile.
 
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
