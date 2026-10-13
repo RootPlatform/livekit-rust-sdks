@@ -66,6 +66,11 @@ constexpr NSInteger kErrorUserDeclined = -3801;
 constexpr NSInteger kErrorNoCaptureSource = -3815;
 constexpr NSInteger kErrorUserStopped = -3817;
 
+// Completion::state: whether the completion ran or its waiter gave up first.
+constexpr int kCompletionPending = 0;
+constexpr int kCompletionDone = 1;
+constexpr int kCompletionAbandoned = 2;
+
 // The rate ScreenCaptureKit delivered when it was not the one a start reported
 // (0: as asked). The next start reports it, so the restart that follows the
 // mismatch converts instead of failing again.
@@ -118,6 +123,7 @@ struct Completion {
   dispatch_semaphore_t done;
   id content = nil;
   NSError* error = nil;
+  std::atomic<int> state{kCompletionPending};
 };
 
 // Waits (bounded) for the blocks already queued on `queue`.
@@ -702,15 +708,35 @@ class SckScreenAudioBackend final : public ScreenAudioBackend {
                          sampleHandlerQueue:frame_queue_
                                       error:nil];
 
+    // The blocks keep the stream, its output and queues alive until
+    // ScreenCaptureKit is done with them. A start whose waiter gave up is
+    // stopped as soon as it completes, so it never runs unowned.
     auto started = std::make_shared<Completion>();
     capturing_ = true;
+    dispatch_queue_t audio_queue = audio_queue_;
+    dispatch_queue_t frame_queue = frame_queue_;
     [stream startCaptureWithCompletionHandler:^(NSError* failure) {
       started->error = [failure retain];
+      if (started->state.exchange(kCompletionDone) == kCompletionAbandoned && !failure) {
+        [stream stopCaptureWithCompletionHandler:^(NSError* ignored) {
+          (void)ignored;
+          (void)stream;
+          (void)output;
+          (void)audio_queue;
+          (void)frame_queue;
+        }];
+      }
       dispatch_semaphore_signal(started->done);
     }];
-    if (!started->Wait(deadline))
-      return Fail(ScreenAudioError::kTimeout,
-                  "ScreenCaptureKit did not start the audio stream within 5 s");
+    if (!started->Wait(deadline)) {
+      int pending = kCompletionPending;
+      if (started->state.compare_exchange_strong(pending, kCompletionAbandoned)) {
+        start_outstanding_ = true;
+        return Fail(ScreenAudioError::kTimeout,
+                    "ScreenCaptureKit did not start the audio stream within 5 s (it is stopped "
+                    "when that start completes)");
+      }
+    }
     if (started->error)
       return Fail(StartError(started->error),
                   "starting the audio stream failed (" + Describe(started->error) + ")");
@@ -745,28 +771,43 @@ class SckScreenAudioBackend final : public ScreenAudioBackend {
     return result;
   }
 
+  // A start that is still outstanding is stopped by its own completion; a
+  // stop that takes longer than its budget keeps the stream, output and
+  // queues alive in its completion.
   API_AVAILABLE(macos(13.0))
   bool StopStream() {
     const Clock::time_point deadline = Clock::now() + kStopBudget;
     LKRootScreenAudioOutput* output = output_;
+    SCStream* stream = stream_;
+    const bool stop = stream && capturing_ && !start_outstanding_;
     if (output && ![output tap]->Close(deadline)) {
       leaked_ = true;
+      if (stop) {
+        [stream stopCaptureWithCompletionHandler:^(NSError* failure) {
+          (void)failure;
+        }];
+      }
       return false;
     }
     CancelSource(&warnings_);
     CancelSource(&exit_source_);
-    SCStream* stream = stream_;
-    if (stream && capturing_) {
+    if (stop) {
       auto stopped = std::make_shared<Completion>();
+      dispatch_queue_t audio_queue = audio_queue_;
+      dispatch_queue_t frame_queue = frame_queue_;
       [stream stopCaptureWithCompletionHandler:^(NSError* failure) {
         (void)failure;
+        (void)stream;
+        (void)output;
+        (void)audio_queue;
+        (void)frame_queue;
         dispatch_semaphore_signal(stopped->done);
       }];
       stopped->Wait(deadline);
     }
-    if (stream && audio_added_)
+    if (stream && audio_added_ && !start_outstanding_)
       [stream removeStreamOutput:output type:SCStreamOutputTypeAudio error:nil];
-    if (stream && frames_added_)
+    if (stream && frames_added_ && !start_outstanding_)
       [stream removeStreamOutput:output type:SCStreamOutputTypeScreen error:nil];
     Drain(audio_queue_, deadline);
     Drain(frame_queue_, deadline);
@@ -781,6 +822,7 @@ class SckScreenAudioBackend final : public ScreenAudioBackend {
     capturing_ = false;
     audio_added_ = false;
     frames_added_ = false;
+    start_outstanding_ = false;
     return true;
   }
 
@@ -795,6 +837,7 @@ class SckScreenAudioBackend final : public ScreenAudioBackend {
   bool capturing_ = false;
   bool audio_added_ = false;
   bool frames_added_ = false;
+  bool start_outstanding_ = false;
   bool leaked_ = false;
 };
 
