@@ -1274,7 +1274,10 @@ audio").
   (`ScreenAudioTarget::restart` tells a backend it restarts the same capture). A gate in
   front of every backend drops late calls, so a backend whose Stop could not join is leaked safely;
   a stop that leaks it says so in `RootScreenAudioStopped.error` (additive field 2) and in the stats'
-  last_error (INTERNAL).
+  last_error (INTERNAL), and so does a stop whose OS stop was not confirmed within its budget
+  (`ScreenAudioBackend::StopConfirmed`, macOS: the capture no longer feeds the source but may still
+  be stopping). A start that knowingly captures less than its target says why in
+  `RootScreenAudioStarted.limitation` (additive field 6, `ScreenAudioStartResult::limitation`).
 - **Windows backend**: `ActivateAudioInterfaceAsync(VAD\Process_Loopback)` with
   `AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK` (structs declared locally; Mmdevapi and avrt loaded
   at run time from System32 only, so nothing new is linked), EXCLUDE (own pid) or INCLUDE (target
@@ -1285,7 +1288,8 @@ audio").
   reports device loss, stream failures and an exited target. Process loopback exists from Windows 10
   2004 (build 19041; the SDK header's 20348 is only its documented minimum): below that the start is
   UNSUPPORTED without trying. E_NOTIMPL, ERROR_NOT_SUPPORTED and ERROR_FILE_NOT_FOUND are
-  UNSUPPORTED, E_ACCESSDENIED PERMISSION_DENIED, device-lost codes DEVICE_LOST and anything else
+  UNSUPPORTED on a first start (START_FAILED on a restart: that capture already ran, so they pass),
+  E_ACCESSDENIED PERMISSION_DENIED, device-lost codes DEVICE_LOST and anything else
   START_FAILED (both restartable, so an audio-service restart recovers on Windows 10 too). The open
   (activations, retries, Initialize) has one 4.8 s budget inside Start's 5 s, and the activation wait
   also wakes on the stop event, so a timed-out start joins its thread. A target counts as running
@@ -1293,10 +1297,12 @@ audio").
   a SYNCHRONIZE handle, or polls its exit code every 500 ms where SYNCHRONIZE is stripped (an
   anti-cheat driver) or a wait fails; a target gone while starting is TARGET_GONE, and where neither
   works the started description says the exit is not watched. A target that is an ancestor of Root
-  (a File Explorer window: explorer.exe started Root) captures nothing, at process scope, as the
-  started description says and the log warns: its tree holds Root's own playout, and all audio would
-  be wider than the user's pick (`ScreenAudioAncestors` walks a Toolhelp snapshot; a parent created
-  after its child is a reused pid).
+  (a File Explorer window when explorer.exe started Root; a browser window when a root:// link
+  started Root from that browser) captures nothing, at process scope, as the started description
+  says, `limitation` is TARGET_IS_ROOT_ANCESTOR (the desktop tells the user) and the log warns: its
+  tree holds Root's own playout, and all audio would be wider than the user's pick
+  (`ScreenAudioAncestors` walks a Toolhelp snapshot; a parent created after its child is a reused
+  pid).
 - **macOS backend** (macOS 13+, else UNSUPPORTED): the desktop's managed `SckLoopbackCaptureService` in
   native code. An audio-only `SCStream` on the main display (capturesAudio, 48 kHz, 2 channels,
   excludesCurrentProcessAudio, 2x2 px, 1 s frame interval, queue depth 3); a window target resolves
@@ -1311,11 +1317,13 @@ audio").
   forgets it; a rate that is not a multiple of 100 Hz is UNSUPPORTED). A stop from the menu bar is
   PERMISSION_DENIED, a lost display (-3815) DEVICE_LOST; the codes count only in
   SCStreamErrorDomain. A buffer whose presentation time is more than 2 ms from where the previous one
-  ended (SCK dropped audio) counts as a discontinuity. A start past its 5 s budget is abandoned to its
-  completion handler, which stops the stream as soon as SCK finishes starting it (an atomic
-  handshake decides who was first), and nothing is stopped or removed while that start is
+  ended (SCK dropped audio) counts as a discontinuity, unless it is 0.5 s or more later
+  (`kScreenAudioIdleGapSeconds`: delivery paused while nothing played). A start past its 5 s budget
+  is abandoned to its completion handler, which stops the stream as soon as SCK finishes starting
+  it (an atomic handshake decides who was first), and nothing is stopped or removed while that start is
   outstanding; start and stop completion blocks hold the stream, output and queues until they run;
-  a close whose callback outlives 2 s still sends stopCapture and keeps every object alive. Manual
+  a close whose callback outlives 2 s still sends stopCapture and keeps every object alive, and a
+  stop SCK does not confirm within 2 s is reported (`StopConfirmed`, stopped.error). Manual
   reference counting; every ScreenCaptureKit reference is newer
   than the deployment target, so it is weak and the library still loads on macOS 10.15-12.
 - **Linux backend**: the desktop's managed `PipeWireLoopbackCaptureService` in native code, without
@@ -1351,7 +1359,8 @@ audio").
   wants it (failures 10 s apart start over), woken by a one-shot loop timer. The process callback
   (data loop) only dequeues, writes into the sink and queues; it also compares the driver's
   `spa_io_position` cycle (kept from io_changed) with the end of the previous one and counts a
-  missed cycle (an xrun) as a discontinuity. A stream error, a disconnect or the daemon closing the
+  missed cycle (an xrun) as a discontinuity; a jump of 0.5 s or more is the node sitting out cycles
+  with nothing linked (idle, not counted). A stream error, a disconnect or the daemon closing the
   connection is DEVICE_LOST (restart). Window and process targets capture everything but Root (the
   portal never names the window), said in the started event's description.
 - **FFI** (`livekit-ffi/src/server/rootapp_screen_audio.rs`): `RootScreenAudioStart/Stop/Stats`
@@ -1369,19 +1378,21 @@ bit for bit, downmix, 44.1 kHz conversion, ±100-2000 ppm drift without underrun
 target decay, backlog skip, large packets, phase-aligned trim, overflow, clipping and non-finite
 samples, a 3 ms fade-out at every underrun whatever is left; the capture against a real queued
 source with scripted fake backends: events, restarts and their budget, a restart that would widen a
-window share or switch process (TARGET_GONE) and one that narrows a system start, stop, a stop whose
-backend cannot stop, a shutdown that never waits, a backend that cannot stop, refused second
+window share or switch process (TARGET_GONE) and one that narrows a system start, the started
+limitation, stop, a stop whose backend cannot stop, a stop the OS did not confirm, a shutdown that
+never waits, a backend that cannot stop, refused second
 captures and host frames, source checks, a 44.1 kHz mono backend; `ScreenAudioAncestors`: the
 parent chain, reused pids, cycles); livekit-ffi `rootapp_screen_audio` (mapping, the stopped error,
-routing and handle lifetime, refusals, and the real request path with the fake tone backend, which
-a scoped guard installs and switches off again); webrtc-sys `root_screen_audio_pipewire_graph` (the
+the started limitation, routing and handle lifetime, refusals, and the real request path with the
+fake tone backend, which every capture a test makes gets: `new_capture` switches it on under
+`cfg(test)`, so no test can open a real OS capture); webrtc-sys `root_screen_audio_pipewire_graph` (the
 Linux backend's graph rules on every OS: channel mapping, a 5.1 stream, client pids, own streams,
 effects apps, loopback link groups, virtual and hardware sinks, chained effects, direct captures,
 the capture node itself, PulseAudio-only graphs, /proc stat parsing and the process tree). The OS
 backends themselves only run live. CI run 38356219034 compiled the macOS and Linux backends (at
-1ad39ef9) for osx-arm64/x64 and linux-x64/arm64; the 2026-10-13 review fixes to them were written on
-Windows and only syntax-checked there (clang-cl against stub SDK and PipeWire headers), so the next
-CI build is their first real compile.
+1ad39ef9) for osx-arm64/x64 and linux-x64/arm64; the 2026-10-13 review and verification fixes to
+them were written on Windows and only syntax-checked there (clang-cl against stub SDK and PipeWire
+headers), so the next CI build is their first real compile.
 
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
