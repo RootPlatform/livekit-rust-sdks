@@ -37,6 +37,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
@@ -60,6 +61,9 @@ constexpr auto kStopBudget = std::chrono::seconds(2);
 constexpr UInt32 kMaxBuffers = 8;
 constexpr size_t kChunkFrames = 4096;
 constexpr size_t kMaxProcessTree = 1024;
+// A buffer that starts this far from where the previous one ended follows
+// audio ScreenCaptureKit dropped.
+constexpr double kDiscontinuitySeconds = 0.002;
 
 // SCStreamErrorCode (SCError.h), in SCStreamErrorDomain.
 constexpr NSInteger kErrorUserDeclined = -3801;
@@ -321,6 +325,7 @@ class SckAudioTap {
              "at that rate");
       return;
     }
+    NoteTimestamp(buffer, format->mSampleRate);
 
     size_t needed = 0;
     OSStatus status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
@@ -391,6 +396,22 @@ class SckAudioTap {
     }
   }
 
+  // A buffer that does not start where the previous one ended follows audio
+  // ScreenCaptureKit dropped (its handler queue backed up).
+  void NoteTimestamp(CMSampleBufferRef buffer, double rate) {
+    const CMTime start = CMSampleBufferGetPresentationTimeStamp(buffer);
+    const CMItemCount frames = CMSampleBufferGetNumSamples(buffer);
+    if ((start.flags & kCMTimeFlags_Valid) == 0 || frames <= 0) {
+      have_expected_ = false;
+      return;
+    }
+    const double seconds = CMTimeGetSeconds(start);
+    if (have_expected_ && std::fabs(seconds - expected_seconds_) > kDiscontinuitySeconds)
+      sink_->MarkDiscontinuity();
+    expected_seconds_ = seconds + static_cast<double>(frames) / rate;
+    have_expected_ = true;
+  }
+
   void NoteFormat(const AudioStreamBasicDescription& format, bool restarting) {
     if (format_noted_.exchange(true, std::memory_order_relaxed))
       return;
@@ -417,6 +438,10 @@ class SckAudioTap {
   std::atomic<bool> closed_{false};
   std::atomic<int32_t> in_flight_{0};
   std::atomic<bool> reported_{false};
+
+  // The audio queue only.
+  bool have_expected_ = false;
+  double expected_seconds_ = 0;
 
   // Written once by the audio queue, read after the pending flag.
   std::atomic<bool> format_noted_{false};
