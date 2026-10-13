@@ -47,6 +47,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <iterator>
 #include <map>
 #include <memory>
@@ -66,15 +67,20 @@ namespace livekit_ffi {
 namespace {
 
 namespace pwg = pipewire_graph;
+using Clock = std::chrono::steady_clock;
 
 constexpr char kLibrary[] = "libpipewire-0.3.so.0";
 constexpr int kSampleRate = 48000;
 constexpr int kChannels = 2;
 constexpr uint32_t kFrameBytes = sizeof(float) * kChannels;
 constexpr auto kStartTimeout = std::chrono::seconds(5);
-// A link the daemon refused or removed this often while both ports exist is
-// not made again (until a port is replaced).
-constexpr int kMaxLinkFailures = 3;
+// A link the daemon refused or removed while both ports exist is made again at
+// once until it failed this often in a row, then after 1 s and every 5 s
+// (until a port is replaced). Failures 10 s apart do not count as in a row.
+constexpr int kImmediateLinkRetries = 3;
+constexpr auto kFirstLinkBackoff = std::chrono::seconds(1);
+constexpr auto kLinkBackoff = std::chrono::seconds(5);
+constexpr auto kLinkFailureMemory = std::chrono::seconds(10);
 
 // The exported libpipewire functions this backend calls, resolved with dlsym.
 // decltype of the header declarations keeps the signatures exact; nothing here
@@ -351,7 +357,8 @@ class PipeWireScreenAudioBackend final : public ScreenAudioBackend {
       *failure = "pw_thread_loop_new failed";
       return ScreenAudioError::kInternal;
     }
-    context_ = api_->context_new(api_->thread_loop_get_loop(loop_), nullptr, 0);
+    main_loop_ = api_->thread_loop_get_loop(loop_);
+    context_ = api_->context_new(main_loop_, nullptr, 0);
     if (context_ == nullptr) {
       *failure = "pw_context_new failed (" + ErrnoText(errno) + ")";
       return ScreenAudioError::kStartFailed;
@@ -391,6 +398,7 @@ class PipeWireScreenAudioBackend final : public ScreenAudioBackend {
       std::lock_guard<std::mutex> lock(mutex_);
       audio_checked_ = true;
     }
+    retry_timer_ = pw_loop_add_timer(main_loop_, &OnRetryTimer, this);
 
     // Never autoconnected: without node.autoconnect=false the session manager
     // links the stream to the default microphone. The links are ours.
@@ -469,6 +477,10 @@ class PipeWireScreenAudioBackend final : public ScreenAudioBackend {
         api_->stream_destroy(stream_);
         stream_ = nullptr;
       }
+      if (retry_timer_ != nullptr) {
+        pw_loop_destroy_source(main_loop_, retry_timer_);
+        retry_timer_ = nullptr;
+      }
       for (auto& [link, entry] : own_links_)
         Release(&entry->proxy, &entry->listener, &entry->listening);
       own_links_.clear();
@@ -503,6 +515,7 @@ class PipeWireScreenAudioBackend final : public ScreenAudioBackend {
       api_->thread_loop_destroy(loop_);
       loop_ = nullptr;
     }
+    main_loop_ = nullptr;
     ports_.clear();
     links_.clear();
     link_failures_.clear();
@@ -585,6 +598,54 @@ class PipeWireScreenAudioBackend final : public ScreenAudioBackend {
     return false;
   }
 
+  void NoteLinkFailure(const pwg::Link& link) {
+    LinkFailures& failures = link_failures_[link];
+    const Clock::time_point now = Clock::now();
+    if (failures.count > 0 && now - failures.last >= kLinkFailureMemory)
+      failures.count = 0;
+    ++failures.count;
+    failures.last = now;
+    if (failures.count < kImmediateLinkRetries) {
+      failures.retry_at = now;
+      return;
+    }
+    if (failures.count == kImmediateLinkRetries) {
+      RTC_LOG(LS_WARNING) << "Screen audio (PipeWire): link " << link.output_port << " -> "
+                          << link.input_port << " failed " << kImmediateLinkRetries
+                          << " times in a row; retrying after 1 s, then every 5 s";
+    }
+    failures.retry_at =
+        now + (failures.count == kImmediateLinkRetries ? kFirstLinkBackoff : kLinkBackoff);
+  }
+
+  // The retry timer fires when the earliest backed-off link the plan still
+  // wants is due.
+  void ArmRetry(const pwg::Plan& plan, const std::set<pwg::Link>& existing,
+                Clock::time_point now) {
+    if (retry_timer_ == nullptr)
+      return;
+    bool due = false;
+    Clock::time_point earliest{};
+    for (const auto& [link, failures] : link_failures_) {
+      if (failures.retry_at <= now || plan.links.count(link) == 0 ||
+          own_links_.count(link) != 0 || existing.count(link) != 0)
+        continue;
+      if (!due || failures.retry_at < earliest)
+        earliest = failures.retry_at;
+      due = true;
+    }
+    if (!due) {
+      pw_loop_update_timer(main_loop_, retry_timer_, nullptr, nullptr, false);
+      return;
+    }
+    int64_t wait = std::max<int64_t>(
+        1, std::chrono::duration_cast<std::chrono::nanoseconds>(earliest - now).count());
+    timespec value{};
+    value.tv_sec = static_cast<time_t>(wait / 1000000000);
+    value.tv_nsec = static_cast<long>(wait % 1000000000);
+    pw_loop_update_timer(main_loop_, retry_timer_, &value, nullptr, false);
+  }
+
   void Reconcile() {
     for (auto it = own_links_.begin(); it != own_links_.end();) {
       LinkEntry* entry = it->second.get();
@@ -595,7 +656,7 @@ class PipeWireScreenAudioBackend final : public ScreenAudioBackend {
       const pwg::Link link = entry->link;
       if (entry->refused ||
           (ports_.count(link.output_port) != 0 && ports_.count(link.input_port) != 0))
-        ++link_failures_[link];
+        NoteLinkFailure(link);
       Release(&entry->proxy, &entry->listener, &entry->listening);
       it = own_links_.erase(it);
     }
@@ -629,14 +690,16 @@ class PipeWireScreenAudioBackend final : public ScreenAudioBackend {
       it = own_links_.erase(it);
     }
     std::set<pwg::Link> existing(graph.links.begin(), graph.links.end());
+    const Clock::time_point now = Clock::now();
     for (const pwg::Link& link : plan.links) {
       if (own_links_.count(link) != 0 || existing.count(link) != 0)
         continue;
       auto failures = link_failures_.find(link);
-      if (failures != link_failures_.end() && failures->second >= kMaxLinkFailures)
+      if (failures != link_failures_.end() && now < failures->second.retry_at)
         continue;
       CreateLink(link);
     }
+    ArmRetry(plan, existing, now);
   }
 
   void CreateLink(const pwg::Link& link) {
@@ -660,7 +723,7 @@ class PipeWireScreenAudioBackend final : public ScreenAudioBackend {
     void* proxy = pw_core_create_object(core_, "link-factory", PW_TYPE_INTERFACE_Link,
                                         PW_VERSION_LINK, &dict, 0);
     if (proxy == nullptr) {
-      ++link_failures_[link];
+      NoteLinkFailure(link);
       return;
     }
     auto entry = std::make_unique<LinkEntry>();
@@ -828,6 +891,11 @@ class PipeWireScreenAudioBackend final : public ScreenAudioBackend {
     changed_.notify_all();
   }
 
+  static void OnRetryTimer(void* data, uint64_t expirations) {
+    (void)expirations;
+    Self(data)->MarkDirty();
+  }
+
   static void OnCoreDone(void* data, uint32_t id, int seq) {
     PipeWireScreenAudioBackend* self = Self(data);
     if (id != PW_ID_CORE)
@@ -984,6 +1052,12 @@ class PipeWireScreenAudioBackend final : public ScreenAudioBackend {
     }
   }
 
+  struct LinkFailures {
+    int count = 0;
+    Clock::time_point last{};
+    Clock::time_point retry_at{};
+  };
+
   const PipeWireApi* api_ = nullptr;
   ScreenAudioSink* sink_ = nullptr;
   std::atomic<bool> writing_{false};
@@ -997,6 +1071,8 @@ class PipeWireScreenAudioBackend final : public ScreenAudioBackend {
 
   // Control thread, and the loop thread under the loop lock.
   pw_thread_loop* loop_ = nullptr;
+  pw_loop* main_loop_ = nullptr;
+  spa_source* retry_timer_ = nullptr;
   pw_context* context_ = nullptr;
   pw_core* core_ = nullptr;
   pw_registry* registry_ = nullptr;
@@ -1029,7 +1105,7 @@ class PipeWireScreenAudioBackend final : public ScreenAudioBackend {
   std::map<uint32_t, pwg::Port> ports_;
   std::map<uint32_t, pwg::Link> links_;
   std::map<pwg::Link, std::unique_ptr<LinkEntry>> own_links_;
-  std::map<pwg::Link, int> link_failures_;
+  std::map<pwg::Link, LinkFailures> link_failures_;
   std::map<uint32_t, pwg::Decision> decisions_;
   bool dirty_ = false;
   bool sync_pending_ = false;
