@@ -199,6 +199,7 @@ struct ScriptedScreenAudioBackends {
   struct StopScript {
     bool ok = true;
     int32_t delay_ms = 0;
+    bool confirmed = true;
   };
 
   std::mutex mutex;
@@ -258,12 +259,16 @@ class ScriptedBackend final : public ScreenAudioBackend {
     writer_.reset();
     if (stop.delay_ms > 0)
       std::this_thread::sleep_for(std::chrono::milliseconds(stop.delay_ms));
+    confirmed_ = stop.confirmed;
     return stop.ok;
   }
+
+  bool StopConfirmed() const override { return confirmed_; }
 
  private:
   std::shared_ptr<ScriptedScreenAudioBackends> script_;
   std::unique_ptr<ToneWriter> writer_;
+  bool confirmed_ = true;
 };
 
 }  // namespace
@@ -359,7 +364,12 @@ void RootScreenAudioCaptureHarness::script_start_limited(int32_t scope,
 
 void RootScreenAudioCaptureHarness::script_stop(bool ok, int32_t delay_ms) const {
   std::lock_guard<std::mutex> lock(backends_->mutex);
-  backends_->stops.push_back({ok, delay_ms});
+  backends_->stops.push_back({ok, delay_ms, true});
+}
+
+void RootScreenAudioCaptureHarness::script_stop_unconfirmed() const {
+  std::lock_guard<std::mutex> lock(backends_->mutex);
+  backends_->stops.push_back({true, 0, false});
 }
 
 void RootScreenAudioCaptureHarness::fail_running(int32_t error) const {

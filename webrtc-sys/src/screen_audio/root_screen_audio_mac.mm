@@ -628,6 +628,8 @@ class SckScreenAudioBackend final : public ScreenAudioBackend {
     return true;
   }
 
+  bool StopConfirmed() const override { return stop_confirmed_; }
+
  private:
   API_AVAILABLE(macos(13.0))
   ScreenAudioStartResult Fail(ScreenAudioError error, std::string detail) {
@@ -821,6 +823,7 @@ class SckScreenAudioBackend final : public ScreenAudioBackend {
     LKRootScreenAudioOutput* output = output_;
     SCStream* stream = stream_;
     const bool stop = stream && capturing_ && !start_outstanding_;
+    stop_confirmed_ = true;
     if (output && ![output tap]->Close(deadline)) {
       leaked_ = true;
       if (stop) {
@@ -844,7 +847,7 @@ class SckScreenAudioBackend final : public ScreenAudioBackend {
         (void)frame_queue;
         dispatch_semaphore_signal(stopped->done);
       }];
-      stopped->Wait(deadline);
+      stop_confirmed_ = stopped->Wait(deadline);
     }
     if (stream && audio_added_ && !start_outstanding_)
       [stream removeStreamOutput:output type:SCStreamOutputTypeAudio error:nil];
@@ -880,6 +883,7 @@ class SckScreenAudioBackend final : public ScreenAudioBackend {
   bool frames_added_ = false;
   bool start_outstanding_ = false;
   bool leaked_ = false;
+  bool stop_confirmed_ = true;
 };
 
 }  // namespace

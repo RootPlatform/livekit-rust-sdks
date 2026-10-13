@@ -845,6 +845,28 @@ fn screen_audio_capture_stop_reports_a_backend_that_could_not_stop() {
 }
 
 #[test]
+fn screen_audio_capture_stop_reports_a_stop_the_os_did_not_confirm() {
+    let h = capture();
+    h.start(&system(), 1);
+    assert_eq!(kinds(&h.wait_events(1, 2000)), vec![STARTED]);
+    h.script_stop_unconfirmed();
+    h.stop(4);
+    let events = h.wait_events(1, 2000);
+    assert_eq!(kinds(&events), vec![STOPPED]);
+    assert_eq!(events[0].async_id, 4);
+    assert_eq!(events[0].error, 8);
+    assert!(events[0].message.contains("did not confirm"), "{}", events[0].message);
+    let stats = h.stats();
+    assert_eq!(stats.state, 5);
+    assert_eq!(stats.last_error, 8);
+    assert_eq!(h.backend_stops(), 1);
+    // The backend was released normally: a new start runs a new one.
+    h.start(&system(), 5);
+    assert_eq!(kinds(&h.wait_events(1, 2000)), vec![STARTED]);
+    assert_eq!(h.backend_starts(), 2);
+}
+
+#[test]
 fn screen_audio_capture_shutdown_never_waits_for_the_backend() {
     let h = capture();
     h.start(&system(), 1);

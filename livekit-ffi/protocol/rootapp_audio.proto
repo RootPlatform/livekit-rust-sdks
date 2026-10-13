@@ -703,7 +703,9 @@ message RootScreenAudioFailed {
 message RootScreenAudioStopped {
   required uint64 async_id = 1;
   // Set when the OS capture could not be stopped in time: it no longer feeds the source but may
-  // run until the process exits (stats: last_error INTERNAL with the same text).
+  // run until the process exits; or when the OS did not confirm the stop in time (macOS): it no
+  // longer feeds the source but may still be stopping (stats: last_error INTERNAL with the same
+  // text).
   optional string error = 2;
 }
 // Events of one capture, polled from 100 ms after the start (so the host listens for its handle

@@ -1038,12 +1038,14 @@ bool RootScreenAudioCapture::TryStart(const ScreenAudioTarget& target,
   return true;
 }
 
-bool RootScreenAudioCapture::StopBackend() {
+RootScreenAudioCapture::BackendStop RootScreenAudioCapture::StopBackend() {
   if (!running_.backend)
-    return true;
+    return BackendStop::kStopped;
   running_.gate->Close();
-  bool stopped = running_.backend->Stop();
-  if (stopped) {
+  BackendStop outcome = BackendStop::kLeaked;
+  if (running_.backend->Stop()) {
+    outcome = running_.backend->StopConfirmed() ? BackendStop::kStopped
+                                                : BackendStop::kUnconfirmed;
     running_.backend.reset();
     delete running_.gate;
   } else {
@@ -1051,7 +1053,7 @@ bool RootScreenAudioCapture::StopBackend() {
   }
   running_.gate = nullptr;
   ClearError();
-  return stopped;
+  return outcome;
 }
 
 // Only once the gate is closed: no report can arrive any more.
@@ -1145,7 +1147,7 @@ void RootScreenAudioCapture::RunStart(const ScreenAudioTarget& target,
 }
 
 void RootScreenAudioCapture::RunStop(uint64_t async_id) {
-  bool stopped = StopBackend();
+  BackendStop stop = StopBackend();
   restart_pending_ = false;
   have_target_ = false;
   RootScreenAudioEventData event;
@@ -1160,11 +1162,14 @@ void RootScreenAudioCapture::RunStop(uint64_t async_id) {
   {
     std::lock_guard<std::mutex> lock(state_mutex_);
     state_ = ScreenAudioState::kStopped;
-    if (!stopped) {
+    if (stop != BackendStop::kStopped) {
       last_error_ = ScreenAudioError::kInternal;
       last_error_message_ =
-          "the OS capture did not stop in time; it no longer feeds the source "
-          "but may run until the process exits";
+          stop == BackendStop::kLeaked
+              ? "the OS capture did not stop in time; it no longer feeds the "
+                "source but may run until the process exits"
+              : "the OS did not confirm the capture's stop in time; it no "
+                "longer feeds the source but may still be stopping";
       event.error = static_cast<int32_t>(last_error_);
       event.message = rust::String::lossy(last_error_message_.data(),
                                           last_error_message_.size());

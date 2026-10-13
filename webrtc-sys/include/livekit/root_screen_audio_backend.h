@@ -174,6 +174,11 @@ class ScreenAudioBackend {
   // thread uses alive (the core then never destroys the backend or the sink).
   // Idempotent.
   virtual bool Stop() = 0;
+
+  // After a Stop that returned true: false when the OS did not confirm within
+  // the budget that its capture stopped (nothing reaches the sink any more,
+  // but the OS capture may still be stopping). The core reports it.
+  virtual bool StopConfirmed() const { return true; }
 };
 
 // A process as a snapshot lists it.

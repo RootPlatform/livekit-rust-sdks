@@ -31,7 +31,8 @@ pub mod ffi {
     }
 
     /// kind: 1 started, 2 failed, 3 stopped. A stopped event with an error:
-    /// the OS capture could not be stopped (message says so).
+    /// the OS capture could not be stopped, or its stop was not confirmed
+    /// (message says which).
     #[derive(Debug, Clone, Default)]
     pub struct RootScreenAudioEventData {
         pub kind: u32,
@@ -160,6 +161,8 @@ pub mod ffi {
         );
         /// The next backend stop returns `ok` after `delay_ms`.
         fn script_stop(self: &RootScreenAudioCaptureHarness, ok: bool, delay_ms: i32);
+        /// The next backend stop returns true without the OS confirming it.
+        fn script_stop_unconfirmed(self: &RootScreenAudioCaptureHarness);
         /// The running backend reports `error` from its audio thread.
         fn fail_running(self: &RootScreenAudioCaptureHarness, error: i32);
         /// The running backend stops (true) or resumes writing.
