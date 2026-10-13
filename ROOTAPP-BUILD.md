@@ -1260,7 +1260,9 @@ audio").
   corrects drift on the exact ring level with the desktop's DriftResampler (6-point Lagrange, 32.32
   phase; 2 ms deadband, 0.2 % at 12 ms, up to 1 % beyond 40 ms), counts underruns and tells capture
   pauses (gaps) from late deliveries (jitter: +10 ms margin up to 200 ms, -10 ms after 60 s), fades
-  3 ms at every edge and splices excess above 60 ms out WSOLA-style (the desktop's AudioSplice). Neither
+  3 ms at every edge and splices a level 30 ms or more above the margin out WSOLA-style (the desktop's
+  AudioSplice; the largest recent OS delivery decays by 1/64 per delivery, so a backlog in the first
+  packet costs one splice, not 20 s of 0.2 % drain). Neither
   side locks, allocates or logs. A control thread per capture runs the backend's Start/Stop and the
   restarts (backoff 0.2, 1, 3, 3, 3 s, 5 per minute; none for permission or a gone target) and queues
   events; dropping the handle detaches at once and leaves the backend stop to that thread. A gate in

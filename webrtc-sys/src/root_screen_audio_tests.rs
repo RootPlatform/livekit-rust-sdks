@@ -392,6 +392,19 @@ fn screen_audio_pipe_skips_a_backlog_when_it_starts() {
 }
 
 #[test]
+fn screen_audio_pipe_forgets_a_large_first_packet() {
+    let mut h = pipe();
+    let mut tone = Tone::new(48_000, 2, 440.0, 0.3);
+    // A capture that starts with 50 ms of backlog in one packet, then 10 ms packets.
+    h.pin_mut().write(&tone.packet(2400));
+    let mut sim = Sim::new(480, 10_000.0);
+    sim.run(&mut h, &mut tone, 10_000_000.0, |_| true, |_, _| {});
+    let stats = h.pin_mut().stats();
+    assert_eq!(stats.underruns, 0);
+    assert!((stats.level_frames - TARGET).abs() < 200, "level {}", stats.level_frames);
+}
+
+#[test]
 fn screen_audio_pipe_waits_for_a_large_packet_to_cover_the_target() {
     let mut h = pipe();
     let mut tone = Tone::new(48_000, 2, 440.0, 0.3);

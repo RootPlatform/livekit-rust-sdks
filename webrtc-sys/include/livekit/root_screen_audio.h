@@ -182,7 +182,7 @@ class ScreenAudioPipe {
   static constexpr double kMaxCorrection = 0.002;
   static constexpr double kRunawayFrames = 1920;
   static constexpr double kRunawayCorrection = 0.01;
-  static constexpr size_t kTrimAboveFrames = 2880;
+  static constexpr size_t kTrimAboveFrames = 1440;
   static constexpr size_t kMaxTrimFrames = 24000;
   static constexpr size_t kSearchFrames = 2 * kFadeFrames;
   // Producer chunk: downmix and conversion work in pieces of this size.
@@ -251,7 +251,7 @@ class ScreenAudioPipe {
   std::atomic<uint64_t> overflow_frames_{0};
   std::atomic<uint64_t> write_max_gap_us_{0};
   std::atomic<uint64_t> stalls_{0};
-  // The largest single delivery since Configure, in 48 kHz frames.
+  // The largest recent delivery in 48 kHz frames (producer-written, decaying).
   std::atomic<uint64_t> largest_write_frames_{0};
 
   // Consumer state.

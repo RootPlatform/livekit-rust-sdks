@@ -363,13 +363,17 @@ bool ScreenAudioPipe::Configure(const ScreenAudioFormat& format) {
   return true;
 }
 
-// A wait counts as a capture stall from 60 ms, or from twice the largest
-// packet's duration for a capture that delivers in larger packets (a PipeWire
-// quantum of 4096 frames), at most 500 ms.
+// The largest delivery decays by 1/64 per delivery (an outlier, such as the
+// backlog of the first packet, is forgotten in about 100 deliveries). A wait
+// counts as a capture stall from 60 ms, or from twice the largest delivery's
+// duration for a capture that delivers in larger packets (a PipeWire quantum
+// of 4096 frames), at most 500 ms.
 void ScreenAudioPipe::NoteArrival(size_t frames) {
   uint64_t frames48 = static_cast<uint64_t>(frames) * kRate /
                       static_cast<uint64_t>(rate_);
-  RaiseMax(largest_write_frames_, frames48);
+  uint64_t largest = largest_write_frames_.load(std::memory_order_relaxed);
+  largest_write_frames_.store(std::max(frames48, largest - largest / 64),
+                              std::memory_order_relaxed);
   int64_t now = clock_->NowUs();
   int64_t last = last_write_us_.exchange(now, std::memory_order_relaxed);
   if (last == 0 || now <= last)
