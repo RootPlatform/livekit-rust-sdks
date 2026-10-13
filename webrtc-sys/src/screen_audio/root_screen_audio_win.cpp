@@ -14,7 +14,8 @@
  * limitations under the License.
  */
 
-// Windows screen audio: WASAPI process loopback (Windows 10 20348+). Everything
+// Windows screen audio: WASAPI process loopback (Windows 10 2004, build 19041,
+// and later). Everything
 // but this process tree (EXCLUDE_TARGET_PROCESS_TREE of our own pid), or only
 // one process tree (INCLUDE_TARGET_PROCESS_TREE). Mmdevapi and avrt are loaded
 // from System32 at run time, so the DLL links nothing new and loads where they
@@ -45,7 +46,9 @@ constexpr DWORD kActivationTypeProcessLoopback = 1;
 constexpr DWORD kLoopbackIncludeTree = 0;
 constexpr DWORD kLoopbackExcludeTree = 1;
 constexpr wchar_t kProcessLoopbackDevice[] = L"VAD\\Process_Loopback";
-constexpr DWORD kProcessLoopbackMinBuild = 20348;
+// Windows 10 2004; the SDK documents 20348, but process loopback works from
+// here (OBS gates its application audio capture on it too).
+constexpr DWORD kProcessLoopbackMinBuild = 19041;
 
 struct ProcessLoopbackParams {
   DWORD target_process_id;
@@ -155,6 +158,20 @@ bool DeviceLost(HRESULT hr) {
   return hr == AUDCLNT_E_DEVICE_INVALIDATED || hr == AUDCLNT_E_SERVICE_NOT_RUNNING ||
          hr == AUDCLNT_E_RESOURCES_INVALIDATED || hr == RPC_E_DISCONNECTED ||
          hr == HRESULT_FROM_WIN32(RPC_S_SERVER_UNAVAILABLE);
+}
+
+// A failed activation, Initialize or client start. Only "not supported" codes
+// are UNSUPPORTED (the build was checked before); anything else can pass (the
+// audio service restarting) and stays restartable.
+ScreenAudioError OpenError(HRESULT hr) {
+  if (hr == E_ACCESSDENIED)
+    return ScreenAudioError::kPermissionDenied;
+  if (hr == E_NOTIMPL || hr == HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED) ||
+      hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND))
+    return ScreenAudioError::kUnsupported;
+  if (DeviceLost(hr))
+    return ScreenAudioError::kDeviceLost;
+  return ScreenAudioError::kStartFailed;
 }
 
 // The activation completes on a COM worker thread; the handler only signals.
@@ -271,6 +288,13 @@ class WasapiProcessLoopbackBackend final : public ScreenAudioBackend {
     ScreenAudioStartResult result;
     Stop();
     const Exports& exports = LoadExports();
+    if (exports.build != 0 && exports.build < kProcessLoopbackMinBuild) {
+      result.error = ScreenAudioError::kUnsupported;
+      result.detail = "process loopback needs Windows 10 version 2004 (build 19041) or later; this "
+                      "is build " +
+                      std::to_string(exports.build);
+      return result;
+    }
     if (!exports.activate) {
       result.error = ScreenAudioError::kUnsupported;
       result.detail = "Mmdevapi.dll has no ActivateAudioInterfaceAsync";
@@ -445,12 +469,7 @@ class WasapiProcessLoopbackBackend final : public ScreenAudioBackend {
         continue;
       }
       if (hr != E_UNEXPECTED || attempt == kInitializeAttempts) {
-        bool unsupported = exports.build != 0 && exports.build < kProcessLoopbackMinBuild;
-        Fail(unsupported ? ScreenAudioError::kUnsupported : ScreenAudioError::kStartFailed,
-             "process loopback " + step + " failed (" + Hex(hr) + ")" +
-                 (unsupported ? ", needs Windows 10 build 20348 or later (this is " +
-                                    std::to_string(exports.build) + ")"
-                              : std::string()));
+        Fail(OpenError(hr), "process loopback " + step + " failed (" + Hex(hr) + ")");
         return false;
       }
       if (WaitForSingleObject(stop_event_, kRetryDelayMs * static_cast<DWORD>(attempt)) ==
@@ -473,8 +492,7 @@ class WasapiProcessLoopbackBackend final : public ScreenAudioBackend {
     if (SUCCEEDED(hr))
       hr = client_->Start();
     if (FAILED(hr)) {
-      Fail(DeviceLost(hr) ? ScreenAudioError::kDeviceLost : ScreenAudioError::kStartFailed,
-           "process loopback start failed (" + Hex(hr) + ")");
+      Fail(OpenError(hr), "process loopback start failed (" + Hex(hr) + ")");
       return false;
     }
     return true;

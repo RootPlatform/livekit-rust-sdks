@@ -545,9 +545,11 @@ enum RootScreenAudioScope {
 
 enum RootScreenAudioError {
   ROOT_SCREEN_AUDIO_ERROR_NONE = 0;
-  // No backend in this build, OS too old (Windows before 10.0.20348, macOS before 13), API missing.
+  // No backend in this build, OS too old (Windows before 10 version 2004, build 19041; macOS before
+  // 13), API missing, the OS says process loopback is not supported, Linux PipeWire does not play
+  // the system's audio (PulseAudio).
   ROOT_SCREEN_AUDIO_ERROR_UNSUPPORTED = 1;
-  // macOS Screen Recording not granted; Linux PipeWire access refused.
+  // macOS Screen Recording not granted; Linux PipeWire access refused; Windows access denied.
   ROOT_SCREEN_AUDIO_ERROR_PERMISSION_DENIED = 2;
   // The OS refused to open the capture.
   ROOT_SCREEN_AUDIO_ERROR_START_FAILED = 3;
