@@ -142,6 +142,7 @@ AudioTrackSource::InternalSource::InternalSource(
   int samples10ms = sample_rate / 100 * num_channels;
 
   silence_buffer_.assign(samples10ms, 0);
+  pull_buffer_.assign(samples10ms, 0);
   queue_size_samples_ = queue_size_ms / 10 * samples10ms;
   notify_threshold_samples_ = queue_size_samples_;  // TODO: this is currently
                                                     // using x2 the queue size
@@ -156,6 +157,20 @@ AudioTrackSource::InternalSource::InternalSource(
       [this, samples10ms]() {
         webrtc::MutexLock lock(&mutex_);
         constexpr int kBitsPerSample = sizeof(int16_t) * 8;
+
+        if (puller_) {
+          puller_->Pull(pull_buffer_.data(), sample_rate_, num_channels_,
+                        samples10ms / num_channels_);
+          for (auto sink : sinks_)
+            sink->OnData(pull_buffer_.data(), kBitsPerSample, sample_rate_,
+                         num_channels_, samples10ms / num_channels_);
+          if (on_complete_) {
+            on_complete_(capture_userdata_);
+            on_complete_ = nullptr;
+            capture_userdata_ = nullptr;
+          }
+          return webrtc::TimeDelta::Millis(10);
+        }
 
         if (buffer_.size() >= samples10ms) {
           for (auto sink : sinks_)
@@ -193,6 +208,9 @@ bool AudioTrackSource::InternalSource::capture_frame(
     void (*on_complete)(const SourceContext*)) {
   webrtc::MutexLock lock(&mutex_);
 
+  if (puller_)
+    return false;
+
   if (queue_size_samples_) {
     int available =
         (queue_size_samples_ + notify_threshold_samples_) - buffer_.size();
@@ -224,6 +242,19 @@ bool AudioTrackSource::InternalSource::capture_frame(
 void AudioTrackSource::InternalSource::clear_buffer() {
   webrtc::MutexLock lock(&mutex_);
   buffer_.clear();
+}
+
+bool AudioTrackSource::InternalSource::set_puller(AudioSourcePuller* puller) {
+  webrtc::MutexLock lock(&mutex_);
+  if (puller == nullptr) {
+    puller_ = nullptr;
+    return true;
+  }
+  if (!queue_size_samples_ || puller_ != nullptr)
+    return false;
+  puller_ = puller;
+  buffer_.clear();
+  return true;
 }
 
 webrtc::MediaSourceInterface::SourceState
@@ -295,6 +326,22 @@ bool AudioTrackSource::capture_frame(
 
 void AudioTrackSource::clear_buffer() const {
   source_->clear_buffer();
+}
+
+bool AudioTrackSource::set_puller(AudioSourcePuller* puller) const {
+  return source_->set_puller(puller);
+}
+
+bool AudioTrackSource::queued() const {
+  return source_->queued();
+}
+
+int AudioTrackSource::sample_rate() const {
+  return source_->sample_rate();
+}
+
+int AudioTrackSource::num_channels() const {
+  return source_->num_channels();
 }
 
 std::shared_ptr<AudioTrackSource> new_audio_track_source(

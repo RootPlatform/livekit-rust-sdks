@@ -96,6 +96,21 @@ std::shared_ptr<NativeAudioSink> new_native_audio_sink(
     int sample_rate,
     int num_channels);
 
+// A native producer that owns a queued source's 10 ms frames (screen audio,
+// root_screen_audio.h). Pull runs on the source's 10 ms task with the source's
+// mutex held and fills `frames` frames of `channels` interleaved int16 at
+// `sample_rate`; it must not lock, allocate or log.
+class AudioSourcePuller {
+ public:
+  virtual void Pull(int16_t* interleaved,
+                    int sample_rate,
+                    int channels,
+                    int frames) = 0;
+
+ protected:
+  ~AudioSourcePuller() = default;
+};
+
 class AudioTrackSource {
   class InternalSource : public webrtc::LocalAudioSource {
    public:
@@ -128,6 +143,16 @@ class AudioTrackSource {
 
     void clear_buffer();
 
+    // While a puller is attached the 10 ms task sends what it pulls instead
+    // of the queue, and capture_frame refuses frames. Needs the queue (a
+    // queue_size_ms above 0). Attaching fails when another puller is
+    // attached; after detaching (nullptr) returns, Pull is not running and
+    // never runs again.
+    bool set_puller(AudioSourcePuller* puller);
+    bool queued() const { return queue_size_samples_ != 0; }
+    int sample_rate() const { return sample_rate_; }
+    int num_channels() const { return num_channels_; }
+
     // Indicate this is an external audio source (when external_audio_source.patch is applied).
     // This prevents AudioState from sending device audio to streams using this source.
     // Note: Omit 'override' to allow builds without the patch applied.
@@ -146,6 +171,8 @@ class AudioTrackSource {
     void (*on_complete_)(const SourceContext*) RTC_GUARDED_BY(mutex_);
 
     std::vector<int16_t> silence_buffer_;
+    std::vector<int16_t> pull_buffer_;
+    AudioSourcePuller* puller_ RTC_GUARDED_BY(mutex_) = nullptr;
 
     int sample_rate_ = 0;
     int num_channels_ = 0;
@@ -174,6 +201,11 @@ class AudioTrackSource {
                      CompleteCallback on_complete) const;
 
   void clear_buffer() const;
+
+  bool set_puller(AudioSourcePuller* puller) const;
+  bool queued() const;
+  int sample_rate() const;
+  int num_channels() const;
 
   webrtc::scoped_refptr<InternalSource> get() const;
 

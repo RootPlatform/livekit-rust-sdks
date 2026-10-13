@@ -58,6 +58,7 @@ fn main() {
         "src/root_audio_mixer.rs",
         "src/root_audio_processing.rs",
         "src/root_denoiser.rs",
+        "src/root_screen_audio.rs",
         "src/packet_trailer.rs",
     ];
 
@@ -99,6 +100,8 @@ fn main() {
         "src/root_audio_monitor.cpp",
         "src/root_audio_processing.cpp",
         "src/root_denoiser.cpp",
+        "src/root_screen_audio.cpp",
+        "src/root_screen_audio_harness.cpp",
         "src/root_speech_detector.cpp",
         "src/root_voice_engine_hold.cpp",
         "src/audio_resampler.cpp",
@@ -115,6 +118,13 @@ fn main() {
     if is_desktop {
         builder.file("src/desktop_capturer.cpp");
     }
+
+    // Native screen-share audio: exactly one backend per target OS
+    // (include/livekit/root_screen_audio_backend.h).
+    builder.file(match target_os.as_str() {
+        "windows" => "src/screen_audio/root_screen_audio_win.cpp",
+        _ => "src/screen_audio/root_screen_audio_none.cpp",
+    });
 
     let webrtc_dir = webrtc_sys_build::webrtc_dir();
     let webrtc_include = webrtc_dir.join("include");
