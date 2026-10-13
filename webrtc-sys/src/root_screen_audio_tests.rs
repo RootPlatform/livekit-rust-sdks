@@ -343,6 +343,42 @@ fn screen_audio_pipe_counts_a_capture_pause_as_a_gap() {
     assert_eq!(stats.state, RUNNING);
 }
 
+/// The capture stops with `left` frames in the queue after the last full pull
+/// (what a pause leaves depends on its phase and the drift): the underrun
+/// fades out over 3 ms even when less, or nothing, is left, so no step exceeds
+/// the tone's own slope plus the fade's.
+#[test]
+fn screen_audio_pipe_fades_every_underrun_over_3_ms() {
+    let tone_step = (0.3 * 32767.0 * 2.0 * std::f64::consts::PI * 440.0 / 48_000.0) as i32 + 2;
+    let fade_step = (0.3 * 32767.0 * std::f64::consts::PI / 2.0 / (FADE as f64 + 1.0)) as i32 + 2;
+    for left in [0usize, 1, 2, 20, 100, 143, 144, 300] {
+        let mut h = pipe();
+        let mut tone = Tone::new(48_000, 2, 440.0, 0.3);
+        // Exactly the start threshold (target + one pull with look-ahead) plus
+        // `left`; three pulls later `left` frames remain.
+        let total = TARGET as usize + 483 + left;
+        for packet in [FRAME, FRAME, FRAME, total - 3 * FRAME] {
+            h.pin_mut().write(&tone.packet(packet));
+        }
+        let mut pulls = Vec::new();
+        for _ in 0..6 {
+            h.pin_mut().advance_us(10_000);
+            pulls.push(h.pin_mut().pull(2));
+        }
+        let stats = h.pin_mut().stats();
+        assert_eq!(stats.skipped_frames, 0, "left {left}");
+        assert_eq!(stats.underruns, 1, "left {left}");
+        let output: Vec<i16> = pulls.concat();
+        let step = max_step(&output, 2);
+        assert!(step <= tone_step + fade_step, "left {left}: step {step}");
+        // The underrun pull still sounds well past what was left.
+        let underrun = &pulls[3];
+        let last = underrun.chunks(2).rposition(|f| f[0] != 0).unwrap_or(0);
+        assert!(last + 16 >= left.max(FADE), "left {left}: audio ends at {last}");
+        assert!(pulls[4].iter().all(|&s| s == 0));
+    }
+}
+
 #[test]
 fn screen_audio_pipe_raises_the_target_after_jitter_and_lowers_it_later() {
     let mut h = pipe();

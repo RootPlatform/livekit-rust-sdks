@@ -330,6 +330,7 @@ ScreenAudioPipe::ScreenAudioPipe(const ScreenAudioClock* clock)
       head_(kFadeFrames * 2, 0.0f),
       candidates_((kSearchFrames + kFadeFrames) * 2, 0.0f),
       tail_(kFadeFrames * 2, 0.0f),
+      sent_tail_(kTailFrames * 2, 0.0f),
       pending_(kFadeFrames * 2, 0.0f) {
   resampler_.Reset(true);
 }
@@ -551,7 +552,7 @@ size_t ScreenAudioPipe::PullRunning() {
     size_t got = Gather(gather_.data(), std::min(available, kGatherFrames));
     size_t produced =
         resampler_.Process(gather_.data(), got, out_.data(), kFrame, &consumed);
-    Fade(out_.data(), produced, false);
+    produced = FadeOut(produced);
     underruns_.fetch_add(1, std::memory_order_relaxed);
     EnterWaiting();
     return produced;
@@ -563,6 +564,8 @@ size_t ScreenAudioPipe::PullRunning() {
     Fade(out_.data(), produced, true);
     fade_in_ = false;
   }
+  std::memcpy(sent_tail_.data(), &out_[(kFrame - kTailFrames) * 2],
+              kTailFrames * 2 * sizeof(float));
   if (++pulls_since_jitter_ >= kTargetDecayPulls) {
     pulls_since_jitter_ = 0;
     if (target_ > kInitialTargetFrames) {
@@ -642,6 +645,28 @@ void ScreenAudioPipe::Trim(size_t excess) {
               std::max(0.0, static_cast<double>(excess) - static_cast<double>(cut));
   window_min_ = SIZE_MAX;
   window_count_ = 0;
+}
+
+// An underrun fades out over kFadeFrames. With fewer frames left, the audio
+// continues mirrored around its last frame (into what the previous pull sent),
+// so the fade never cuts the signal short.
+size_t ScreenAudioPipe::FadeOut(size_t produced) {
+  if (produced < kFadeFrames) {
+    for (size_t i = produced; i < kFadeFrames; ++i) {
+      ptrdiff_t source = 2 * static_cast<ptrdiff_t>(produced) - 2 -
+                         static_cast<ptrdiff_t>(i);
+      const float* frame =
+          source >= 0 ? &out_[static_cast<size_t>(source) * 2]
+                      : &sent_tail_[static_cast<size_t>(
+                                        static_cast<ptrdiff_t>(kTailFrames) + source) *
+                                    2];
+      out_[i * 2] = frame[0];
+      out_[i * 2 + 1] = frame[1];
+    }
+    produced = kFadeFrames;
+  }
+  Fade(out_.data(), produced, false);
+  return produced;
 }
 
 void ScreenAudioPipe::Emit(int16_t* out, int channels, size_t produced) {

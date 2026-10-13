@@ -169,6 +169,7 @@ class ScreenAudioPipe {
   static constexpr size_t kFrame = 480;
   static constexpr size_t kRingFrames = 65536;
   static constexpr size_t kFadeFrames = 144;
+  static constexpr size_t kTailFrames = kFadeFrames + 1;
   static constexpr size_t kInitialTargetFrames = 960;
   static constexpr size_t kTargetStepFrames = 480;
   static constexpr size_t kMaxTargetFrames = 9600;
@@ -228,6 +229,7 @@ class ScreenAudioPipe {
   void EnterWaiting();
   void UpdateLevel(size_t margin);
   void Trim(size_t excess);
+  size_t FadeOut(size_t produced);
   void Emit(int16_t* out, int channels, size_t produced);
 
   const ScreenAudioClock* clock_;
@@ -272,6 +274,8 @@ class ScreenAudioPipe {
   std::vector<float> head_;
   std::vector<float> candidates_;
   std::vector<float> tail_;
+  // The last kTailFrames frames the previous running pull sent.
+  std::vector<float> sent_tail_;
   std::vector<float> pending_;
   size_t pending_frames_ = 0;
   size_t pending_offset_ = 0;
