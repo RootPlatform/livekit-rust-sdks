@@ -1237,6 +1237,57 @@ e435c4dc2, golden vectors regenerated: 25 vectors, two new at the cap). Powers o
 `pow10` (libm's pow with an opaque base), so LLVM cannot turn them into exp10 on macOS and Linux;
 golden vectors written on Windows may still need `ROOTAPP_DSP_GOLDEN_LOOSE=1` on another libm.
 
+## Native screen-share audio (`rootapp/native-screen-audio`)
+
+Screen-share audio was the last real-time audio path in .NET (OS loopback, 100 ms batches, a managed
+pacer). It now runs natively; design: the desktop's `docs/native-platform-audio.md` ("Screen-share
+audio").
+
+- **Backend interface** `webrtc-sys/include/livekit/root_screen_audio_backend.h`: one
+  `ScreenAudioBackend` per OS opens the capture and resolves the target (everything but this process
+  tree, one process tree, or a window's application), and writes interleaved float32 into a wait-free
+  `ScreenAudioSink` from its own audio thread. Exactly one file per OS defines
+  `RootScreenAudioBackendBuilt()` and `CreateRootScreenAudioBackend()`, chosen in `webrtc-sys/build.rs`:
+  `src/screen_audio/root_screen_audio_win.cpp` (WASAPI process loopback) on Windows,
+  `root_screen_audio_none.cpp` elsewhere until the macOS (`root_screen_audio_mac.mm`, ScreenCaptureKit)
+  and Linux (`root_screen_audio_linux.cpp`, PipeWire) backends land. A backend that lands also adds its
+  OS to `SCREEN_AUDIO_OS` in `livekit-ffi/src/server/rootapp_audio.rs`.
+- **Core** `root_screen_audio.{h,cpp}`: `RootScreenAudioCapture` attaches to a queued 48 kHz mono or
+  stereo `AudioTrackSource` as its `AudioSourcePuller` (`audio_track.{h,cpp}`: the source's 10 ms task
+  asks the puller for every frame and `capture_frame` refuses frames meanwhile). The pipe downmixes to
+  stereo, converts other rates with `PushResampler<float>` in 10 ms chunks, and keeps a 65536-frame
+  SPSC ring; the pull primes a 20 ms margin (plus what a large OS packet holds), skips a backlog,
+  corrects drift on the exact ring level with the desktop's DriftResampler (6-point Lagrange, 32.32
+  phase; 2 ms deadband, 0.2 % at 12 ms, up to 1 % beyond 40 ms), counts underruns and tells capture
+  pauses (gaps) from late deliveries (jitter: +10 ms margin up to 200 ms, -10 ms after 60 s), fades
+  3 ms at every edge and splices excess above 60 ms out WSOLA-style (the desktop's AudioSplice). Neither
+  side locks, allocates or logs. A control thread per capture runs the backend's Start/Stop and the
+  restarts (backoff 0.2, 1, 3, 3, 3 s, 5 per minute; none for permission or a gone target) and queues
+  events; dropping the handle detaches at once and leaves the backend stop to that thread. A gate in
+  front of every backend drops late calls, so a backend whose Stop could not join is leaked safely.
+- **Windows backend**: `ActivateAudioInterfaceAsync(VAD\Process_Loopback)` with
+  `AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK` (structs declared locally; Mmdevapi and avrt loaded
+  at run time, so nothing new is linked), EXCLUDE (own pid) or INCLUDE (target pid) tree, an agile
+  completion handler, shared LOOPBACK | EVENTCALLBACK at 48 kHz float32 stereo with a 100 ms buffer
+  (20 ms if refused), E_UNEXPECTED retried with re-activation; an MMCSS "Audio" thread owns every COM
+  object, writes packets straight from `GetBuffer` (SILENT as silence, DATA_DISCONTINUITY counted) and
+  reports device loss, stream failures and an exited target (its process handle in the wait set).
+  Before build 20348 activation fails as UNSUPPORTED.
+- **FFI** (`livekit-ffi/src/server/rootapp_screen_audio.rs`): `RootScreenAudioStart/Stop/Stats`
+  (requests 1012-1014), `RootScreenAudioEvent` (event 1001, polled every 20 ms from 100 ms after the
+  start); an owned capture handle. Caps bit 13 SCREEN_AUDIO where an OS backend is built (Windows:
+  16383 on 64 bit). `NativeAudioSource::attach_screen_audio` (libwebrtc) keeps cxx types out of the
+  FFI crate.
+
+Tests (device-free): webrtc-sys `root_screen_audio_tests` (the pipe on a manual clock: pass-through
+bit for bit, downmix, 44.1 kHz conversion, ±100-2000 ppm drift without underruns, gaps vs jitter,
+target decay, backlog skip, large packets, phase-aligned trim, overflow, clipping and non-finite
+samples; the capture against a real queued source with scripted fake backends: events, restarts and
+their budget, stop, a shutdown that never waits, a backend that cannot stop, refused second captures
+and host frames, source checks, a 44.1 kHz mono backend); livekit-ffi `rootapp_screen_audio` (mapping,
+routing and handle lifetime, refusals, and the real request path with the fake tone backend that
+`root_screen_audio_use_fake_backend` installs). The Windows backend itself only runs live.
+
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
 | Commit | Change |

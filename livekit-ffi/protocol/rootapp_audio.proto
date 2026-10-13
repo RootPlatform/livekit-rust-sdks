@@ -679,7 +679,8 @@ message RootScreenAudioFailed {
 message RootScreenAudioStopped {
   required uint64 async_id = 1;
 }
-// Events of one capture, polled every 20 ms while its handle lives (none after the drop).
+// Events of one capture, polled from 100 ms after the start (so the host listens for its handle
+// first) every 20 ms while the handle lives (none after the drop).
 message RootScreenAudioEvent {
   required uint64 capture_handle = 1;
   oneof message {

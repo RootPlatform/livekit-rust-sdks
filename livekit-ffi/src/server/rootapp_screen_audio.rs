@@ -38,6 +38,9 @@ use super::{
 use crate::{proto, FfiHandleId, FfiResult};
 
 const EVENT_POLL: Duration = Duration::from_millis(20);
+/// The first poll waits this long, so the host listens for the handle's
+/// events (it learns the handle from the response) before any is sent.
+const FIRST_POLL_DELAY: Duration = Duration::from_millis(100);
 const NOT_SUPPORTED: &str = "native screen audio is not supported by this build";
 /// Window titles longer than this are cut (a lookup key only).
 const MAX_TITLE_CHARS: usize = 512;
@@ -234,7 +237,8 @@ fn spawn_event_pump(
     emit: impl Fn(proto::RootScreenAudioEvent) + Send + 'static,
 ) {
     server.async_runtime.spawn(async move {
-        let mut poll = tokio::time::interval(EVENT_POLL);
+        let mut poll =
+            tokio::time::interval_at(tokio::time::Instant::now() + FIRST_POLL_DELAY, EVENT_POLL);
         poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             poll.tick().await;
