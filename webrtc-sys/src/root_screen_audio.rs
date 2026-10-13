@@ -183,3 +183,40 @@ pub mod ffi {
 }
 
 impl_thread_safety!(ffi::RootScreenAudioCaptureHandle, Send + Sync);
+
+/// A native screen-audio capture attached to one queued source. Dropping it
+/// detaches the capture at once and stops the OS capture on the capture's own
+/// thread (never blocks).
+pub struct ScreenAudioCapture(cxx::UniquePtr<ffi::RootScreenAudioCaptureHandle>);
+
+impl ScreenAudioCapture {
+    /// Attaches a capture to a queued 48 kHz mono or stereo source; the error
+    /// says why the source cannot take one.
+    pub fn new(
+        source: cxx::SharedPtr<crate::audio_track::ffi::AudioTrackSource>,
+    ) -> Result<Self, String> {
+        let mut error = String::new();
+        let capture = ffi::new_root_screen_audio_capture(source, &mut error);
+        if capture.is_null() {
+            Err(error)
+        } else {
+            Ok(Self(capture))
+        }
+    }
+
+    pub fn start(&self, target: &ffi::RootScreenAudioTargetSpec, async_id: u64) {
+        self.0.start(target, async_id);
+    }
+
+    pub fn stop(&self, async_id: u64) {
+        self.0.stop(async_id);
+    }
+
+    pub fn stats(&self) -> ffi::RootScreenAudioStatsData {
+        self.0.stats()
+    }
+
+    pub fn take_events(&self) -> Vec<ffi::RootScreenAudioEventData> {
+        self.0.take_events()
+    }
+}

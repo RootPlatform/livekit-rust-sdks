@@ -210,5 +210,14 @@ pub mod native {
         pub fn num_channels(&self) -> u32 {
             self.handle.num_channels()
         }
+
+        /// RootApp: attaches a native screen-audio capture to this source
+        /// (webrtc-sys root_screen_audio.h); the error says why the source
+        /// cannot take one.
+        pub fn attach_screen_audio(
+            &self,
+        ) -> Result<webrtc_sys::root_screen_audio::ScreenAudioCapture, String> {
+            webrtc_sys::root_screen_audio::ScreenAudioCapture::new(self.handle.sys_handle())
+        }
     }
 }

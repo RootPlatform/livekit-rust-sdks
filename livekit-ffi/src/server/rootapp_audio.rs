@@ -66,6 +66,11 @@ pub const CAP_DENOISER: u64 = 1 << 9;
 pub const CAP_MONITOR: u64 = 1 << 10;
 pub const CAP_APM_DECORATOR: u64 = 1 << 11;
 pub const CAP_SPEECH_DETECTION: u64 = 1 << 12;
+pub const CAP_SCREEN_AUDIO: u64 = 1 << 13;
+
+/// Target OSes whose native screen-audio backend is built (webrtc-sys
+/// `root_screen_audio_backend.h`; one backend file per OS in its build.rs).
+const SCREEN_AUDIO_OS: bool = cfg!(target_os = "windows");
 
 /// What `livekit_ffi_rootapp_audio_caps` reports. The ADM hardening is desktop
 /// only, so mobile builds report nothing. The voice chain (DSP), the mic test
@@ -73,7 +78,8 @@ pub const CAP_SPEECH_DETECTION: u64 = 1 << 12;
 /// detector the chain gates with (SPEECH_DETECTION) run wherever the factory
 /// builds its APM (webrtc-sys `kRootDspSupported`); the Effects SDK slot
 /// (DENOISER) only where the SDK's x64/arm64 calling convention holds
-/// (`kRootDenoiserSupported`).
+/// (`kRootDenoiserSupported`); native screen audio (SCREEN_AUDIO) where an OS
+/// backend is built (`SCREEN_AUDIO_OS`).
 pub const ROOTAPP_AUDIO_CAPS: u64 = if cfg!(any(target_os = "ios", target_os = "android")) {
     0
 } else {
@@ -90,6 +96,7 @@ pub const ROOTAPP_AUDIO_CAPS: u64 = if cfg!(any(target_os = "ios", target_os = "
         | CAP_MONITOR
         | CAP_APM_DECORATOR
         | CAP_SPEECH_DETECTION
+        | if SCREEN_AUDIO_OS { CAP_SCREEN_AUDIO } else { 0 }
 };
 
 const NOT_SUPPORTED: &str = "not supported by this build";
@@ -1320,16 +1327,21 @@ mod tests {
     fn rootapp_audio_caps_cover_phase_3() {
         let mobile = cfg!(any(target_os = "ios", target_os = "android"));
         if !mobile {
+            let screen = if SCREEN_AUDIO_OS { CAP_SCREEN_AUDIO } else { 0 };
             let expected = if cfg!(target_pointer_width = "64") {
                 0b1_1111_1111_1111
             } else {
                 0b1_1101_1111_1111
-            };
+            } | screen;
             assert_eq!(ROOTAPP_AUDIO_CAPS, expected);
-            if cfg!(target_pointer_width = "64") {
-                assert_eq!(ROOTAPP_AUDIO_CAPS, 8191);
+            if cfg!(all(target_pointer_width = "64", target_os = "windows")) {
+                assert_eq!(ROOTAPP_AUDIO_CAPS, 16383);
             }
         }
+        assert_eq!(
+            ROOTAPP_AUDIO_CAPS & CAP_SCREEN_AUDIO != 0,
+            !mobile && webrtc_sys::root_screen_audio::ffi::root_screen_audio_backend_built()
+        );
         assert_eq!(crate::cabi::livekit_ffi_rootapp_audio_caps(), ROOTAPP_AUDIO_CAPS);
         // Each bit is set exactly where the native side builds what it claims.
         assert_eq!(

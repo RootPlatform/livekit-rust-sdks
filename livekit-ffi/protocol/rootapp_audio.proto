@@ -510,3 +510,181 @@ message RootAudioEvent {
     RootAudioDenoiserState denoiser_state = 7;
   }
 }
+
+// Screen-share audio captured natively (capability SCREEN_AUDIO). The OS captures what the machine
+// plays (Windows: WASAPI process loopback; macOS: ScreenCaptureKit; Linux: PipeWire) and native code
+// paces it at 10 ms into an AudioSource the host created and publishes as before, so no host thread
+// is on the audio path. While a capture is attached the source sends only what the capture gives it
+// (silence while it waits for audio, restarts or after a stop) and refuses CaptureAudioFrame. The
+// source's format and the published track never change: an OS capture that fails or restarts leaves
+// silence in the same stream (never stop, restart or retarget a published audio sender in place).
+// Independent of PlatformAudio: it works with the platform and the host-driven call audio alike.
+
+// What to capture. Absent or `system`: everything the machine plays except this process and its
+// children (the call's own playout, so remote voices are never sent back).
+message RootScreenAudioTarget {
+  oneof target {
+    bool system = 1;
+    // Only this process and its children (Windows). macOS: the application with this pid. Linux:
+    // system. A process that cannot be found, or this process itself: system.
+    uint32 process_id = 2;
+    // Only the application owning this window: HWND (Windows: its process tree), CGWindowID (macOS:
+    // its application, window_title as a second lookup, exact then case-insensitive). Linux: system.
+    // A window that cannot be found: system.
+    uint64 window_id = 3;
+  }
+  optional string window_title = 4;
+}
+
+// What a started capture captures (RootScreenAudioStarted.scope, RootScreenAudioStats.scope).
+enum RootScreenAudioScope {
+  ROOT_SCREEN_AUDIO_SCOPE_SYSTEM = 0;
+  ROOT_SCREEN_AUDIO_SCOPE_PROCESS = 1;
+  ROOT_SCREEN_AUDIO_SCOPE_APPLICATION = 2;
+}
+
+enum RootScreenAudioError {
+  ROOT_SCREEN_AUDIO_ERROR_NONE = 0;
+  // No backend in this build, OS too old (Windows before 10.0.20348, macOS before 13), API missing.
+  ROOT_SCREEN_AUDIO_ERROR_UNSUPPORTED = 1;
+  // macOS Screen Recording not granted; Linux PipeWire access refused.
+  ROOT_SCREEN_AUDIO_ERROR_PERMISSION_DENIED = 2;
+  // The OS refused to open the capture.
+  ROOT_SCREEN_AUDIO_ERROR_START_FAILED = 3;
+  // The capture endpoint went away (device invalidated, audio service or daemon restarted).
+  ROOT_SCREEN_AUDIO_ERROR_DEVICE_LOST = 4;
+  // Any other failure of a running capture.
+  ROOT_SCREEN_AUDIO_ERROR_STREAM_FAILED = 5;
+  // The captured process or application exited.
+  ROOT_SCREEN_AUDIO_ERROR_TARGET_GONE = 6;
+  ROOT_SCREEN_AUDIO_ERROR_TIMEOUT = 7;
+  ROOT_SCREEN_AUDIO_ERROR_INTERNAL = 8;
+}
+
+enum RootScreenAudioState {
+  // A start (or the first one) is running.
+  ROOT_SCREEN_AUDIO_STATE_STARTING = 0;
+  // The OS capture runs; the stream sends silence until enough audio is queued (and again after it
+  // ran dry).
+  ROOT_SCREEN_AUDIO_STATE_WAITING = 1;
+  ROOT_SCREEN_AUDIO_STATE_RUNNING = 2;
+  // The OS capture failed and native restarts it (backoff 0.2, 1, 3, 3, 3 s; at most 5 per minute).
+  ROOT_SCREEN_AUDIO_STATE_RESTARTING = 3;
+  // The start failed, or a running capture failed for good; the stream stays silent.
+  ROOT_SCREEN_AUDIO_STATE_FAILED = 4;
+  ROOT_SCREEN_AUDIO_STATE_STOPPED = 5;
+}
+
+// Attaches a capture to source_handle, an AudioSource of type NATIVE at 48 kHz with 1 or 2 channels
+// and a queue (queue_size_ms above 0), and starts it on the capture's own native thread. A refused
+// request (no SCREEN_AUDIO in this build, an unknown or unusable source, a source that already has a
+// capture) sets error and makes no capture. Otherwise capture_handle is an owned handle: dropping it
+// (FfiDropHandle) detaches the capture from the source at once and stops the OS capture on the
+// capture's thread, so the drop never blocks. The start completes with RootScreenAudioEvent.started
+// or .failed carrying async_id.
+message RootScreenAudioStartRequest {
+  required uint64 source_handle = 1;
+  optional RootScreenAudioTarget target = 2;
+}
+message RootScreenAudioStartResponse {
+  optional uint64 capture_handle = 1;
+  optional uint64 async_id = 2;
+  optional string error = 3;
+}
+
+// Stops the OS capture (the source sends silence until the handle is dropped); completes with
+// RootScreenAudioEvent.stopped carrying async_id, after which no OS capture runs.
+message RootScreenAudioStopRequest {
+  required uint64 capture_handle = 1;
+}
+message RootScreenAudioStopResponse {
+  optional uint64 async_id = 1;
+  optional string error = 2;
+}
+
+// Counters are cumulative for the capture; the *_max_* fields are maxima since the previous
+// RootScreenAudioStatsRequest (reset on read: one reader). Frames are per channel; "48 kHz frames"
+// are after native's conversion to the source's rate.
+message RootScreenAudioStats {
+  required RootScreenAudioState state = 1;
+  required RootScreenAudioScope scope = 2;
+  // The OS capture's format (0 before the first start).
+  required uint32 capture_rate = 3;
+  required uint32 capture_channels = 4;
+  // OS side: frames delivered (at capture_rate), of those flagged silent by the OS, OS-reported lost
+  // audio (WASAPI data discontinuity, a PipeWire xrun), 48 kHz frames dropped because the ring was
+  // full, the longest wait between two deliveries (µs, reset on read), and deliveries after a wait of
+  // 60 ms or more (or twice the largest delivery, at most 500 ms).
+  required uint64 captured_frames = 5;
+  required uint64 silent_capture_frames = 6;
+  required uint64 discontinuities = 7;
+  required uint64 overflow_frames = 8;
+  required uint64 write_max_gap_us = 9;
+  required uint64 capture_stalls = 10;
+  // Source side (the 10 ms pulls): pulls, the longest wait between two (µs, reset on read), 48 kHz
+  // frames of captured audio sent and of silence sent (waiting, gaps, stopped), times the queue ran
+  // dry, those of them that a capture pause caused (gaps; the others were late deliveries and raised
+  // the target by 10 ms), frames spliced out to bring the latency down, frames of a backlog skipped
+  // when sending (re)started, and samples clipped to full scale.
+  required uint64 pulls = 11;
+  required uint64 pull_max_gap_us = 12;
+  required uint64 sent_frames = 13;
+  required uint64 silence_frames = 14;
+  required uint64 underruns = 15;
+  required uint64 gaps = 16;
+  required uint64 trimmed_frames = 17;
+  required uint64 skipped_frames = 18;
+  required uint64 clipped_samples = 19;
+  // Level of the captured audio sent: sum of squares in int16 units over sent_samples.
+  required double sent_sumsq = 20;
+  required uint64 sent_samples = 21;
+  // The queue: its smoothed lowest level after a pull (-1 before the first measurement) and the
+  // margin native holds it at (20 ms, raised by late deliveries up to 200 ms), in ms; the clock-drift
+  // rate correction now, in ppm (positive: the capture runs fast).
+  required float level_ms = 22;
+  required float target_ms = 23;
+  required int32 drift_ppm = 24;
+  // OS capture restarts that succeeded, and the last failure (NONE before any).
+  required uint32 restarts = 25;
+  required RootScreenAudioError last_error = 26;
+  optional string last_error_message = 27;
+}
+message RootScreenAudioStatsRequest {
+  required uint64 capture_handle = 1;
+}
+message RootScreenAudioStatsResponse {
+  optional RootScreenAudioStats stats = 1;
+  optional string error = 2;
+}
+
+// The OS capture runs. async_id is the start request's, 0 for a restart after a failure. description
+// says what it captures, e.g. "process 1234 (chrome.exe) and its children" or "window not found; all
+// audio except process 5678 and its children". sample_rate and channels are the OS capture's (native
+// converts to the source's format).
+message RootScreenAudioStarted {
+  required uint64 async_id = 1;
+  required RootScreenAudioScope scope = 2;
+  required string description = 3;
+  required uint32 sample_rate = 4;
+  required uint32 channels = 5;
+}
+// A start failed (async_id the start request's) or a running capture failed (async_id 0). retrying:
+// native restarts it; false: it gave up and the stream stays silent until the handle is dropped.
+message RootScreenAudioFailed {
+  required uint64 async_id = 1;
+  required RootScreenAudioError error = 2;
+  required string message = 3;
+  required bool retrying = 4;
+}
+message RootScreenAudioStopped {
+  required uint64 async_id = 1;
+}
+// Events of one capture, polled every 20 ms while its handle lives (none after the drop).
+message RootScreenAudioEvent {
+  required uint64 capture_handle = 1;
+  oneof message {
+    RootScreenAudioStarted started = 2;
+    RootScreenAudioFailed failed = 3;
+    RootScreenAudioStopped stopped = 4;
+  }
+}

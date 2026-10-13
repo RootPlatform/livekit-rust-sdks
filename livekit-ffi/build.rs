@@ -92,6 +92,7 @@ fn generate_protobuf() {
         .derive_from_variants("livekit.proto.ByteStreamReaderEvent.detail")
         .derive_from_variants("livekit.proto.DataTrackStreamEvent.detail")
         .derive_from_variants("livekit.proto.RootAudioEvent.message")
+        .derive_from_variants("livekit.proto.RootScreenAudioEvent.message")
         .compile_protos(&paths, &[PROTO_SRC_DIR])
         .expect("Protobuf generation failed");
 }

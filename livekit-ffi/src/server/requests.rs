@@ -28,7 +28,8 @@ use super::{
     participant::FfiParticipant,
     platform_audio, resampler,
     room::{self, FfiPublication, FfiTrack},
-    rootapp_audio, video_source, video_stream, FfiError, FfiResult, FfiServer,
+    rootapp_audio, rootapp_screen_audio, video_source, video_stream, FfiError, FfiResult,
+    FfiServer,
 };
 use crate::proto;
 
@@ -1513,6 +1514,9 @@ pub fn handle_request(
         }
         Request::RootAudioSetMonitor(req) => rootapp_audio::on_set_monitor(server, req)?.into(),
         Request::RootAudioStats(req) => rootapp_audio::on_stats(server, req)?.into(),
+        Request::RootScreenAudioStart(req) => rootapp_screen_audio::on_start(server, req)?.into(),
+        Request::RootScreenAudioStop(req) => rootapp_screen_audio::on_stop(server, req)?.into(),
+        Request::RootScreenAudioStats(req) => rootapp_screen_audio::on_stats(server, req)?.into(),
     });
 
     Ok(res)
