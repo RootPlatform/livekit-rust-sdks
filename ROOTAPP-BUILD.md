@@ -1249,9 +1249,9 @@ audio").
   `ScreenAudioSink` from its own audio thread. Exactly one file per OS defines
   `RootScreenAudioBackendBuilt()` and `CreateRootScreenAudioBackend()`, chosen in `webrtc-sys/build.rs`:
   `src/screen_audio/root_screen_audio_win.cpp` (WASAPI process loopback) on Windows,
-  `root_screen_audio_mac.mm` (ScreenCaptureKit) on macOS, `root_screen_audio_none.cpp` elsewhere until
-  the Linux (`root_screen_audio_linux.cpp`, PipeWire) backend lands. A backend that lands also adds its
-  OS to `SCREEN_AUDIO_OS` in `livekit-ffi/src/server/rootapp_audio.rs`.
+  `root_screen_audio_mac.mm` (ScreenCaptureKit) on macOS, `root_screen_audio_linux.cpp` (PipeWire) on
+  Linux, `root_screen_audio_none.cpp` elsewhere. Each backend's OS is also in `SCREEN_AUDIO_OS` in
+  `livekit-ffi/src/server/rootapp_audio.rs`.
 - **Core** `root_screen_audio.{h,cpp}`: `RootScreenAudioCapture` attaches to a queued 48 kHz mono or
   stereo `AudioTrackSource` as its `AudioSourcePuller` (`audio_track.{h,cpp}`: the source's 10 ms task
   asks the puller for every frame and `capture_frame` refuses frames meanwhile). The pipe downmixes to
@@ -1288,11 +1288,30 @@ audio").
   a different rate restarts at that rate. A stop from the menu bar is PERMISSION_DENIED, a lost
   display (-3815) DEVICE_LOST. Manual reference counting; every ScreenCaptureKit reference is newer
   than the deployment target, so it is weak and the library still loads on macOS 10.15-12.
+- **Linux backend**: the desktop's managed `PipeWireLoopbackCaptureService` in native code, without
+  pw-dump/pw-link. libpipewire-0.3 is dlopened (nothing new in NEEDED; no library: UNSUPPORTED, no
+  daemon: UNSUPPORTED, EACCES: PERMISSION_DENIED); only the exported functions come from it, the
+  registry, bind and link-factory calls are the headers' inline interface calls. The headers are the
+  libwebrtc sysroot's (`debian_bullseye_*-sysroot/usr/include/{pipewire-0.3,spa-0.2}`, PipeWire
+  0.3.65), else the host's `libpipewire-0.3-dev`. A `pw_thread_loop` runs a `pw_stream` capture node
+  (F32LE 48 kHz FL/FR, MAP_BUFFERS | RT_PROCESS, never autoconnected; node.name
+  root-screen-share-audio, media.role Screen) and a registry listener that binds every node and client
+  for its full properties and links the node itself (`link-factory`, `object.linger=false`, so the
+  links die with the client) to every Stream/Output/Audio node not in this process tree (node or
+  client `application.process.id`, a /proc walk from `getpid()`) and not a downstream re-emitter of its
+  audio (effects apps, loopbacks, filter-chains: the managed `PipeWireGraph.DownstreamReemitters` taint
+  walk), FL to FL, FR to FR, MONO to both, other layouts alternately. Graph changes are coalesced by a
+  core sync and planned on the loop (`root_screen_audio_pipewire_graph.h`, platform-free), so new
+  streams are linked as they appear and a stream that turns into a re-emitter is unlinked; a link the
+  daemon refuses or removes 3 times is left alone. The process callback (data loop) only dequeues,
+  writes into the sink and queues. A stream error, a disconnect or the daemon closing the connection
+  is DEVICE_LOST (restart). Window and process targets capture everything but Root (the portal never
+  names the window), said in the started event's description.
 - **FFI** (`livekit-ffi/src/server/rootapp_screen_audio.rs`): `RootScreenAudioStart/Stop/Stats`
   (requests 1012-1014), `RootScreenAudioEvent` (event 1001, polled every 20 ms from 100 ms after the
-  start); an owned capture handle. Caps bit 13 SCREEN_AUDIO where an OS backend is built (Windows and
-  macOS: 16383 on 64 bit). `NativeAudioSource::attach_screen_audio` (libwebrtc) keeps cxx types out of the
-  FFI crate.
+  start); an owned capture handle. Caps bit 13 SCREEN_AUDIO where an OS backend is built (Windows,
+  macOS and Linux: 16383 on 64 bit). `NativeAudioSource::attach_screen_audio` (libwebrtc) keeps cxx
+  types out of the FFI crate.
 
 Tests (device-free): webrtc-sys `root_screen_audio_tests` (the pipe on a manual clock: pass-through
 bit for bit, downmix, 44.1 kHz conversion, ±100-2000 ppm drift without underruns, gaps vs jitter,
@@ -1301,9 +1320,12 @@ samples; the capture against a real queued source with scripted fake backends: e
 their budget, stop, a shutdown that never waits, a backend that cannot stop, refused second captures
 and host frames, source checks, a 44.1 kHz mono backend); livekit-ffi `rootapp_screen_audio` (mapping,
 routing and handle lifetime, refusals, and the real request path with the fake tone backend that
-`root_screen_audio_use_fake_backend` installs). The OS backends themselves only run live; the macOS
-one was written on Windows and only syntax-checked there (Objective-C++ against stub SDK headers), so
-its first macOS build is its first real compile.
+`root_screen_audio_use_fake_backend` installs); webrtc-sys `root_screen_audio_pipewire_graph` (the
+Linux backend's graph rules on every OS: channel mapping, client pids, own streams, effects apps,
+loopback link groups, chained effects, direct captures, the capture node itself, /proc stat parsing
+and the process tree). The OS backends themselves only run live; the macOS and Linux ones were
+written on Windows and only syntax-checked there (against stub SDK and PipeWire headers), so their
+first macOS and Linux builds are their first real compiles.
 
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
