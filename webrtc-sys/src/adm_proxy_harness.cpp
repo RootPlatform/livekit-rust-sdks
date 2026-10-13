@@ -514,8 +514,9 @@ AdmProxyHarness::AdmProxyHarness(
   proxy_->SetPlayoutOpenedSink(
       [log = opened_](const AdmPlayoutOpened& opened) {
         webrtc::MutexLock lock(&log->mutex);
-        log->entries.push_back(opened.system_default
-                                   ? std::string("default")
+        log->entries.push_back(!opened.open ? std::string("closed")
+                               : opened.system_default
+                                   ? "default|" + opened.name
                                    : opened.guid + "|" + opened.name);
       });
   controller_ = std::make_unique<AudioDeviceController>(proxy_, mixer_, apm_,

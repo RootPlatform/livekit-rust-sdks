@@ -788,6 +788,14 @@ bool AdmProxy::StopDeviceLocked(bool playout, AdmDirectionOutcome* outcome) {
     capture_state_->ClearSpeaking();
   }
   if (result == 0) {
+#if !LK_ADM_MOBILE
+    if (playout && playout_opened_sink_) {
+      AdmPlayoutOpened closed;
+      closed.open = false;
+      closed.system_default = false;
+      playout_opened_ = std::move(closed);
+    }
+#endif
     return true;
   }
   device_stop_failures_.fetch_add(1, std::memory_order_relaxed);
@@ -870,20 +878,7 @@ void AdmProxy::ReconcilePlayoutLocked(const DesiredState& desired,
     }
 #if !LK_ADM_MOBILE
     if (playout_opened_sink_) {
-      AdmPlayoutOpened opened;
-      opened.system_default = last_playout_index_ == kAdmResolveDefault;
-      const int index = opened.system_default ? 0 : last_playout_index_;
-      AdmNameBuffers buffers;
-      if (index >= 0 && platform_adm->PlayoutDeviceName(
-                            static_cast<uint16_t>(index), buffers.name,
-                            buffers.guid) == 0) {
-        opened.name = buffers.Name();
-        opened.guid = buffers.Guid();
-      }
-      if (opened.system_default) {
-        opened.guid.clear();
-      }
-      playout_opened_ = std::move(opened);
+      playout_opened_ = last_playout_identity_;
     }
 #endif
   }
@@ -1021,7 +1016,8 @@ void AdmProxy::PublishStateLocked(const DesiredState& desired) {
 
 int AdmProxy::ResolveSelectionLocked(
     [[maybe_unused]] bool playout,
-    [[maybe_unused]] const AdmDeviceSelection& selection) {
+    [[maybe_unused]] const AdmDeviceSelection& selection,
+    [[maybe_unused]] AdmPlayoutOpened* matched) {
 #if LK_ADM_MOBILE
   return kAdmResolveDefault;
 #else
@@ -1045,23 +1041,51 @@ int AdmProxy::ResolveSelectionLocked(
   }
   const int count = playout ? platform_adm->PlayoutDevices()
                             : platform_adm->RecordingDevices();
-  return ResolveAdmDeviceIndex(
+  auto device_at = [platform_adm, playout](int index, std::string* name,
+                                           std::string* guid) {
+    AdmNameBuffers buffers;
+    const uint16_t device = static_cast<uint16_t>(index);
+    const int32_t result =
+        playout ? platform_adm->PlayoutDeviceName(device, buffers.name,
+                                                  buffers.guid)
+                : platform_adm->RecordingDeviceName(device, buffers.name,
+                                                    buffers.guid);
+    if (result != 0) {
+      return false;
+    }
+    *name = buffers.Name();
+    *guid = buffers.Guid();
+    return true;
+  };
+  int read_index = kAdmResolveNotFound;
+  std::string read_name;
+  std::string read_guid;
+  const int index = ResolveAdmDeviceIndex(
       *wanted, count,
-      [platform_adm, playout](int index, std::string* name, std::string* guid) {
-        AdmNameBuffers buffers;
-        const uint16_t device = static_cast<uint16_t>(index);
-        const int32_t result =
-            playout ? platform_adm->PlayoutDeviceName(device, buffers.name,
-                                                      buffers.guid)
-                    : platform_adm->RecordingDeviceName(device, buffers.name,
-                                                        buffers.guid);
-        if (result != 0) {
+      [&](int at, std::string* name, std::string* guid) {
+        if (!device_at(at, name, guid)) {
           return false;
         }
-        *name = buffers.Name();
-        *guid = buffers.Guid();
+        read_index = at;
+        read_name = *name;
+        read_guid = *guid;
         return true;
       });
+  if (matched != nullptr && index != kAdmResolveNotFound) {
+    *matched = AdmPlayoutOpened{};
+    matched->system_default = index == kAdmResolveDefault;
+    const int at = matched->system_default ? 0 : index;
+    if (at == read_index) {
+      matched->name = std::move(read_name);
+      matched->guid = std::move(read_guid);
+    } else if (at < count) {
+      device_at(at, &matched->name, &matched->guid);
+    }
+    if (matched->system_default) {
+      matched->guid.clear();
+    }
+  }
+  return index;
 #endif
 }
 
@@ -1075,9 +1099,11 @@ int32_t AdmProxy::ApplySelectionLocked(
   if (!platform_adm) {
     return -1;
   }
-  const int index = ResolveSelectionLocked(playout, selection);
+  AdmPlayoutOpened matched;
+  const int index =
+      ResolveSelectionLocked(playout, selection, playout ? &matched : nullptr);
   if (playout) {
-    last_playout_index_ = index;
+    last_playout_identity_ = std::move(matched);
   }
   if (index == kAdmResolveNotFound) {
     RTC_LOG(LS_WARNING) << "AdmProxy: the selected "

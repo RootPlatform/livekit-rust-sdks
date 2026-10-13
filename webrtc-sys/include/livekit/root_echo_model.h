@@ -41,6 +41,7 @@ struct RootEchoPolicyProbe;
 struct RootEchoWindowProbe;
 struct RootEchoHarnessProbe;
 struct RootEchoStressProbe;
+struct RootEchoGraceProbe;
 class RootEchoHarness;
 }  // namespace livekit_ffi
 #include "webrtc-sys/src/root_echo_model.rs.h"
@@ -124,7 +125,8 @@ struct RootOutputDevice {
 RootOutputDevice ClassifyOutputDevice(const RootPlayoutIdentity& identity);
 
 // What the estimators of one engine publish (written on the capture thread,
-// relaxed atomics).
+// relaxed atomics). The mean is read from two counters, so one read can be
+// off by an inference.
 struct RootEchoModelCounters {
   std::atomic<uint64_t> inferences{0};
   std::atomic<uint64_t> inference_us_total{0};
@@ -133,12 +135,15 @@ struct RootEchoModelCounters {
   std::atomic<float> inference_p99_us{std::numeric_limits<float>::quiet_NaN()};
   // Set by an estimator, cleared by a session reset.
   std::atomic<bool> kill_switch{false};
+  // Moved by a session reset: the windows start over.
+  std::atomic<uint64_t> session{0};
 };
 
 // The CPU kill switch's measurement: windows of kWindow inferences after the
 // first kWarmup of an estimator; a window fails when more than kAllowedSlow of
 // its inferences took over kSlowUs (p99 over 2 ms); kFailingWindows failing
-// windows in a row trip the switch. Capture thread only.
+// windows in a row trip the switch. A new session (counters.session) starts
+// the windows and the streak over. Capture thread only.
 class RootInferenceWindow {
  public:
   static constexpr uint32_t kWindow = 1000;
@@ -158,6 +163,9 @@ class RootInferenceWindow {
   float last_p99_us() const { return last_p99_us_; }
 
  private:
+  void StartOver();
+
+  uint64_t session_ = 0;
   uint32_t warmup_ = kWarmup;
   uint32_t count_ = 0;
   uint32_t slow_ = 0;
@@ -212,14 +220,17 @@ std::unique_ptr<webrtc::NeuralResidualEchoEstimator> NewRootResidualEchoEstimato
 // kMinFramesPerSample processed capture frames since the previous one, is
 // evidence at kEvidenceErleDb or more, and kEvidenceSamples of the last
 // kWindowSamples latch the model on for the current device until the session
-// resets. The latch survives switching to another device and back.
+// resets. The latch survives switching to another device and back; a device
+// without a key is never measured (nothing tells it from others). Calibrated
+// on the AEC Challenge's real recordings (ROOTAPP-BUILD.md): without an echo
+// path AEC3's ERLE stays under 0.5 dB.
 class RootEchoModelPolicy {
  public:
   static constexpr int64_t kSampleIntervalMs = 250;
   static constexpr uint64_t kMinFramesPerSample = 20;
-  static constexpr double kEvidenceErleDb = 6.0;
+  static constexpr double kEvidenceErleDb = 3.0;
   static constexpr size_t kWindowSamples = 40;
-  static constexpr size_t kEvidenceSamples = 12;
+  static constexpr size_t kEvidenceSamples = 8;
   static constexpr size_t kMaxLatchedDevices = 8;
 
   struct Decision {
@@ -234,12 +245,14 @@ class RootEchoModelPolicy {
   void SetUnavailable(bool unavailable) { unavailable_ = unavailable; }
   // Mode off, latches, measurement and kill switch cleared; the device kept.
   void ResetSession();
+  // Back to no device.
+  void ForgetDevice();
   // The measurement starts over (a swap).
   void RestartMeasurement();
   // Whether the sample latched the current device.
   bool AddErleSample(double erle_db, uint64_t processed_frames);
-  // Whether a sample would be taken now: AUTO, no latch for the device, no
-  // kill switch.
+  // Whether a sample would be taken now: AUTO, a device with a key and no
+  // latch, no kill switch.
   bool Measuring() const;
   Decision Decide() const;
 
@@ -282,7 +295,9 @@ struct RootEchoModelStatsSnapshot {
 // mode is not OFF or the model APM still runs. Mode, device and reset come
 // from other threads and post a decision; the audio threads only write the
 // counters. A switch waits for a pause in the user's speech, at most
-// kSpeechPauseMaxMs.
+// kSpeechPauseMaxMs; with no audio running the scheduler's thread makes it.
+// The model is prepared the first time a decision wants it, and is off
+// (UNAVAILABLE) while the APM's echo canceller is: it has nothing to run on.
 class RootEchoModelController {
  public:
   using Clock = std::function<int64_t()>;
@@ -307,6 +322,10 @@ class RootEchoModelController {
   void OnPlayoutOpened(const RootPlayoutIdentity& identity);
   // The same with a classification already made (tests, other platforms).
   void OnOutputDevice(RootOutputDevice device);
+  // The platform playout device closed.
+  void OnPlayoutClosed();
+  // The device is kept only while a platform playout is open (a call's open
+  // classifies again).
   void ResetSession();
   // Any thread but the audio threads; takes the since-last-read values.
   RootEchoModelStatsSnapshot ReadStats();
@@ -316,6 +335,10 @@ class RootEchoModelController {
   }
   // The scheduler's thread: one decision and poll now (tests drive it).
   void Run();
+  // The measured-echo evidence in the current window (tests).
+  uint32_t evidence() const {
+    return evidence_.load(std::memory_order_relaxed);
+  }
 
  private:
   // Replaces any scheduled run: only the newest one runs.
@@ -323,6 +346,7 @@ class RootEchoModelController {
   void RunGeneration(uint64_t generation);
   void RunLocked(int64_t now_ms);
   void StartPrepareLocked();
+  RootEchoModelPolicy::Decision DecideLocked() const;
 
   RootApmDecorator* const decorator_;
   const Scheduler scheduler_;
@@ -334,6 +358,7 @@ class RootEchoModelController {
 
   webrtc::Mutex mutex_;
   RootEchoModelPolicy policy_;
+  bool playout_open_ = false;
   bool prepare_started_ = false;
   std::atomic<bool> prepared_{false};
   std::atomic<bool> prepare_failed_{false};
@@ -348,6 +373,7 @@ class RootEchoModelController {
   std::atomic<uint32_t> mode_{static_cast<uint32_t>(RootEchoModelMode::kOff)};
   std::atomic<uint32_t> kind_{static_cast<uint32_t>(RootOutputDeviceKind::kNone)};
   std::atomic<bool> measured_{false};
+  std::atomic<uint32_t> evidence_{0};
   webrtc::Mutex read_mutex_;
   uint64_t read_inferences_ = 0;
   uint64_t read_us_total_ = 0;
@@ -368,8 +394,10 @@ RootEchoPolicyProbe root_echo_policy_probe(uint32_t mode,
                                            uint32_t kind,
                                            rust::Slice<const double> erle_db,
                                            uint64_t frames_per_sample);
-// The kill switch over a script of inference durations (µs).
-RootEchoWindowProbe root_echo_window_probe(rust::Slice<const uint64_t> us);
+// The kill switch over a script of inference durations (µs), with a session
+// reset before inference `reset_at` (-1: none).
+RootEchoWindowProbe root_echo_window_probe(rust::Slice<const uint64_t> us,
+                                           int64_t reset_at);
 // AdjustConfig over the default config: the masks and controls it sets.
 bool root_echo_adjust_config_is_googles_tuning();
 
@@ -389,21 +417,39 @@ class RootEchoHarness {
                            uint32_t render_channels,
                            rust::Slice<const float> render,
                            rust::Slice<const float> capture) const;
+  // The same through the int16 interface the voice engine uses (interleaved,
+  // in place); samples are rounded and clamped to int16.
+  rust::Vec<float> process_int16(int32_t rate,
+                                 uint32_t render_channels,
+                                 rust::Slice<const float> render,
+                                 rust::Slice<const float> capture) const;
+  // Initializes the APM for process's formats, as a staged variant is (a
+  // first call initializes for its own direction only, and the other
+  // direction's first call again).
+  void initialize(int32_t rate, uint32_t render_channels) const;
   // The DSP chain passes the APM output on (no voice gain, gate open).
   void open_dsp_chain() const;
   void prepare_model() const;
   void set_mode(uint32_t mode) const;
+  // A playout open classified as `kind`.
   void set_device(uint32_t kind, rust::Str key) const;
+  void close_playout() const;
+  // The host's echo cancellation policy (applied at a pause, as in calls).
+  void set_echo_cancellation(bool on) const;
   void reset_session() const;
   void trip_kill_switch() const;
   void set_speaking(bool speaking) const;
   // Moves the clock on in 10 ms steps, running the tasks that come due.
   void advance(int64_t ms) const;
   RootEchoHarnessProbe probe() const;
-  // A render and a capture thread run frames while this thread switches the
-  // variant `switches` times (stage, then collect); every APM a switch
-  // replaced is released.
+  // A render and a capture thread run frames, and a third reads statistics,
+  // while this thread switches the variant `switches` times (stage, then
+  // collect); every APM a switch replaced is released.
   RootEchoStressProbe stress(uint32_t switches) const;
+  // The grace period against a reader stalled between reading the epoch and
+  // counting itself, across two switches (no audio may have run): the second
+  // switch's APM is released only after the reader leaves.
+  RootEchoGraceProbe grace_replay() const;
 
  private:
   struct Task {

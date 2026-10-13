@@ -39,6 +39,7 @@
 
 #if defined(WEBRTC_MAC) && !defined(WEBRTC_IOS)
 #include <CoreAudio/CoreAudio.h>
+#include <CoreFoundation/CoreFoundation.h>
 #endif
 
 namespace livekit_ffi {
@@ -378,7 +379,10 @@ RootOutputDevice ClassifyOutputDevice(const RootPlayoutIdentity& identity) {
   return ClassifyMac(identity);
 #else
   RootOutputDevice result;
-  result.key = identity.system_default ? std::string("default") : identity.name;
+  if (!identity.name.empty()) {
+    result.key = identity.system_default ? "default:" + identity.name
+                                         : identity.name;
+  }
   result.kind = RootOutputDeviceKind::kUnknown;
   return result;
 #endif
@@ -394,8 +398,21 @@ const std::array<uint32_t, RootInferenceWindow::kBuckets - 1>
         500,  600,  700,  800,  900,  1000,  1250,  1500,  1750,  2000, 2500,
         3000, 4000, 5000, 7500, 10000, 15000, 20000, 30000, 50000};
 
+void RootInferenceWindow::StartOver() {
+  count_ = 0;
+  slow_ = 0;
+  failing_streak_ = 0;
+  max_us_ = 0;
+  histogram_.fill(0);
+}
+
 void RootInferenceWindow::Add(uint64_t us, RootEchoModelCounters& counters) {
   constexpr auto kRelaxed = std::memory_order_relaxed;
+  const uint64_t session = counters.session.load(kRelaxed);
+  if (session != session_) {
+    session_ = session;
+    StartOver();
+  }
   counters.inference_us_total.fetch_add(us, kRelaxed);
   counters.inferences.fetch_add(1, kRelaxed);
   RaiseTo(counters.inference_max_us, us);
@@ -567,6 +584,10 @@ void RootEchoModelPolicy::ResetSession() {
   RestartMeasurement();
 }
 
+void RootEchoModelPolicy::ForgetDevice() {
+  SetDevice(RootOutputDevice{});
+}
+
 void RootEchoModelPolicy::RestartMeasurement() {
   window_.fill(false);
   next_ = 0;
@@ -585,7 +606,8 @@ size_t RootEchoModelPolicy::evidence() const {
 
 bool RootEchoModelPolicy::Measuring() const {
   return mode_ == RootEchoModelMode::kAuto && !kill_switch_ && !unavailable_ &&
-         !measured_echo() && !RootOutputKindIsLoudspeaker(device_.kind);
+         !device_.key.empty() && !measured_echo() &&
+         !RootOutputKindIsLoudspeaker(device_.kind);
 }
 
 bool RootEchoModelPolicy::AddErleSample(double erle_db,
@@ -686,9 +708,6 @@ void RootEchoModelController::SetMode(RootEchoModelMode mode) {
   webrtc::MutexLock lock(&mutex_);
   policy_.SetMode(mode);
   mode_.store(static_cast<uint32_t>(mode), std::memory_order_relaxed);
-  if (mode != RootEchoModelMode::kOff) {
-    StartPrepareLocked();
-  }
   Schedule(0);
 }
 
@@ -699,15 +718,29 @@ void RootEchoModelController::OnPlayoutOpened(
 
 void RootEchoModelController::OnOutputDevice(RootOutputDevice device) {
   webrtc::MutexLock lock(&mutex_);
+  playout_open_ = true;
   kind_.store(static_cast<uint32_t>(device.kind), std::memory_order_relaxed);
   policy_.SetDevice(std::move(device));
   Schedule(0);
 }
 
+void RootEchoModelController::OnPlayoutClosed() {
+  webrtc::MutexLock lock(&mutex_);
+  playout_open_ = false;
+}
+
 void RootEchoModelController::ResetSession() {
   webrtc::MutexLock lock(&mutex_);
   policy_.ResetSession();
+  if (!playout_open_) {
+    policy_.ForgetDevice();
+    kind_.store(static_cast<uint32_t>(RootOutputDeviceKind::kNone),
+                std::memory_order_relaxed);
+  }
   counters_->kill_switch.store(false, std::memory_order_relaxed);
+  counters_->inference_p99_us.store(std::numeric_limits<float>::quiet_NaN(),
+                                    std::memory_order_relaxed);
+  counters_->session.fetch_add(1, std::memory_order_relaxed);
   mode_.store(static_cast<uint32_t>(RootEchoModelMode::kOff),
               std::memory_order_relaxed);
   change_since_ms_.reset();
@@ -734,7 +767,7 @@ void RootEchoModelController::RunLocked(int64_t now_ms) {
   if (prepare_failed_.load(std::memory_order_acquire)) {
     policy_.SetUnavailable(true);
   }
-  const bool running = decorator_->running_model();
+  bool running = decorator_->running_model();
   const uint64_t swaps = decorator_->swaps();
   if (swaps != seen_swaps_) {
     seen_swaps_ = swaps;
@@ -749,7 +782,10 @@ void RootEchoModelController::RunLocked(int64_t now_ms) {
                  : 0;
     policy_.AddErleSample(stats.erle_db, frames);
   }
-  const RootEchoModelPolicy::Decision decision = policy_.Decide();
+  const RootEchoModelPolicy::Decision decision = DecideLocked();
+  if (decision.on) {
+    StartPrepareLocked();
+  }
   const bool prepared =
       prepared_.load(std::memory_order_acquire) || root_echo_model_prepared();
   std::optional<bool> staged = decorator_->staged_variant();
@@ -757,7 +793,8 @@ void RootEchoModelController::RunLocked(int64_t now_ms) {
     decorator_->CancelStaged();
     staged.reset();
   }
-  const bool collected = decorator_->CollectRetired();
+  bool collected = decorator_->CollectRetired();
+  running = decorator_->running_model();
   if (decision.on == running) {
     change_since_ms_.reset();
   } else if (!staged.has_value() && collected) {
@@ -774,17 +811,32 @@ void RootEchoModelController::RunLocked(int64_t now_ms) {
       }
     }
   }
-  const RootEchoModelPolicy::Decision settled = policy_.Decide();
+  if (staged.has_value() && decorator_->SwitchIfIdle()) {
+    staged.reset();
+    collected = decorator_->CollectRetired();
+  }
+  const bool now_running = decorator_->running_model();
+  const RootEchoModelPolicy::Decision settled = DecideLocked();
   target_on_.store(settled.on, std::memory_order_relaxed);
   reason_.store(static_cast<uint32_t>(settled.reason), std::memory_order_relaxed);
   measured_.store(policy_.measured_echo(), std::memory_order_relaxed);
+  evidence_.store(static_cast<uint32_t>(policy_.evidence()),
+                  std::memory_order_relaxed);
   const bool switching = staged.has_value() || !collected ||
-                         settled.on != running;
+                         settled.on != now_running;
   if (switching) {
     Schedule(kSwapPollMs);
-  } else if (policy_.mode() != RootEchoModelMode::kOff || running) {
+  } else if (policy_.mode() != RootEchoModelMode::kOff || now_running) {
     Schedule(kPollMs);
   }
+}
+
+RootEchoModelPolicy::Decision RootEchoModelController::DecideLocked() const {
+  RootEchoModelPolicy::Decision decision = policy_.Decide();
+  if (decision.on && !decorator_->echo_cancellation_active()) {
+    decision = {false, RootEchoModelReason::kUnavailable};
+  }
+  return decision;
 }
 
 RootEchoModelStatsSnapshot RootEchoModelController::ReadStats() {
@@ -868,12 +920,17 @@ RootEchoPolicyProbe root_echo_policy_probe(uint32_t mode,
   return probe;
 }
 
-RootEchoWindowProbe root_echo_window_probe(rust::Slice<const uint64_t> us) {
+RootEchoWindowProbe root_echo_window_probe(rust::Slice<const uint64_t> us,
+                                           int64_t reset_at) {
   RootEchoModelCounters counters;
   RootInferenceWindow window;
   RootEchoWindowProbe probe{};
   probe.tripped_at = -1;
   for (size_t i = 0; i < us.size(); ++i) {
+    if (static_cast<int64_t>(i) == reset_at) {
+      counters.kill_switch.store(false);
+      counters.session.fetch_add(1);
+    }
     window.Add(us[i], counters);
     if (probe.tripped_at < 0 && counters.kill_switch.load()) {
       probe.tripped_at = static_cast<int64_t>(i);
@@ -908,8 +965,7 @@ RootEchoHarness::RootEchoHarness(bool today)
     auto processor = std::make_shared<RootCaptureProcessor>(capture_);
     decorator_ = webrtc::make_ref_counted<RootApmDecorator>(
         BuildRootApmVariant(env, processor, nullptr), std::move(scheduler),
-        std::move(clock), capture_, NewRootVariantBuilder(env, processor),
-        processor);
+        std::move(clock), capture_, NewRootVariantBuilder(env, processor));
   }
   // As the voice engine does for a device track with echo cancellation.
   webrtc::AudioProcessing::Config config = decorator_->GetConfig();
@@ -981,6 +1037,51 @@ rust::Vec<float> RootEchoHarness::process(
   return out;
 }
 
+rust::Vec<float> RootEchoHarness::process_int16(
+    int32_t rate,
+    uint32_t render_channels,
+    rust::Slice<const float> render,
+    rust::Slice<const float> capture) const {
+  auto to_int16 = [](float v) {
+    return static_cast<int16_t>(std::clamp(std::lround(v), -32768L, 32767L));
+  };
+  const size_t frames = static_cast<size_t>(rate / 100);
+  const size_t channels = std::max<uint32_t>(render_channels, 1);
+  std::vector<int16_t> render_data(frames * channels, 0);
+  for (size_t c = 0; c < channels; ++c) {
+    for (size_t i = 0; i < frames && c * frames + i < render.size(); ++i) {
+      render_data[i * channels + c] = to_int16(render[c * frames + i]);
+    }
+  }
+  const webrtc::StreamConfig render_config(rate, channels);
+  decorator_->ProcessReverseStream(render_data.data(), render_config,
+                                   render_config, render_data.data());
+  rust::Vec<float> out;
+  if (capture.empty()) {
+    return out;
+  }
+  std::vector<int16_t> capture_data(frames, 0);
+  for (size_t i = 0; i < std::min(capture.size(), frames); ++i) {
+    capture_data[i] = to_int16(capture[i]);
+  }
+  const webrtc::StreamConfig capture_config(rate, 1);
+  decorator_->set_stream_delay_ms(0);
+  decorator_->ProcessStream(capture_data.data(), capture_config,
+                            capture_config, capture_data.data());
+  for (int16_t v : capture_data) {
+    out.push_back(static_cast<float>(v));
+  }
+  return out;
+}
+
+void RootEchoHarness::initialize(int32_t rate, uint32_t render_channels) const {
+  const webrtc::StreamConfig capture(rate, 1);
+  const webrtc::StreamConfig render(rate,
+                                    std::max<uint32_t>(render_channels, 1));
+  decorator_->Initialize(
+      webrtc::ProcessingConfig{{capture, capture, render, render}});
+}
+
 void RootEchoHarness::open_dsp_chain() const {
   capture_->auto_gain.store(false);
   capture_->auto_sensitivity.store(false);
@@ -1002,6 +1103,16 @@ void RootEchoHarness::set_device(uint32_t kind, rust::Str key) const {
     echo->OnOutputDevice({std::string(key.data(), key.size()),
                           static_cast<RootOutputDeviceKind>(kind)});
   }
+}
+
+void RootEchoHarness::close_playout() const {
+  if (RootEchoModelController* echo = decorator_->echo_model()) {
+    echo->OnPlayoutClosed();
+  }
+}
+
+void RootEchoHarness::set_echo_cancellation(bool on) const {
+  decorator_->SetPolicy(on, std::nullopt);
 }
 
 void RootEchoHarness::reset_session() const {
@@ -1054,6 +1165,7 @@ RootEchoHarnessProbe RootEchoHarness::probe() const {
     probe.inference_p99_us = stats.inference_p99_us;
     probe.measured_echo = stats.measured_echo;
     probe.kill_switch = stats.kill_switch;
+    probe.evidence = echo->evidence();
   }
   const RootDspStatsSnapshot dsp = capture_->ReadDspStats(false);
   probe.processed_frames = dsp.processed_frames;
@@ -1101,6 +1213,16 @@ RootEchoStressProbe RootEchoHarness::stress(uint32_t switches) const {
       ++n;
     }
   });
+  std::atomic<uint64_t> reads{0};
+  std::thread reader([&] {
+    while (!stop.load()) {
+      decorator->ReadStats();
+      if (decorator->proc_sample_rate_hz() < 0) {
+        break;
+      }
+      reads.fetch_add(1);
+    }
+  });
   RootEchoStressProbe probe{};
   const uint64_t swaps_before = decorator->swaps();
   for (uint32_t s = 0; s < switches; ++s) {
@@ -1125,10 +1247,38 @@ RootEchoStressProbe RootEchoHarness::stress(uint32_t switches) const {
   stop.store(true);
   render.join();
   capture.join();
+  reader.join();
   probe.swaps = decorator->swaps() - swaps_before;
   probe.render_frames = render_frames.load();
   probe.capture_frames = capture_frames.load();
+  probe.reads = reads.load();
   probe.collected = decorator->CollectRetired();
+  return probe;
+}
+
+RootEchoGraceProbe RootEchoHarness::grace_replay() const {
+  RootApmDecorator& d = *decorator_;
+  auto live = [&d](webrtc::AudioProcessing* apm) {
+    webrtc::MutexLock lock(&d.mutex_);
+    return std::any_of(
+        d.live_.begin(), d.live_.end(),
+        [apm](const auto& variant) { return variant->apm.get() == apm; });
+  };
+  auto swap = [&d] { return d.StageVariant(false) && d.SwitchIfIdle(); };
+  RootEchoGraceProbe probe{};
+  webrtc::AudioProcessing* first = d.active_for_test();
+  const uint32_t epoch = d.GraceEpoch();
+  probe.first_switched = swap();
+  webrtc::AudioProcessing* second = d.active_for_test();
+  probe.first_released = d.CollectRetired() && !live(first);
+  const RootApmDecorator::Entered entered = d.GraceEnter(epoch);
+  probe.reader_holds_second = entered.apm == second;
+  probe.reader_parity_moved = entered.parity != (epoch & 1u);
+  probe.second_switched = swap();
+  probe.second_held = !d.CollectRetired() && live(second);
+  probe.held_usable = entered.apm->num_output_channels() > 0;
+  d.GraceLeave(entered.parity);
+  probe.released_after_leave = d.CollectRetired() && !live(second);
   return probe;
 }
 

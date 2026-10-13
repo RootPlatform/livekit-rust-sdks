@@ -334,9 +334,6 @@ class RootCaptureProcessor : public webrtc::CustomProcessing {
   std::string ToString() const override;
   void SetRuntimeSetting(
       webrtc::AudioProcessing::RuntimeSetting setting) override;
-  // The capture thread: the next Process leaves the frame and every state
-  // alone (an APM variant warming up on frames the chain already ran).
-  void SkipNextFrame(bool skip) { skip_next_ = skip; }
 
  private:
   void Publish(const RootDspOutputs& outputs,
@@ -362,16 +359,18 @@ class RootCaptureProcessor : public webrtc::CustomProcessing {
   // The detector judged the last frame. When it did not (detection off, an
   // unsupported frame), its state is stale and it starts over.
   bool speech_running_ = false;
-  bool skip_next_ = false;
   std::array<float, kDenoiseOutputFrames * kMaxRate / 100> denoise_out_{};
 };
 
 // The capture post-processor of every APM variant: forwards to one shared
-// RootCaptureProcessor, so a variant switch keeps the voice chain. Only the
-// APM the audio threads use calls Process.
+// RootCaptureProcessor, so a variant switch keeps the voice chain. While
+// `forward` is false (a variant warming up on frames the chain already ran)
+// nothing reaches the processor, so the frame and its state are left alone;
+// without a flag it always forwards.
 class RootCaptureProcessorRef : public webrtc::CustomProcessing {
  public:
-  explicit RootCaptureProcessorRef(std::shared_ptr<RootCaptureProcessor> processor);
+  RootCaptureProcessorRef(std::shared_ptr<RootCaptureProcessor> processor,
+                          std::shared_ptr<std::atomic<bool>> forward = nullptr);
 
   void Initialize(int sample_rate_hz, int num_channels) override;
   void Process(webrtc::AudioBuffer* audio) override;
@@ -380,16 +379,20 @@ class RootCaptureProcessorRef : public webrtc::CustomProcessing {
       webrtc::AudioProcessing::RuntimeSetting setting) override;
 
  private:
+  bool Forwarding() const;
+
   const std::shared_ptr<RootCaptureProcessor> processor_;
+  const std::shared_ptr<std::atomic<bool>> forward_;
 };
 
 // The factory's APM without (null estimator) or with the echo model:
 // libwebrtc's builtin APM, high-pass filter on, the shared processor as its
-// capture post-processor.
+// capture post-processor (gated by `forward` when given).
 webrtc::scoped_refptr<webrtc::AudioProcessing> BuildRootApmVariant(
     const webrtc::Environment& env,
     std::shared_ptr<RootCaptureProcessor> processor,
-    std::unique_ptr<webrtc::NeuralResidualEchoEstimator> estimator);
+    std::unique_ptr<webrtc::NeuralResidualEchoEstimator> estimator,
+    std::shared_ptr<std::atomic<bool>> forward = nullptr);
 
 struct RootApmStats {
   double erl_db = 0;
@@ -427,12 +430,13 @@ struct RootApmPolicyStats {
 //    (at most kSpeechPauseMaxMs late); toggling AEC or NS re-initializes
 //    them. The denoiser fallback turning NS on is applied at once.
 //  - With a variant builder it runs one of two APMs, without and with the
-//    echo model (RootEchoModelController decides). StageVariant builds and
-//    configures the other one off the audio threads; the next ProcessStream,
-//    ProcessReverseStream or AnalyzeReverseStream switches to it at its frame
-//    boundary. Every forwarded call reads the APM in use lock-free under a
-//    two-counter grace period, and an APM it may still be using is released
-//    (on the scheduler's thread) only once that period ends.
+//    echo model (RootEchoModelController decides). StageVariant builds,
+//    configures and warms the other one off the audio threads; the next
+//    ProcessStream (or, while capture is idle, ProcessReverseStream,
+//    AnalyzeReverseStream or the scheduler's thread) switches to it at a
+//    frame boundary. Every forwarded call reads the APM in use lock-free
+//    under a two-counter grace period, and an APM it may still be using is
+//    released (on the scheduler's thread) only once that period ends.
 // Lock order: mutex_ -> APM render -> APM capture. No lock is added to the
 // per-frame calls, and mutex_ is never taken on an audio thread.
 class RootApmDecorator : public webrtc::AudioProcessing {
@@ -448,51 +452,58 @@ class RootApmDecorator : public webrtc::AudioProcessing {
   using Scheduler =
       std::function<void(int64_t delay_ms, absl::AnyInvocable<void() &&>)>;
   // Builds an APM variant (null when it cannot): with the echo model, whose
-  // estimator publishes to `counters`, or without.
+  // estimator publishes to `counters`, or without; its capture post-processor
+  // forwards to the shared processor only while `forward` is set.
   using VariantBuilder = std::function<webrtc::scoped_refptr<webrtc::AudioProcessing>(
       bool model,
-      std::shared_ptr<RootEchoModelCounters> counters)>;
+      std::shared_ptr<RootEchoModelCounters> counters,
+      std::shared_ptr<std::atomic<bool>> forward)>;
 
   // Without a scheduler policy changes are applied inline. The capture state
   // (may be null) gives the published speaking flag and receives what NS is
   // applied. With a variant builder and a scheduler, `inner` is the variant
   // without the model and the echo model controller exists.
-  // `processor` is the capture post-processor every variant shares; a variant
-  // warms up on the last kWarmFrames frames with it skipping them.
   RootApmDecorator(webrtc::scoped_refptr<webrtc::AudioProcessing> inner,
                    Scheduler scheduler,
                    Clock clock,
                    std::shared_ptr<RootCaptureState> capture_state = nullptr,
-                   VariantBuilder variant_builder = nullptr,
-                   std::shared_ptr<RootCaptureProcessor> processor = nullptr);
+                   VariantBuilder variant_builder = nullptr);
   ~RootApmDecorator() override;
 
-  // A switch replays the last kWarmFrames render and capture frames (at most
-  // kMaxWarmSamples samples each, kWarmMaxAgeUs old) into the variant before
-  // the audio threads use it, so its delay lines, high-pass filter and render
-  // history continue those of the APM it replaces. The capture thread does
-  // the switch while capture runs; the render thread only when no capture
-  // frame came for kCaptureIdleUs.
+  // StageVariant replays the last kWarmFrames render and capture frames (at
+  // most kMaxWarmSamples samples each, kWarmMaxAgeUs old) into the variant on
+  // the scheduler's thread, so its delay lines, high-pass filter and render
+  // history continue those of the APM it replaces. The thread that switches
+  // first replays the frames kept since, the last kMaxCatchUp of each at most
+  // (more is a discontinuity instead of an overrun). The capture thread
+  // switches on its next frame; the render thread only when no capture frame
+  // came for kIdleMs, and the scheduler's thread (SwitchIfIdle) when neither
+  // direction ran for kIdleMs, without a catch-up.
   static constexpr size_t kWarmFrames = 8;
   static constexpr size_t kMaxWarmSamples = 480 * 8;
+  static constexpr uint64_t kMaxCatchUp = 2;
   static constexpr int64_t kWarmMaxAgeUs = 200'000;
-  static constexpr int64_t kCaptureIdleUs = 100'000;
+  static constexpr int64_t kIdleMs = 100;
 
   // The echo model's controller; null without a variant builder.
   RootEchoModelController* echo_model() const { return echo_model_.get(); }
 
   // Variant switching (the scheduler's thread). StageVariant builds the
-  // variant, applies the current config, formats and stream settings, and
-  // hands it to the audio threads, replacing a staged one; false when it
-  // could not be built or a switch is still being collected. CancelStaged
-  // withdraws a staged variant no audio thread took yet.
+  // variant, applies the current config, formats and stream settings, warms
+  // it, and hands it to the audio threads, replacing a staged one; false when
+  // it could not be built or a switch is still being collected. CancelStaged
+  // withdraws a staged variant no thread took yet.
   bool StageVariant(bool model);
   void CancelStaged();
+  // Switches to the staged variant here when no audio thread ran for kIdleMs
+  // (no frame would take it); true when it switched.
+  bool SwitchIfIdle();
   // Releases the APM a switch replaced once no forwarded call can be using
   // it; true when nothing is left to release.
   bool CollectRetired();
-  // Atomics: whether the APM in use has the model, the staged variant, and
-  // the switches made.
+  // Atomics: whether the APM in use has the model, the staged variant (also
+  // while a thread is switching to it; running_model is current once it is
+  // gone), and the switches made.
   bool running_model() const;
   std::optional<bool> staged_variant() const;
   uint64_t swaps() const;
@@ -570,6 +581,20 @@ class RootApmDecorator : public webrtc::AudioProcessing {
   Config GetConfig() const override;
 
  private:
+  friend class RootEchoHarness;
+
+  // The grace period's two steps, apart so a test can stall a reader between
+  // them: the epoch a reader starts from, then counting itself in that
+  // epoch's parity, again in the new one while the epoch moved meanwhile,
+  // and taking the APM in use.
+  struct Entered {
+    uint32_t parity;
+    webrtc::AudioProcessing* apm;
+  };
+  uint32_t GraceEpoch() const;
+  Entered GraceEnter(uint32_t epoch) const;
+  void GraceLeave(uint32_t parity) const;
+
   // An audio-thread-safe reference to the APM in use for one forwarded call.
   class Use {
    public:
@@ -577,19 +602,37 @@ class RootApmDecorator : public webrtc::AudioProcessing {
     ~Use();
     Use(const Use&) = delete;
     Use& operator=(const Use&) = delete;
-    webrtc::AudioProcessing* operator->() const { return apm_; }
-    webrtc::AudioProcessing* get() const { return apm_; }
+    webrtc::AudioProcessing* operator->() const { return entered_.apm; }
+    webrtc::AudioProcessing* get() const { return entered_.apm; }
 
    private:
     const RootApmDecorator& decorator_;
-    uint32_t parity_;
-    webrtc::AudioProcessing* apm_;
+    Entered entered_;
   };
 
+  // An APM the decorator owns: the flag its post-processor forwards under
+  // (null for the first one, which always forwards), whether it has the
+  // model, and how many kept frames of each direction its warm-up replayed
+  // up to. Immutable once staged.
+  struct Variant {
+    webrtc::scoped_refptr<webrtc::AudioProcessing> apm;
+    std::shared_ptr<std::atomic<bool>> forward;
+    bool model = false;
+    uint64_t render_warmed = 0;
+    uint64_t capture_warmed = 0;
+  };
+
+  // The interface a frame came through; a replay goes through the same one
+  // (an APM's int16 and float paths do not share all their state: int16
+  // frames after a float warm-up glitch at the switch).
+  enum class WarmApi : uint8_t { kFloat, kInt16, kAnalyze };
+
   // One frame kept for the warm-up: deinterleaved -1..1 samples under a
-  // seqlock (odd while written), with its format and time.
+  // seqlock (odd while written), with its index, interface, format and time.
   struct WarmFrame {
     std::atomic<uint64_t> seq{0};
+    uint64_t index = 0;
+    WarmApi api = WarmApi::kFloat;
     int rate = 0;
     size_t channels = 0;
     int64_t when_us = 0;
@@ -597,17 +640,41 @@ class RootApmDecorator : public webrtc::AudioProcessing {
   };
   using WarmRing = std::array<WarmFrame, kWarmFrames>;
 
+  struct ReplayScratch {
+    std::vector<float> in = std::vector<float>(kMaxWarmSamples);
+    std::vector<float> out = std::vector<float>(kMaxWarmSamples);
+    std::vector<int16_t> in16 = std::vector<int16_t>(kMaxWarmSamples);
+    std::vector<int16_t> out16 = std::vector<int16_t>(kMaxWarmSamples);
+  };
+
   // A frame entry point switches to a staged variant first: the capture
-  // thread always, the render thread only while capture is idle.
+  // thread always, the render thread only while capture is idle. One thread
+  // at a time (switching_), and never before the collector took the APM the
+  // last switch replaced (retired_ holds one at a time).
   void SwitchIfStaged(bool capture);
-  void WarmUp(webrtc::AudioProcessing* apm, int64_t now_us);
-  // Copies a slot under its seqlock into the warm-up scratch; false when it
-  // is empty, torn, too old or too big.
-  bool ReadWarmFrame(const WarmFrame& slot,
+  void Switch(Variant* next);
+  // Replays kept frames [render_from, render_to) and [capture_from,
+  // capture_to), oldest first and taking turns, into `apm`.
+  void Replay(webrtc::AudioProcessing* apm,
+              uint64_t render_from,
+              uint64_t render_to,
+              uint64_t capture_from,
+              uint64_t capture_to,
+              ReplayScratch& scratch,
+              int64_t now_us);
+  // Copies frame `index` under its slot's seqlock into `samples`; false when
+  // the slot holds another frame or is torn, too old or too big.
+  bool ReadWarmFrame(const WarmRing& ring,
+                     uint64_t index,
                      int64_t now_us,
+                     float* samples,
                      int* rate,
                      size_t* channels,
-                     int64_t* when_us);
+                     WarmApi* api);
+  void RemoveLiveLocked(webrtc::AudioProcessing* apm);
+  // Fill slot `index` before the forwarded call (an in-place call overwrites
+  // the input); the kept count moves after it, so a switch never replays a
+  // frame an APM it replaced is still processing.
   void KeepInt16(WarmRing& ring,
                  uint64_t index,
                  const int16_t* src,
@@ -617,7 +684,8 @@ class RootApmDecorator : public webrtc::AudioProcessing {
                  uint64_t index,
                  const float* const* src,
                  const webrtc::StreamConfig& config,
-                 int64_t now_us);
+                 int64_t now_us,
+                 WarmApi api);
   void RecordFormat(std::atomic<uint64_t>& slot,
                     const webrtc::StreamConfig& config);
   webrtc::ProcessingConfig RecordedFormats() const;
@@ -650,11 +718,14 @@ class RootApmDecorator : public webrtc::AudioProcessing {
   // by the first frame entry point that sees it) and the one a switch
   // replaced, which the scheduler's thread releases after the grace period.
   std::atomic<webrtc::AudioProcessing*> active_{nullptr};
-  std::atomic<webrtc::AudioProcessing*> pending_{nullptr};
+  std::atomic<Variant*> pending_{nullptr};
+  // What staged_variant reports (the switch reads the Variant's own flag).
   std::atomic<bool> pending_model_{false};
   std::atomic<bool> running_model_{false};
   std::atomic<webrtc::AudioProcessing*> retired_{nullptr};
   std::atomic<uint64_t> swaps_{0};
+  // Held by the thread that is switching (never waited for).
+  std::atomic<bool> switching_{false};
   // Grace period: a forwarded call counts itself in the counter of the
   // epoch's parity while it uses an APM.
   mutable std::atomic<uint32_t> epoch_{0};
@@ -669,22 +740,23 @@ class RootApmDecorator : public webrtc::AudioProcessing {
   std::atomic<bool> stream_delay_set_{false};
   std::atomic<bool> key_pressed_{false};
   std::atomic<webrtc::AudioProcessing*> stream_settings_apm_{nullptr};
-  // The warm-up: the shared processor, the frame rings (allocated only with a
-  // variant builder), how many frames each got, the last capture frame's
-  // time, and the capture thread's scratch.
-  const std::shared_ptr<RootCaptureProcessor> processor_;
+  // The warm-up: the frame rings (allocated only with a variant builder), how
+  // many frames each got, when each direction last ran (the clock's ms), and
+  // the switching thread's catch-up scratch.
   std::unique_ptr<WarmRing> render_ring_;
   std::unique_ptr<WarmRing> capture_ring_;
   std::atomic<uint64_t> render_frames_kept_{0};
   std::atomic<uint64_t> capture_frames_kept_{0};
-  std::atomic<int64_t> last_capture_us_{0};
-  std::vector<float> warm_in_;
-  std::vector<float> warm_out_;
+  std::atomic<int64_t> last_capture_ms_{
+      std::numeric_limits<int64_t>::min() / 2};
+  std::atomic<int64_t> last_render_ms_{
+      std::numeric_limits<int64_t>::min() / 2};
+  std::unique_ptr<ReplayScratch> catch_up_;
 
   mutable webrtc::Mutex mutex_;
-  // Owning references of every APM an audio thread may use: the active one,
-  // a staged one and a retired one.
-  std::vector<webrtc::scoped_refptr<webrtc::AudioProcessing>> live_;
+  // Every APM an audio thread may use: the active one, a staged one and a
+  // retired one.
+  std::vector<std::unique_ptr<Variant>> live_;
   webrtc::AudioProcessing* collecting_ = nullptr;
   uint32_t collecting_parity_ = 0;
   std::unique_ptr<RootEchoModelController> echo_model_;

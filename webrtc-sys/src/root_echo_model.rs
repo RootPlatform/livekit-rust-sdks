@@ -63,6 +63,8 @@ pub mod ffi {
         pub format_seq: u64,
         pub erle_db: f64,
         pub pending_tasks: u32,
+        /// Measured-echo evidence samples in the current window.
+        pub evidence: u32,
     }
 
     #[derive(Debug, Clone, Copy, Default)]
@@ -70,8 +72,28 @@ pub mod ffi {
         pub swaps: u64,
         pub render_frames: u64,
         pub capture_frames: u64,
+        /// Statistics reads by the third thread.
+        pub reads: u64,
         pub failed_stages: u32,
         pub collected: bool,
+    }
+
+    /// `grace_replay`: a reader that read the epoch before switch 1 and
+    /// counted itself after it.
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct RootEchoGraceProbe {
+        pub first_switched: bool,
+        /// Switch 1's APM was released (nobody was counted yet).
+        pub first_released: bool,
+        /// The reader holds the APM switch 1 made active...
+        pub reader_holds_second: bool,
+        /// ...counted in the new epoch's parity, not the one it first read.
+        pub reader_parity_moved: bool,
+        pub second_switched: bool,
+        /// Switch 2's collection waits for the reader and keeps its APM.
+        pub second_held: bool,
+        pub held_usable: bool,
+        pub released_after_leave: bool,
     }
 
     extern "Rust" {
@@ -115,7 +137,7 @@ pub mod ffi {
             erle_db: &[f64],
             frames_per_sample: u64,
         ) -> RootEchoPolicyProbe;
-        fn root_echo_window_probe(us: &[u64]) -> RootEchoWindowProbe;
+        fn root_echo_window_probe(us: &[u64], reset_at: i64) -> RootEchoWindowProbe;
         fn root_echo_adjust_config_is_googles_tuning() -> bool;
 
         type RootEchoHarness;
@@ -128,16 +150,27 @@ pub mod ffi {
             render: &[f32],
             capture: &[f32],
         ) -> Vec<f32>;
+        fn process_int16(
+            self: &RootEchoHarness,
+            rate: i32,
+            render_channels: u32,
+            render: &[f32],
+            capture: &[f32],
+        ) -> Vec<f32>;
+        fn initialize(self: &RootEchoHarness, rate: i32, render_channels: u32);
         fn open_dsp_chain(self: &RootEchoHarness);
         fn prepare_model(self: &RootEchoHarness);
         fn set_mode(self: &RootEchoHarness, mode: u32);
         fn set_device(self: &RootEchoHarness, kind: u32, key: &str);
+        fn close_playout(self: &RootEchoHarness);
+        fn set_echo_cancellation(self: &RootEchoHarness, on: bool);
         fn reset_session(self: &RootEchoHarness);
         fn trip_kill_switch(self: &RootEchoHarness);
         fn set_speaking(self: &RootEchoHarness, speaking: bool);
         fn advance(self: &RootEchoHarness, ms: i64);
         fn probe(self: &RootEchoHarness) -> RootEchoHarnessProbe;
         fn stress(self: &RootEchoHarness, switches: u32) -> RootEchoStressProbe;
+        fn grace_replay(self: &RootEchoHarness) -> RootEchoGraceProbe;
     }
 }
 

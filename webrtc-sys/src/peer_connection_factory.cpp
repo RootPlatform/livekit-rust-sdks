@@ -237,8 +237,12 @@ PeerConnectionFactory::PeerConnectionFactory(
     adm_proxy_->SetPlayoutOpenedSink(
         [apm = apm_](const AdmPlayoutOpened& opened) {
           if (RootEchoModelController* echo_model = apm->echo_model()) {
-            echo_model->OnPlayoutOpened(
-                {opened.system_default, opened.guid, opened.name});
+            if (opened.open) {
+              echo_model->OnPlayoutOpened(
+                  {opened.system_default, opened.guid, opened.name});
+            } else {
+              echo_model->OnPlayoutClosed();
+            }
           }
         });
   }

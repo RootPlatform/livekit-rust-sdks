@@ -79,9 +79,11 @@ constexpr int kAdmResolveDefault = -1;
 constexpr int kAdmResolveNotFound = -2;
 
 // A platform playout device that opened: the OS default (the console role on
-// Windows, ADM index 0 elsewhere, whose GUID and name are also given) or the
-// selected device's ADM GUID and name.
+// Windows, ADM index 0 elsewhere, whose name is also given) or the selected
+// device's ADM GUID and name, as the selection resolved them. With `open`
+// false: the platform playout device closed (nothing else is set).
 struct AdmPlayoutOpened {
+  bool open = true;
   bool system_default = true;
   std::string guid;
   std::string name;
@@ -456,7 +458,7 @@ class AdmProxy : public webrtc::AudioDeviceModule {
 
   /// Called on the device thread, outside the device mutex, after every
   /// successful platform playout init (the echo model classifies the
-  /// device). Set once, before any device opens.
+  /// device) and stop. Set once, before any device opens.
   void SetPlayoutOpenedSink(AdmPlayoutOpenedSink sink);
 
   /// Atomics only; the max gaps are reset on read.
@@ -613,11 +615,16 @@ class AdmProxy : public webrtc::AudioDeviceModule {
   void CompleteOutcomeLocked(const DesiredState& desired,
                              AdmRequestOutcome* outcome);
   void PublishStateLocked(const DesiredState& desired);
-  // The device thread, after releasing mutex_: reports a playout open.
+  // The device thread, after releasing mutex_: reports a playout open or
+  // close.
   void NotifyPlayoutOpened();
   int32_t ApplySelectionLocked(bool playout,
                                const AdmDeviceSelection& selection);
-  int ResolveSelectionLocked(bool playout, const AdmDeviceSelection& selection);
+  // With `matched`, also the identity of the device it resolved, read with
+  // the resolution (index 0's name for the default).
+  int ResolveSelectionLocked(bool playout,
+                             const AdmDeviceSelection& selection,
+                             AdmPlayoutOpened* matched = nullptr);
   void SchedulePlayoutDelayRefreshLocked();
   void ScheduleRetryLocked();
   void ShutdownLocked();
@@ -665,7 +672,7 @@ class AdmProxy : public webrtc::AudioDeviceModule {
   AdmUidTranslator uid_translator_;
   // The playout device the last ApplySelectionLocked resolved, and what the
   // device thread reports to the sink once mutex_ is released.
-  int last_playout_index_ = kAdmResolveDefault;
+  AdmPlayoutOpened last_playout_identity_;
   std::optional<AdmPlayoutOpened> playout_opened_;
   AdmPlayoutOpenedSink playout_opened_sink_;
   // capture_state_'s monitor, set with it.

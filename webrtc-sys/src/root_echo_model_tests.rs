@@ -42,6 +42,7 @@ const REASON_MODE_ON: u32 = 1;
 const REASON_DEVICE_KIND: u32 = 2;
 const REASON_MEASURED_ECHO: u32 = 3;
 const REASON_KILL_SWITCH: u32 = 4;
+const REASON_UNAVAILABLE: u32 = 5;
 
 const KIND_NONE: u32 = 0;
 const KIND_UNKNOWN: u32 = 1;
@@ -301,36 +302,37 @@ fn root_echo_policy_decides_by_mode_and_device_kind() {
     }
 }
 
+/// 8 samples (2 s) of 3 dB ERLE or more within the last 40 (10 s).
 #[test]
-fn root_echo_measured_echo_needs_3_s_of_evidence_in_10_s() {
+fn root_echo_measured_echo_needs_2_s_of_evidence_in_10_s() {
     let auto = |erle: &[f64], frames: u64| {
         root_echo_policy_probe(MODE_AUTO, KIND_HEADPHONES, erle, frames)
     };
-    // The first sample is the baseline; then 11 of 12 evidence samples: off.
-    let mut erle = vec![9.0; 12];
+    // The first sample is the baseline; then 7 of 8 evidence samples: off.
+    let mut erle = vec![9.0; 8];
     let p = auto(&erle, 20);
-    assert!(!p.on && !p.measured_echo && p.evidence == 11 && p.latched_at == -1, "{p:?}");
+    assert!(!p.on && !p.measured_echo && p.evidence == 7 && p.latched_at == -1, "{p:?}");
     erle.push(9.0);
     let p = auto(&erle, 20);
     assert!(
-        p.on && p.measured_echo && p.reason == REASON_MEASURED_ECHO && p.latched_at == 12,
+        p.on && p.measured_echo && p.reason == REASON_MEASURED_ECHO && p.latched_at == 8,
         "{p:?}"
     );
-    // 12 evidence samples spread over the 40-sample window still latch.
-    let spread: Vec<f64> = (0..41).map(|i| if i % 3 == 1 { 7.0 } else { 0.0 }).collect();
+    // 8 evidence samples spread over the 40-sample window still latch.
+    let spread: Vec<f64> = (0..41).map(|i| if i % 5 == 1 { 3.0 } else { 0.0 }).collect();
     assert!(auto(&spread, 20).on);
-    // 12 evidence samples over more than 40: the oldest leave the window.
-    let thin: Vec<f64> = (0..80).map(|i| if i % 4 == 1 { 7.0 } else { 0.0 }).collect();
+    // One every 6 samples is at most 7 in any 40: the oldest leave the window.
+    let thin: Vec<f64> = (0..80).map(|i| if i % 6 == 1 { 4.0 } else { 0.0 }).collect();
     assert!(!auto(&thin, 20).on);
-    // ERLE under 6 dB is no evidence, nor NaN.
-    assert!(!auto(&[5.9; 60], 20).on);
+    // ERLE under 3 dB is no evidence, nor NaN.
+    assert!(!auto(&[2.9; 60], 20).on);
     assert!(!auto(&[f64::NAN; 60], 20).on);
     // A sample counts only after 20 new capture frames: frozen statistics (no
     // capture) never do, and slow capture counts every other sample.
     let p = auto(&[30.0; 60], 0);
     assert!(!p.on && p.counted == 0, "{p:?}");
-    let p = auto(&[30.0; 22], 19);
-    assert!(!p.on && p.counted == 10, "{p:?}");
+    let p = auto(&[30.0; 16], 19);
+    assert!(!p.on && p.counted == 7, "{p:?}");
     // Loudspeakers are on already, ON needs no measurement, OFF takes none.
     assert_eq!(root_echo_policy_probe(MODE_AUTO, KIND_SPEAKERS, &[30.0; 60], 20).latched_at, -1);
     assert_eq!(root_echo_policy_probe(MODE_ON, KIND_HEADPHONES, &[30.0; 60], 20).latched_at, -1);
@@ -348,23 +350,34 @@ fn root_echo_kill_switch_trips_on_two_slow_windows_in_a_row() {
     let mut script = warmup.clone();
     script.extend(window(10));
     script.extend(window(10));
-    let p = root_echo_window_probe(&script);
+    let p = root_echo_window_probe(&script, -1);
     assert_eq!(p.tripped_at, -1, "10 of 1000 over 2 ms is p99 at 2 ms: fine");
     assert!(p.p99_us <= 2000.0, "{p:?}");
     let mut script = warmup.clone();
     script.extend(window(11));
-    let p = root_echo_window_probe(&script);
+    let p = root_echo_window_probe(&script, -1);
     assert!(p.tripped_at == -1 && p.failing_streak == 1 && p.p99_us > 2000.0, "{p:?}");
     script.extend(window(0));
     script.extend(window(11));
-    let p = root_echo_window_probe(&script);
+    let p = root_echo_window_probe(&script, -1);
     assert_eq!(p.tripped_at, -1, "a good window in between starts over");
     script.extend(window(500));
-    let p = root_echo_window_probe(&script);
+    let p = root_echo_window_probe(&script, -1);
     assert_eq!(p.tripped_at, (100 + 4000 - 1) as i64, "{p:?}");
     let steady: Vec<u64> = vec![120; 3100];
-    let p = root_echo_window_probe(&steady);
+    let p = root_echo_window_probe(&steady, -1);
     assert!(p.tripped_at == -1 && p.p99_us <= 125.0 && p.p99_us >= 100.0, "{p:?}");
+    // A session reset starts the streak over: one failing window before it
+    // and one after do not trip it, a second one after it does.
+    let mut script = warmup.clone();
+    script.extend(window(11));
+    let reset_at = script.len() as i64;
+    script.extend(window(11));
+    let p = root_echo_window_probe(&script, reset_at);
+    assert!(p.tripped_at == -1 && p.failing_streak == 1, "{p:?}");
+    script.extend(window(11));
+    let p = root_echo_window_probe(&script, reset_at);
+    assert_eq!(p.tripped_at, (100 + 3000 - 1) as i64, "{p:?}");
 }
 
 #[test]
@@ -396,11 +409,13 @@ fn root_echo_unset_mode_is_todays_apm_bit_for_bit() {
     }
 }
 
-/// The switch happens at a frame boundary, the output stays continuous and
-/// the voice chain (its state, resets, format) is untouched.
-#[test]
-fn root_echo_switches_at_a_frame_boundary_without_a_glitch() {
-    let tone: Vec<f32> = (0..700 * FRAME)
+/// A 440 Hz tone at the mic, silent render, through the float or the int16
+/// interface; the model on at frame 100 and off at frame 700. Both switches
+/// happen at a frame boundary, the output stays continuous and the voice
+/// chain (its state, resets, format) is untouched.
+fn switch_twice_without_a_glitch(int16: bool) {
+    const TOTAL: usize = 1300;
+    let tone: Vec<f32> = (0..TOTAL * FRAME)
         .map(|i| 6000.0 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / FS).sin())
         .collect();
     let silence = vec![0.0f32; 2 * FRAME];
@@ -408,24 +423,32 @@ fn root_echo_switches_at_a_frame_boundary_without_a_glitch() {
     h.open_dsp_chain();
     h.prepare_model();
     let mut out: Vec<Vec<f32>> = Vec::new();
-    let mut swap_frame = None;
+    let mut swaps_at = Vec::new();
     let mut before = h.probe();
-    for f in 0..700 {
+    for f in 0..TOTAL {
         if f == 100 {
             before = h.probe();
             h.set_mode(MODE_ON);
         }
-        out.push(h.process(RATE, 2, &silence, &tone[f * FRAME..(f + 1) * FRAME]));
+        if f == 700 {
+            h.set_mode(MODE_OFF);
+        }
+        let capture = &tone[f * FRAME..(f + 1) * FRAME];
+        out.push(if int16 {
+            h.process_int16(RATE, 2, &silence, capture)
+        } else {
+            h.process(RATE, 2, &silence, capture)
+        });
         h.advance(10);
-        if swap_frame.is_none() && h.probe().swaps == 1 {
-            swap_frame = Some(f);
+        if h.probe().swaps as usize > swaps_at.len() {
+            swaps_at.push(f);
         }
     }
     let after = h.probe();
-    let swap = swap_frame.expect("switched");
-    assert!(after.running_model && after.swaps == 1 && after.state == STATE_ON, "{after:?}");
-    assert!(swap >= 100, "{swap}");
-    assert_eq!(after.processed_frames - before.processed_frames, 600);
+    assert_eq!(swaps_at.len(), 2, "{swaps_at:?} {after:?}");
+    assert!(!after.running_model && after.state == STATE_OFF, "{after:?}");
+    assert!((100..700).contains(&swaps_at[0]) && swaps_at[1] >= 700, "{swaps_at:?}");
+    assert_eq!(after.processed_frames - before.processed_frames, (TOTAL - 100) as u64);
     assert_eq!(
         (after.dsp_resets, after.dsp_flushes, after.format_seq),
         (before.dsp_resets, before.dsp_flushes, before.format_seq)
@@ -435,17 +458,117 @@ fn root_echo_switches_at_a_frame_boundary_without_a_glitch() {
     let reference = rms(&out[90]);
     for (f, frame) in out.iter().enumerate().skip(30) {
         let db = 20.0 * (rms(frame) / reference).log10();
-        assert!(
-            db.abs() < 1.0,
-            "frame {f} ({} from the switch): {db:.2} dB",
-            f as i64 - swap as i64
-        );
+        assert!(db.abs() < 1.0, "frame {f} (switches at {swaps_at:?}): {db:.2} dB");
     }
     let max_step = |v: &[f32]| v.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
     let steady = max_step(&out[90]);
-    let joined: Vec<f32> =
-        out[swap - 1].iter().chain(out[swap].iter()).chain(out[swap + 1].iter()).copied().collect();
-    assert!(max_step(&joined) < 1.5 * steady, "{} vs {steady}", max_step(&joined));
+    for &swap in &swaps_at {
+        let joined: Vec<f32> = out[swap - 1]
+            .iter()
+            .chain(out[swap].iter())
+            .chain(out[swap + 1].iter())
+            .copied()
+            .collect();
+        assert!(max_step(&joined) < 1.5 * steady, "{swap}: {} vs {steady}", max_step(&joined));
+    }
+}
+
+#[test]
+fn root_echo_switches_at_a_frame_boundary_without_a_glitch() {
+    switch_twice_without_a_glitch(false);
+}
+
+/// The voice engine's interface: interleaved int16, processed in place.
+#[test]
+fn root_echo_int16_switches_at_a_frame_boundary_without_a_glitch() {
+    switch_twice_without_a_glitch(true);
+}
+
+/// Through the int16 interface, an unset mode is today's APM sample for
+/// sample too.
+#[test]
+fn root_echo_int16_unset_mode_is_todays_apm_bit_for_bit() {
+    let s = scene(6.0, (0.5, 4.0), (2.5, 5.5), true, 0.5);
+    let reference = today();
+    let candidate = with_variants();
+    let mut render = vec![0.0f32; 2 * FRAME];
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    for f in 0..frames(&s) {
+        let r = &s.render[f * FRAME..(f + 1) * FRAME];
+        render[..FRAME].copy_from_slice(r);
+        render[FRAME..].copy_from_slice(r);
+        let capture = &s.capture[f * FRAME..(f + 1) * FRAME];
+        a.extend(reference.process_int16(RATE, 2, &render, capture));
+        b.extend(candidate.process_int16(RATE, 2, &render, capture));
+        reference.advance(10);
+        candidate.advance(10);
+    }
+    assert!(a.iter().any(|&v| v.abs() > 100.0), "the scene reaches the output");
+    assert_eq!(a, b);
+}
+
+/// On, off, on again, with echo present. The variant without the model that
+/// replaces the model's is today's APM: its output equals, sample for sample,
+/// a fresh APM (initialized for the formats, as a staged variant is) fed the
+/// same frames from the 8 its warm-up replayed onward, once the fresh
+/// harness's own voice chain is past its startup hold.
+#[test]
+fn root_echo_off_variant_is_a_fresh_apm_bit_for_bit() {
+    let s = scene(20.0, (0.0, 20.0), (6.0, 12.0), true, 0.5);
+    let a = with_variants();
+    a.open_dsp_chain();
+    a.prepare_model();
+    a.set_mode(MODE_ON);
+    let mut out: Vec<Vec<f32>> = Vec::new();
+    let step = |h: &RootEchoHarness, out: &mut Vec<Vec<f32>>| {
+        let f = out.len();
+        out.push(run(h, &s, f, f + 1));
+        h.probe()
+    };
+    while !step(&a, &mut out).running_model {
+        assert!(out.len() < 500, "on");
+    }
+    for _ in 0..100 {
+        step(&a, &mut out);
+    }
+    a.set_mode(MODE_OFF);
+    let mut staged_after = None;
+    let switched_at = loop {
+        assert!(out.len() < 900, "off");
+        let p = step(&a, &mut out);
+        if staged_after.is_none() && p.staged == 0 {
+            staged_after = Some(out.len() - 1);
+        }
+        if !p.running_model {
+            break out.len() - 1;
+        }
+    };
+    let staged_after = staged_after.expect("staged before the switch");
+    assert_eq!(switched_at, staged_after + 1, "the next capture frame takes it");
+    for _ in 0..300 {
+        step(&a, &mut out);
+    }
+    assert_eq!(a.probe().swaps, 2);
+
+    let first = staged_after - 7;
+    let b = with_variants();
+    b.open_dsp_chain();
+    b.initialize(RATE, 2);
+    let fresh = run(&b, &s, first, out.len());
+    let from = switched_at + 40;
+    let fresh_tail = &fresh[(from - first) * FRAME..];
+    let model_tail: Vec<f32> = out[from..].iter().flatten().copied().collect();
+    assert_eq!(fresh_tail.len(), model_tail.len());
+    assert!(fresh_tail.iter().any(|&v| v.abs() > 100.0), "the scene reaches the output");
+    let differs = fresh_tail.iter().zip(&model_tail).position(|(x, y)| x.to_bits() != y.to_bits());
+    assert_eq!(differs, None, "the off variant differs from a fresh APM at {differs:?}");
+
+    a.set_mode(MODE_ON);
+    while !step(&a, &mut out).running_model {
+        assert!(out.len() < frames(&s), "on again");
+    }
+    let p = a.probe();
+    assert!(p.swaps == 3 && p.state == STATE_ON && p.reason == REASON_MODE_ON, "{p:?}");
 }
 
 #[test]
@@ -475,9 +598,79 @@ fn root_echo_auto_follows_the_output_device() {
     until(&h, &s, 0, 400, |p| !p.running_model);
     let p = h.probe();
     assert_eq!((p.mode, p.state, p.reason, p.swaps), (MODE_OFF, STATE_OFF, REASON_MODE_OFF, 4));
-    assert_eq!(p.kind, KIND_DISPLAY_AUDIO, "the device is kept across sessions");
+    assert_eq!(p.kind, KIND_DISPLAY_AUDIO, "an open playout keeps its device across sessions");
     run(&h, &s, 0, 50);
     assert_eq!(h.probe().pending_tasks, 0, "nothing polls with the mode off and the model gone");
+    h.close_playout();
+    h.reset_session();
+    h.advance(0);
+    assert_eq!(h.probe().kind, KIND_NONE, "a closed playout's device is forgotten");
+    h.set_mode(MODE_AUTO);
+    run(&h, &s, 0, 50);
+    let p = h.probe();
+    assert!(!p.running_model && p.reason == REASON_DEVICE_KIND, "{p:?}");
+}
+
+/// A call that ends with the model on: the audio stops before the session
+/// resets, so no frame takes the variant without it. The worker switches
+/// once both directions are idle, and then stops polling.
+#[test]
+fn root_echo_switches_off_on_the_worker_once_audio_stops() {
+    let s = scene(4.0, (0.0, 4.0), (9.0, 9.0), false, 0.0);
+    let h = with_variants();
+    h.prepare_model();
+    h.set_mode(MODE_ON);
+    until(&h, &s, 0, 200, |p| p.running_model);
+    h.reset_session();
+    h.advance(5000);
+    let p = h.probe();
+    assert!(!p.running_model && p.swaps == 2 && p.staged == -1 && p.state == STATE_OFF, "{p:?}");
+    assert_eq!(p.pending_tasks, 0, "nothing polls between calls");
+    let out = run(&h, &s, 0, 20);
+    assert!(out.iter().all(|v| v.is_finite()) && h.probe().processed_frames > 0);
+}
+
+/// review M1: a reader stalled between reading the epoch and counting
+/// itself, while one switch is collected and a second one made, keeps the
+/// APM it then holds until it leaves.
+#[test]
+fn root_echo_grace_period_holds_a_stalled_reader() {
+    let p = with_variants().grace_replay();
+    assert!(p.first_switched && p.first_released, "{p:?}");
+    assert!(p.reader_holds_second && p.reader_parity_moved, "{p:?}");
+    assert!(p.second_switched && p.second_held && p.held_usable, "{p:?}");
+    assert!(p.released_after_leave, "{p:?}");
+}
+
+/// With the APM's echo canceller off the model has nothing to run on: it is
+/// off (unavailable) until echo cancellation is back.
+#[test]
+fn root_echo_model_is_off_while_echo_cancellation_is() {
+    let s = scene(4.0, (0.0, 4.0), (9.0, 9.0), false, 0.0);
+    let h = with_variants();
+    h.prepare_model();
+    h.set_mode(MODE_ON);
+    until(&h, &s, 0, 200, |p| p.running_model);
+    h.set_echo_cancellation(false);
+    until(&h, &s, 0, 600, |p| !p.running_model);
+    let p = h.probe();
+    assert!(p.state == STATE_OFF && p.reason == REASON_UNAVAILABLE && p.inferences > 0, "{p:?}");
+    h.set_echo_cancellation(true);
+    until(&h, &s, 0, 600, |p| p.running_model);
+    assert_eq!(h.probe().reason, REASON_MODE_ON);
+}
+
+/// A device without a key (an identity lookup that failed) is never
+/// measured, so it cannot latch the model on for unrelated devices.
+#[test]
+fn root_echo_device_without_a_key_is_never_measured() {
+    let s = scene(15.0, (0.0, 15.0), (40.0, 40.0), true, 0.6);
+    let h = with_variants();
+    h.set_device(KIND_HEADPHONES, "");
+    h.set_mode(MODE_AUTO);
+    run(&h, &s, 0, frames(&s));
+    let p = h.probe();
+    assert!(!p.measured_echo && !p.running_model && p.evidence == 0, "{p:?}");
 }
 
 #[test]
@@ -511,7 +704,7 @@ fn root_echo_no_echo_path_never_turns_the_model_on() {
     run(&h, &s, 0, frames(&s));
     let p = h.probe();
     assert!(!p.running_model && !p.measured_echo && p.swaps == 0, "{p:?}");
-    assert!(p.erle_db.is_nan() || p.erle_db < 6.0, "erle {}", p.erle_db);
+    assert!(p.erle_db.is_nan() || p.erle_db < 3.0, "erle {}", p.erle_db);
 }
 
 #[test]
@@ -555,6 +748,8 @@ fn root_echo_reports_inference_costs() {
         "reset on read: {again:?}"
     );
     assert!(!p.kill_switch);
+    h.reset_session();
+    assert!(h.probe().inference_p99_us.is_nan(), "a new session has no window yet");
 }
 
 /// The research's 48 kHz laptop scenes, synthesized: a loudspeaker driven
@@ -663,8 +858,8 @@ fn leak(signal: &[f32], scene: &Scene, from_s: f32, to_s: f32) -> (f64, f64) {
     (100.0 * leaking as f64 / windows.max(1) as f64, worst)
 }
 
-/// Both harnesses over the scene from its first frame, the model APM staged
-/// before it.
+/// Both harnesses over the scene from its first frame, the model APM in use
+/// before it (no audio ran, so the worker switched).
 fn compare(s: &Scene) -> (Vec<f32>, Vec<f32>) {
     let n = frames(s);
     let reference = today();
@@ -675,8 +870,8 @@ fn compare(s: &Scene) -> (Vec<f32>, Vec<f32>) {
     model.prepare_model();
     model.set_mode(MODE_ON);
     let deadline = Instant::now() + std::time::Duration::from_secs(10);
-    while model.probe().staged != 1 {
-        assert!(Instant::now() < deadline, "staged before the first frame");
+    while !model.probe().running_model {
+        assert!(Instant::now() < deadline, "on before the first frame");
         model.advance(10);
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
@@ -752,7 +947,50 @@ fn root_echo_switching_under_load_releases_every_apm() {
     h.prepare_model();
     let p = h.stress(40);
     assert_eq!((p.swaps, p.failed_stages), (40, 0), "{p:?}");
-    assert!(p.collected && p.render_frames > 40 && p.capture_frames > 40, "{p:?}");
+    assert!(p.collected && p.render_frames > 40 && p.capture_frames > 40 && p.reads > 0, "{p:?}");
+}
+
+/// The capture callback's cost (render and capture of one 10 ms frame at
+/// 48 kHz) on the frame each switch happens, against the frames around it,
+/// over four switches each way with echo present (printed with --nocapture).
+#[test]
+fn root_echo_switch_capture_cost() {
+    let s = laptop_scene(30.0, (0.0, 30.0), (12.0, 20.0), Chimes::None);
+    let h = with_variants();
+    h.prepare_model();
+    let mut render = vec![0.0f32; 2 * FRAME];
+    let mut steady = Vec::new();
+    let mut switch_costs = Vec::new();
+    let mut f = 0;
+    for switch in 0..8 {
+        h.set_mode(if switch % 2 == 0 { MODE_ON } else { MODE_OFF });
+        let swaps = h.probe().swaps;
+        for _ in 0..300 {
+            let r = &s.render[f * FRAME..(f + 1) * FRAME];
+            render[..FRAME].copy_from_slice(r);
+            render[FRAME..].copy_from_slice(r);
+            let t = Instant::now();
+            h.process(RATE, 2, &render, &s.capture[f * FRAME..(f + 1) * FRAME]);
+            let us = t.elapsed().as_secs_f64() * 1e6;
+            h.advance(10);
+            f += 1;
+            if h.probe().swaps > swaps {
+                switch_costs.push(us);
+                break;
+            }
+            steady.push(us);
+        }
+    }
+    assert_eq!(switch_costs.len(), 8, "every switch happened");
+    steady.sort_by(f64::total_cmp);
+    let worst_switch = switch_costs.iter().copied().fold(0.0, f64::max);
+    eprintln!(
+        "capture callback: steady median {:.0} us, p99 {:.0} us, max {:.0} us; switch frames {:?} us, worst {worst_switch:.0} us",
+        steady[steady.len() / 2],
+        steady[steady.len() * 99 / 100],
+        steady[steady.len() - 1],
+        switch_costs.iter().map(|v| v.round() as u64).collect::<Vec<_>>()
+    );
 }
 
 /// What ProcessStream costs per 10 ms at 48 kHz with and without the model
@@ -799,7 +1037,7 @@ fn root_echo_playout_opens_reach_the_sink() {
     h.enable(true, true);
     h.hold(true);
     h.flush();
-    assert_eq!(h.take_playout_opened(), vec!["default".to_string()]);
+    assert_eq!(h.take_playout_opened(), vec!["default|Device {a}".to_string()]);
     let unset = AudioDeviceSelection {
         kind: AudioDeviceSelectionKind::Default,
         id: String::new(),
@@ -815,7 +1053,7 @@ fn root_echo_playout_opens_reach_the_sink() {
     assert_eq!(h.take_playout_opened(), vec!["{b}|Device {b}".to_string()]);
     h.hold(false);
     h.flush();
-    assert!(h.take_playout_opened().is_empty(), "closing reports nothing");
+    assert_eq!(h.take_playout_opened(), vec!["closed".to_string()]);
 }
 
 #[test]
@@ -832,4 +1070,109 @@ fn root_echo_control_is_refused_without_the_echo_model() {
     assert!(h.apply_control(&other));
     let stats = h.stats();
     assert!(!stats.echo_model_available);
+}
+
+/// A 16-bit PCM mono WAV: its rate and samples (int16 scale).
+fn read_wav(path: &std::path::Path) -> (u32, Vec<f32>) {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    assert!(bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE");
+    let u16_at = |i: usize| u16::from_le_bytes([bytes[i], bytes[i + 1]]);
+    let u32_at =
+        |i: usize| u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+    let (mut rate, mut pos) = (0, 12);
+    while pos + 8 <= bytes.len() {
+        let size = u32_at(pos + 4) as usize;
+        let body = pos + 8;
+        if &bytes[pos..pos + 4] == b"fmt " {
+            assert_eq!((u16_at(body), u16_at(body + 2), u16_at(body + 14)), (1, 1, 16));
+            rate = u32_at(body + 4);
+        } else if &bytes[pos..pos + 4] == b"data" {
+            let end = (body + size).min(bytes.len());
+            let samples = bytes[body..end]
+                .chunks_exact(2)
+                .map(|b| f32::from(i16::from_le_bytes([b[0], b[1]])))
+                .collect();
+            return (rate, samples);
+        }
+        pos = body + size + (size & 1);
+    }
+    panic!("{}: no data chunk", path.display());
+}
+
+/// The measured-echo rule over one recording (AUTO, a device it may latch):
+/// when it latched (s), and the most evidence it saw.
+fn measure_echo(rate: u32, render: &[f32], capture: &[f32]) -> (Option<f32>, u32) {
+    let h = with_variants();
+    h.set_device(KIND_HEADPHONES, "calibration");
+    h.set_mode(MODE_AUTO);
+    let frame = rate as usize / 100;
+    let mut most = 0;
+    for f in 0..render.len().min(capture.len()) / frame {
+        let range = f * frame..(f + 1) * frame;
+        h.process(rate as i32, 1, &render[range.clone()], &capture[range]);
+        h.advance(10);
+        let p = h.probe();
+        most = most.max(p.evidence);
+        if p.measured_echo {
+            return (Some((f + 1) as f32 / 100.0), most);
+        }
+    }
+    (None, most)
+}
+
+/// Review m12 (design section 8): the measured-echo thresholds against the
+/// AEC Challenge's real recordings. No near-end single-talk clip under
+/// another clip's far end latches, and at least 16 of the 24 far-end
+/// single-talk clips (their loopback as the render) latch within 10 s; on the
+/// others AEC3's linear filter never converges (ERLE under 2 dB, no ERLE rule
+/// can see them) or converges after 10 s. Needs ROOTAPP_AEC_REAL_DIR, the
+/// challenge's `real` folder (`<id>_farend_singletalk_{mic,lpb}.wav`,
+/// `<id>_nearend_singletalk_mic.wav`). Prints every clip with --nocapture.
+#[test]
+#[ignore = "needs ROOTAPP_AEC_REAL_DIR (AEC Challenge real recordings)"]
+fn root_echo_measured_echo_calibration_on_real_recordings() {
+    let dir = std::path::PathBuf::from(
+        std::env::var_os("ROOTAPP_AEC_REAL_DIR")
+            .expect("ROOTAPP_AEC_REAL_DIR is not set: this test cannot run without it"),
+    );
+    let suffix = "_farend_singletalk_mic.wav";
+    let mut ids: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter_map(|name| name.strip_suffix(suffix).map(str::to_string))
+        .collect();
+    ids.sort();
+    assert!(!ids.is_empty(), "no far-end clips in {}", dir.display());
+    let wav = |id: &str, part: &str| read_wav(&dir.join(format!("{id}_{part}.wav")));
+    let (mut late, mut false_latches) = (Vec::new(), Vec::new());
+    for (k, id) in ids.iter().enumerate() {
+        let (rate, mic) = wav(id, "farend_singletalk_mic");
+        let (lpb_rate, lpb) = wav(id, "farend_singletalk_lpb");
+        assert_eq!(rate, lpb_rate);
+        let (far, far_most) = measure_echo(rate, &lpb, &mic);
+        let other = &ids[(k + 1) % ids.len()];
+        let (_, unrelated) = wav(other, "farend_singletalk_lpb");
+        let (_, near_mic) = wav(id, "nearend_singletalk_mic");
+        let (near, near_most) = measure_echo(rate, &unrelated, &near_mic);
+        eprintln!(
+            "{id}: far end {} ({:.1} s, evidence {far_most}); near end under {other}'s far end {} (evidence {near_most})",
+            far.map_or("never latched".to_string(), |s| format!("latched at {s:.2} s")),
+            mic.len() as f32 / rate as f32,
+            near.map_or("never latched".to_string(), |s| format!("latched at {s:.2} s")),
+        );
+        if far.is_none_or(|s| s > 10.0) {
+            late.push(id.clone());
+        }
+        if near.is_some() {
+            false_latches.push(id.clone());
+        }
+    }
+    eprintln!(
+        "{} far-end clips: {} latched within 10 s; {} near-end clips latched",
+        ids.len(),
+        ids.len() - late.len(),
+        false_latches.len()
+    );
+    assert!(false_latches.is_empty(), "near end latched: {false_latches:?}");
+    assert!(ids.len() - late.len() >= 16, "not latched within 10 s: {late:?}");
 }
