@@ -272,6 +272,10 @@ class PipeWireScreenAudioBackend final : public ScreenAudioBackend {
       start_error_ = ScreenAudioError::kNone;
       start_detail_.clear();
       reported_ = false;
+      // A restart may follow a daemon restart, whose graph can lack the
+      // devices for a while: only a first start checks it.
+      audio_checked_ = target.restart;
+      handles_audio_ = true;
     }
     writing_.store(true, std::memory_order_release);
 
@@ -369,7 +373,7 @@ class PipeWireScreenAudioBackend final : public ScreenAudioBackend {
       int error = errno;
       *failure = "cannot connect to the PipeWire daemon (" + ErrnoText(error) + ")";
       return error == EACCES || error == EPERM ? ScreenAudioError::kPermissionDenied
-                                               : ScreenAudioError::kUnsupported;
+                                               : ScreenAudioError::kStartFailed;
     }
     (void)pw_core_add_listener(core_, &core_listener_, &core_events_, this);
     core_listening_ = true;
@@ -380,6 +384,13 @@ class PipeWireScreenAudioBackend final : public ScreenAudioBackend {
     }
     (void)pw_registry_add_listener(registry_, &registry_listener_, &registry_events_, this);
     registry_listening_ = true;
+    // Answered once the daemon listed every global.
+    registry_sync_seq_ = pw_core_sync(core_, PW_ID_CORE, 0);
+    registry_sync_pending_ = registry_sync_seq_ >= 0;
+    if (!registry_sync_pending_) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      audio_checked_ = true;
+    }
 
     // Never autoconnected: without node.autoconnect=false the session manager
     // links the stream to the default microphone. The links are ours.
@@ -418,10 +429,13 @@ class PipeWireScreenAudioBackend final : public ScreenAudioBackend {
     return ScreenAudioError::kNone;
   }
 
-  // Control thread: until the stream has its node (paused) or failed.
+  // Control thread: until the stream has its node (paused) and the graph
+  // was listed, or the start failed.
   ScreenAudioError WaitUntilReady(std::string* failure) {
     std::unique_lock<std::mutex> lock(mutex_);
-    bool settled = changed_.wait_for(lock, kStartTimeout, [this] { return ready_ || start_failed_; });
+    bool settled = changed_.wait_for(lock, kStartTimeout, [this] {
+      return (ready_ && audio_checked_) || start_failed_;
+    });
     if (start_failed_) {
       *failure = start_detail_;
       return start_error_;
@@ -429,6 +443,13 @@ class PipeWireScreenAudioBackend final : public ScreenAudioBackend {
     if (!settled) {
       *failure = "the PipeWire stream did not start within 5 s";
       return ScreenAudioError::kTimeout;
+    }
+    if (!handles_audio_) {
+      *failure =
+          "PipeWire does not handle this system's audio (its graph has no audio sink and no "
+          "playback stream; the sound server is probably PulseAudio without pipewire-pulse), so "
+          "there is nothing to capture";
+      return ScreenAudioError::kUnsupported;
     }
     phase_ = Phase::kRunning;
     return ScreenAudioError::kNone;
@@ -489,6 +510,7 @@ class PipeWireScreenAudioBackend final : public ScreenAudioBackend {
     capture_node_ = PW_ID_ANY;
     dirty_ = false;
     sync_pending_ = false;
+    registry_sync_pending_ = false;
     bind_serial_ = 0;
     sync_request_serial_ = 0;
     synced_serial_ = 0;
@@ -504,14 +526,17 @@ class PipeWireScreenAudioBackend final : public ScreenAudioBackend {
     *proxy = nullptr;
   }
 
-  // Loop thread. A failure while starting fails the start; a running stream
-  // reports once and goes quiet (the core stops it and decides on a restart).
-  // `while_running` false: only a start fails, a running stream logs it.
-  void Fail(ScreenAudioError error, const std::string& detail, bool while_running = true) {
+  // Loop thread. A fatal failure while starting fails the start; a running
+  // stream reports it once and goes quiet (the core stops it and decides on a
+  // restart). One that is not fatal is only logged.
+  void Fail(ScreenAudioError error, const std::string& detail, bool fatal = true) {
     bool report = false;
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      if (phase_ == Phase::kStarting) {
+      if (!fatal) {
+        if (phase_ == Phase::kStarting || phase_ == Phase::kRunning)
+          RTC_LOG(LS_WARNING) << "Screen audio (PipeWire): " << detail;
+      } else if (phase_ == Phase::kStarting) {
         if (!start_failed_) {
           start_failed_ = true;
           start_error_ =
@@ -521,11 +546,9 @@ class PipeWireScreenAudioBackend final : public ScreenAudioBackend {
           start_detail_ = detail;
         }
         changed_.notify_all();
-      } else if (phase_ == Phase::kRunning && !reported_ && while_running) {
+      } else if (phase_ == Phase::kRunning && !reported_) {
         reported_ = true;
         report = true;
-      } else if (phase_ == Phase::kRunning && !while_running) {
-        RTC_LOG(LS_WARNING) << "Screen audio (PipeWire): " << detail;
       }
     }
     if (!report)
@@ -789,9 +812,31 @@ class PipeWireScreenAudioBackend final : public ScreenAudioBackend {
     return static_cast<PipeWireScreenAudioBackend*>(data);
   }
 
+  // The first start only runs where PipeWire plays the audio: with PulseAudio
+  // as the sound server (PipeWire for video only) the capture would stay
+  // silent.
+  void OnRegistryListed() {
+    std::vector<pwg::Node> nodes;
+    for (const auto& [id, entry] : nodes_)
+      nodes.push_back(entry->node);
+    const bool handles_audio = pwg::HandlesAudio(nodes);
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (audio_checked_)
+      return;
+    audio_checked_ = true;
+    handles_audio_ = handles_audio;
+    changed_.notify_all();
+  }
+
   static void OnCoreDone(void* data, uint32_t id, int seq) {
     PipeWireScreenAudioBackend* self = Self(data);
-    if (id != PW_ID_CORE || !self->sync_pending_ || seq != self->sync_seq_)
+    if (id != PW_ID_CORE)
+      return;
+    if (self->registry_sync_pending_ && seq == self->registry_sync_seq_) {
+      self->registry_sync_pending_ = false;
+      self->OnRegistryListed();
+    }
+    if (!self->sync_pending_ || seq != self->sync_seq_)
       return;
     self->sync_pending_ = false;
     self->synced_serial_ = self->sync_request_serial_;
@@ -813,7 +858,7 @@ class PipeWireScreenAudioBackend final : public ScreenAudioBackend {
     else if (res == -EACCES || res == -EPERM)
       Self(data)->Fail(ScreenAudioError::kPermissionDenied, detail);
     else
-      Self(data)->Fail(ScreenAudioError::kStartFailed, detail, false);
+      Self(data)->Fail(ScreenAudioError::kStartFailed, detail, /*fatal=*/false);
   }
 
   static void OnGlobal(void* data,
@@ -972,6 +1017,10 @@ class PipeWireScreenAudioBackend final : public ScreenAudioBackend {
   ScreenAudioError start_error_ = ScreenAudioError::kNone;
   std::string start_detail_;
   bool reported_ = false;
+  // Whether the graph was listed (or need not be) and shows PipeWire playing
+  // the system's audio.
+  bool audio_checked_ = false;
+  bool handles_audio_ = true;
 
   // Loop thread.
   uint32_t capture_node_ = PW_ID_ANY;
@@ -985,6 +1034,8 @@ class PipeWireScreenAudioBackend final : public ScreenAudioBackend {
   bool dirty_ = false;
   bool sync_pending_ = false;
   int sync_seq_ = 0;
+  bool registry_sync_pending_ = false;
+  int registry_sync_seq_ = 0;
   uint64_t bind_serial_ = 0;
   uint64_t sync_request_serial_ = 0;
   uint64_t synced_serial_ = 0;
