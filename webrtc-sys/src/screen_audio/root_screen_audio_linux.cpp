@@ -38,6 +38,7 @@
 #include <unistd.h>
 
 #include <pipewire/pipewire.h>
+#include <spa/node/io.h>
 #include <spa/param/audio/format-utils.h>
 
 #include <algorithm>
@@ -245,6 +246,7 @@ class PipeWireScreenAudioBackend final : public ScreenAudioBackend {
     registry_events_.global_remove = &OnGlobalRemove;
     stream_events_.version = PW_VERSION_STREAM_EVENTS;
     stream_events_.state_changed = &OnStreamState;
+    stream_events_.io_changed = &OnStreamIo;
     stream_events_.param_changed = &OnStreamParam;
     stream_events_.process = &OnProcess;
     node_events_.version = PW_VERSION_NODE_EVENTS;
@@ -283,6 +285,7 @@ class PipeWireScreenAudioBackend final : public ScreenAudioBackend {
       audio_checked_ = target.restart;
       handles_audio_ = true;
     }
+    cycle_valid_ = false;
     writing_.store(true, std::memory_order_release);
 
     ScreenAudioError error = Open(&failure);
@@ -477,6 +480,7 @@ class PipeWireScreenAudioBackend final : public ScreenAudioBackend {
         api_->stream_destroy(stream_);
         stream_ = nullptr;
       }
+      position_.store(nullptr, std::memory_order_release);
       if (retry_timer_ != nullptr) {
         pw_loop_destroy_source(main_loop_, retry_timer_);
         retry_timer_ = nullptr;
@@ -1028,12 +1032,39 @@ class PipeWireScreenAudioBackend final : public ScreenAudioBackend {
                          " instead of 48 kHz stereo float");
   }
 
+  static void OnStreamIo(void* data, uint32_t id, void* area, uint32_t size) {
+    if (id != SPA_IO_Position)
+      return;
+    const spa_io_position* position =
+        area != nullptr && size >= sizeof(spa_io_clock) ? static_cast<spa_io_position*>(area)
+                                                        : nullptr;
+    Self(data)->position_.store(position, std::memory_order_release);
+  }
+
+  // Data loop. A cycle that starts after the end of the previous one this
+  // node ran in means it missed cycles (an xrun).
+  void NoteCycle(const spa_io_clock& clock) {
+    const uint64_t position = clock.position;
+    const uint64_t duration = clock.duration;
+    const uint32_t id = clock.id;
+    const uint32_t rate = clock.rate.denom;
+    if (cycle_valid_ && id == cycle_clock_ && rate == cycle_rate_ && position > cycle_next_)
+      sink_->MarkDiscontinuity();
+    cycle_next_ = position + duration;
+    cycle_clock_ = id;
+    cycle_rate_ = rate;
+    cycle_valid_ = true;
+  }
+
   // Data loop, real time: no allocation, locks, logging or syscalls.
   static void OnProcess(void* data) {
     PipeWireScreenAudioBackend* self = Self(data);
     const PipeWireApi* api = self->api_;
     pw_stream* stream = self->stream_;
     const bool writing = self->writing_.load(std::memory_order_acquire);
+    const spa_io_position* position = self->position_.load(std::memory_order_acquire);
+    if (writing && position != nullptr)
+      self->NoteCycle(position->clock);
     while (pw_buffer* buffer = api->stream_dequeue_buffer(stream)) {
       spa_buffer* spa = buffer->buffer;
       if (writing && spa != nullptr && spa->n_datas > 0) {
@@ -1061,6 +1092,14 @@ class PipeWireScreenAudioBackend final : public ScreenAudioBackend {
   const PipeWireApi* api_ = nullptr;
   ScreenAudioSink* sink_ = nullptr;
   std::atomic<bool> writing_{false};
+  // The driver's position (io_changed, any thread; read on the data loop).
+  std::atomic<const spa_io_position*> position_{nullptr};
+
+  // Data loop: the cycle this node expects next.
+  bool cycle_valid_ = false;
+  uint64_t cycle_next_ = 0;
+  uint32_t cycle_clock_ = 0;
+  uint32_t cycle_rate_ = 0;
 
   pw_core_events core_events_{};
   pw_registry_events registry_events_{};
