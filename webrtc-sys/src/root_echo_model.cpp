@@ -460,68 +460,84 @@ void RootInferenceWindow::Add(uint64_t us, RootEchoModelCounters& counters) {
 // RootResidualEchoEstimator
 // =============================================================================
 
+void RootEchoFarEnd::SetDelayMs(int32_t delay) {
+  const int64_t d = std::max<int64_t>(delay, 0);
+  hold_us.store(std::max(kMinHoldMs, d + kHoldAfterDelayMs) * 1000,
+                std::memory_order_relaxed);
+  onset_guard_blocks.store(
+      static_cast<uint32_t>(
+          (std::max(kMinGuardMs, d + kGuardAfterDelayMs) + kBlockMs - 1) /
+          kBlockMs),
+      std::memory_order_relaxed);
+  delay_ms.store(static_cast<int32_t>(d), std::memory_order_relaxed);
+}
+
+bool RootEchoFarEnd::Active(int64_t capture_now_us) const {
+  return capture_now_us -
+             last_active_render_us.load(std::memory_order_relaxed) <=
+         hold_us.load(std::memory_order_relaxed);
+}
+
 RootResidualEchoEstimator::RootResidualEchoEstimator(
     rust::Box<RootEchoModelSession> session,
-    std::shared_ptr<RootEchoModelCounters> counters)
+    std::shared_ptr<RootEchoModelCounters> counters,
+    std::shared_ptr<const RootEchoFarEnd> far_end,
+    std::shared_ptr<const std::atomic<int64_t>> capture_now_us)
     : session_(std::move(session)),
       counters_(counters ? std::move(counters)
-                         : std::make_shared<RootEchoModelCounters>()) {}
+                         : std::make_shared<RootEchoModelCounters>()),
+      far_end_(std::move(far_end)),
+      capture_now_us_(capture_now_us
+                          ? std::move(capture_now_us)
+                          : std::make_shared<const std::atomic<int64_t>>(0)) {}
 
 RootResidualEchoEstimator::~RootResidualEchoEstimator() = default;
 
 void RootResidualEchoEstimator::Estimate(
     const webrtc::Block& render,
-    std::span<const std::array<float, 64>> /* y */,
+    std::span<const std::array<float, 64>> y,
     std::span<const std::array<float, 64>> e,
-    std::span<const std::array<float, 65>> /* S2 */,
-    std::span<const std::array<float, 65>> /* Y2 */,
+    std::span<const std::array<float, 65>> S2,
+    std::span<const std::array<float, 65>> Y2,
     std::span<const std::array<float, 65>> E2,
-    bool /* dominant_nearend */,
+    bool dominant_nearend,
     std::span<std::array<float, 65>> R2,
     std::span<std::array<float, 65>> R2_unbounded) {
-  std::array<float, 64> reference{};
-  const int render_channels = render.NumChannels();
-  if (render.NumBands() > 0 && render_channels > 0) {
-    for (int channel = 0; channel < render_channels; ++channel) {
-      const auto view = render.View(0, channel);
-      for (size_t i = 0; i < reference.size(); ++i) {
-        reference[i] += view[i];
-      }
-    }
-    const float scale = 1.0f / static_cast<float>(render_channels);
-    for (float& v : reference) {
-      v *= scale;
-    }
-  }
-  std::array<float, 64> linear{};
-  if (!e.empty()) {
-    for (const auto& channel : e) {
-      for (size_t i = 0; i < linear.size(); ++i) {
-        linear[i] += channel[i];
-      }
-    }
-    const float scale = 1.0f / static_cast<float>(e.size());
-    for (float& v : linear) {
-      v *= scale;
-    }
-  }
-  std::array<float, 65> fraction{};
+  static_assert(sizeof(std::array<float, 65>) == 65 * sizeof(float));
+  static constexpr std::array<float, 64> kSilence{};
+  const float* render0 = render.NumBands() > 0 && render.NumChannels() > 0
+                             ? render.View(0, 0).data()
+                             : kSilence.data();
+  const float* y0 = y.empty() ? kSilence.data() : y[0].data();
+  const float* e0 = e.empty() ? kSilence.data() : e[0].data();
+  const size_t channels =
+      std::min({S2.size(), Y2.size(), E2.size(), R2.size(), R2_unbounded.size()});
+  const size_t bins = channels * 65;
+  const bool active =
+      far_end_ != nullptr &&
+      far_end_->Active(capture_now_us_->load(std::memory_order_relaxed));
+  const uint32_t guard =
+      far_end_ != nullptr
+          ? far_end_->onset_guard_blocks.load(std::memory_order_relaxed)
+          : 0;
+  static constexpr std::array<float, 65> kNoBins{};
+  std::array<float, 65> no_output{};
   const auto start = std::chrono::steady_clock::now();
-  const bool inferred = session_->estimate_block(
-      rust::Slice<const float>(reference.data(), reference.size()),
-      rust::Slice<const float>(linear.data(), linear.size()),
-      rust::Slice<float>(fraction.data(), fraction.size()));
+  const bool inferred = session_->estimate(
+      rust::Slice<const float>(render0, 64), rust::Slice<const float>(y0, 64),
+      rust::Slice<const float>(e0, 64),
+      rust::Slice<const float>(channels > 0 ? S2[0].data() : kNoBins.data(), bins),
+      rust::Slice<const float>(channels > 0 ? Y2[0].data() : kNoBins.data(), bins),
+      rust::Slice<const float>(channels > 0 ? E2[0].data() : kNoBins.data(), bins),
+      dominant_nearend, active, guard,
+      rust::Slice<float>(channels > 0 ? R2[0].data() : no_output.data(), bins));
   if (inferred) {
     const auto elapsed = std::chrono::steady_clock::now() - start;
     const int64_t us =
         std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count();
     window_.Add(static_cast<uint64_t>(std::max<int64_t>(us, 0)), *counters_);
   }
-  const size_t channels = std::min({E2.size(), R2.size(), R2_unbounded.size()});
   for (size_t channel = 0; channel < channels; ++channel) {
-    for (size_t k = 0; k < fraction.size(); ++k) {
-      R2[channel][k] = E2[channel][k] * fraction[k];
-    }
     R2_unbounded[channel] = R2[channel];
   }
 }
@@ -544,6 +560,11 @@ webrtc::EchoCanceller3Config::Suppressor RootResidualEchoEstimator::Tuned(
 
 webrtc::EchoCanceller3Config::Suppressor RootResidualEchoEstimator::AdjustConfig(
     const webrtc::EchoCanceller3Config::Suppressor& config) const {
+  session_->set_today_masks(config.normal_tuning.mask_lf.enr_suppress,
+                            config.normal_tuning.mask_hf.enr_suppress,
+                            config.nearend_tuning.mask_lf.enr_suppress,
+                            config.nearend_tuning.mask_hf.enr_suppress,
+                            config.last_lf_band, config.first_hf_band);
   return Tuned(config);
 }
 
@@ -552,7 +573,9 @@ void RootResidualEchoEstimator::Reset() {
 }
 
 std::unique_ptr<webrtc::NeuralResidualEchoEstimator> NewRootResidualEchoEstimator(
-    std::shared_ptr<RootEchoModelCounters> counters) {
+    std::shared_ptr<RootEchoModelCounters> counters,
+    std::shared_ptr<const RootEchoFarEnd> far_end,
+    std::shared_ptr<const std::atomic<int64_t>> capture_now_us) {
   if (!kRootEchoModelSupported || !root_echo_model_prepared()) {
     return nullptr;
   }
@@ -560,8 +583,9 @@ std::unique_ptr<webrtc::NeuralResidualEchoEstimator> NewRootResidualEchoEstimato
   if (!session->valid()) {
     return nullptr;
   }
-  return std::make_unique<RootResidualEchoEstimator>(std::move(session),
-                                                     std::move(counters));
+  return std::make_unique<RootResidualEchoEstimator>(
+      std::move(session), std::move(counters), std::move(far_end),
+      std::move(capture_now_us));
 }
 
 // =============================================================================
@@ -773,14 +797,23 @@ void RootEchoModelController::RunLocked(int64_t now_ms) {
     seen_swaps_ = swaps;
     policy_.RestartMeasurement();
   }
+  std::optional<RootApmStats> stats;
+  if (policy_.mode() != RootEchoModelMode::kOff) {
+    stats = decorator_->ReadStats();
+    if (stats->delay_ms >= 0) {
+      decorator_->SetEstimatedDelayMs(stats->delay_ms);
+    }
+  }
   if (policy_.Measuring() && !running &&
       now_ms - last_sample_ms_ >= RootEchoModelPolicy::kSampleIntervalMs) {
     last_sample_ms_ = now_ms;
-    const RootApmStats stats = decorator_->ReadStats();
+    if (!stats.has_value()) {
+      stats = decorator_->ReadStats();
+    }
     const uint64_t frames =
         capture_ ? capture_->processed_frames.load(std::memory_order_relaxed)
                  : 0;
-    policy_.AddErleSample(stats.erle_db, frames);
+    policy_.AddErleSample(stats->erle_db, frames);
   }
   const RootEchoModelPolicy::Decision decision = DecideLocked();
   if (decision.on) {
@@ -1028,7 +1061,7 @@ rust::Vec<float> RootEchoHarness::process(
   }
   float* capture_ptr = capture_data.data();
   const webrtc::StreamConfig capture_config(rate, 1);
-  decorator_->set_stream_delay_ms(0);
+  decorator_->set_stream_delay_ms(stream_delay_ms_);
   decorator_->ProcessStream(&capture_ptr, capture_config, capture_config,
                             &capture_ptr);
   for (float v : capture_data) {
@@ -1065,7 +1098,7 @@ rust::Vec<float> RootEchoHarness::process_int16(
     capture_data[i] = to_int16(capture[i]);
   }
   const webrtc::StreamConfig capture_config(rate, 1);
-  decorator_->set_stream_delay_ms(0);
+  decorator_->set_stream_delay_ms(stream_delay_ms_);
   decorator_->ProcessStream(capture_data.data(), capture_config,
                             capture_config, capture_data.data());
   for (int16_t v : capture_data) {
@@ -1080,6 +1113,10 @@ void RootEchoHarness::initialize(int32_t rate, uint32_t render_channels) const {
                                     std::max<uint32_t>(render_channels, 1));
   decorator_->Initialize(
       webrtc::ProcessingConfig{{capture, capture, render, render}});
+}
+
+void RootEchoHarness::set_stream_delay(int32_t delay_ms) const {
+  stream_delay_ms_ = delay_ms;
 }
 
 void RootEchoHarness::open_dsp_chain() const {
@@ -1174,6 +1211,12 @@ RootEchoHarnessProbe RootEchoHarness::probe() const {
   probe.format_seq = capture_->format_seq.load();
   probe.erle_db = decorator_->ReadStats().erle_db;
   probe.pending_tasks = static_cast<uint32_t>(tasks_->size());
+  const RootEchoFarEnd& far_end = *decorator_->far_end_;
+  probe.far_end_active = far_end.Active(
+      decorator_->active_.load()->capture_now_us->load());
+  probe.far_end_hold_ms = far_end.hold_us.load() / 1000;
+  probe.onset_guard_blocks = far_end.onset_guard_blocks.load();
+  probe.far_end_delay_ms = far_end.delay_ms.load();
   return probe;
 }
 
@@ -1272,11 +1315,11 @@ RootEchoGraceProbe RootEchoHarness::grace_replay() const {
   webrtc::AudioProcessing* second = d.active_for_test();
   probe.first_released = d.CollectRetired() && !live(first);
   const RootApmDecorator::Entered entered = d.GraceEnter(epoch);
-  probe.reader_holds_second = entered.apm == second;
+  probe.reader_holds_second = entered.variant->apm.get() == second;
   probe.reader_parity_moved = entered.parity != (epoch & 1u);
   probe.second_switched = swap();
   probe.second_held = !d.CollectRetired() && live(second);
-  probe.held_usable = entered.apm->num_output_channels() > 0;
+  probe.held_usable = entered.variant->apm->num_output_channels() > 0;
   d.GraceLeave(entered.parity);
   probe.released_after_leave = d.CollectRetired() && !live(second);
   return probe;

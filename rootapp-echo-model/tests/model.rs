@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use rootapp_echo_model::{
     dtln::{process_offline, Dtln},
-    weights, Estimator, Kernel, Model, Tuning, AEC3_BINS, AEC3_BLOCK,
+    weights, Estimator, Hook, Kernel, Model, ModelFraction, AEC3_BINS, AEC3_BLOCK, SCALE,
 };
 use sha2::{Digest, Sha256};
 
@@ -33,16 +33,15 @@ fn model() -> Arc<Model> {
     Arc::new(Model::embedded().unwrap())
 }
 
-/// The estimator's fraction after every block of the scene.
-fn fractions(model: Arc<Model>, tuning: Tuning, blocks: usize) -> Vec<[f32; AEC3_BINS]> {
+/// The model's fraction at `scale` after every block of the scene.
+fn fractions(model: Arc<Model>, scale: f32, blocks: usize) -> Vec<[f32; AEC3_BINS]> {
     let (render, linear) = scene::scene(blocks * AEC3_BLOCK);
-    let mut estimator = Estimator::new(model, tuning);
+    let mut m = ModelFraction::new(model, scale);
     let mut out = Vec::new();
     for b in 0..blocks {
         let range = b * AEC3_BLOCK..(b + 1) * AEC3_BLOCK;
-        let mut f = [0.0f32; AEC3_BINS];
-        estimator.estimate_block(&render[range.clone()], &linear[range], &mut f);
-        out.push(f);
+        m.block(&render[range.clone()], &linear[range]);
+        out.push(*m.fraction());
     }
     out
 }
@@ -80,13 +79,13 @@ fn malformed_models_are_errors_not_panics() {
 /// The fractions the research runtime (scratchpad `echo/dtln`, verified
 /// against the authors' outputs) gives on the same scene, x2.
 #[test]
-fn estimator_matches_the_research_runtime() {
+fn model_fraction_matches_the_research_runtime() {
     let golden: Vec<f32> = include_bytes!("data/golden-x2.f32")
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     let hops = golden.len() / AEC3_BINS;
-    let ours = fractions(model(), Tuning::default(), hops * 2);
+    let ours = fractions(model(), 2.0, hops * 2);
     let (mut max, mut sum, mut n) = (0.0f32, 0.0f64, 0usize);
     let mut below_one = 0;
     for hop in 0..hops {
@@ -108,10 +107,10 @@ fn estimator_matches_the_research_runtime() {
 }
 
 #[test]
-fn every_kernel_gives_the_same_estimate() {
+fn every_kernel_gives_the_same_fraction() {
     let reference = fractions(
         Arc::new(Model::embedded().unwrap().with_kernel(Kernel::Scalar).unwrap()),
-        Tuning::default(),
+        SCALE,
         400,
     );
     for kernel in [Kernel::Sse2, Kernel::Avx2Fma, Kernel::Neon] {
@@ -119,7 +118,7 @@ fn every_kernel_gives_the_same_estimate() {
             assert!(!kernel.available());
             continue;
         };
-        let other = fractions(Arc::new(model), Tuning::default(), 400);
+        let other = fractions(Arc::new(model), SCALE, 400);
         let max = reference
             .iter()
             .zip(&other)
@@ -157,71 +156,82 @@ fn kernels_compute_dot_products() {
     }
 }
 
+/// AEC3-like hook inputs for block `b` of the scene: the render, the mic as
+/// echo plus near voice, the linear output, and their spectra (Y2 from the
+/// mic, E2 from the linear output, S2 from their difference).
+fn hook_spectra(
+    render: &[f32],
+    linear: &[f32],
+    b: usize,
+) -> ([f32; 64], [f32; 64], [f32; 64], [[f32; 65]; 3]) {
+    let r: [f32; 64] = render[b * 64..(b + 1) * 64].try_into().unwrap();
+    let e: [f32; 64] = linear[b * 64..(b + 1) * 64].try_into().unwrap();
+    let mut y = [0.0f32; 64];
+    for i in 0..64 {
+        y[i] = e[i] + 0.2 * r[i];
+    }
+    let power = |x: &[f32; 64]| -> [f32; 65] {
+        let mut out = [0.0f32; 65];
+        for (k, o) in out.iter_mut().enumerate() {
+            let (mut re, mut im) = (0.0f64, 0.0f64);
+            for (n, v) in x.iter().enumerate() {
+                let a = -2.0 * std::f64::consts::PI * (k * n) as f64 / 128.0;
+                re += f64::from(*v) * a.cos();
+                im += f64::from(*v) * a.sin();
+            }
+            *o = (re * re + im * im) as f32;
+        }
+        out
+    };
+    let mut s = [0.0f32; 64];
+    for i in 0..64 {
+        s[i] = y[i] - e[i];
+    }
+    (r, y, e, [power(&s), power(&y), power(&e)])
+}
+
+fn run_estimator(e: &mut Estimator, blocks: usize) -> (Vec<[f32; 65]>, usize) {
+    let (render, linear) = scene::scene(blocks * AEC3_BLOCK);
+    let mut all = Vec::new();
+    let mut inferences = 0;
+    for b in 0..blocks {
+        let (r, y, lin, [s2, y2, e2]) = hook_spectra(&render, &linear, b);
+        let hook = Hook {
+            render: &r,
+            y: &y,
+            e: &lin,
+            s2: &s2,
+            y2: &y2,
+            e2: &e2,
+            dominant_nearend: b % 50 > 40,
+            far_end_active: b % 100 > 10,
+            onset_guard_blocks: 15,
+        };
+        let mut r2 = [0.0f32; 65];
+        if e.estimate(&hook, &mut r2) {
+            inferences += 1;
+        }
+        all.push(r2);
+    }
+    (all, inferences)
+}
+
 #[test]
 fn the_estimate_starts_at_one_and_reset_repeats_it_exactly() {
-    let model = model();
-    let (render, linear) = scene::scene(200 * AEC3_BLOCK);
-    let mut estimator = Estimator::new(model, Tuning::default());
-    let mut first = [0.0f32; AEC3_BINS];
-    assert!(!estimator.estimate_block(&render[..64], &linear[..64], &mut first));
-    assert!(first.iter().all(|&f| f == 1.0));
-    let run = |e: &mut Estimator| {
-        let mut all = Vec::new();
-        let mut inferences = 0;
-        for b in 0..200 {
-            let mut f = [0.0f32; AEC3_BINS];
-            if e.estimate_block(
-                &render[b * 64..(b + 1) * 64],
-                &linear[b * 64..(b + 1) * 64],
-                &mut f,
-            ) {
-                inferences += 1;
-            }
-            all.push(f);
-        }
-        (all, inferences)
-    };
+    let m = ModelFraction::new(model(), SCALE);
+    assert!(m.fraction().iter().all(|&f| f == 1.0));
+    let mut estimator = Estimator::new(model());
+    let (a, inferences) = run_estimator(&mut estimator, 200);
     estimator.reset();
-    let (a, inferences) = run(&mut estimator);
-    estimator.reset();
-    let (b, _) = run(&mut estimator);
+    let (b, _) = run_estimator(&mut estimator, 200);
     assert_eq!(inferences, 100);
     assert_eq!(a, b);
-    assert!(a.iter().flatten().all(|f| (0.0..=1.0).contains(f)));
+    assert!(a.iter().flatten().all(|v| v.is_finite() && *v >= 0.0));
 }
 
 #[test]
-fn the_render_gate_zeroes_the_estimate_after_silence() {
-    let model = model();
-    let mut gated =
-        Estimator::new(model.clone(), Tuning { render_gate_blocks: 75, ..Tuning::default() });
-    let mut open = Estimator::new(model, Tuning::default());
-    let (render, linear) = scene::scene(300 * AEC3_BLOCK);
-    let silence = [0.0f32; AEC3_BLOCK];
-    let (mut g, mut o) = ([1.0f32; AEC3_BINS], [0.0f32; AEC3_BINS]);
-    gated.estimate_block(&silence, &linear[..64], &mut g);
-    assert!(g.iter().all(|&v| v == 0.0), "silent render from the start is gated");
-    gated.reset();
-    let mut open_after_gate = false;
-    for b in 0..300 {
-        let r = if b < 100 { &render[b * 64..(b + 1) * 64] } else { &silence[..] };
-        let e = &linear[b * 64..(b + 1) * 64];
-        gated.estimate_block(r, e, &mut g);
-        open.estimate_block(r, e, &mut o);
-        if b < 100 + 74 {
-            assert_eq!(g, o, "block {b}: active render, then 74 silent blocks");
-        } else {
-            assert!(g.iter().all(|&v| v == 0.0), "block {b}");
-            open_after_gate |= o.iter().any(|&v| v > 0.0);
-        }
-    }
-    assert!(open_after_gate, "without the gate the model kept estimating");
-}
-
-#[test]
-fn hostile_input_never_panics_and_keeps_the_estimate_in_range() {
-    let mut estimator = Estimator::new(model(), Tuning::default());
-    let mut f = [0.0f32; AEC3_BINS];
+fn hostile_input_never_panics_and_keeps_the_fraction_in_range() {
+    let mut m = ModelFraction::new(model(), SCALE);
     let blocks: [[f32; AEC3_BLOCK]; 6] = [
         [f32::NAN; AEC3_BLOCK],
         [f32::INFINITY; AEC3_BLOCK],
@@ -233,13 +243,32 @@ fn hostile_input_never_panics_and_keeps_the_estimate_in_range() {
     for _ in 0..20 {
         for x in &blocks {
             for y in &blocks {
-                estimator.estimate_block(x, y, &mut f);
-                assert!(f.iter().all(|v| (0.0..=1.0).contains(v)), "{f:?}");
+                m.block(x, y);
+                assert!(m.fraction().iter().all(|v| (0.0..=1.0).contains(v)), "{:?}", m.fraction());
             }
         }
     }
-    estimator.estimate_block(&[1.0; 3], &[], &mut f[..10]);
-    estimator.estimate_block(&[], &[], &mut []);
+    m.block(&[1.0; 3], &[]);
+    let mut estimator = Estimator::new(model());
+    let spectrum = [1e30f32; 65];
+    let short = [1.0f32; 10];
+    let mut r2 = [0.0f32; 65 * 2];
+    for x in &blocks {
+        let hook = Hook {
+            render: x,
+            y: x,
+            e: &short,
+            s2: &spectrum,
+            y2: &short,
+            e2: &spectrum,
+            dominant_nearend: false,
+            far_end_active: true,
+            onset_guard_blocks: 15,
+        };
+        estimator.estimate(&hook, &mut r2);
+        estimator.estimate(&hook, &mut r2[..3]);
+        estimator.estimate(&hook, &mut []);
+    }
 }
 
 /// The authors' published outputs of DTLN-aec-512 (the only size they

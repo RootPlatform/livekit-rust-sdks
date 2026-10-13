@@ -767,6 +767,18 @@ enum Chimes {
 }
 
 fn laptop_scene(seconds: f32, far: (f32, f32), near: (f32, f32), chimes: Chimes) -> Scene {
+    laptop_scene_with_noise(seconds, far, near, chimes, 3.0)
+}
+
+/// The same with mic noise of `noise_amplitude` (an Lcg amplitude in int16
+/// units; 3 is about -85 dBFS).
+fn laptop_scene_with_noise(
+    seconds: f32,
+    far: (f32, f32),
+    near: (f32, f32),
+    chimes: Chimes,
+    noise_amplitude: f32,
+) -> Scene {
     let n = (seconds * FS) as usize;
     let mut noise = Lcg(5);
     let mut far_voice = Voice { f0: 125.0, swing: 25.0, syllables_hz: 3.3, phase: 0.0 };
@@ -827,7 +839,7 @@ fn laptop_scene(seconds: f32, far: (f32, f32), near: (f32, f32), chimes: Chimes)
                 e += g * speaker[i - d];
             }
         }
-        capture[i] = e + near_part[i] + 3.0 * noise.next();
+        capture[i] = e + near_part[i] + noise_amplitude * noise.next();
     }
     Scene { render, capture, far_active, near_active }
 }
@@ -858,15 +870,11 @@ fn leak(signal: &[f32], scene: &Scene, from_s: f32, to_s: f32) -> (f64, f64) {
     (100.0 * leaking as f64 / windows.max(1) as f64, worst)
 }
 
-/// Both harnesses over the scene from its first frame, the model APM in use
-/// before it (no audio ran, so the worker switched).
-fn compare(s: &Scene) -> (Vec<f32>, Vec<f32>) {
-    let n = frames(s);
-    let reference = today();
+/// The decorator with the model APM in use before any frame (no audio ran,
+/// so the worker switched), the voice chain passing the APM's output on.
+fn model_harness() -> UniquePtr<RootEchoHarness> {
     let model = with_variants();
-    for h in [&reference, &model] {
-        h.open_dsp_chain();
-    }
+    model.open_dsp_chain();
     model.prepare_model();
     model.set_mode(MODE_ON);
     let deadline = Instant::now() + std::time::Duration::from_secs(10);
@@ -875,19 +883,28 @@ fn compare(s: &Scene) -> (Vec<f32>, Vec<f32>) {
         model.advance(10);
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
+    model
+}
+
+/// Both harnesses over the scene from its first frame, the model APM in use
+/// before it.
+fn compare(s: &Scene) -> (Vec<f32>, Vec<f32>) {
+    let n = frames(s);
+    let reference = today();
+    reference.open_dsp_chain();
+    let model = model_harness();
     let a = run(&reference, s, 0, n);
     let b = run(&model, s, 0, n);
     assert!(model.probe().running_model);
     (a, b)
 }
 
-/// The research's claims on synthesized laptop scenes, with thresholds at or
-/// below what they measure (printed with --nocapture): less residual echo
-/// from a clipping loudspeaker, fewer leaking windows from call-start chimes
-/// (their first onset leaks with and without the model here), the near voice
-/// kept in double talk and when the far end is silent.
+/// estimator-spec.md 8.1, the loud laptop (a clipping loudspeaker; spec: off
+/// 10.0% / 35.0 dB, on 2.5% / 22.7): leak at most half of AEC3 alone's, the
+/// worst window 5 dB under it, the near voice in double talk within 3 dB and,
+/// with the far end silent 1 s, within 0.5 dB.
 #[test]
-fn root_echo_model_removes_more_echo_than_aec3_alone() {
+fn root_echo_model_on_the_loud_laptop() {
     let s = laptop_scene(16.0, (0.2, 12.0), (8.0, 15.0), Chimes::None);
     let (a, b) = compare(&s);
     let (leak_a, worst_a) = leak(&a, &s, 2.0, 8.0);
@@ -901,44 +918,91 @@ fn root_echo_model_removes_more_echo_than_aec3_alone() {
     eprintln!(
         "loud laptop: leak {leak_a:.1}% -> {leak_b:.1}%, worst {worst_a:.1} -> {worst_b:.1} dB over the floor; double talk {dt_a:.1} -> {dt_b:.1} dB; near only {near_a:.1} -> {near_b:.1} dB"
     );
-
-    let c = laptop_scene(8.0, (4.0, 8.0), (9.0, 9.0), Chimes::Bells);
-    let (ca, cb) = compare(&c);
-    let (chime_leak_a, chime_worst_a) = leak(&ca, &c, 0.4, 3.5);
-    let (chime_leak_b, chime_worst_b) = leak(&cb, &c, 0.4, 3.5);
-    eprintln!(
-        "fresh call bells: leak {chime_leak_a:.1}% -> {chime_leak_b:.1}%, worst {chime_worst_a:.1} -> {chime_worst_b:.1} dB over the floor"
-    );
-
-    assert!(leak_b <= leak_a / 2.0, "steady leak {leak_a:.1}% -> {leak_b:.1}%");
-    assert!(worst_b <= worst_a + 1.0, "steady worst {worst_a:.1} -> {worst_b:.1} dB");
-    assert!(
-        chime_leak_b <= chime_leak_a * 0.75,
-        "bells leak {chime_leak_a:.1}% -> {chime_leak_b:.1}%"
-    );
-    assert!(
-        chime_worst_b <= chime_worst_a + 1.0,
-        "bells {chime_worst_a:.1} -> {chime_worst_b:.1} dB"
-    );
+    assert!(leak_b <= 0.5 * leak_a, "leak {leak_a:.1}% -> {leak_b:.1}%");
+    assert!(worst_b <= worst_a - 5.0, "worst {worst_a:.1} -> {worst_b:.1} dB");
     assert!(dt_b >= dt_a - 3.0, "double talk {dt_a:.1} -> {dt_b:.1} dB");
-    assert!((near_b - near_a).abs() <= 3.0, "near only {near_a:.1} -> {near_b:.1} dB");
+    assert!((near_b - near_a).abs() <= 0.5, "near only {near_a:.1} -> {near_b:.1} dB");
 }
 
-/// The baseline's known weak spot (the research's music result): purely
-/// tonal render (two-tone beeps) leaks far louder with the model than with
-/// AEC3 alone (on this scene about 23 -> 56 dB over the floor at the worst
-/// window). estimator-spec.md's never-worse rule for music is to fix it;
-/// until then this stays ignored and documents the gap.
+/// 8.1, call-start bells (spec: off 88.9% / 64.4 dB, on 38.9% / 64.3; the
+/// worst window falls where AEC3 does not consult the estimator).
 #[test]
-#[ignore = "baseline x2 estimator: tonal render is worse than AEC3 alone until estimator-spec.md lands"]
+fn root_echo_model_on_call_start_bells() {
+    let c = laptop_scene(8.0, (4.0, 8.0), (9.0, 9.0), Chimes::Bells);
+    let (a, b) = compare(&c);
+    let (leak_a, worst_a) = leak(&a, &c, 0.4, 3.5);
+    let (leak_b, worst_b) = leak(&b, &c, 0.4, 3.5);
+    eprintln!(
+        "fresh call bells: leak {leak_a:.1}% -> {leak_b:.1}%, worst {worst_a:.1} -> {worst_b:.1} dB over the floor"
+    );
+    assert!(leak_b <= 0.6 * leak_a, "leak {leak_a:.1}% -> {leak_b:.1}%");
+    assert!(worst_b <= worst_a + 1.0, "worst {worst_a:.1} -> {worst_b:.1} dB");
+}
+
+/// 8.1, purely tonal render, two-tone beeps (spec: off 8.3% / 23.1 dB, on
+/// 0.0% / -3.1; the x2 baseline gave 55.6): never worse than AEC3 alone.
+#[test]
 fn root_echo_model_is_never_worse_on_tonal_render() {
     let c = laptop_scene(8.0, (4.0, 8.0), (9.0, 9.0), Chimes::Beeps);
-    let (ca, cb) = compare(&c);
-    let (leak_a, worst_a) = leak(&ca, &c, 0.4, 3.5);
-    let (leak_b, worst_b) = leak(&cb, &c, 0.4, 3.5);
+    let (a, b) = compare(&c);
+    let (leak_a, worst_a) = leak(&a, &c, 0.4, 3.5);
+    let (leak_b, worst_b) = leak(&b, &c, 0.4, 3.5);
     eprintln!("beeps: leak {leak_a:.1}% -> {leak_b:.1}%, worst {worst_a:.1} -> {worst_b:.1} dB over the floor");
-    assert!(worst_b <= worst_a + 1.0, "beeps {worst_a:.1} -> {worst_b:.1} dB");
-    assert!(leak_b <= leak_a, "beeps leak {leak_a:.1}% -> {leak_b:.1}%");
+    assert!(worst_b <= worst_a + 1.0 && worst_b <= 10.0, "worst {worst_a:.1} -> {worst_b:.1} dB");
+    assert!(leak_b <= leak_a, "leak {leak_a:.1}% -> {leak_b:.1}%");
+}
+
+/// 8.1, the beeps with five times the mic noise (about -72 dBFS; spec: off
+/// 23.6 dB, on 8.6). `leak` keeps the default noise floor, so only the worst
+/// windows compare.
+#[test]
+fn root_echo_model_on_beeps_in_a_noisier_room() {
+    let c = laptop_scene_with_noise(8.0, (4.0, 8.0), (9.0, 9.0), Chimes::Beeps, 15.0);
+    let (a, b) = compare(&c);
+    let (_, worst_a) = leak(&a, &c, 0.4, 3.5);
+    let (_, worst_b) = leak(&b, &c, 0.4, 3.5);
+    eprintln!("beeps, noise x5: worst {worst_a:.1} -> {worst_b:.1} dB over the default floor");
+    assert!(worst_b <= worst_a - 6.0, "worst {worst_a:.1} -> {worst_b:.1} dB");
+}
+
+/// 8.3: the far end is active exactly while a capture frame comes at most
+/// the hold after the last render frame above -60 dBFS; hold and onset guard
+/// follow the stream delay (max(100 ms, D + 60), max(60 ms, D + 40) in 4 ms
+/// blocks). Both interfaces measure the level.
+#[test]
+fn root_echo_far_end_activity_holds_after_the_last_loud_render_frame() {
+    for (delay, hold_frames, guard) in [(0, 10i64, 15u32), (80, 14, 30)] {
+        for int16 in [false, true] {
+            let h = with_variants();
+            h.set_stream_delay(delay);
+            let loud = vec![37.0f32; FRAME];
+            let quiet = vec![29.0f32; FRAME];
+            let mic = vec![0.0f32; FRAME];
+            let mut last_loud = -1000i64;
+            for f in 0..120i64 {
+                let render = if (20..40).contains(&f) || f == 70 { &loud } else { &quiet };
+                if int16 {
+                    h.process_int16(RATE, 1, render, &mic);
+                } else {
+                    h.process(RATE, 1, render, &mic);
+                }
+                if std::ptr::eq(render, &loud) {
+                    last_loud = f;
+                }
+                h.advance(10);
+                let p = h.probe();
+                assert_eq!(
+                    p.far_end_active,
+                    f - last_loud <= hold_frames,
+                    "delay {delay} int16 {int16} frame {f}: {p:?}"
+                );
+                assert_eq!(
+                    (p.far_end_hold_ms, p.onset_guard_blocks, p.far_end_delay_ms),
+                    ((hold_frames * 10), guard, delay)
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -1072,26 +1136,36 @@ fn root_echo_control_is_refused_without_the_echo_model() {
     assert!(!stats.echo_model_available);
 }
 
-/// A 16-bit PCM mono WAV: its rate and samples (int16 scale).
+/// A mono WAV, 16-bit PCM or 32-bit float: its rate and samples (int16
+/// scale).
 fn read_wav(path: &std::path::Path) -> (u32, Vec<f32>) {
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     assert!(bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WAVE");
     let u16_at = |i: usize| u16::from_le_bytes([bytes[i], bytes[i + 1]]);
     let u32_at =
         |i: usize| u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
-    let (mut rate, mut pos) = (0, 12);
+    let (mut rate, mut float, mut pos) = (0, false, 12);
     while pos + 8 <= bytes.len() {
         let size = u32_at(pos + 4) as usize;
         let body = pos + 8;
         if &bytes[pos..pos + 4] == b"fmt " {
-            assert_eq!((u16_at(body), u16_at(body + 2), u16_at(body + 14)), (1, 1, 16));
+            let format = (u16_at(body), u16_at(body + 2), u16_at(body + 14));
+            assert!(format == (1, 1, 16) || format == (3, 1, 32), "{format:?}");
+            float = format.0 == 3;
             rate = u32_at(body + 4);
         } else if &bytes[pos..pos + 4] == b"data" {
             let end = (body + size).min(bytes.len());
-            let samples = bytes[body..end]
-                .chunks_exact(2)
-                .map(|b| f32::from(i16::from_le_bytes([b[0], b[1]])))
-                .collect();
+            let samples = if float {
+                bytes[body..end]
+                    .chunks_exact(4)
+                    .map(|b| 32768.0 * f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect()
+            } else {
+                bytes[body..end]
+                    .chunks_exact(2)
+                    .map(|b| f32::from(i16::from_le_bytes([b[0], b[1]])))
+                    .collect()
+            };
             return (rate, samples);
         }
         pos = body + size + (size & 1);
@@ -1175,4 +1249,152 @@ fn root_echo_measured_echo_calibration_on_real_recordings() {
     );
     assert!(false_latches.is_empty(), "near end latched: {false_latches:?}");
     assert!(ids.len() - late.len() >= 16, "not latched within 10 s: {late:?}");
+}
+
+/// Mono 10 ms frames of `render` and `capture` at `rate` through `h` with
+/// the stream delay at 40 ms; the output in -1..1.
+fn run_mono(h: &RootEchoHarness, rate: i32, render: &[f32], capture: &[f32]) -> Vec<f32> {
+    let frame = rate as usize / 100;
+    h.set_stream_delay(40);
+    let mut out = Vec::with_capacity(capture.len());
+    for f in 0..render.len().min(capture.len()) / frame {
+        let range = f * frame..(f + 1) * frame;
+        out.extend(h.process(rate, 1, &render[range.clone()], &capture[range]));
+        h.advance(10);
+    }
+    out.iter().map(|v| v / 32768.0).collect()
+}
+
+/// AEC3 alone and with the model over a scene directory's mic, ref and near
+/// (echo = mic - near), measured at 16 kHz with the output aligned by `lag`
+/// samples there.
+fn measure_scene(
+    dir: &std::path::Path,
+    lag: usize,
+) -> (crate::root_echo_metrics::Metrics, crate::root_echo_metrics::Metrics, Vec<f32>, Vec<f32>) {
+    use crate::root_echo_metrics::{measure, resample};
+    let (rate, mic) = read_wav(&dir.join("mic.wav"));
+    let (ref_rate, render) = read_wav(&dir.join("ref.wav"));
+    let (near_rate, near) = read_wav(&dir.join("near.wav"));
+    assert!(rate == ref_rate && rate == near_rate, "{}", dir.display());
+    let echo: Vec<f32> = mic.iter().zip(&near).map(|(m, n)| m - n).collect();
+    let reference = today();
+    reference.open_dsp_chain();
+    let off = run_mono(&reference, rate as i32, &render, &mic);
+    let on = run_mono(&model_harness(), rate as i32, &render, &mic);
+    let to16 = |v: &[f32], scale: f32| {
+        resample(&v.iter().map(|x| x * scale).collect::<Vec<_>>(), rate, 16_000)
+    };
+    let unit = 1.0 / 32768.0;
+    let (mic16, near16, echo16, ref16) =
+        (to16(&mic, unit), to16(&near, unit), to16(&echo, unit), to16(&render, unit));
+    let aligned = |out: &[f32]| {
+        let mut v: Vec<f32> = to16(out, 1.0).into_iter().skip(lag).collect();
+        v.resize(mic16.len(), 0.0);
+        v
+    };
+    let (off16, on16) = (aligned(&off), aligned(&on));
+    let a = measure(&mic16, &off16, &near16, &echo16, &ref16);
+    let b = measure(&mic16, &on16, &near16, &echo16, &ref16);
+    (a, b, off16, on16)
+}
+
+/// The research's own 48 kHz call-start chime scene (`echo/data/sim48x`,
+/// laptop-fresh-chimes-A: 72 s, stream delay 40 ms, measured at 16 kHz with
+/// the output aligned by 143 samples; spec's summary: AEC3 47.9 dB worst, x2
+/// 16.8, spec 5.4): never worse than AEC3 alone. Needs
+/// ROOTAPP_ECHO_SIM48X_DIR (the research's `echo/data/sim48x`).
+#[test]
+#[ignore = "needs ROOTAPP_ECHO_SIM48X_DIR (echo/data/sim48x)"]
+fn root_echo_model_on_the_48_khz_chime_scene() {
+    let dir = std::path::PathBuf::from(
+        std::env::var_os("ROOTAPP_ECHO_SIM48X_DIR")
+            .expect("ROOTAPP_ECHO_SIM48X_DIR is not set: this test cannot run without it"),
+    );
+    let (a, b, _, _) = measure_scene(&dir.join("laptop-fresh-chimes-A"), 143);
+    eprintln!(
+        "48 kHz chimes: leak {:.1}% -> {:.1}%, worst {:.1} -> {:.1} dB, idle {:.1} -> {:.1} dB, near kept {:.1} -> {:.1} dB, STOI {:.3} -> {:.3}",
+        a.leak_pct, b.leak_pct, a.worst_db, b.worst_db, a.idle_delta, b.idle_delta,
+        a.near_keep_dt, b.near_keep_dt, a.stoi, b.stoi
+    );
+    assert!(b.worst_db <= a.worst_db + 0.5 && b.leak_pct <= a.leak_pct + 0.5, "{a:?} {b:?}");
+}
+
+/// estimator-spec.md 8.2: the seven 16 kHz real-speech scenes (20 s each:
+/// mic, ref and near; echo = mic - near), stream delay 40 ms, AEC3 alone
+/// against AEC3 with the model, the output aligned to the mic by 128 samples,
+/// the research's metrics (`root_echo_metrics`). Needs ROOTAPP_ECHO_FIX16_DIR
+/// (the research's `echo/data/fix16`; LibriVox speech from the AEC
+/// Challenge's synthetic set, so not in the repository).
+#[test]
+#[ignore = "needs ROOTAPP_ECHO_FIX16_DIR (echo/data/fix16)"]
+fn root_echo_model_on_the_16_khz_speech_scenes() {
+    use crate::root_echo_metrics::loudest_frame_dbfs;
+    let dir = std::path::PathBuf::from(
+        std::env::var_os("ROOTAPP_ECHO_FIX16_DIR")
+            .expect("ROOTAPP_ECHO_FIX16_DIR is not set: this test cannot run without it"),
+    );
+    let mut failures = Vec::new();
+    for scene in [
+        "music",
+        "skipped-cycles",
+        "dt-laptop",
+        "drift-100ppm",
+        "loud-distorted",
+        "near-after-far",
+        "fresh-chimes",
+    ] {
+        let (a, b, off_a, on_a) = measure_scene(&dir.join(scene), 128);
+        let late = |out: &[f32]| loudest_frame_dbfs(out, 17 * 16_000, 17_600 * 16);
+        eprintln!(
+            "{scene}: leak {:.1}% -> {:.1}%, worst {:.1} -> {:.1} dB, idle {:.1} -> {:.1} dB, near kept {:.1} -> {:.1} dB, STOI {:.3} -> {:.3}, far quiet SNR {:.1} -> {:.1} dB, level {:.1} -> {:.1} dB, loudest 17.0-17.6 s {:.1} -> {:.1} dBFS",
+            a.leak_pct, b.leak_pct, a.worst_db, b.worst_db, a.idle_delta, b.idle_delta,
+            a.near_keep_dt, b.near_keep_dt, a.stoi, b.stoi, a.neq_snr, b.neq_snr,
+            a.neq_level, b.neq_level, late(&off_a), late(&on_a)
+        );
+        let mut check = |ok: bool, what: &str| {
+            if !ok {
+                failures.push(format!("{scene}: {what}"));
+            }
+        };
+        check(b.idle_delta >= -3.5, "idle noise change");
+        check(b.worst_db <= a.worst_db + 0.5, "worst over off + 0.5");
+        check(b.leak_pct <= a.leak_pct + 0.5, "leak over off + 0.5 points");
+        match scene {
+            "music" => {
+                check(b.worst_db <= 20.0 && b.worst_db <= a.worst_db, "worst");
+                check(b.leak_pct <= 5.0, "leak");
+            }
+            "skipped-cycles" => {
+                check(b.worst_db <= 8.0 && b.worst_db <= a.worst_db, "worst");
+                check(b.leak_pct <= 2.0, "leak");
+            }
+            "dt-laptop" => {
+                check(b.worst_db <= 10.0, "worst");
+                check(b.leak_pct <= 1.0, "leak");
+                check(b.near_keep_dt >= a.near_keep_dt - 0.5, "near kept");
+                check(b.stoi >= a.stoi - 0.01, "STOI");
+            }
+            "drift-100ppm" => {
+                check(b.worst_db <= 12.0, "worst");
+                check(b.leak_pct <= 1.0, "leak");
+            }
+            "loud-distorted" => {
+                check(b.worst_db <= 12.0 && b.worst_db <= a.worst_db, "worst");
+                check(b.leak_pct <= 2.0, "leak");
+                check(b.near_keep_dt >= a.near_keep_dt - 1.0, "near kept");
+            }
+            "near-after-far" => {
+                check(b.worst_db <= 5.0, "worst");
+                check((b.neq_snr - a.neq_snr).abs() <= 0.2, "far quiet SNR");
+                check((b.neq_level - a.neq_level).abs() <= 0.2, "far quiet level");
+            }
+            _ => {
+                check(b.leak_pct <= 15.0, "leak");
+                check((b.neq_snr - a.neq_snr).abs() <= 0.2, "far quiet SNR");
+                check(late(&on_a) <= -55.0, "loudest 10 ms in 17.0-17.6 s");
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:?}");
 }
