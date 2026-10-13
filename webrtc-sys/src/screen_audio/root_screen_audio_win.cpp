@@ -28,6 +28,7 @@
 #include <objidl.h>
 #include <propidl.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <iterator>
@@ -64,8 +65,10 @@ static_assert(sizeof(ActivationParams) == 12, "AUDIOCLIENT_ACTIVATION_PARAMS lay
 
 constexpr int kSampleRate = 48000;
 constexpr int kChannels = 2;
-constexpr DWORD kActivateTimeoutMs = 5000;
-constexpr DWORD kStartTimeoutMs = 6000;
+// Start waits this long; the capture thread's open (activations, retries and
+// Initialize) gets a little less, so its own timeout normally answers first.
+constexpr DWORD kStartTimeoutMs = 5000;
+constexpr DWORD kOpenBudgetMs = 4800;
 constexpr DWORD kStopTimeoutMs = 2000;
 constexpr DWORD kWaitTimeoutMs = 200;
 constexpr int kInitializeAttempts = 3;
@@ -302,6 +305,7 @@ class WasapiProcessLoopbackBackend final : public ScreenAudioBackend {
     }
     resolved_ = ResolveTarget(target);
     sink_ = sink;
+    open_deadline_ = GetTickCount64() + kOpenBudgetMs;
     stop_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     started_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (!stop_event_ || !started_event_) {
@@ -320,7 +324,7 @@ class WasapiProcessLoopbackBackend final : public ScreenAudioBackend {
     if (WaitForSingleObject(started_event_, kStartTimeoutMs) != WAIT_OBJECT_0) {
       Stop();
       result.error = ScreenAudioError::kTimeout;
-      result.detail = "the process loopback client did not start within 6 s";
+      result.detail = "the process loopback client did not start within 5 s";
       return result;
     }
     result = start_result_;
@@ -366,6 +370,12 @@ class WasapiProcessLoopbackBackend final : public ScreenAudioBackend {
     start_result_.detail = std::move(detail);
   }
 
+  // What is left of the open's budget, in ms.
+  DWORD Remaining() const {
+    ULONGLONG now = GetTickCount64();
+    return now >= open_deadline_ ? 0 : static_cast<DWORD>(open_deadline_ - now);
+  }
+
   void Run() {
     const Exports& exports = LoadExports();
     if (exports.describe)
@@ -407,9 +417,16 @@ class WasapiProcessLoopbackBackend final : public ScreenAudioBackend {
     HRESULT hr = handler->event() ? exports.activate(kProcessLoopbackDevice, __uuidof(IAudioClient),
                                                      &variant, handler, &operation)
                                   : E_OUTOFMEMORY;
-    if (SUCCEEDED(hr) &&
-        WaitForSingleObject(handler->event(), kActivateTimeoutMs) != WAIT_OBJECT_0)
-      hr = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+    if (SUCCEEDED(hr)) {
+      HANDLE waits[2] = {handler->event(), stop_event_};
+      DWORD signaled = WaitForMultipleObjects(2, waits, FALSE, Remaining());
+      if (signaled == WAIT_OBJECT_0 + 1)
+        hr = HRESULT_FROM_WIN32(ERROR_CANCELLED);
+      else if (signaled == WAIT_TIMEOUT)
+        hr = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+      else if (signaled != WAIT_OBJECT_0)
+        hr = HRESULT_FROM_WIN32(GetLastError());
+    }
     if (SUCCEEDED(hr)) {
       HRESULT activated = E_FAIL;
       IUnknown* unknown = nullptr;
@@ -463,17 +480,26 @@ class WasapiProcessLoopbackBackend final : public ScreenAudioBackend {
           break;
       }
       Close();
+      if (hr == HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
+        Fail(ScreenAudioError::kStartFailed, "stopped while starting");
+        return false;
+      }
+      if (hr == HRESULT_FROM_WIN32(ERROR_TIMEOUT)) {
+        Fail(ScreenAudioError::kTimeout,
+             "process loopback " + step + " did not complete within the 5 s start budget");
+        return false;
+      }
       if (step == "Initialize" && BufferRefused(hr) && duration + 1 < std::size(kDurations)) {
         ++duration;
         --attempt;
         continue;
       }
-      if (hr != E_UNEXPECTED || attempt == kInitializeAttempts) {
+      if (hr != E_UNEXPECTED || attempt == kInitializeAttempts || Remaining() == 0) {
         Fail(OpenError(hr), "process loopback " + step + " failed (" + Hex(hr) + ")");
         return false;
       }
-      if (WaitForSingleObject(stop_event_, kRetryDelayMs * static_cast<DWORD>(attempt)) ==
-          WAIT_OBJECT_0) {
+      DWORD delay = std::min<DWORD>(kRetryDelayMs * static_cast<DWORD>(attempt), Remaining());
+      if (WaitForSingleObject(stop_event_, delay) == WAIT_OBJECT_0) {
         Fail(ScreenAudioError::kStartFailed, "stopped while starting");
         return false;
       }
@@ -575,6 +601,7 @@ class WasapiProcessLoopbackBackend final : public ScreenAudioBackend {
   Resolved resolved_;
   ScreenAudioSink* sink_ = nullptr;
   ScreenAudioStartResult start_result_;
+  ULONGLONG open_deadline_ = 0;
   HANDLE thread_ = nullptr;
   HANDLE stop_event_ = nullptr;
   HANDLE started_event_ = nullptr;
