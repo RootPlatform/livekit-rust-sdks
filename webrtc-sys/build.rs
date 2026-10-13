@@ -59,6 +59,7 @@ fn main() {
         "src/root_audio_processing.rs",
         "src/root_denoiser.rs",
         "src/root_screen_audio.rs",
+        "src/root_screen_audio_pipewire_graph.rs",
         "src/packet_trailer.rs",
     ];
 
@@ -102,6 +103,7 @@ fn main() {
         "src/root_denoiser.cpp",
         "src/root_screen_audio.cpp",
         "src/root_screen_audio_harness.cpp",
+        "src/screen_audio/root_screen_audio_pipewire_graph.cpp",
         "src/root_speech_detector.cpp",
         "src/root_voice_engine_hold.cpp",
         "src/audio_resampler.cpp",
@@ -126,6 +128,8 @@ fn main() {
         // Its frameworks are linked below; ScreenCaptureKit references are
         // weak (newer than the deployment target).
         "macos" => "src/screen_audio/root_screen_audio_mac.mm",
+        // libpipewire is dlopened; only its headers are needed (below).
+        "linux" => "src/screen_audio/root_screen_audio_linux.cpp",
         _ => "src/screen_audio/root_screen_audio_none.cpp",
     });
 
@@ -218,6 +222,7 @@ fn main() {
 
             // In order to avoid any ABI mismatches we use the sysroot's headers.
             add_gio_headers(&mut builder);
+            add_pipewire_headers(&mut builder);
 
             // Do not use pkg_config::probe_library, because we only require headers.
             for lib_name in ["glib-2.0", "gobject-2.0", "gio-2.0"] {
@@ -691,4 +696,41 @@ fn add_gio_headers(builder: &mut cc::Build) {
     let glib_path_config = glib_path_config.join(arch_specific_path);
     let glib_path_config = glib_path_config.join("glib-2.0/include");
     builder.include(&glib_path_config);
+}
+
+/// PipeWire headers for the screen-audio backend, which dlopens
+/// libpipewire-0.3 (nothing is linked): the sysroot's, as libwebrtc's own
+/// PipeWire code was built against them, else the host's libpipewire-0.3-dev.
+fn add_pipewire_headers(builder: &mut cc::Build) {
+    let webrtc_dir = webrtc_sys_build::webrtc_dir();
+    let target_arch_sysroot = match webrtc_sys_build::target_arch().as_str() {
+        "arm64" => "arm64",
+        "x64" => "amd64",
+        _ => panic!("unsupported arch"),
+    };
+    let include = webrtc_dir
+        .join(format!("include/build/linux/debian_bullseye_{target_arch_sysroot}-sysroot"))
+        .join("usr/include");
+    let pipewire = include.join("pipewire-0.3");
+    let spa = include.join("spa-0.2");
+    if pipewire.join("pipewire/pipewire.h").exists()
+        && spa.join("spa/param/audio/format-utils.h").exists()
+    {
+        println!("cargo:info=add_pipewire_headers {}", include.display());
+        builder.include(pipewire).include(spa);
+        return;
+    }
+    match pkg_config::Config::new().cargo_metadata(false).probe("libpipewire-0.3") {
+        Ok(lib) => {
+            for path in lib.include_paths {
+                builder.include(path);
+            }
+        }
+        Err(e) => panic!(
+            "PipeWire headers not found: neither {} nor pkg-config libpipewire-0.3 ({e}). \
+             The Linux screen-audio backend needs them (libpipewire itself is loaded at run \
+             time); install libpipewire-0.3-dev.",
+            pipewire.display()
+        ),
+    }
 }

@@ -38,6 +38,7 @@ pub mod root_audio_mixer;
 pub mod root_audio_processing;
 pub mod root_denoiser;
 pub mod root_screen_audio;
+pub mod root_screen_audio_pipewire_graph;
 
 #[cfg(test)]
 mod adm_proxy_tests;
