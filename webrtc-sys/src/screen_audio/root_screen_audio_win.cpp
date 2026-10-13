@@ -17,7 +17,8 @@
 // Windows screen audio: WASAPI process loopback (Windows 10 20348+). Everything
 // but this process tree (EXCLUDE_TARGET_PROCESS_TREE of our own pid), or only
 // one process tree (INCLUDE_TARGET_PROCESS_TREE). Mmdevapi and avrt are loaded
-// at run time, so the DLL links nothing new and loads where they are missing.
+// from System32 at run time, so the DLL links nothing new and loads where they
+// are missing.
 
 #include <windows.h>
 
@@ -89,10 +90,10 @@ struct Exports {
 const Exports& LoadExports() {
   static const Exports exports = [] {
     Exports e;
-    if (HMODULE mmdevapi = LoadLibraryW(L"Mmdevapi.dll"))
+    if (HMODULE mmdevapi = LoadLibraryExW(L"Mmdevapi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32))
       e.activate = reinterpret_cast<ActivateAudioInterfaceAsyncFn>(
           reinterpret_cast<void*>(GetProcAddress(mmdevapi, "ActivateAudioInterfaceAsync")));
-    if (HMODULE avrt = LoadLibraryW(L"avrt.dll")) {
+    if (HMODULE avrt = LoadLibraryExW(L"avrt.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32)) {
       e.mmcss_set = reinterpret_cast<AvSetMmThreadCharacteristicsFn>(
           reinterpret_cast<void*>(GetProcAddress(avrt, "AvSetMmThreadCharacteristicsW")));
       e.mmcss_revert = reinterpret_cast<AvRevertMmThreadCharacteristicsFn>(
