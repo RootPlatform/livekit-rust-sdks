@@ -198,7 +198,9 @@ function New-FfiZip([string]$Rid, [string]$Dll) {
         Copy-Item "$PSScriptRoot\livekit-ffi\include\livekit_ffi.h" "$work\livekit_ffi.h"
         $fence = '```'
         $license = "# livekit`n$fence`n" + [IO.File]::ReadAllText("$PSScriptRoot\LICENSE").TrimEnd() + "`n$fence`n" +
-            [IO.File]::ReadAllText($webrtcLicense)
+            [IO.File]::ReadAllText($webrtcLicense) +
+            "`n# DTLN-aec (the echo model's weights, rootapp-echo-model/weights)`n$fence`n" +
+            [IO.File]::ReadAllText("$PSScriptRoot\rootapp-echo-model\weights\LICENSE").TrimEnd() + "`n$fence`n"
         [IO.File]::WriteAllText("$work\LICENSE.md", $license, $utf8)
         if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
         Compress-Archive -Path "$work\livekit_ffi.dll", "$work\livekit_ffi.h", "$work\LICENSE.md" -DestinationPath $zipPath

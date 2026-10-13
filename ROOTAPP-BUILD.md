@@ -755,8 +755,10 @@ denoiser hand-off, and (Phase 3) the mic test monitor in native code.
 `livekit_ffi_rootapp_audio_caps()` is a zero-protobuf export (every target) returning the native audio
 features the build implements: bit 0 SELECT_DEVICES, 1 PLAYOUT_HOLD, 2 STATS, 3 ADM_HARDENED, 4 MIXER,
 5 TRACK_GAINS, 6 EFFECTS, 7 CONTROL, 8 DSP, 9 DENOISER, 10 MONITOR, 11 APM_DECORATOR, 12
-SPEECH_DETECTION. This branch reports `0b1111111111111` (8191: bits 0-12) on 64-bit desktop,
-`0b1110111111111` (7679, no DENOISER) on 32-bit desktop and 0 on mobile; builds up to hw.7 reported
+SPEECH_DETECTION, (13 SCREEN_AUDIO on `rootapp/native-screen-audio`), 14 ECHO_MODEL. This branch
+(`rootapp/echo-model`) reports `0b101111111111111` (24575: bits 0-12 and 14) on 64-bit desktop,
+`0b101110111111111` (24063, no DENOISER) on 32-bit desktop and 0 on mobile; hw.8 reported 8191 (bits
+0-12), builds up to hw.7 reported
 4095 (no SPEECH_DETECTION), Phase 2 builds 3071 (no MONITOR) and Phase 1 builds `0b100011111111`
 (2303). The
 `RootAudio*` requests (`rootapp_audio.proto`, oneof cases from 1000) that a build does not implement
@@ -1237,27 +1239,129 @@ e435c4dc2, golden vectors regenerated: 25 vectors, two new at the cap). Powers o
 `pow10` (libm's pow with an opaque base), so LLVM cannot turn them into exp10 on macOS and Linux;
 golden vectors written on Windows may still need `ROOTAPP_DSP_GOLDEN_LOOSE=1` on another libm.
 
-### Echo model contract (`rootapp/echo-model`, stage 1: no native model yet)
+### Echo model (`rootapp/echo-model`, 2026-10-13)
 
-DTLN-aec-128 (MIT, Westhausen) as AEC3's neural residual echo estimator in the platform engine's APM.
-This stage only fixes the FFI contract; nothing native runs the model.
+DTLN-aec-128 (Westhausen 2021, MIT) as AEC3's neural residual echo estimator in the platform engine's
+APM (`BuiltinAudioProcessingBuilder::SetNeuralResidualEchoEstimator`, m150). The managed engine's
+`AudioProcessingModule` never has it. Research, design and evaluation: the desktop session's
+scratchpad `echo/design.md` and `echomodel/design.md`.
 
-- `RootAudioControl.echo_model` (15, `RootAudioEchoModel` OFF/ON/AUTO; native OFF until set and at
-  every session start and end; unknown values OFF) and `RootAudioStats` 114-124 (mode, state, reason,
-  output device kind, swaps, inferences, inference mean/max since the previous read, the last window's
-  p99, measured echo, kill switch). No new requests or events; nothing collides with the screen-audio
-  branch (bit 13, requests 1012-1014, event 1001).
-- Capability bit 14 `ECHO_MODEL` (`CAP_ECHO_MODEL`) is defined and **not reported**: caps stay 8191.
-  `livekit::ECHO_MODEL_AVAILABLE` is false, so a control that sets `echo_model` is answered "not
-  supported by this build" (the other fields are applied) and `RootAudioStats::echo_model` is `None`.
-- Tests: `cargo test -p livekit-ffi --lib --release rootapp_audio` (`rootapp_audio_echo_model_*`,
-  `rootapp_audio_control_maps_the_echo_model_*`) and `cargo test -p livekit --lib --release
-  platform_audio` (`echo_model_*`).
-- Building this worktree on Windows: the prebuilt's deepest abseil header
-  (`absl/time/internal/cctz/include/cctz/civil_time_detail.h`) passes MAX_PATH under
-  `livekit-rust-sdks-echo\target\release\build\scratch-*\out\livekit_webrtc\...`, and cl.exe fails
-  with C1083. Point `LK_CUSTOM_WEBRTC` at a short junction to the extracted prebuilt
-  (`win-x64-release` with `include`, `lib`, `webrtc.ninja`).
+What runs:
+
+- `rootapp-echo-model` (new crate, rustfft only): a bounds-checked TFLite reader and an
+  allocation-free executor for DTLN-aec's two float graphs, the streaming model (512 window, 128 hop,
+  16 kHz) and `Estimator`, AEC3's 4 ms block adapter. Every second block it runs the full model on
+  AEC3's band-0 linear output and the render (both averaged over their channels) and turns the per-bin
+  power gain it applied (`GainTracker`, 24 ms old) into `R2 = E2 * min(1, scale * (1 - gain))`, scale 2
+  (the research's `aec3+nree128-full-x2`). `Tuning` also has a render gate (off). `estimate_block` and
+  `reset` never allocate, lock, log or panic (non-finite state resets the model). Dot products: AVX2
+  with FMA when the CPU has both (`is_x86_feature_detected!`), SSE2 otherwise, NEON on aarch64, a
+  scalar fallback. The workspace builds this crate and rustfft at opt-level 3 (the release profile is
+  `z`).
+- Weights: `rootapp-echo-model/weights/dtln_aec_128_{1,2}.tflite`, float32, from
+  `https://github.com/breizhn/DTLN-aec` at 9d24e128b4f409db18227b8babb343016625921f
+  (`pretrained_models/`), embedded with `include_bytes!` (7.27 MB; the library grows by about that):
+  `_1` 1,996,600 bytes, sha256 `8d241b3a732af8ca140b2e30043e56a6c3c7800c46e22c26f4eea2f70974ad1e`;
+  `_2` 5,277,012 bytes, sha256 `350bb01a1152ae3cabe09fe5e868ef2f7d8b988a9f22aae44f140195f6493126`
+  (equal to the research copies). Decoded once per process (`prepare`, about 10 ms, on a thread of
+  its own the first time a mode other than OFF is set). No f16: the estimator spec has no verdict yet.
+  webrtc-sys depends on the crate on desktop targets only.
+- `RootResidualEchoEstimator` (webrtc-sys `root_echo_model.{h,cpp}`) wraps a model session; its
+  `AdjustConfig` sets Google's suppressor tuning for its estimator (masks 0/1/0.3, max_inc 100,
+  max_dec_lf 0, nearend_average_blocks 1, dominant-nearend 0.5/2, high-frequency limiting 24/3). Each
+  inference is timed (steady clock) for the stats and the kill switch.
+- Two APMs: `RootApmDecorator` runs either the factory's APM exactly as before (`BuildRootApmVariant`
+  without an estimator) or the same with the model; both share one `RootCaptureProcessor` through a
+  forwarder (`RootCaptureProcessorRef`), so the voice chain, denoiser, speech detector and monitor
+  never notice a switch. `StageVariant` builds and configures the other one on the worker thread
+  (config, policy, formats, stream delay); the next `ProcessStream` switches at its frame boundary
+  after replaying the last 8 render and capture frames into it (the processor skips them), so its
+  delay lines and high-pass filter continue the old one's (no gap); `ProcessReverseStream` switches only
+  while capture has been idle for 100 ms (call start). Forwarded calls read the APM in use lock-free
+  under a two-counter grace period; the replaced APM is released on the worker thread once no call can
+  use it. Audio threads never build, configure or release an APM. A switch still starts AEC3 over.
+- `RootEchoModelController` (worker thread; posted runs and a 250 ms poll, 20 ms while a switch is
+  under way): mode from `RootAudioControl.echo_model` (OFF until set, back to OFF at every session
+  start and end); AUTO by the playout device's kind (on for SPEAKERS, LINE_OUT, DISPLAY_AUDIO); the
+  measured-echo rule (AUTO while AEC3 runs alone: AEC3's fullband ERLE from `GetStatistics` every
+  250 ms, a sample counting after 20 new capture frames, 12 samples of 6 dB or more within the last 40
+  latch the device on until the session ends; never off by measurement); the kill switch (inference
+  wall time over 2 ms in more than 10 of 1000 inferences, two windows in a row, the first 100 of an
+  estimator skipped: off until the session ends); switches wait for a pause in speech (at most 3 s).
+- Device kind, at every platform playout open (AdmProxy reports it on its device thread, outside its
+  mutex), read-only: Windows, the endpoint's `PKEY_AudioEndpoint_FormFactor` (the console default
+  for "default") and Bluetooth when a devnode ancestor's instance id starts with `BTH` (CfgMgr32:
+  `CM_Locate_DevNodeW("SWD\MMDEVAPI\<endpoint id>")`, `CM_Get_Parent`, `CM_Get_Device_IDW`; links
+  `cfgmgr32`); macOS, `kAudioDevicePropertyTransportType`, then for built-in devices the output
+  `kAudioDevicePropertyDataSource` (`ispk`/`espk` speakers, `hdpn` headphones, `line` line out) and
+  otherwise the first output stream's `kAudioStreamPropertyTerminalType`, keyed by the device UID;
+  Linux UNKNOWN (the PulseAudio ADM's context is private).
+- FFI: control field 15, stats 114-124 (`RootAudioNativeStats.echo_model_*`), capability bit 14
+  ECHO_MODEL wherever the factory builds its APM (desktop; `kRootEchoModelSupported`). A control that
+  sets `echo_model` without the controller (the APM failed to build) is answered "not supported".
+
+Env override: none natively. The desktop reads `ROOTAPP_ECHO_MODEL=off|on|auto` and sends it as
+`RootAudioControl.echo_model` (its default is AUTO); an old desktop never sets the field, and native
+then runs exactly the APM of builds without the model.
+
+Measured on this machine (Ryzen 9 9950X3D, Windows, release, one thread): one inference 103 µs mean,
+115 µs p99 with AVX2+FMA (136 µs scalar, 139 µs SSE2; `cargo run --release -p rootapp-echo-model
+--example bench`); the APM at 48 kHz, stereo render and mono capture per 10 ms: 49 µs without the
+model, 184 µs mean, 159 µs median, 277-301 µs p99 with it (`root_echo_apm_cpu_per_10_ms`).
+
+Baseline, not the estimator spec: `<scratchpad>\echo\estimator-spec.md` (the music never-worse rule,
+the far-end activity rule for near-only voice, the f16 verdict, pass bars) did not exist when this was
+built. The x2 baseline is worse than AEC3 alone on purely tonal render: on the synthesized two-tone
+beeps the loudest leaking window rises from 23 to 56 dB over the floor (`root_echo_model_is_never_
+worse_on_tonal_render`, ignored until the spec lands), the research's music result.
+
+Tests (device-free; no FFI server; LK_HW_AUDIO_TESTS unset):
+
+- `cargo test -p rootapp-echo-model --release` (11): the weights' hashes and sizes, DTLN-aec-128's
+  parameter count, malformed models as errors, the estimator against the research runtime's x2
+  fractions on a synthesized scene (`tests/data/golden-x2.f32`: max 2e-3, mean 1e-5), every kernel
+  against the scalar one, dot products against f64, reset repeats bit for bit, the render gate, hostile
+  input, no allocation or free in 4000 blocks (counting allocator), and with
+  `ROOTAPP_DTLN_REFERENCE_DIR` (a DTLN-aec checkout) the executor on the authors' published outputs
+  (DTLN-aec-512, the only size they published): within 1 LSB on all three clips, one reference sample
+  that clipped excluded (soundfile writes x * 32768). `cargo clippy -p rootapp-echo-model
+  --all-targets --release -- -D warnings`, also for `aarch64-pc-windows-msvc` (the NEON path).
+- `cargo test -p webrtc-sys --lib --release root_echo` (18, 1 ignored): Windows and macOS
+  classification tables with fake property values and Bluetooth instance ids, the policy (modes,
+  kinds, the measured-echo window, frozen statistics), the kill switch's windows, AdjustConfig, an
+  unset mode and OFF bit for bit equal to the APM built as before (6 s scene through the whole voice
+  chain), the switch at a frame boundary with no level step or sample jump and the voice chain
+  untouched (processed frames, resets, flushes, format), AUTO following the device and the session
+  reset, measured echo turning it on (5.3 s into a clipping laptop echo) and keeping it per device, no
+  echo path never turning it on, the kill switch, inference stats, a synthesized clipping laptop scene
+  (leaking windows 10% -> 2.5%, worst burst not worse, near voice in double talk 4 dB louder,
+  near-only within 1 dB) and call-start bells (leaking windows 89% -> 44%), switching 40 times under
+  running render and capture threads, playout opens reaching the sink, the control refused without
+  the model, and the APM's CPU per 10 ms.
+- `cargo test -p livekit-ffi --lib --release rootapp_audio` (33), `platform_audio`, `cargo test -p
+  livekit --lib --release platform_audio` (29): wire values, control and stats conversions, bit 14
+  (caps 24575) tied to `root_echo_model_supported()`.
+
+Notices: the DTLN-aec MIT text is `rootapp-echo-model/weights/LICENSE`, named in `NOTICE`, and
+appended to the `LICENSE.md` every `ffi-*.zip` carries (`build-rootapp-common.sh`,
+`build-rootapp-windows.ps1`). The weights were trained on the DNS and AEC Challenge data (CC BY 4.0,
+CC0, LibriVox and others); whether those terms reach a trained model is open for a legal look.
+
+What CI has to prove on macOS (x64 and arm64, deployment 10.15/11.0) and Linux (x64, arm64): build and
+link (`root_echo_model.cpp` with CoreAudio on macOS; only its macOS and Linux paths were checked here,
+syntax-only with clang-cl and stub CoreAudio/pthread headers, and `adm_proxy.cpp`,
+`audio_device_controller.cpp` and `peer_connection_factory.cpp` were not); `cargo test -p
+rootapp-echo-model --release` (the NEON kernel runs nowhere yet; the golden tolerance may need to grow
+on another libm); `cargo test -p webrtc-sys --lib --release root_echo` (the bit-for-bit test assumes
+one APM build is deterministic per platform); the CPU test's numbers on an Intel Mac and an older
+Linux laptop. Live (Jesse): the device kinds on real hardware (AirPods, a Bluetooth speaker, a USB
+headset, HDMI audio, a combined laptop jack), a switch mid-call, and the kill switch on a slow machine.
+
+Building this worktree on Windows: the prebuilt's deepest abseil header
+(`absl/time/internal/cctz/include/cctz/civil_time_detail.h`) passes MAX_PATH under
+`livekit-rust-sdks-echo\target\release\build\scratch-*\out\livekit_webrtc\...`, and cl.exe fails with
+C1083. Point `LK_CUSTOM_WEBRTC` at a short junction to the extracted prebuilt (`win-x64-release` with
+`include`, `lib`, `webrtc.ninja`).
 
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 

@@ -236,6 +236,11 @@ rk_package() {
     cat "$ROOT/LICENSE"
     echo '```'
     cat "$ROOT/livekit-ffi/WEBRTC_LICENSE.md"
+    echo
+    echo "# DTLN-aec (the echo model's weights, rootapp-echo-model/weights)"
+    echo '```'
+    cat "$ROOT/rootapp-echo-model/weights/LICENSE"
+    echo '```'
   } > "$work/LICENSE.md"
   rm -f "$DIST/$asset"
   (cd "$work" && zip -X -q "$DIST/$asset" "$lib" livekit_ffi.h LICENSE.md)
