@@ -1274,28 +1274,45 @@ What runs:
   without an estimator) or the same with the model; both share one `RootCaptureProcessor` through a
   forwarder (`RootCaptureProcessorRef`), so the voice chain, denoiser, speech detector and monitor
   never notice a switch. `StageVariant` builds and configures the other one on the worker thread
-  (config, policy, formats, stream delay); the next `ProcessStream` switches at its frame boundary
-  after replaying the last 8 render and capture frames into it (the processor skips them), so its
-  delay lines and high-pass filter continue the old one's (no gap); `ProcessReverseStream` switches only
-  while capture has been idle for 100 ms (call start). Forwarded calls read the APM in use lock-free
-  under a two-counter grace period; the replaced APM is released on the worker thread once no call can
-  use it. Audio threads never build, configure or release an APM. A switch still starts AEC3 over.
+  (config, policy, formats, stream delay) and warms it there: the last 8 render and capture frames
+  (kept by the audio threads in seqlocked rings) are replayed into it with its forwarder off (the
+  processor never sees them), each through the interface it came in by (the APM's int16 and float
+  paths do not share all their state: a float replay before the voice engine's int16 frames put a
+  2000-step glitch into the switch frame, as stage 2's float-only warm-up would have), so its delay
+  lines, high-pass filter and render history continue the old one's. The next
+  `ProcessStream` switches at its frame boundary after replaying what was kept since (at most the last
+  2 frames of each direction); `ProcessReverseStream` switches only while capture has been idle for
+  100 ms, and the worker thread itself once neither direction ran for 100 ms (a call that ended with
+  the model on: no frame would take the staged APM, review M2). One thread switches at a time, and none
+  while the APM a switch replaced is still waiting to be released. A frame is counted as kept only
+  after its forwarded call, so a switch never replays a frame the old APM is still processing. Forwarded
+  calls read the APM in use lock-free under a two-counter grace period: a reader counts itself in the
+  epoch it read, reads the epoch again and moves over while it changed (review M1: a reader stalled
+  between the two steps across two switches held an APM the second collection released); the replaced
+  APM is released on the worker thread once no call can use it. Audio threads never build, configure,
+  warm or release an APM. A switch still starts AEC3 over.
 - `RootEchoModelController` (worker thread; posted runs and a 250 ms poll, 20 ms while a switch is
   under way): mode from `RootAudioControl.echo_model` (OFF until set, back to OFF at every session
   start and end); AUTO by the playout device's kind (on for SPEAKERS, LINE_OUT, DISPLAY_AUDIO); the
   measured-echo rule (AUTO while AEC3 runs alone: AEC3's fullband ERLE from `GetStatistics` every
-  250 ms, a sample counting after 20 new capture frames, 12 samples of 6 dB or more within the last 40
-  latch the device on until the session ends; never off by measurement); the kill switch (inference
-  wall time over 2 ms in more than 10 of 1000 inferences, two windows in a row, the first 100 of an
-  estimator skipped: off until the session ends); switches wait for a pause in speech (at most 3 s).
-- Device kind, at every platform playout open (AdmProxy reports it on its device thread, outside its
-  mutex), read-only: Windows, the endpoint's `PKEY_AudioEndpoint_FormFactor` (the console default
+  250 ms, a sample counting after 20 new capture frames, 8 samples of 3 dB or more within the last 40
+  latch the device on until the session ends; never off by measurement; a device without a key is
+  never measured); the kill switch (inference wall time over 2 ms in more than 10 of 1000 inferences,
+  two windows in a row, the first 100 of an estimator skipped: off until the session ends, and a
+  session reset starts the windows over); switches wait for a pause in speech (at most 3 s). The model
+  is prepared the first time a decision wants it (not for AUTO on headphones), and is off (reason
+  UNAVAILABLE) while the APM's echo canceller is off. A session reset keeps the device only while a
+  platform playout is open, so a call never starts on the last call's device kind.
+- Device kind, at every platform playout open (AdmProxy reports opens and closes on its device thread,
+  outside its mutex, with the GUID and name the selection resolved to, read with the resolution),
+  read-only: Windows, the endpoint's `PKEY_AudioEndpoint_FormFactor` (the console default
   for "default") and Bluetooth when a devnode ancestor's instance id starts with `BTH` (CfgMgr32:
   `CM_Locate_DevNodeW("SWD\MMDEVAPI\<endpoint id>")`, `CM_Get_Parent`, `CM_Get_Device_IDW`; links
   `cfgmgr32`); macOS, `kAudioDevicePropertyTransportType`, then for built-in devices the output
   `kAudioDevicePropertyDataSource` (`ispk`/`espk` speakers, `hdpn` headphones, `line` line out) and
   otherwise the first output stream's `kAudioStreamPropertyTerminalType`, keyed by the device UID;
-  Linux UNKNOWN (the PulseAudio ADM's context is private).
+  Linux UNKNOWN (the PulseAudio ADM's context is private), keyed by the ADM's device name ("default:"
+  and index 0's name for the default).
 - FFI: control field 15, stats 114-124 (`RootAudioNativeStats.echo_model_*`), capability bit 14
   ECHO_MODEL wherever the factory builds its APM (desktop; `kRootEchoModelSupported`). A control that
   sets `echo_model` without the controller (the APM failed to build) is answered "not supported".
@@ -1307,7 +1324,22 @@ then runs exactly the APM of builds without the model.
 Measured on this machine (Ryzen 9 9950X3D, Windows, release, one thread): one inference 103 µs mean,
 115 µs p99 with AVX2+FMA (136 µs scalar, 139 µs SSE2; `cargo run --release -p rootapp-echo-model
 --example bench`); the APM at 48 kHz, stereo render and mono capture per 10 ms: 49 µs without the
-model, 184 µs mean, 159 µs median, 277-301 µs p99 with it (`root_echo_apm_cpu_per_10_ms`).
+model, 184-193 µs mean, 159-162 µs median, 277-375 µs p99 with it (`root_echo_apm_cpu_per_10_ms`).
+The capture callback (render and capture of one frame) on the frame a switch happens, over 8
+switches with echo present (`root_echo_switch_capture_cost`): worst 1.58 ms while the warm-up ran
+there, 164-172 µs since it runs on the worker thread (steady frames: median 150-157 µs, p99 370-405
+µs).
+
+Measured-echo calibration (review m12), on the AEC Challenge's real recordings (16 kHz, 24 far-end
+single-talk clips with their loopback as the render, 24 near-end single-talk clips under another
+clip's far end; `root_echo_measured_echo_calibration_on_real_recordings`, ignored, with
+`ROOTAPP_AEC_REAL_DIR`): without an echo path AEC3's ERLE never passes 0.4 dB, and it reads 0.2 dB
+for the first 3.5-4 s of every clip. 6 dB / 12 samples latched 11 far-end clips within 10 s; 3 dB / 8
+samples latches 16 (4.5-8 s), and still no near-end clip shows a single evidence sample. The other 8:
+on 6 AEC3's linear filter never converges (ERLE under 1.7 dB for the whole clip), although AEC3 alone
+leaks on 5 of them (15-91% of far-end windows in the research's measurements), and 2 converge too late
+(10.3 s; after 12 s). No ERLE threshold can see the first 6; that needs another signal (the
+reviewer's nonlinear-loudspeaker case).
 
 Baseline, not the estimator spec: `<scratchpad>\echo\estimator-spec.md` (the music never-worse rule,
 the far-end activity rule for near-only voice, the f16 verdict, pass bars) did not exist when this was
@@ -1317,27 +1349,35 @@ worse_on_tonal_render`, ignored until the spec lands), the research's music resu
 
 Tests (device-free; no FFI server; LK_HW_AUDIO_TESTS unset):
 
-- `cargo test -p rootapp-echo-model --release` (11): the weights' hashes and sizes, DTLN-aec-128's
-  parameter count, malformed models as errors, the estimator against the research runtime's x2
-  fractions on a synthesized scene (`tests/data/golden-x2.f32`: max 2e-3, mean 1e-5), every kernel
-  against the scalar one, dot products against f64, reset repeats bit for bit, the render gate, hostile
-  input, no allocation or free in 4000 blocks (counting allocator), and with
-  `ROOTAPP_DTLN_REFERENCE_DIR` (a DTLN-aec checkout) the executor on the authors' published outputs
-  (DTLN-aec-512, the only size they published): within 1 LSB on all three clips, one reference sample
-  that clipped excluded (soundfile writes x * 32768). `cargo clippy -p rootapp-echo-model
-  --all-targets --release -- -D warnings`, also for `aarch64-pc-windows-msvc` (the NEON path).
-- `cargo test -p webrtc-sys --lib --release root_echo` (18, 1 ignored): Windows and macOS
+- `cargo test -p rootapp-echo-model --release` (10, 1 ignored): the weights' hashes and sizes,
+  DTLN-aec-128's parameter count, malformed models as errors, the estimator against the research
+  runtime's x2 fractions on a synthesized scene (`tests/data/golden-x2.f32`: max 2e-3, mean 1e-5),
+  every kernel against the scalar one, dot products against f64, reset repeats bit for bit, the render
+  gate, hostile input, no allocation or free in 4000 blocks (counting allocator). Ignored unless asked
+  for (`-- --ignored` with `ROOTAPP_DTLN_REFERENCE_DIR`, a DTLN-aec checkout; it fails without it):
+  the executor on the authors' published outputs (DTLN-aec-512, the only size they published): within
+  1 LSB on all three clips, one reference sample that clipped excluded (soundfile writes x * 32768).
+  `cargo clippy -p rootapp-echo-model --all-targets --release -- -D warnings`, also for
+  `aarch64-pc-windows-msvc` (the NEON path).
+- `cargo test -p webrtc-sys --lib --release root_echo` (26, 2 ignored): Windows and macOS
   classification tables with fake property values and Bluetooth instance ids, the policy (modes,
-  kinds, the measured-echo window, frozen statistics), the kill switch's windows, AdjustConfig, an
-  unset mode and OFF bit for bit equal to the APM built as before (6 s scene through the whole voice
-  chain), the switch at a frame boundary with no level step or sample jump and the voice chain
-  untouched (processed frames, resets, flushes, format), AUTO following the device and the session
-  reset, measured echo turning it on (5.3 s into a clipping laptop echo) and keeping it per device, no
-  echo path never turning it on, the kill switch, inference stats, a synthesized clipping laptop scene
-  (leaking windows 10% -> 2.5%, worst burst not worse, near voice in double talk 4 dB louder,
-  near-only within 1 dB) and call-start bells (leaking windows 89% -> 44%), switching 40 times under
-  running render and capture threads, playout opens reaching the sink, the control refused without
-  the model, and the APM's CPU per 10 ms.
+  kinds, the measured-echo window, frozen statistics, a device without a key), the kill switch's
+  windows and a session reset starting them over, AdjustConfig, an unset mode and OFF bit for bit
+  equal to the APM built as before (6 s scene through the whole voice chain; also through the int16
+  interface), switches on and off at a frame boundary with no level step or sample jump and the voice
+  chain untouched (processed frames, resets, flushes, format; float and int16), on, off and on again
+  with echo present with the variant without the model bit for bit a fresh APM fed the same frames
+  from its warm-up on, AUTO following the device and the session reset (the device forgotten once the
+  playout closed), the worker switching off after the audio stopped and then not polling, a reader
+  stalled inside the grace period across two switches (the real decorator, the review's interleaving),
+  measured echo turning it on (4.3 s into a clipping laptop echo) and keeping it per device, no echo
+  path never turning it on, the model off while echo cancellation is, the kill switch, inference stats
+  (p99 NaN after a session reset), a synthesized clipping laptop scene (leaking windows 10% -> 2.5%,
+  worst burst not worse, near voice in double talk 4 dB louder, near-only within 1 dB) and call-start
+  bells (leaking windows 89% -> 44%), switching 40 times under running render and capture threads and
+  a statistics reader, the capture callback's cost on switch frames, playout opens and closes reaching
+  the sink, the control refused without the model, and the APM's CPU per 10 ms. Ignored: the tonal
+  render gap (below) and the measured-echo calibration (needs `ROOTAPP_AEC_REAL_DIR`).
 - `cargo test -p livekit-ffi --lib --release rootapp_audio` (33), `platform_audio`, `cargo test -p
   livekit --lib --release platform_audio` (29): wire values, control and stats conversions, bit 14
   (caps 24575) tied to `root_echo_model_supported()`.
@@ -1348,9 +1388,10 @@ appended to the `LICENSE.md` every `ffi-*.zip` carries (`build-rootapp-common.sh
 CC0, LibriVox and others); whether those terms reach a trained model is open for a legal look.
 
 What CI has to prove on macOS (x64 and arm64, deployment 10.15/11.0) and Linux (x64, arm64): build and
-link (`root_echo_model.cpp` with CoreAudio on macOS; only its macOS and Linux paths were checked here,
-syntax-only with clang-cl and stub CoreAudio/pthread headers, and `adm_proxy.cpp`,
-`audio_device_controller.cpp` and `peer_connection_factory.cpp` were not); `cargo test -p
+link (`root_echo_model.cpp` with CoreAudio and CoreFoundation on macOS; only its and
+`root_audio_processing.cpp`'s macOS and Linux paths were checked here, syntax-only with clang-cl and
+stub CoreAudio/CoreFoundation/pthread headers, and `adm_proxy.cpp`, `audio_device_controller.cpp` and
+`peer_connection_factory.cpp` were not); `cargo test -p
 rootapp-echo-model --release` (the NEON kernel runs nowhere yet; the golden tolerance may need to grow
 on another libm); `cargo test -p webrtc-sys --lib --release root_echo` (the bit-for-bit test assumes
 one APM build is deterministic per platform); the CPU test's numbers on an Intel Mac and an older

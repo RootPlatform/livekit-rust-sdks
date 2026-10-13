@@ -89,7 +89,7 @@ enum RootAudioEchoModel {
   ROOT_AUDIO_ECHO_MODEL_ON = 1;
   // The platform playout device's kind decides at every open: the model for loudspeakers (SPEAKERS, LINE_OUT,
   // DISPLAY_AUDIO), AEC3 alone for the other kinds. While AEC3 runs alone, an echo path it measures on the device
-  // (fullband ERLE of 6 dB or more in 3 s of capture within 10 s) turns the model on for that device until the session
+  // (fullband ERLE of 3 dB or more in 2 s of capture within 10 s) turns the model on for that device until the session
   // ends; a measurement never turns it off.
   ROOT_AUDIO_ECHO_MODEL_AUTO = 2;
 }
@@ -99,7 +99,8 @@ enum RootAudioEchoModelState {
   ROOT_AUDIO_ECHO_MODEL_STATE_OFF = 0;
   ROOT_AUDIO_ECHO_MODEL_STATE_ON = 1;
   // Native decided on the model; AEC3 alone runs until the model's APM is built and, at a pause in the user's
-  // speech (at most 3 s later), the next audio frame (capture or render) switches to it.
+  // speech (at most 3 s later), the next audio frame (capture or render) switches to it, or native does once no
+  // audio has run for 100 ms.
   ROOT_AUDIO_ECHO_MODEL_STATE_STARTING = 2;
   // Native decided against the model; AEC3 with it runs until the switch, as for STARTING.
   ROOT_AUDIO_ECHO_MODEL_STATE_STOPPING = 3;
@@ -117,7 +118,8 @@ enum RootAudioEchoModelReason {
   ROOT_AUDIO_ECHO_MODEL_REASON_MEASURED_ECHO = 3;
   // The CPU kill switch tripped: off until the session ends.
   ROOT_AUDIO_ECHO_MODEL_REASON_KILL_SWITCH = 4;
-  // The model or its APM could not be built: off.
+  // The model or its APM could not be built, or the APM's echo canceller is off (nothing for the model to run
+  // on): off.
   ROOT_AUDIO_ECHO_MODEL_REASON_UNAVAILABLE = 5;
 }
 
@@ -510,7 +512,8 @@ message RootAudioStats {
 
   // Echo model (capability ECHO_MODEL; absent without it). echo_model is the mode native applies,
   // echo_model_state what the APM runs and echo_model_reason why. output_device_kind is the platform
-  // playout device's kind from its last open (kept across sessions), in every mode.
+  // playout device's kind from its last open (kept across sessions while that playout stays open, else NONE
+  // after a session reset), in every mode.
   optional RootAudioEchoModel echo_model = 114;
   optional RootAudioEchoModelState echo_model_state = 115;
   optional RootAudioEchoModelReason echo_model_reason = 116;
