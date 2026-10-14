@@ -12,6 +12,7 @@ pub mod voice_gain;
 
 pub use chain::{DspChain, AUTO_MIN_OPEN_BLOCKS};
 pub use speech_gate::SpeechDetection;
+pub use voice_gain::VoiceGainTuning;
 
 /// Managed `Math.Pow(10, x)`: libm's pow. The base goes through black_box because LLVM turns a
 /// constant base of 10 into exp10 where libm has one (macOS, glibc), which can round 1 ulp away
@@ -41,6 +42,8 @@ pub const STARTUP_HOLD_FRAMES: u32 = 20;
 pub const MAX_DENOISER_WAIT_FRAMES: u32 = 100;
 pub const DENOISER_STALL_FRAMES: u32 = 100;
 pub const TRANSMIT_FADE_MS: u32 = 5;
+/// Gain resets are clamped to 0..=this, and so is the voice gain's maximum a host can set (the
+/// default maximum is VoiceGainTuning::DEFAULT, 12 dB).
 pub const MAX_VOICE_GAIN_DB: f32 = 18.0;
 /// Auto sensitivity's open minimum (dBFS before the voice gain) while the host sets none.
 pub const AUTO_SENSITIVITY_MINIMUM_DB: f32 = -54.0;
@@ -85,7 +88,9 @@ pub struct DspSettings {
     /// Off, or what the speech detector's verdict qualifies (push-to-talk ignores it).
     pub speech_detection: SpeechDetection,
     /// The speech detector's probability for this frame's pre-denoise input, 0..1; negative or
-    /// non-finite when it did not run (the level gate alone decides, as with Off).
+    /// non-finite when it did not run (the level gate alone decides, as with Off). The voice gain
+    /// uses it in every mode whenever it is valid: only frames at its minimum probability or above
+    /// are the person's speech.
     pub speech_probability: f32,
     /// The frame's raw capture (before the APM) was digital silence: no sample above -100 dBFS, so
     /// every int16 sample 0. Auto sensitivity learns nothing from it (a hardware mute).
@@ -93,6 +98,9 @@ pub struct DspSettings {
     /// Auto sensitivity's open minimum, dBFS before the voice gain: non-finite is
     /// AUTO_SENSITIVITY_MINIMUM_DB, the rest clamped to AUTO_SENSITIVITY_MINIMUM_RANGE_DB.
     pub auto_sensitivity_minimum_db: f32,
+    /// The voice gain's tunables as the host set them: non-finite fields are the defaults, the rest
+    /// clamped (VoiceGainTuning::sanitized).
+    pub voice_gain: VoiceGainTuning,
 }
 
 impl Default for DspSettings {
@@ -110,6 +118,7 @@ impl Default for DspSettings {
             speech_probability: -1.0,
             capture_silent: false,
             auto_sensitivity_minimum_db: AUTO_SENSITIVITY_MINIMUM_DB,
+            voice_gain: VoiceGainTuning::UNSET,
         }
     }
 }
@@ -121,7 +130,7 @@ pub struct DspCommands {
     pub reset: bool,
     /// Stream (re)start: aligner, stall count and startup hold start over.
     pub flush: bool,
-    /// Restart the voice gain from gain_reset_db (non-finite: ignored; clamped 0..18).
+    /// Restart the voice gain from gain_reset_db (non-finite: ignored; clamped 0..18, then to the voice gain's maximum).
     pub gain_reset: bool,
     pub gain_reset_db: f32,
 }

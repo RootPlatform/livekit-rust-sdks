@@ -11,7 +11,8 @@ mod support;
 use rootapp_voice_dsp::auto_sensitivity::AutoSensitivityOptions;
 use rootapp_voice_dsp::{
     DenoiserOutput, DspChain, DspCommands, DspOutputs, DspSettings, PreDenoise, PushToTalk,
-    AUTO_MIN_OPEN_BLOCKS, DENOISER_STALL_FRAMES, MAX_DENOISER_WAIT_FRAMES, STARTUP_HOLD_FRAMES,
+    SpeechDetection, AUTO_MIN_OPEN_BLOCKS, DENOISER_STALL_FRAMES, MAX_DENOISER_WAIT_FRAMES,
+    STARTUP_HOLD_FRAMES,
 };
 use support::{in_range, near, silent, sine, Rng};
 
@@ -112,7 +113,7 @@ fn a_streams_first_frames_are_never_sent_or_counted_as_speech() {
     h.settings.auto_sensitivity = false;
     h.settings.gate_threshold = 0.001;
     h.commands.gain_reset = true;
-    h.commands.gain_reset_db = 16.0;
+    h.commands.gain_reset_db = 10.0;
     let mut first_speaking = None;
     let mut sent = Vec::new();
     for i in 0..40 {
@@ -125,7 +126,7 @@ fn a_streams_first_frames_are_never_sent_or_counted_as_speech() {
     assert!(sent[..HOLD].iter().all(|f| silent(f)));
     assert!(sent[HOLD..].iter().any(|f| !silent(f)));
     assert!(first_speaking.unwrap() >= HOLD);
-    assert_eq!(h.out.voice_gain_db, 16.0);
+    assert_eq!(h.out.voice_gain_db, 10.0);
 }
 
 /// Managed GainControlFollowsTheSettingAndStartsFromTheRememberedGain.
@@ -160,13 +161,13 @@ fn gain_control_follows_the_setting_and_starts_from_the_remembered_gain() {
     assert_eq!(h.out.voice_gain_db, 4.0, "a reset while off only sets the start");
     h.settings.auto_gain = true;
     h.run(0.0);
-    assert_eq!(h.out.voice_gain_db, 18.0, "back on: from the newest reset, clamped");
+    assert_eq!(h.out.voice_gain_db, 12.0, "back on: from the newest reset, clamped to the maximum");
 
     for db in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
         h.commands.gain_reset = true;
         h.commands.gain_reset_db = db;
         h.run(0.0);
-        assert_eq!(h.out.voice_gain_db, 18.0, "{db} is ignored");
+        assert_eq!(h.out.voice_gain_db, 12.0, "{db} is ignored");
     }
     h.commands.gain_reset = true;
     h.commands.gain_reset_db = -3.0;
@@ -220,19 +221,19 @@ fn a_voice_gain_jump_does_not_open_the_auto_gate_on_room_noise() {
     }
     assert_eq!(h.out.voice_gain_db, 0.0);
     h.commands.gain_reset = true;
-    h.commands.gain_reset_db = 15.0;
+    h.commands.gain_reset_db = 12.0;
     for _ in 0..300 {
         let input = noise(480);
         assert!(silent(&h.run_input(&input)));
     }
-    assert_eq!(h.out.voice_gain_db, 15.0);
+    assert_eq!(h.out.voice_gain_db, 12.0);
     assert!(!h.out.speaking && !h.out.gate_open);
     let options = AutoSensitivityOptions::default();
     let threshold_db = 20.0 * f64::from(h.out.threshold).log10();
-    let minimum_db = options.open_minimum_db + options.voice_gain_cap_db.min(15.0);
+    let minimum_db = options.open_minimum_db + options.voice_gain_cap_db.min(12.0);
     assert!(
         threshold_db >= minimum_db
-            && threshold_db <= (-70.0 + options.open_margin_db + 15.0).max(minimum_db) + 0.5,
+            && threshold_db <= (-70.0 + options.open_margin_db + 12.0).max(minimum_db) + 0.5,
         "{threshold_db}"
     );
 }
@@ -469,6 +470,85 @@ fn a_gain_reset_with_a_reset_in_the_same_frame_survives_it() {
     h.commands.gain_reset_db = 7.0;
     h.run(0.0);
     assert_eq!(h.out.voice_gain_db, 7.0);
+}
+
+/// The host's maximum applies in the frame it arrives in, before that frame's gain reset: a reset
+/// clamps to it (and never above 18 dB), unset or non-finite is 12 dB.
+#[test]
+fn a_gain_reset_is_clamped_to_the_hosts_maximum_from_the_same_frame() {
+    for (max, reset, expected) in [
+        (f32::NAN, 30.0f32, 12.0f32),
+        (18.0, 30.0, 18.0),
+        (40.0, 30.0, 18.0),
+        (6.0, 10.0, 6.0),
+        (-5.0, 10.0, 0.0),
+        (f32::INFINITY, 10.0, 10.0),
+    ] {
+        let mut h = Harness::new(48000);
+        h.run(0.0);
+        h.settings.voice_gain.max_gain_db = max;
+        h.commands.gain_reset = true;
+        h.commands.gain_reset_db = reset;
+        h.run(0.0);
+        assert_eq!(h.out.voice_gain_db, expected, "max {max}, reset {reset}");
+    }
+}
+
+/// 1 s phrases of syllables of a 440 Hz tone at `level_db` RMS (200 ms on, 100 ms off) with half a
+/// second between phrases (where the room is measured) and `probability` on every frame; returns
+/// the voice gain after `seconds`.
+fn talk_with(h: &mut Harness, level_db: f64, seconds: f64, probability: f32) -> f32 {
+    let amplitude = (10f64.powf(level_db / 20.0) * 2f64.sqrt()) as f32 * 32768.0;
+    for f in 0..(seconds * 100.0) as usize {
+        h.settings.speech_probability = probability;
+        if f % 150 < 100 && f % 30 < 20 {
+            h.run_tone(amplitude);
+        } else {
+            h.run(0.0);
+        }
+    }
+    h.out.voice_gain_db
+}
+
+/// The voice gain takes the speech probability whenever there is one, whatever the speech
+/// detection mode: frames under its minimum are not speech, so a sound the detector rejects never
+/// sets the level, and without a probability the level alone decides.
+#[test]
+fn the_voice_gain_learns_speech_only_from_frames_the_detector_accepts() {
+    for detection in [SpeechDetection::Off, SpeechDetection::Ring, SpeechDetection::Gate] {
+        for (probability, boosted) in [
+            (0.1f32, false),
+            (0.49, false),
+            (0.5, true),
+            (0.9, true),
+            (-1.0, true),
+            (f32::NAN, true),
+        ] {
+            let mut h = Harness::new(48000);
+            h.settings.speech_detection = detection;
+            let gain = talk_with(&mut h, -42.0, 10.0, probability);
+            assert_eq!(gain > 11.0, boosted, "{detection:?} p {probability}: {gain}");
+            if !boosted {
+                assert_eq!(gain, 0.0, "{detection:?} p {probability}");
+            }
+        }
+    }
+}
+
+/// The host's minimum probability and target apply: a minimum of 0 takes every frame with a
+/// probability, a higher target asks for more gain.
+#[test]
+fn the_hosts_minimum_probability_and_target_apply() {
+    let mut h = Harness::new(48000);
+    h.settings.voice_gain.min_speech_probability = 0.0;
+    assert!(talk_with(&mut h, -42.0, 10.0, 0.1) > 11.0);
+
+    let mut quiet = Harness::new(48000);
+    let default = talk_with(&mut quiet, -30.0, 12.0, 0.9);
+    let mut louder = Harness::new(48000);
+    louder.settings.voice_gain.target_db = -21.0;
+    let raised = talk_with(&mut louder, -30.0, 12.0, 0.9);
+    assert!(in_range(f64::from(raised - default), 3.5, 4.5), "{default} -> {raised}");
 }
 
 #[test]

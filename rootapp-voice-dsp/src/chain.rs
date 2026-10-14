@@ -280,6 +280,8 @@ impl DspChain {
             return PreDenoise { flush_denoiser: false, supported: false };
         }
         out.unsupported = false;
+        // Before the commands, so a gain reset in this frame is clamped to this frame's maximum.
+        self.voice_gain.set_tuning(&settings.voice_gain);
 
         let mut flushed = false;
         if rate != self.rate {
@@ -409,7 +411,7 @@ impl DspChain {
         let denoised_rms = rms(w);
         let mut gain_db = 0.0;
         if *voice_gain_enabled {
-            voice_gain.process(w);
+            voice_gain.process_with_probability(w, settings.speech_probability);
             gain_db = voice_gain.gain_db();
             *voice_gain_db = gain_db as f32;
             *voice_gain_settled = voice_gain.is_settled();

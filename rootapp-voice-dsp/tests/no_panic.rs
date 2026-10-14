@@ -10,6 +10,7 @@ mod support;
 
 use rootapp_voice_dsp::{
     DenoiserOutput, DspChain, DspCommands, DspOutputs, DspSettings, PushToTalk, SpeechDetection,
+    VoiceGainTuning,
 };
 use support::Rng;
 
@@ -39,6 +40,23 @@ fn fill(frame: &mut [f32], kind: usize, rng: &mut Rng) {
                 [f32::NAN, 1e30, -1e30, 1e-40, 32767.0, -32768.0, 0.0][(v % 7) as usize]
             }
         };
+    }
+}
+
+/// Voice gain tunables from FLOATS (NaN, infinities, negative, huge, 0) and the bounds.
+fn tuning(step: usize) -> VoiceGainTuning {
+    let f = |k: usize, scale: f32| FLOATS[(step / 7 + k) % FLOATS.len()] * scale;
+    match step % 4 {
+        0 => VoiceGainTuning::MIN,
+        1 => VoiceGainTuning::MAX,
+        _ => VoiceGainTuning {
+            max_gain_db: f(0, 20.0),
+            target_db: f(1, -30.0),
+            rise_db_per_second: f(2, 5.0),
+            fall_db_per_second: f(3, 5.0),
+            level_time_constant_ms: f(4, 3000.0),
+            min_speech_probability: f(5, 0.5),
+        },
     }
 }
 
@@ -111,6 +129,7 @@ fn any_shape_settings_input_and_denoiser_output_leaves_finite_full_scale_audio()
                                 [step % 6],
                             capture_silent: step % 8 < 3,
                             auto_sensitivity_minimum_db: FLOATS[(step / 5) % FLOATS.len()] * -50.0,
+                            voice_gain: tuning(step),
                         };
                         let commands = DspCommands {
                             reset: step % 29 == 0,
@@ -187,6 +206,7 @@ fn abrupt_changes_and_commands_in_every_state_never_panic() {
             capture_silent: (v >> 42) % 3 == 0,
             auto_sensitivity_minimum_db: [-54.0, f32::NAN, f32::NEG_INFINITY, 20.0, -1e30]
                 [((v >> 46) % 5) as usize],
+            voice_gain: tuning((v >> 48) as usize),
         };
         let commands = DspCommands {
             reset: (v >> 38) % 40 == 0,

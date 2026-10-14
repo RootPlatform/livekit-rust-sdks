@@ -12,7 +12,7 @@ mod support;
 use rootapp_voice_dsp::voice_gain::{VoiceGain, VoiceGainOptions};
 use rootapp_voice_dsp::{
     DenoiserOutput, DspChain, DspCommands, DspOutputs, DspSettings, PushToTalk, SpeechDetection,
-    MAX_FRAME,
+    VoiceGainTuning, MAX_FRAME,
 };
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -116,6 +116,17 @@ fn the_chain_never_allocates_or_frees_after_new() {
                 speech_probability: [0.9, 0.1, -1.0, 0.6, 0.0][(f / 7) % 5],
                 capture_silent: f % 160 < 70,
                 auto_sensitivity_minimum_db: [-54.0, -40.0, f32::NAN, -100.0][(f / 130) % 4],
+                voice_gain: [
+                    VoiceGainTuning::UNSET,
+                    VoiceGainTuning::DEFAULT,
+                    VoiceGainTuning::MIN,
+                    VoiceGainTuning::MAX,
+                    VoiceGainTuning {
+                        max_gain_db: 40.0,
+                        level_time_constant_ms: 1.0,
+                        ..VoiceGainTuning::UNSET
+                    },
+                ][(f / 170) % 5],
             };
             let commands = DspCommands {
                 reset: f % 997 == 3,
@@ -161,9 +172,12 @@ fn voice_gain_processing_allocates_nothing() {
         gain.process(&mut frame);
     }
     let events = counted(|| {
-        for _ in 0..2000 {
+        for i in 0..2000 {
             gain.observe_input(&frame);
-            gain.process(&mut frame);
+            gain.process_with_probability(&mut frame, [0.9, -1.0, 0.1, f32::NAN][i % 4]);
+            if i % 500 == 0 {
+                gain.set_tuning(&VoiceGainTuning::MAX);
+            }
         }
         gain.reset(6.0);
     });

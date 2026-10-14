@@ -1,6 +1,105 @@
-use crate::{clamp_f64, pow10};
+use crate::{clamp_f64, pow10, speech_gate};
 
 const FRAME_MS: f64 = 10.0;
+/// The room estimate a committed frame is clipped against never counts as quieter than this
+/// (-90 dB), so a room that was digital silence can still be learned.
+const MIN_ROOM_POWER: f64 = 1e-9;
+
+/// The voice gain's tunables a host can set (RootAudioControl 17-22; managed `VoiceGainOptions`
+/// defaults, which the desktop sends). A non-finite field is the default.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VoiceGainTuning {
+    pub max_gain_db: f32,
+    pub target_db: f32,
+    pub rise_db_per_second: f32,
+    pub fall_db_per_second: f32,
+    pub level_time_constant_ms: f32,
+    pub min_speech_probability: f32,
+}
+
+impl VoiceGainTuning {
+    /// Nothing set: every field the default.
+    pub const UNSET: Self = Self {
+        max_gain_db: f32::NAN,
+        target_db: f32::NAN,
+        rise_db_per_second: f32::NAN,
+        fall_db_per_second: f32::NAN,
+        level_time_constant_ms: f32::NAN,
+        min_speech_probability: f32::NAN,
+    };
+    pub const DEFAULT: Self = Self {
+        max_gain_db: 12.0,
+        target_db: -25.0,
+        rise_db_per_second: 3.0,
+        fall_db_per_second: 2.0,
+        level_time_constant_ms: 4000.0,
+        min_speech_probability: 0.5,
+    };
+    /// The lowest value of each field a host can set.
+    pub const MIN: Self = Self {
+        max_gain_db: 0.0,
+        target_db: -40.0,
+        rise_db_per_second: 0.5,
+        fall_db_per_second: 0.5,
+        level_time_constant_ms: 500.0,
+        min_speech_probability: 0.0,
+    };
+    /// The highest value of each field a host can set.
+    pub const MAX: Self = Self {
+        max_gain_db: crate::MAX_VOICE_GAIN_DB,
+        target_db: -10.0,
+        rise_db_per_second: 20.0,
+        fall_db_per_second: 20.0,
+        level_time_constant_ms: 20_000.0,
+        min_speech_probability: 1.0,
+    };
+
+    /// Each field clamped to MIN..=MAX, a non-finite one the default.
+    pub fn sanitized(self) -> Self {
+        let field = |value: f32, default: f32, min: f32, max: f32| {
+            if value.is_finite() {
+                value.clamp(min, max)
+            } else {
+                default
+            }
+        };
+        let (d, lo, hi) = (Self::DEFAULT, Self::MIN, Self::MAX);
+        Self {
+            max_gain_db: field(self.max_gain_db, d.max_gain_db, lo.max_gain_db, hi.max_gain_db),
+            target_db: field(self.target_db, d.target_db, lo.target_db, hi.target_db),
+            rise_db_per_second: field(
+                self.rise_db_per_second,
+                d.rise_db_per_second,
+                lo.rise_db_per_second,
+                hi.rise_db_per_second,
+            ),
+            fall_db_per_second: field(
+                self.fall_db_per_second,
+                d.fall_db_per_second,
+                lo.fall_db_per_second,
+                hi.fall_db_per_second,
+            ),
+            level_time_constant_ms: field(
+                self.level_time_constant_ms,
+                d.level_time_constant_ms,
+                lo.level_time_constant_ms,
+                hi.level_time_constant_ms,
+            ),
+            min_speech_probability: field(
+                self.min_speech_probability,
+                d.min_speech_probability,
+                lo.min_speech_probability,
+                hi.min_speech_probability,
+            ),
+        }
+    }
+}
+
+impl Default for VoiceGainTuning {
+    fn default() -> Self {
+        Self::UNSET
+    }
+}
 
 /// Managed `VoiceGainOptions` (`VoiceGain.cs`); Default = the C# defaults.
 #[derive(Clone, Debug, PartialEq)]
@@ -12,9 +111,10 @@ pub struct VoiceGainOptions {
     pub foreground_margin_db: f64,
     pub room_noise_time_constant_ms: f64,
     pub room_guard_ms: f64,
-    pub room_limit_fall_db_per_second: f64,
+    pub room_burst_db: f64,
     pub speech_margin_db: f64,
     pub speech_minimum_db: f64,
+    pub min_speech_probability: f64,
     pub level_time_constant_ms: f64,
     pub min_speech_ms: f64,
     pub settled_speech_ms: f64,
@@ -28,27 +128,30 @@ pub struct VoiceGainOptions {
     pub noise_settle_ms: f64,
     pub noise_after_speech_ms: f64,
     pub limiter_ceiling: f32,
+    pub limiter_release_db_per_second: f64,
 }
 
 impl Default for VoiceGainOptions {
     fn default() -> Self {
+        let tuning = VoiceGainTuning::DEFAULT;
         Self {
-            target_db: -22.0,
-            max_gain_db: 18.0,
+            target_db: f64::from(tuning.target_db),
+            max_gain_db: f64::from(tuning.max_gain_db),
             max_output_noise_db: -60.0,
             max_room_noise_db: -50.0,
             foreground_margin_db: 12.0,
             room_noise_time_constant_ms: 2000.0,
             room_guard_ms: 200.0,
-            room_limit_fall_db_per_second: 10.0,
+            room_burst_db: 6.0,
             speech_margin_db: 10.0,
             speech_minimum_db: -62.0,
-            level_time_constant_ms: 1500.0,
+            min_speech_probability: f64::from(tuning.min_speech_probability),
+            level_time_constant_ms: f64::from(tuning.level_time_constant_ms),
             min_speech_ms: 500.0,
             settled_speech_ms: 3000.0,
-            rise_db_per_second: 3.0,
-            fall_db_per_second: 6.0,
-            unsettled_db_per_second: 10.0,
+            rise_db_per_second: f64::from(tuning.rise_db_per_second),
+            fall_db_per_second: f64::from(tuning.fall_db_per_second),
+            unsettled_db_per_second: 6.0,
             floor_fall_time_constant_ms: 300.0,
             floor_rise_db_per_second: 2.0,
             speech_run_frames: 3,
@@ -56,6 +159,7 @@ impl Default for VoiceGainOptions {
             noise_settle_ms: 1000.0,
             noise_after_speech_ms: 250.0,
             limiter_ceiling: 0.9,
+            limiter_release_db_per_second: 100.0,
         }
     }
 }
@@ -64,11 +168,13 @@ impl Default for VoiceGainOptions {
 #[derive(Clone, Debug)]
 pub struct VoiceGain {
     options: VoiceGainOptions,
-    foreground_ratio: f64,
+    room_burst_ratio: f64,
+    limiter_release: f32,
     pending_room: Vec<f64>,
     gain_db: f64,
     floor_db: f64,
-    speech_power: f64,
+    level_sum: f64,
+    level_weight: f64,
     speech_ms: f64,
     floor_known: bool,
     noise_power: f64,
@@ -79,19 +185,22 @@ pub struct VoiceGain {
     room_power: f64,
     input_power: f64,
     pending_next: usize,
+    limiter: f32,
 }
 
 impl VoiceGain {
     pub fn new(start_gain_db: f64, options: VoiceGainOptions) -> Self {
-        let foreground_ratio = pow10(-options.foreground_margin_db / 10.0);
         let pending = ((options.room_guard_ms / FRAME_MS) as usize).max(1);
         let mut gain = Self {
+            room_burst_ratio: pow10(options.room_burst_db / 10.0),
+            limiter_release: pow10(options.limiter_release_db_per_second * FRAME_MS / 1000.0 / 20.0)
+                as f32,
             options,
-            foreground_ratio,
             pending_room: vec![-1.0; pending],
             gain_db: 0.0,
             floor_db: -90.0,
-            speech_power: -1.0,
+            level_sum: 0.0,
+            level_weight: 0.0,
             speech_ms: 0.0,
             floor_known: false,
             noise_power: -1.0,
@@ -102,6 +211,7 @@ impl VoiceGain {
             room_power: -1.0,
             input_power: -1.0,
             pending_next: 0,
+            limiter: 1.0,
         };
         gain.reset(start_gain_db);
         gain
@@ -111,15 +221,30 @@ impl VoiceGain {
         &self.options
     }
 
+    /// The host's tunables, sanitised here: they apply from the next frame and never allocate. A
+    /// gain over a lowered maximum comes down at the fall rate; a reset clamps to it.
+    pub fn set_tuning(&mut self, tuning: &VoiceGainTuning) {
+        let t = tuning.sanitized();
+        let o = &mut self.options;
+        o.max_gain_db = f64::from(t.max_gain_db);
+        o.target_db = f64::from(t.target_db);
+        o.rise_db_per_second = f64::from(t.rise_db_per_second);
+        o.fall_db_per_second = f64::from(t.fall_db_per_second);
+        o.level_time_constant_ms = f64::from(t.level_time_constant_ms);
+        o.min_speech_probability = f64::from(t.min_speech_probability);
+    }
+
     pub fn gain_db(&self) -> f64 {
         self.gain_db
     }
 
+    /// The talker's level: the average frame level (dBFS) of their speech over about
+    /// LevelTimeConstantMs of it, each frame weighted by its speech probability (1 without one).
     pub fn speech_level_db(&self) -> f64 {
-        if self.speech_power < 0.0 {
-            f64::NEG_INFINITY
+        if self.level_weight > 0.0 {
+            self.level_sum / self.level_weight
         } else {
-            10.0 * self.speech_power.max(1e-12).log10()
+            f64::NEG_INFINITY
         }
     }
 
@@ -149,6 +274,11 @@ impl VoiceGain {
         }
     }
 
+    /// The peak limiter's gain on the last frame (1: not limiting).
+    pub fn limiter_gain(&self) -> f32 {
+        self.limiter
+    }
+
     /// Enough speech heard that the gain is worth remembering for this microphone.
     pub fn is_settled(&self) -> bool {
         self.speech_ms >= self.options.settled_speech_ms
@@ -159,7 +289,8 @@ impl VoiceGain {
         self.gain_db = clamp_f64(start, 0.0, self.options.max_gain_db);
         self.floor_db = -90.0;
         self.floor_known = false;
-        self.speech_power = -1.0;
+        self.level_sum = 0.0;
+        self.level_weight = 0.0;
         self.speech_ms = 0.0;
         self.noise_power = -1.0;
         self.run = 0;
@@ -170,6 +301,7 @@ impl VoiceGain {
         self.input_power = -1.0;
         self.pending_room.fill(-1.0);
         self.pending_next = 0;
+        self.limiter = 1.0;
     }
 
     /// The frame as it was before the denoiser; call it before `process` for the same frame.
@@ -184,7 +316,14 @@ impl VoiceGain {
         self.input_power = power / frame.len() as f64;
     }
 
+    /// A frame without a speech probability.
     pub fn process(&mut self, frame: &mut [f32]) {
+        self.process_with_probability(frame, -1.0);
+    }
+
+    /// `speech_probability`: the speech detector's for this frame's input, 0..1 (above 1 is 1);
+    /// negative or non-finite when there is none, and level alone decides what is speech.
+    pub fn process_with_probability(&mut self, frame: &mut [f32], speech_probability: f32) {
         if frame.is_empty() {
             return;
         }
@@ -196,6 +335,9 @@ impl VoiceGain {
         }
         power /= frame.len() as f64;
         let level_db = 10.0 * power.max(1e-12).log10();
+        let probability = speech_gate::probability(speech_probability);
+        let voiced = probability.map(|p| f64::from(p) >= self.options.min_speech_probability);
+        let weight = probability.map_or(1.0, f64::from);
 
         self.elapsed_ms += FRAME_MS;
         if self.since_speech_ms < f64::MAX {
@@ -213,13 +355,18 @@ impl VoiceGain {
                 room = false;
             } else {
                 let first_run = self.run == self.options.speech_run_frames;
-                let run_power =
-                    if first_run { (self.run_power + power) / f64::from(self.run) } else { power };
-                speech = self.is_foreground(run_power);
+                let run_db = if first_run {
+                    let mean = (self.run_power + power) / f64::from(self.run);
+                    10.0 * mean.max(1e-12).log10()
+                } else {
+                    level_db
+                };
+                let foreground = self.is_foreground(run_db);
+                speech = foreground && voiced != Some(false);
                 if speech {
-                    self.add_speech(run_power, if first_run { self.run } else { 1 });
+                    self.add_speech(run_db, weight, if first_run { self.run } else { 1 });
                 }
-                room = !speech;
+                room = !foreground;
             }
         } else {
             if self.run > 0 && self.run < self.options.speech_run_frames {
@@ -235,6 +382,13 @@ impl VoiceGain {
 
         let o = &self.options;
         let previous_db = self.gain_db;
+        let settled = self.is_settled();
+        let up = (if settled { o.rise_db_per_second } else { o.unsettled_db_per_second })
+            * FRAME_MS
+            / 1000.0;
+        let down = (if settled { o.fall_db_per_second } else { o.unsettled_db_per_second })
+            * FRAME_MS
+            / 1000.0;
         let room_limit = if self.room_power >= 0.0 {
             0f64.max(o.max_room_noise_db - self.room_noise_db())
         } else if self.input_power >= 0.0 {
@@ -242,49 +396,46 @@ impl VoiceGain {
         } else {
             o.max_gain_db
         };
-        if self.speech_ms >= o.min_speech_ms {
+        if self.speech_ms >= o.min_speech_ms && self.level_weight > 0.0 {
             let mut wanted = clamp_f64(o.target_db - self.speech_level_db(), 0.0, o.max_gain_db);
             wanted =
                 wanted.min(0f64.max(o.max_output_noise_db - self.floor_db.max(self.noise_db())));
             wanted = wanted.min(room_limit);
-            let settled = self.is_settled();
-            let up = (if settled { o.rise_db_per_second } else { o.unsettled_db_per_second })
-                * FRAME_MS
-                / 1000.0;
-            let down = (if settled { o.fall_db_per_second } else { o.unsettled_db_per_second })
-                * FRAME_MS
-                / 1000.0;
             if wanted > self.gain_db && speech {
                 self.gain_db = wanted.min(self.gain_db + up);
             } else if wanted < self.gain_db {
                 self.gain_db = wanted.max(self.gain_db - down);
             }
         } else if room_limit < self.gain_db {
-            self.gain_db =
-                room_limit.max(self.gain_db - o.room_limit_fall_db_per_second * FRAME_MS / 1000.0);
+            self.gain_db = room_limit.max(self.gain_db - down);
         }
 
         let from = to_linear(previous_db);
         let to = to_linear(self.gain_db);
         let ceiling = self.options.limiter_ceiling;
-        let limit =
+        let needed =
             if peak * from.max(to) > ceiling { ceiling / (peak * from.max(to)) } else { 1.0 };
-        if from == 1.0 && to == 1.0 && limit == 1.0 {
+        let limit_from = self.limiter;
+        let limit_to = needed.min(limit_from * self.limiter_release).min(1.0);
+        self.limiter = limit_to;
+        if from == 1.0 && to == 1.0 && limit_from == 1.0 && limit_to == 1.0 {
             return;
         }
         let step = (to - from) / frame.len() as f32;
+        let limit_start = if limit_to < limit_from { limit_to } else { limit_from };
+        let limit_step = (limit_to - limit_start) / frame.len() as f32;
         let mut i = 0.0f32;
         for s in frame.iter_mut() {
             i += 1.0;
-            *s *= (from + step * i) * limit;
+            *s *= (from + step * i) * (limit_start + limit_step * i);
         }
     }
 
     /// Before MinSpeechMs every voice counts as the person's: the first one heard sets the level.
-    fn is_foreground(&self, power: f64) -> bool {
-        self.speech_power < 0.0
+    fn is_foreground(&self, level_db: f64) -> bool {
+        self.level_weight <= 0.0
             || self.speech_ms < self.options.min_speech_ms
-            || power >= self.speech_power * self.foreground_ratio
+            || level_db >= self.speech_level_db() - self.options.foreground_margin_db
     }
 
     fn track_room(&mut self, room: bool, speech: bool) {
@@ -309,20 +460,20 @@ impl VoiceGain {
         if self.room_power < 0.0 {
             self.room_power = committed;
         } else {
-            self.room_power += (committed - self.room_power)
-                * (FRAME_MS / self.options.room_noise_time_constant_ms);
+            let clipped =
+                committed.min(self.room_power.max(MIN_ROOM_POWER) * self.room_burst_ratio);
+            self.room_power +=
+                (clipped - self.room_power) * (FRAME_MS / self.options.room_noise_time_constant_ms);
         }
     }
 
-    fn add_speech(&mut self, power: f64, frames: u32) {
+    fn add_speech(&mut self, level_db: f64, weight: f64, frames: u32) {
         self.speech_ms += f64::from(frames) * FRAME_MS;
         self.since_speech_ms = 0.0;
-        if self.speech_power < 0.0 {
-            self.speech_power = power;
-        }
+        let leak = 1.0 - FRAME_MS / self.options.level_time_constant_ms;
         for _ in 0..frames {
-            self.speech_power +=
-                (power - self.speech_power) * (FRAME_MS / self.options.level_time_constant_ms);
+            self.level_sum = self.level_sum * leak + level_db * weight;
+            self.level_weight = self.level_weight * leak + weight;
         }
     }
 

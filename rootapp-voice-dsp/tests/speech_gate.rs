@@ -131,7 +131,7 @@ fn lost(off: &Run, gate: &Run, range: std::ops::Range<usize>) -> Vec<usize> {
 #[test]
 fn off_and_no_probability_match_the_level_gate_exactly() {
     let script = speech_then_noise();
-    let off = run(SpeechDetection::Off, &script, |_, _| {});
+    let off = run(SpeechDetection::Off, &script, |_, s| s.speech_probability = -1.0);
     for detection in [SpeechDetection::Ring, SpeechDetection::Gate] {
         let none = run(detection, &script, |_, s| s.speech_probability = -1.0);
         assert_eq!(off.sent, none.sent);

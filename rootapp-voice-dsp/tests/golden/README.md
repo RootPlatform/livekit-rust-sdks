@@ -15,7 +15,7 @@ dotnet Tests\RootApp.Client.Avalonia.Tests\bin\Debug\net10.0\RootApp.Client.Aval
 
 Format (little-endian): `RDSPVEC1`, `u32` header length, `key=value` lines, then one `FRAM` record per
 10 ms frame: rate, length, settings and commands (the first settings byte: bit 0 mic_muted, bit 1
-capture_silent), the int16 input with injected non-finite values, the denoiser's output (kind, restart,
+capture_silent, bit 2 a speech probability follows gain_reset_db as an f32; without it the frame has none), the int16 input with injected non-finite values, the denoiser's output (kind, restart,
 int16 or f32 samples), then the expected flags, sent samples (on stored frames) and seven f32 values. `ROOTAPP_DSP_GOLDEN_EXTRA` adds folders (replays of recordings, never
 committed); `ROOTAPP_DSP_GOLDEN_REPORT=1` prints the largest deviation per field;
 `ROOTAPP_DSP_GOLDEN_LOOSE=1` uses the looser tolerances meant for other platforms' math libraries.

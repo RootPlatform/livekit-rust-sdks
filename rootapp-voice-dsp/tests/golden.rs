@@ -125,6 +125,7 @@ fn parse(bytes: &[u8]) -> Result<(Header, Vec<Record>), String> {
         let input_volume = r.f32()?;
         let gate_threshold = r.f32()?;
         let gain_reset_db = r.f32()?;
+        let speech_probability = if b[0] & 4 != 0 { r.f32()? } else { -1.0 };
         let mut input = Vec::with_capacity(n);
         for _ in 0..n {
             input.push(f32::from(r.i16()?));
@@ -169,6 +170,7 @@ fn parse(bytes: &[u8]) -> Result<(Header, Vec<Record>), String> {
                 gate_threshold,
                 auto_sensitivity: b[3] != 0,
                 denoiser_wanted: b[4] != 0,
+                speech_probability,
                 ..DspSettings::default()
             },
             commands: DspCommands {
@@ -516,9 +518,39 @@ fn golden_vectors_match_the_managed_reference() {
     );
 }
 
-/// The speech detector's paths leave the managed reference's audio as it is when they change
-/// nothing: Ring mode with any probability (it qualifies the ring only), and Gate mode with a
-/// probability that never stops being speech (it never closes).
+type Tweak = Box<dyn Fn(usize, &mut DspSettings)>;
+
+/// Every frame's sent audio, values and flags through one chain, with `tweak` applied to each
+/// record's settings.
+fn run_chain(
+    records: &[Record],
+    tweak: impl Fn(usize, &mut DspSettings),
+) -> Vec<(Vec<f32>, [f32; 7], u8)> {
+    let mut chain = DspChain::new(48_000);
+    let mut out = DspOutputs::default();
+    let mut frames = Vec::with_capacity(records.len());
+    for (index, record) in records.iter().enumerate() {
+        let mut frame = record.input.clone();
+        let mut settings = record.settings;
+        tweak(index, &mut settings);
+        chain.pre_denoise(&mut frame, &settings, &record.commands, &mut out);
+        let denoised = match record.kind {
+            0 => DenoiserOutput::NotInUse,
+            1 => DenoiserOutput::Missed,
+            _ => DenoiserOutput::Ran { samples: &record.denoised, restart: record.restart },
+        };
+        chain.post_denoise(&mut frame, denoised, &settings, &mut out);
+        let values = actual_values(&out, &frame);
+        frames.push((frame, values, actual_flags(&out)));
+    }
+    frames
+}
+
+/// The speech detector's paths leave the audio as it is when they change nothing: Ring mode (it
+/// qualifies the ring only) sends what the managed reference sent with each vector's own
+/// probabilities, and bit for bit what Off sends with any probability; Gate mode with a
+/// probability that never stops being speech (it never closes) sends what Off sends. The voice
+/// gain takes the probability in every mode, so each pair compares the same probabilities.
 #[test]
 fn golden_vectors_hold_where_speech_detection_changes_no_audio() {
     let tolerance =
@@ -528,22 +560,40 @@ fn golden_vectors_hold_where_speech_detection_changes_no_audio() {
     for path in vector_files() {
         let name = path.file_stem().unwrap().to_string_lossy().to_string();
         let (_, records) = parse(&std::fs::read(&path).unwrap()).unwrap();
-        let ring = run_vector(&records, tolerance, |f, s| {
-            s.speech_detection = SpeechDetection::Ring;
-            s.speech_probability = ANY[(f / 3) % ANY.len()];
-        });
-        let gate = run_vector(&records, tolerance, |_, s| {
-            s.speech_detection = SpeechDetection::Gate;
-            s.speech_probability = 0.9;
-        });
-        for (mode, outcome) in [("ring", ring), ("gate", gate)] {
-            if outcome.failed_frames > 0 {
-                failed.push(format!(
-                    "{name} ({mode}): {} of {} frames differ\n    {}",
-                    outcome.failed_frames,
-                    outcome.frames,
-                    outcome.failures.join("\n    ")
-                ));
+        let ring =
+            run_vector(&records, tolerance, |_, s| s.speech_detection = SpeechDetection::Ring);
+        if ring.failed_frames > 0 {
+            failed.push(format!(
+                "{name} (ring, its own probabilities): {} of {} frames differ\n    {}",
+                ring.failed_frames,
+                ring.frames,
+                ring.failures.join("\n    ")
+            ));
+        }
+        let any = |f: usize| ANY[(f / 3) % ANY.len()];
+        let pairs: [(&str, Tweak, Tweak); 2] = [
+            (
+                "ring vs off, any probability",
+                Box::new(move |f, s| {
+                    s.speech_detection = SpeechDetection::Ring;
+                    s.speech_probability = any(f);
+                }),
+                Box::new(move |f, s| s.speech_probability = any(f)),
+            ),
+            (
+                "gate vs off, constant speech",
+                Box::new(|_, s| {
+                    s.speech_detection = SpeechDetection::Gate;
+                    s.speech_probability = 1.0;
+                }),
+                Box::new(|_, s| s.speech_probability = 1.0),
+            ),
+        ];
+        for (label, mode, off) in pairs {
+            let a = run_chain(&records, mode);
+            let b = run_chain(&records, off);
+            if let Some(f) = (0..a.len()).find(|&f| a[f] != b[f]) {
+                failed.push(format!("{name} ({label}): frame {f} differs"));
             }
         }
     }
