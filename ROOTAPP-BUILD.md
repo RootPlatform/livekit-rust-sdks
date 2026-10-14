@@ -873,7 +873,8 @@ managed engine's `NativeAudioSource` tracks, which bypass it):
   (128 samples at 48 kHz, 43 at 16 kHz).
 - With no `RootAudioSetControl` the chain runs on its defaults: noise gate in auto sensitivity
   (threshold from the noise floor of the denoised voice before the voice gain, 8 dB over it but never
-  below -60 dBFS, plus the frame's voice gain; 5 blocks to open), voice gain on from 0 dB (it only boosts, up to
+  below -54 dBFS (-60 before hw.11; see "Auto sensitivity"), plus the frame's voice gain; 5 blocks to
+  open), voice gain on from 0 dB (it only boosts, up to
   18 dB), no denoiser. Every recording start silences its first 20 frames (200 ms, the startup
   hold), and with `denoiser_wanted` up to 100 frames until the denoiser runs. Mute and push-to-talk
   key up silence after the 5 ms fade; the gate, voice gain and auto sensitivity keep running.
@@ -1666,6 +1667,67 @@ the platform engine's mic follows the server's answers again (DTX, channels and 
 later answers give them; not yet checked in a live call), and every factory's environment turns
 `WebRTC-SdpBundlePayloadTypeCollisionCheck` off. Both are described in Phase 2 of "Native call audio"
 (from "The server's answers change codecs too").
+
+## Auto sensitivity (`rootapp/auto-sensitivity`, hw.11)
+
+The voice chain's auto sensitivity (`rootapp-voice-dsp/src/auto_sensitivity.rs`, bit for bit the
+desktop's `AutoSensitivity.cs` through the golden vectors) learns the noise floor of the denoised voice
+before the voice gain; the gate opens 8 dB over it, never below a minimum that rises with at most 11 dB
+of the gain. hw.11 changes three things.
+
+- The minimum is -54 dBFS (`AUTO_SENSITIVITY_MINIMUM_DB`, was -60; the desktop's
+  `AutoSensitivity.MinimumDb`). A headset with the Effects SDK on (Windows, 10/14) kept its denoised
+  floor under minimum - 8 dB for whole calls, so the threshold sat at the minimum and desk taps opened
+  the gate.
+- A hardware mute teaches nothing. A muted device delivers digital silence; counted as a level it
+  dragged the floor to -90 dB within seconds, and after the unmute the floor climbed back at 1 dB/s
+  (39 s to -50 dBFS of room; 41 s in the chain with its gate). `RootApmDecorator::ProcessStream` (int16
+  and float) checks the raw capture before the APM: every sample of every channel at or below
+  `kRootCaptureSilencePeak`, 1e-5 of full scale (-100 dBFS). That is under one int16 step (-90.3
+  dBFS), so the int16 frames the voice engine passes must be all zeros, while a float capture still
+  counts with a muted converter's dither or a resampler's decaying residue; a live mic chain never gets
+  that low (even -100 dBFS RMS of self-noise peaks about 10 dB higher within 10 ms). Neither the APM
+  output nor the denoised level can decide: AEC3 can add comfort noise (its noise floor is -96 dBFS)
+  where it suppresses echo, and the Effects SDK can return near-silence on a live mic. The decorator
+  stores the flag in `RootCaptureState::capture_silent` before the inner APM runs, and the capture
+  processor takes it (exchange) into `DspSettings::capture_silent`, so a frame that did not come
+  through the decorator never sees a stale one. Silent frames leave the floor and the window of recent
+  levels alone and get the unchanged floor's thresholds (with the gain); after `relearn_silence_ms`
+  (500 ms) or more of them the next live frame empties the window and restarts the 10 dB/s startup rise
+  for 2 s, as at the start of a call. 30 s of mute then -50 dBFS of room: back at the room + 8 dB in
+  0.9 s from a -60 dB floor or a fresh one (0.94 s in the chain), 1.9 s from -70 dB (from -75 dB the
+  startup rise covers 20 of the 25 dB: 5.9 s). Mute in the app is the transmit gate after the chain:
+  the mic still delivers the room, so auto sensitivity runs exactly as unmuted.
+- `RootAudioControl.auto_sensitivity_minimum_db` (16) sets the minimum, so later tuning is a desktop
+  change. The controller stores it as sent; the chain clamps it every frame to -80..-30
+  (`sanitize::auto_sensitivity_minimum_db`, non-finite is the default) and a session start forgets it.
+  `RootAudioStats.auto_sensitivity_minimum_db` (125, with the DSP stats) is the value applied, through
+  the same function (bridged as `root_auto_sensitivity_minimum_db`). No capability bit (caps stay
+  32767): a library that predates the field skips it as an unknown field and keeps -60, and the stat's
+  absence tells the desktop so.
+
+Golden vectors regenerated from desktop e7e38e124: 26 with `capture_silence_8k` (a 300 ms and a 500 ms
+mute, zeros of a live capture, the flag over -96 dBFS residue; 8 kHz keeps the set at 12,543,311
+bytes, under 12 MiB). Bit 1 of the settings byte that holds mic_muted carries capture_silent. All 26
+match bit for bit (0 ulp in every value).
+
+Tests: `auto_sensitivity` (the minimum, 30 s of mute then room noise and the 39 s it took counted as a
+level, the thresholds through a mute at any gain, the window, 49 vs 50 frames, the relearn's window, a
+near-silent level of a live capture), `chain` (the mute and the unmute with the gate, a software mute
+leaves auto sensitivity exactly as unmuted, the minimum and its range), capture_silent and the minimum
+in the no-alloc and no-panic runs; `root_capture_processor_learns_nothing_from_a_frame_flagged_silent_*`,
+`root_capture_processor_applies_the_auto_sensitivity_minimum_it_is_given`,
+`root_apm_decorator_flags_digital_silence_on_the_raw_capture` (the real APM, int16, mono and stereo,
+one int16 step is live), `root_apm_decorator_float_capture_is_silent_up_to_minus_100_dbfs`,
+`adm_proxy_controller_stores_the_auto_sensitivity_minimum_*`, and the livekit and livekit-ffi
+conversions.
+
+## hw.11 (2026-10-14)
+
+Auto sensitivity only; caps stay 32767. The -54 dBFS minimum, hardware mute detection on the raw
+capture with a relearn after it, and the minimum as control field 16 with stat 125: see "Auto
+sensitivity" (bc267532 the voice chain and its golden vectors, b2980e32 the decorator, controller,
+livekit and livekit-ffi).
 
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
