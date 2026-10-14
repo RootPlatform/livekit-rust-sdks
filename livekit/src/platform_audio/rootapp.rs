@@ -378,7 +378,7 @@ pub struct RootAudioControl {
     pub auto_sensitivity_minimum_db: Option<f32>,
     /// The voice gain's tunables: the chain clamps each to its range and takes
     /// a non-finite one as its default (`rootapp_voice_dsp::VoiceGainTuning`):
-    /// most boost 0..18 dB (12), target -40..-10 dBFS (-25), rise and fall
+    /// most boost 0..18 dB (15), target -40..-10 dBFS (-25), rise and fall
     /// 0.5..20 dB/s (3, 2), level time constant 500..20000 ms (4000) and the
     /// speech probability from which a frame is speech 0..1 (0.5).
     pub voice_gain_max_db: Option<f32>,
@@ -1490,7 +1490,7 @@ mod tests {
 
         let applied = |dsp_available: bool| NativeAudioStats {
             dsp_available,
-            voice_gain_max_db: 12.0,
+            voice_gain_max_db: 15.0,
             voice_gain_target_db: -25.0,
             voice_gain_rise_db_per_second: 3.0,
             voice_gain_fall_db_per_second: 2.0,
@@ -1501,7 +1501,7 @@ mod tests {
         let stats = RootAudioStats::from_native(applied(true));
         assert_eq!(
             (stats.voice_gain_max_db, stats.voice_gain_target_db),
-            (Some(12.0), Some(-25.0))
+            (Some(15.0), Some(-25.0))
         );
         assert_eq!(
             (stats.voice_gain_rise_db_per_second, stats.voice_gain_fall_db_per_second),

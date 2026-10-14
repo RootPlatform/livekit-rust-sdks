@@ -89,7 +89,7 @@ fn a_quiet_talker_is_brought_up_to_the_target_within_a_few_seconds() {
 fn a_very_quiet_talker_gets_at_most_the_maximum_boost() {
     let mut gain = new_gain(0.0);
     talk_quiet_room(&mut gain, -46.0, 6.0);
-    assert_eq!(VoiceGainOptions::default().max_gain_db, 12.0);
+    assert_eq!(VoiceGainOptions::default().max_gain_db, 15.0);
     assert!(near(gain.gain_db(), VoiceGainOptions::default().max_gain_db, 1e-3));
 }
 
@@ -178,7 +178,7 @@ fn clicks_in_a_pause_cap_a_quiet_talkers_gain() {
         previous = gain.gain_db();
     }
 
-    assert!(in_range(talking, 11.9, VoiceGainOptions::default().max_gain_db), "{talking}");
+    assert!(in_range(talking, 14.9, VoiceGainOptions::default().max_gain_db), "{talking}");
     assert!(gain.gain_db() < talking - 6.0, "gain {} after typing vs {talking}", gain.gain_db());
     assert!(gain.noise_db() > -65.0, "noise estimate {}", gain.noise_db());
 }
@@ -288,7 +288,7 @@ fn a_quiet_room_still_boosts_a_quiet_talker() {
     let mut gain = new_gain(0.0);
     room_talk(&mut gain, Some(-38.0), -75.0, 8.0, None);
     assert!(in_range(gain.room_noise_db(), -78.0, -70.0), "{}", gain.room_noise_db());
-    assert!(in_range(gain.gain_db(), 11.5, 12.0), "{}", gain.gain_db());
+    assert!(in_range(gain.gain_db(), 12.5, 13.5), "{}", gain.gain_db());
 }
 
 #[test]
@@ -336,14 +336,14 @@ fn a_remembered_gain_is_kept_in_a_quiet_room_until_the_person_speaks() {
 #[test]
 fn a_noise_burst_in_a_pause_barely_moves_the_room() {
     let mut gain = new_gain(0.0);
-    room_talk(&mut gain, Some(-38.0), -64.0, 8.0, None);
+    room_talk(&mut gain, Some(-38.0), -66.0, 8.0, None);
     let before = gain.room_noise_db();
     let talking = gain.gain_db();
-    assert!(in_range(talking, 11.9, 12.0), "{talking}");
+    assert!(in_range(talking, 12.5, 13.5), "{talking}");
     room_talk_with(
         &mut gain,
         None,
-        &|f| if (50..80).contains(&f) { -34.0 } else { -64.0 },
+        &|f| if (50..80).contains(&f) { -36.0 } else { -66.0 },
         2.0,
         None,
     );
@@ -359,7 +359,7 @@ fn a_noise_burst_in_a_pause_barely_moves_the_room() {
 fn a_rising_room_caps_the_gain_at_the_fall_rate() {
     let mut gain = new_gain(0.0);
     room_talk(&mut gain, Some(-38.0), -75.0, 8.0, None);
-    assert!(in_range(gain.gain_db(), 11.5, 12.0), "{}", gain.gain_db());
+    assert!(in_range(gain.gain_db(), 12.5, 13.5), "{}", gain.gain_db());
     let start = gain.gain_db();
     let mut gains = room_talk_with(
         &mut gain,
@@ -519,10 +519,10 @@ fn the_start_moves_at_six_db_a_second_without_overshooting() {
 fn tuning_applies_on_the_next_frame_and_a_reset_clamps_to_the_maximum() {
     let mut gain = new_gain(0.0);
     talk_quiet_room(&mut gain, -46.0, 6.0);
-    assert!(near(gain.gain_db(), 12.0, 1e-3));
+    assert!(near(gain.gain_db(), 15.0, 1e-3));
     gain.set_tuning(&VoiceGainTuning { max_gain_db: 6.0, ..VoiceGainTuning::UNSET });
     talk_quiet_room(&mut gain, -46.0, 1.0);
-    assert!(in_range(gain.gain_db(), 9.9, 10.1), "falls at 2 dB/s: {}", gain.gain_db());
+    assert!(in_range(gain.gain_db(), 12.9, 13.1), "falls at 2 dB/s: {}", gain.gain_db());
     talk_quiet_room(&mut gain, -46.0, 4.0);
     assert!(near(gain.gain_db(), 6.0, 1e-6), "{}", gain.gain_db());
     gain.reset(30.0);
@@ -549,7 +549,7 @@ fn tunables_are_clamped_and_non_finite_ones_are_the_defaults() {
     );
     assert!(unset.fall_db_per_second.is_nan() && unset.level_time_constant_ms.is_nan());
     assert!(unset.min_speech_probability.is_nan());
-    assert_eq!((d.max_gain_db, d.target_db), (12.0, -25.0));
+    assert_eq!((d.max_gain_db, d.target_db), (15.0, -25.0));
     assert_eq!((d.rise_db_per_second, d.fall_db_per_second), (3.0, 2.0));
     assert_eq!((d.level_time_constant_ms, d.min_speech_probability), (4000.0, 0.5));
     let low = VoiceGainTuning {
@@ -595,7 +595,7 @@ fn reset_starts_over_from_the_given_gain() {
 fn start_gains_are_clamped_and_nan_is_zero() {
     assert_eq!(new_gain(f64::NAN).gain_db(), 0.0);
     assert_eq!(new_gain(-4.0).gain_db(), 0.0);
-    assert_eq!(new_gain(f64::INFINITY).gain_db(), 12.0);
+    assert_eq!(new_gain(f64::INFINITY).gain_db(), 15.0);
     assert!(new_gain(0.0).room_noise_db().is_nan());
     assert_eq!(new_gain(0.0).speech_level_db(), f64::NEG_INFINITY);
     assert_eq!(new_gain(0.0).noise_db(), -90.0);

@@ -161,13 +161,13 @@ fn gain_control_follows_the_setting_and_starts_from_the_remembered_gain() {
     assert_eq!(h.out.voice_gain_db, 4.0, "a reset while off only sets the start");
     h.settings.auto_gain = true;
     h.run(0.0);
-    assert_eq!(h.out.voice_gain_db, 12.0, "back on: from the newest reset, clamped to the maximum");
+    assert_eq!(h.out.voice_gain_db, 15.0, "back on: from the newest reset, clamped to the maximum");
 
     for db in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
         h.commands.gain_reset = true;
         h.commands.gain_reset_db = db;
         h.run(0.0);
-        assert_eq!(h.out.voice_gain_db, 12.0, "{db} is ignored");
+        assert_eq!(h.out.voice_gain_db, 15.0, "{db} is ignored");
     }
     h.commands.gain_reset = true;
     h.commands.gain_reset_db = -3.0;
@@ -473,11 +473,11 @@ fn a_gain_reset_with_a_reset_in_the_same_frame_survives_it() {
 }
 
 /// The host's maximum applies in the frame it arrives in, before that frame's gain reset: a reset
-/// clamps to it (and never above 18 dB), unset or non-finite is 12 dB.
+/// clamps to it (and never above 18 dB), unset or non-finite is 15 dB.
 #[test]
 fn a_gain_reset_is_clamped_to_the_hosts_maximum_from_the_same_frame() {
     for (max, reset, expected) in [
-        (f32::NAN, 30.0f32, 12.0f32),
+        (f32::NAN, 30.0f32, 15.0f32),
         (18.0, 30.0, 18.0),
         (40.0, 30.0, 18.0),
         (6.0, 10.0, 6.0),

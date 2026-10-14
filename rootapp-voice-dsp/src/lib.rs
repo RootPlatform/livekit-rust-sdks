@@ -43,7 +43,7 @@ pub const MAX_DENOISER_WAIT_FRAMES: u32 = 100;
 pub const DENOISER_STALL_FRAMES: u32 = 100;
 pub const TRANSMIT_FADE_MS: u32 = 5;
 /// Gain resets are clamped to 0..=this, and so is the voice gain's maximum a host can set (the
-/// default maximum is VoiceGainTuning::DEFAULT, 12 dB).
+/// default maximum is VoiceGainTuning::DEFAULT, 15 dB).
 pub const MAX_VOICE_GAIN_DB: f32 = 18.0;
 /// Auto sensitivity's open minimum (dBFS before the voice gain) while the host sets none.
 pub const AUTO_SENSITIVITY_MINIMUM_DB: f32 = -54.0;

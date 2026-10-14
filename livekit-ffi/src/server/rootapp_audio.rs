@@ -1566,7 +1566,7 @@ mod tests {
             speech_detection: Some(proto::RootAudioSpeechDetection::Gate as i32),
             echo_model: Some(proto::RootAudioEchoModel::Auto as i32),
             auto_sensitivity_minimum_db: Some(-54.0),
-            voice_gain_max_db: Some(12.0),
+            voice_gain_max_db: Some(15.0),
             voice_gain_target_db: Some(-25.0),
             voice_gain_rise_db_per_second: Some(3.0),
             voice_gain_fall_db_per_second: Some(2.0),
@@ -1576,7 +1576,7 @@ mod tests {
         assert_eq!(control.auto_sensitivity_minimum_db, Some(-54.0));
         assert_eq!(
             (control.voice_gain_max_db, control.voice_gain_target_db),
-            (Some(12.0), Some(-25.0))
+            (Some(15.0), Some(-25.0))
         );
         assert_eq!(
             (control.voice_gain_rise_db_per_second, control.voice_gain_fall_db_per_second),
@@ -1712,7 +1712,7 @@ mod tests {
         );
 
         let p: proto::RootAudioStats = RootAudioStats {
-            voice_gain_max_db: Some(12.0),
+            voice_gain_max_db: Some(15.0),
             voice_gain_target_db: Some(-25.0),
             voice_gain_rise_db_per_second: Some(3.0),
             voice_gain_fall_db_per_second: Some(2.0),
@@ -1721,7 +1721,7 @@ mod tests {
             ..Default::default()
         }
         .into();
-        assert_eq!((p.voice_gain_max_db, p.voice_gain_target_db), (Some(12.0), Some(-25.0)));
+        assert_eq!((p.voice_gain_max_db, p.voice_gain_target_db), (Some(15.0), Some(-25.0)));
         assert_eq!(
             (p.voice_gain_rise_db_per_second, p.voice_gain_fall_db_per_second),
             (Some(3.0), Some(2.0))

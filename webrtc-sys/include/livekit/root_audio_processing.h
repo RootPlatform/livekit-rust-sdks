@@ -70,7 +70,7 @@ enum class RootPushToTalk : uint32_t {
 };
 
 // The app's VoiceGain only boosts: a gain reset is clamped to 0..18 dB here,
-// and the chain clamps it to its maximum (12 dB unless the host sets another,
+// and the chain clamps it to its maximum (15 dB unless the host sets another,
 // at most this).
 constexpr float kRootMaxVoiceGainDb = 18.0f;
 

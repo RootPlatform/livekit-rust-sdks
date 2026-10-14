@@ -28,7 +28,7 @@ impl VoiceGainTuning {
         min_speech_probability: f32::NAN,
     };
     pub const DEFAULT: Self = Self {
-        max_gain_db: 12.0,
+        max_gain_db: 15.0,
         target_db: -25.0,
         rise_db_per_second: 3.0,
         fall_db_per_second: 2.0,

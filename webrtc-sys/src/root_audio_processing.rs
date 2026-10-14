@@ -980,14 +980,14 @@ mod processor_tests {
 
         h.gain_reset(30.0);
         run(&h, 48000, 1, 0.0);
-        assert_eq!(h.dsp(false).voice_gain_db, 12.0, "clamped to the voice gain's maximum");
+        assert_eq!(h.dsp(false).voice_gain_db, 15.0, "clamped to the voice gain's maximum");
         h.gain_reset(f32::NAN);
         run(&h, 48000, 1, 0.0);
-        assert_eq!(h.dsp(false).voice_gain_db, 12.0, "a non-finite reset is ignored");
+        assert_eq!(h.dsp(false).voice_gain_db, 15.0, "a non-finite reset is ignored");
 
         h.set_dsp(false, true, 0.025);
         run(&h, 48000, 1, 0.0);
-        assert_eq!(h.dsp(false).voice_gain_db, 12.0, "off keeps the last value");
+        assert_eq!(h.dsp(false).voice_gain_db, 15.0, "off keeps the last value");
         h.gain_reset(3.0);
         h.set_dsp(true, true, 0.025);
         run(&h, 48000, 1, 0.0);
@@ -1434,7 +1434,7 @@ mod processor_tests {
         let h = started(48000, 1);
         h.set_dsp(true, true, 0.025);
         for (max, reset, expected) in
-            [(f32::NAN, 15.0f32, 12.0f32), (6.0, 15.0, 6.0), (40.0, 15.0, 15.0), (-3.0, 15.0, 0.0)]
+            [(f32::NAN, 17.0f32, 15.0f32), (6.0, 17.0, 6.0), (40.0, 17.0, 17.0), (-3.0, 17.0, 0.0)]
         {
             h.set_voice_gain_tuning(tuning(max));
             h.gain_reset(reset);
@@ -1447,9 +1447,9 @@ mod processor_tests {
         h.reset_controls();
         assert!(h.dsp(false).voice_gain.max_gain_db.is_nan(), "a reset forgets them");
         h.set_dsp(true, true, 0.025);
-        h.gain_reset(15.0);
+        h.gain_reset(17.0);
         run(&h, 48000, 1, 0.0);
-        assert_eq!(h.dsp(false).voice_gain_db, 12.0);
+        assert_eq!(h.dsp(false).voice_gain_db, 15.0);
 
         let applied = root_voice_gain_tuning(RootVoiceGainTuning {
             max_gain_db: 40.0,

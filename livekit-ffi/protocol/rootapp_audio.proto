@@ -203,7 +203,7 @@ message RootAudioControl {
   // when the first platform audio handle opens and when the last one closes (as the other DSP
   // settings). Libraries that predate them keep hw.11's voice gain (18 dB, the power-averaged level).
   // RootAudioStats fields 126-131 are the values applied.
-  // The most it boosts, dB: 0..18, default 12. A gain reset is clamped to it in the frame it arrives in.
+  // The most it boosts, dB: 0..18, default 15. A gain reset is clamped to it in the frame it arrives in.
   optional float voice_gain_max_db = 17;
   // The talker's level it aims for (its average frame level in dB), dBFS: -40..-10, default -25.
   optional float voice_gain_target_db = 18;

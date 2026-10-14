@@ -861,7 +861,7 @@ fn adm_proxy_controller_stores_the_voice_gain_tunables_until_a_reset_and_reports
             s.voice_gain_min_speech_probability,
         ]
     };
-    assert_eq!(applied(&h), [12.0, -25.0, 3.0, 2.0, 4000.0, 0.5], "the chain's defaults");
+    assert_eq!(applied(&h), [15.0, -25.0, 3.0, 2.0, 4000.0, 0.5], "the chain's defaults");
     assert!(h.apply_control(&RootAudioControlUpdate {
         has_voice_gain_max_db: true,
         voice_gain_max_db: 40.0,
@@ -892,7 +892,7 @@ fn adm_proxy_controller_stores_the_voice_gain_tunables_until_a_reset_and_reports
     h.reset_root_audio(false);
     assert!(h.control_state().voice_gain_max_db.is_nan());
     assert!(h.control_state().voice_gain_level_time_constant_ms.is_nan());
-    assert_eq!(applied(&h), [12.0, -25.0, 3.0, 2.0, 4000.0, 0.5]);
+    assert_eq!(applied(&h), [15.0, -25.0, 3.0, 2.0, 4000.0, 0.5]);
 }
 
 fn denoiser_completions(h: &AdmProxyHarness, count: usize) -> Vec<RootDenoiserCompletionItem> {
