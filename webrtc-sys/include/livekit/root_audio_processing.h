@@ -71,6 +71,11 @@ enum class RootPushToTalk : uint32_t {
 // The app's VoiceGain only boosts, up to 18 dB.
 constexpr float kRootMaxVoiceGainDb = 18.0f;
 
+// A raw capture frame whose every sample is at or below -100 dBFS (a ±1
+// signal) is digital silence: a hardware mute. Under one int16 step
+// (-90.3 dBFS), so an int16 frame has to be all zeros.
+constexpr float kRootCaptureSilencePeak = 1e-5f;
+
 // The factory builds this APM, and with it the voice chain, on desktop only
 // (the condition of LK_ADM_MOBILE); mobile keeps libwebrtc's APM. The DSP
 // capability bit is set exactly where this holds.
@@ -157,6 +162,8 @@ struct RootDspStatsSnapshot {
   uint64_t speech_frames = 0;
   uint64_t speech_closed_frames = 0;
   uint64_t speech_unavailable_frames = 0;
+  // The stored setting (NaN: none, the chain's default).
+  float auto_sensitivity_minimum_db = std::numeric_limits<float>::quiet_NaN();
 };
 
 struct RootSpeakingSnapshot {
@@ -189,6 +196,15 @@ struct RootCaptureState {
   std::atomic<bool> denoiser_wanted{false};
   // RootSpeechDetection; off until the host asks (the managed engine's gate).
   std::atomic<uint32_t> speech_detection{0};
+  // Auto sensitivity's open minimum as the host set it, dBFS before the
+  // voice gain; the chain clamps it, and NaN (none) is its default.
+  std::atomic<float> auto_sensitivity_minimum_db{
+      std::numeric_limits<float>::quiet_NaN()};
+  // Stored by the APM decorator before each capture frame it forwards: that
+  // frame's raw input was digital silence (kRootCaptureSilencePeak). The
+  // processor takes it, so a frame that did not come through the decorator
+  // never sees a stale one.
+  std::atomic<bool> capture_silent{false};
   // Command: the payload is stored before the sequence number is bumped.
   std::atomic<float> gain_reset_db{0.0f};
   std::atomic<uint64_t> gain_reset_seq{0};
@@ -327,9 +343,10 @@ RootCaptureFormatSnapshot ReadCaptureFormat(const RootCaptureState& state);
 // denoiser slot and copies the result to the other channels:
 //   sanitise, voice gain level -> speech detector (while speech_detection is
 //   set; 16, 32 and 48 kHz) -> denoiser slot (Effects SDK) -> aligner ->
-//   voice gain -> auto sensitivity -> startup hold -> noise gate (with the
-//   speech gate) -> input volume (20 ms ramp) -> mute/PTT gate (5 ms fade
-//   each way).
+//   voice gain -> auto sensitivity (learning nothing from a frame whose raw
+//   input the decorator found digitally silent) -> startup hold -> noise
+//   gate (with the speech gate) -> input volume (20 ms ramp) -> mute/PTT gate
+//   (5 ms fade each way).
 // Real-time code: no locks, allocation, logging or APM calls. Initialize runs
 // under both APM locks on up to four threads and only stores the format.
 class RootCaptureProcessor : public webrtc::CustomProcessing {
@@ -868,6 +885,9 @@ class RootProcessorHarness {
   void set_denoise_power(float power) const;
   // RootSpeechDetection, stored as the controller stores it.
   void set_speech_detection(uint32_t mode) const;
+  void set_auto_sensitivity_minimum_db(float db) const;
+  // As the APM decorator does before the next frame.
+  void set_capture_silent(bool silent) const;
   void set_webrtc_ns_applied(bool applied) const;
   void set_ns_fallback_decided(bool on) const;
   void bump_stream_epoch() const;
@@ -938,6 +958,10 @@ class RootApmHarness {
   // Real APM only: one 10 ms int16 frame of a 1 kHz tone of amplitude
   // `amplitude` through ProcessStream. Returns the output's peak.
   int16_t process_frame(int32_t rate, size_t channels, int16_t amplitude) const;
+  // The same through the float ProcessStream (a ±1 signal).
+  float process_float_frame(int32_t rate,
+                            size_t channels,
+                            float amplitude) const;
   void set_mic_muted(bool muted) const;
   void set_dsp(bool auto_gain,
                bool auto_sensitivity,

@@ -157,6 +157,9 @@ pub mod ffi {
         pub gate_open_delay_us: u64,
         pub ns_gap_frames: u64,
         pub ns_fallback_pending_frames: u64,
+        /// The auto sensitivity minimum the chain applies (dBFS before the
+        /// voice gain).
+        pub auto_sensitivity_minimum_db: f32,
         pub denoiser_installed: bool,
         pub denoiser_frames: u64,
         pub denoiser_misses: u64,
@@ -266,6 +269,10 @@ pub mod ffi {
         /// 0 off, 1 on, 2 auto; other values are off.
         pub has_echo_model: bool,
         pub echo_model: u32,
+        /// dBFS before the voice gain; the chain clamps it to -80..-30 and
+        /// takes a non-finite value as its default (-54).
+        pub has_auto_sensitivity_minimum_db: bool,
+        pub auto_sensitivity_minimum_db: f32,
     }
 
     /// The stored controls (tests).
@@ -284,6 +291,8 @@ pub mod ffi {
         pub deafened: bool,
         pub denoiser_wanted: bool,
         pub speech_detection: u32,
+        /// As stored (NaN: none, the chain's default).
+        pub auto_sensitivity_minimum_db: f32,
         pub stream_epoch: u64,
         pub dsp_reset_seq: u64,
     }

@@ -816,6 +816,35 @@ fn adm_proxy_controller_stores_speech_detection_until_a_reset_and_turns_unknown_
     assert_eq!((stats.speech_detection, stats.speech_probability), (0, -1.0));
 }
 
+#[test]
+fn adm_proxy_controller_stores_the_auto_sensitivity_minimum_until_a_reset_and_reports_it_clamped() {
+    let h = harness(&["{spk}"], &["{mic}"]);
+    assert!(h.control_state().auto_sensitivity_minimum_db.is_nan(), "none until the host sets one");
+    assert_eq!(h.stats().auto_sensitivity_minimum_db, -54.0, "the chain's default");
+    let set = |db: f32| {
+        assert!(h.apply_control(&RootAudioControlUpdate {
+            has_auto_sensitivity_minimum_db: true,
+            auto_sensitivity_minimum_db: db,
+            ..Default::default()
+        }));
+        h.stats().auto_sensitivity_minimum_db
+    };
+    assert_eq!(set(-50.0), -50.0);
+    assert_eq!(set(-95.0), -80.0);
+    assert_eq!(set(0.0), -30.0);
+    assert_eq!(set(f32::NAN), -54.0);
+    assert_eq!(set(-48.0), -48.0);
+    h.apply_control(&RootAudioControlUpdate {
+        has_mic_muted: true,
+        mic_muted: true,
+        ..Default::default()
+    });
+    assert_eq!(h.control_state().auto_sensitivity_minimum_db, -48.0, "an unset field keeps it");
+    h.reset_root_audio(false);
+    assert!(h.control_state().auto_sensitivity_minimum_db.is_nan());
+    assert_eq!(h.stats().auto_sensitivity_minimum_db, -54.0);
+}
+
 fn denoiser_completions(h: &AdmProxyHarness, count: usize) -> Vec<RootDenoiserCompletionItem> {
     let all = std::cell::RefCell::new(Vec::new());
     wait_until("denoiser completions", || {

@@ -18,7 +18,8 @@
 //! only reachable through libwebrtc.
 
 use rootapp_voice_dsp::{
-    DenoiserOutput, DspChain, DspCommands, DspOutputs, DspSettings, PushToTalk, SpeechDetection,
+    sanitize, DenoiserOutput, DspChain, DspCommands, DspOutputs, DspSettings, PushToTalk,
+    SpeechDetection,
 };
 
 #[cxx::bridge(namespace = "livekit_ffi")]
@@ -26,7 +27,9 @@ pub mod ffi {
     /// `rootapp_voice_dsp::DspSettings`; push_to_talk 0 voice activity, 1 held,
     /// anything else released; speech_detection 0 off, 1 ring, 2 gate, anything
     /// else off; speech_probability the detector's for this frame (negative:
-    /// it did not run).
+    /// it did not run); capture_silent the decorator found this frame's raw
+    /// input digitally silent; auto_sensitivity_minimum_db as the host set it
+    /// (NaN: the chain's default).
     #[derive(Debug, Clone, Copy, Default)]
     pub struct RootDspSettings {
         pub sample_rate: u32,
@@ -39,6 +42,8 @@ pub mod ffi {
         pub denoiser_wanted: bool,
         pub speech_detection: u32,
         pub speech_probability: f32,
+        pub capture_silent: bool,
+        pub auto_sensitivity_minimum_db: f32,
     }
 
     #[derive(Debug, Clone, Copy, Default)]
@@ -97,6 +102,10 @@ pub mod ffi {
     extern "Rust" {
         type RootDspChain;
 
+        /// The auto sensitivity minimum (dBFS before the voice gain) the chain
+        /// applies for a host's setting: non-finite is the default (-54), the
+        /// rest clamped to -80..-30.
+        fn root_auto_sensitivity_minimum_db(requested: f32) -> f32;
         fn new_root_dsp_chain(max_rate: u32) -> Box<RootDspChain>;
         fn pre_denoise(
             self: &mut RootDspChain,
@@ -205,6 +214,8 @@ pub mod ffi {
         pub speech_frames: u64,
         pub speech_closed_frames: u64,
         pub speech_unavailable_frames: u64,
+        /// The stored setting (NaN: none).
+        pub auto_sensitivity_minimum_db: f32,
     }
 
     /// RootSpeechDetector over a synthetic signal (`root_speech_detector_probe`).
@@ -280,6 +291,9 @@ pub mod ffi {
         fn set_denoise_power(self: &RootProcessorHarness, power: f32);
         /// 0 off, 1 ring, 2 gate (as the controller stores it).
         fn set_speech_detection(self: &RootProcessorHarness, mode: u32);
+        fn set_auto_sensitivity_minimum_db(self: &RootProcessorHarness, db: f32);
+        /// As the APM decorator does before the next frame.
+        fn set_capture_silent(self: &RootProcessorHarness, silent: bool);
         fn set_webrtc_ns_applied(self: &RootProcessorHarness, applied: bool);
         /// As the denoiser control does when it decides the NS fallback.
         fn set_ns_fallback_decided(self: &RootProcessorHarness, on: bool);
@@ -342,6 +356,13 @@ pub mod ffi {
         fn pending_tasks(self: &RootApmHarness) -> u32;
         fn probe(self: &RootApmHarness) -> RootDecoratorProbe;
         fn process_frame(self: &RootApmHarness, rate: i32, channels: usize, amplitude: i16) -> i16;
+        /// The same through the float ProcessStream (a ±1 signal).
+        fn process_float_frame(
+            self: &RootApmHarness,
+            rate: i32,
+            channels: usize,
+            amplitude: f32,
+        ) -> f32;
         fn set_mic_muted(self: &RootApmHarness, muted: bool);
         fn set_dsp(
             self: &RootApmHarness,
@@ -398,6 +419,10 @@ fn new_root_dsp_chain(max_rate: u32) -> Box<RootDspChain> {
     Box::new(RootDspChain { chain: DspChain::new(max_rate), out: DspOutputs::default() })
 }
 
+fn root_auto_sensitivity_minimum_db(requested: f32) -> f32 {
+    sanitize::auto_sensitivity_minimum_db(requested)
+}
+
 fn dsp_settings(settings: &ffi::RootDspSettings) -> DspSettings {
     DspSettings {
         sample_rate: settings.sample_rate,
@@ -410,6 +435,8 @@ fn dsp_settings(settings: &ffi::RootDspSettings) -> DspSettings {
         denoiser_wanted: settings.denoiser_wanted,
         speech_detection: SpeechDetection::from_wire(settings.speech_detection),
         speech_probability: settings.speech_probability,
+        capture_silent: settings.capture_silent,
+        auto_sensitivity_minimum_db: settings.auto_sensitivity_minimum_db,
     }
 }
 
@@ -1294,6 +1321,54 @@ mod processor_tests {
         }
         assert_eq!(run(&h, 48000, 1, 1.0), vec![1.0; 480]);
     }
+
+    fn threshold_db(h: &RootProcessorHarness) -> f64 {
+        20.0 * f64::from(h.dsp(false).threshold).log10()
+    }
+
+    /// The decorator's flag, set by hand here: a digitally silent frame teaches auto sensitivity
+    /// nothing, and the processor takes the flag, so the next frame without one is a level again.
+    #[test]
+    fn root_capture_processor_learns_nothing_from_a_frame_flagged_silent_and_takes_the_flag() {
+        let h = started(48000, 1);
+        h.set_dsp(false, true, 0.025);
+        let room = 32768.0 * 10f32.powf(-60.0 / 20.0);
+        for _ in 0..300 {
+            run(&h, 48000, 1, room);
+        }
+        let learned = h.dsp(false).threshold;
+        assert!((threshold_db(&h) + 52.0).abs() < 0.5, "{}", threshold_db(&h));
+        for _ in 0..300 {
+            h.set_capture_silent(true);
+            run(&h, 48000, 1, 0.0);
+        }
+        assert_eq!(h.dsp(false).threshold, learned);
+        run(&h, 48000, 1, 0.0);
+        assert!(h.dsp(false).threshold < learned, "an unflagged frame of zeros is a level");
+    }
+
+    #[test]
+    fn root_capture_processor_applies_the_auto_sensitivity_minimum_it_is_given() {
+        let h = started(48000, 1);
+        h.set_dsp(false, true, 0.025);
+        for (setting, expected) in
+            [(f32::NAN, -54.0), (-40.0, -40.0), (-100.0, -80.0), (-20.0, -30.0), (-54.0, -54.0)]
+        {
+            h.set_auto_sensitivity_minimum_db(setting);
+            for _ in 0..300 {
+                run(&h, 48000, 1, 0.0);
+            }
+            assert!((threshold_db(&h) - expected).abs() < 1e-3, "{setting}: {}", threshold_db(&h));
+        }
+        h.set_auto_sensitivity_minimum_db(-40.0);
+        h.reset_controls();
+        assert!(h.dsp(false).auto_sensitivity_minimum_db.is_nan(), "a reset forgets it");
+        h.set_dsp(false, true, 0.025);
+        for _ in 0..300 {
+            run(&h, 48000, 1, 0.0);
+        }
+        assert!((threshold_db(&h) + 54.0).abs() < 1e-3, "{}", threshold_db(&h));
+    }
 }
 
 #[cfg(test)]
@@ -1610,6 +1685,63 @@ mod decorator_tests {
 
     fn fake() -> cxx::UniquePtr<RootApmHarness> {
         new_root_apm_harness(false)
+    }
+
+    fn threshold_db(h: &RootApmHarness) -> f64 {
+        20.0 * f64::from(h.dsp(false).threshold).log10()
+    }
+
+    /// The real APM, no echo canceller, auto sensitivity on and no voice gain.
+    fn real_auto() -> cxx::UniquePtr<RootApmHarness> {
+        let h = new_root_apm_harness(true);
+        h.engine_apply(false, false, false, false, true);
+        h.set_dsp(false, true, 0.025);
+        h
+    }
+
+    /// A hardware mute through the real APM: the decorator flags raw int16 frames of zeros (at any
+    /// channel count) before the APM, so auto sensitivity keeps what the room taught it whatever the
+    /// high-pass filter's tail; one int16 step of capture is live and is learned.
+    #[test]
+    fn root_apm_decorator_flags_digital_silence_on_the_raw_capture() {
+        for channels in [1usize, 2] {
+            let h = real_auto();
+            for _ in 0..500 {
+                h.process_frame(48000, channels, 73);
+            }
+            let learned = h.dsp(false).threshold;
+            assert!((threshold_db(&h) + 48.0).abs() < 1.0, "{channels}: {}", threshold_db(&h));
+            for _ in 0..300 {
+                h.process_frame(48000, channels, 0);
+            }
+            assert_eq!(h.dsp(false).threshold, learned, "{channels}");
+            for _ in 0..300 {
+                h.process_frame(48000, channels, 1);
+            }
+            assert!(threshold_db(&h) < -53.0, "{channels}: {}", threshold_db(&h));
+        }
+    }
+
+    /// The float path's bound: a frame peaking at -100 dBFS is silence, one at -94 dBFS is not.
+    #[test]
+    fn root_apm_decorator_float_capture_is_silent_up_to_minus_100_dbfs() {
+        let room = 10f32.powf(-56.0 / 20.0) * std::f32::consts::SQRT_2;
+        for (amplitude, silent) in [(0.0f32, true), (1e-5, true), (2e-5, false)] {
+            let h = real_auto();
+            for _ in 0..500 {
+                h.process_float_frame(48000, 1, room);
+            }
+            let learned = h.dsp(false).threshold;
+            assert!((threshold_db(&h) + 48.0).abs() < 1.0, "{}", threshold_db(&h));
+            for _ in 0..300 {
+                h.process_float_frame(48000, 1, amplitude);
+            }
+            if silent {
+                assert_eq!(h.dsp(false).threshold, learned, "{amplitude}");
+            } else {
+                assert!(threshold_db(&h) < -53.0, "{amplitude}: {}", threshold_db(&h));
+            }
+        }
     }
 
     #[test]

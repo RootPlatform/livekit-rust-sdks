@@ -146,10 +146,10 @@ enum RootAudioOutputDeviceKind {
 
 // Live control. Only the fields that are set change. Values are sanitised natively (finite, clamped).
 // The response's error says "not supported by this build" when a set field has nothing to act on
-// (the other fields are applied). Fields 8-14 act with the DSP chain (capability DSP; denoise_power
-// and denoiser_wanted with DENOISER, speech_detection with SPEECH_DETECTION) and are only stored by
-// builds without it. echo_model acts with ECHO_MODEL; builds without it answer "not supported by this
-// build" when it is set, and libraries that predate it ignore it.
+// (the other fields are applied). Fields 8-14 and 16 act with the DSP chain (capability DSP;
+// denoise_power and denoiser_wanted with DENOISER, speech_detection with SPEECH_DETECTION) and are
+// only stored by builds without it. echo_model acts with ECHO_MODEL; builds without it answer "not
+// supported by this build" when it is set. Libraries that predate a field ignore it.
 message RootAudioControl {
   // Transmit gate: no audio leaves and no speaking is reported while muted. It fades over 5 ms each
   // way; mic_muted and push_to_talk of one control change together.
@@ -176,7 +176,9 @@ message RootAudioControl {
   optional bool auto_gain = 9;
   // Noise gate threshold, linear RMS of a ±1 signal, 0..1 (manual sensitivity).
   optional float gate_threshold = 10;
-  // The threshold follows the noise floor instead of gate_threshold.
+  // The threshold follows the noise floor instead of gate_threshold. Capture frames that are digital
+  // silence (a hardware mute: every raw sample at or below -100 dBFS, before the APM) teach it
+  // nothing, and after 500 ms or more of them it relearns the floor as at the start of a call.
   optional bool auto_sensitivity = 11;
   // Command: restart the voice gain from this gain in dB (0..18); every set value restarts it once.
   optional float gain_reset_db = 12;
@@ -189,6 +191,12 @@ message RootAudioControl {
   // OFF until set, and again when the first platform audio handle opens and when the last one closes (as
   // the other DSP settings). Values this build does not know are OFF.
   optional RootAudioEchoModel echo_model = 15;
+  // Automatic sensitivity's open minimum, dBFS before the voice gain (it rises with at most 11 dB of
+  // the gain): the noise gate never opens below it, whatever the noise floor. Clamped to -80..-30; a
+  // non-finite value is the default. -54 until set, and again when the first platform audio handle
+  // opens and when the last one closes (as the other DSP settings); -60 in libraries that predate it.
+  // RootAudioStats.auto_sensitivity_minimum_db is the value applied.
+  optional float auto_sensitivity_minimum_db = 16;
 }
 message RootAudioSetControlRequest {
   required uint64 platform_audio_handle = 1;
@@ -533,6 +541,11 @@ message RootAudioStats {
   // The CPU kill switch tripped in this session (inference p99 over 2 ms in two windows in a row): the
   // model stays off until the session ends.
   optional bool echo_model_kill_switch = 124;
+
+  // DSP chain (capability DSP; absent without it and from libraries that predate it): the automatic
+  // sensitivity minimum native applies (RootAudioControl.auto_sensitivity_minimum_db after clamping),
+  // dBFS before the voice gain.
+  optional float auto_sensitivity_minimum_db = 125;
 }
 // One playout mixer source (a remote audio stream): its audio as it reached the mixer, decoded and
 // before its gain (tile volume, master volume, deafen; a muted frame counts as silence), as a sum of

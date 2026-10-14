@@ -98,6 +98,39 @@ webrtc::StreamConfig UnpackFormat(uint64_t packed) {
                               static_cast<size_t>(packed & 0xffff));
 }
 
+bool CaptureSilent(const int16_t* src, const webrtc::StreamConfig& config) {
+  const size_t samples = config.num_frames() * config.num_channels();
+  if (src == nullptr || samples == 0) {
+    return false;
+  }
+  for (size_t i = 0; i < samples; ++i) {
+    if (src[i] != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool CaptureSilent(const float* const* src,
+                   const webrtc::StreamConfig& config) {
+  if (src == nullptr || config.num_frames() == 0 ||
+      config.num_channels() == 0) {
+    return false;
+  }
+  for (size_t c = 0; c < config.num_channels(); ++c) {
+    const float* channel = src[c];
+    if (channel == nullptr) {
+      return false;
+    }
+    for (size_t i = 0; i < config.num_frames(); ++i) {
+      if (!(std::fabs(channel[i]) <= kRootCaptureSilencePeak)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 }  // namespace
 
 webrtc::scoped_refptr<webrtc::AudioProcessing> BuildRootApmVariant(
@@ -201,6 +234,8 @@ void RootCaptureState::ResetControls(bool close_gate) {
   auto_sensitivity.store(true, std::memory_order_relaxed);
   denoiser_wanted.store(false, std::memory_order_relaxed);
   speech_detection.store(0, std::memory_order_relaxed);
+  auto_sensitivity_minimum_db.store(std::numeric_limits<float>::quiet_NaN(),
+                                    std::memory_order_relaxed);
   // A press of the last session that no frame saw is no delay of this one.
   gate_open_stamp_us.store(0, std::memory_order_relaxed);
   ClearSpeaking();
@@ -282,6 +317,7 @@ RootDspStatsSnapshot RootCaptureState::ReadDspStats(bool take_maxima) {
   s.speech_frames = speech_frames.load(kRelaxed);
   s.speech_closed_frames = speech_closed_frames.load(kRelaxed);
   s.speech_unavailable_frames = speech_unavailable_frames.load(kRelaxed);
+  s.auto_sensitivity_minimum_db = auto_sensitivity_minimum_db.load(kRelaxed);
   s.aligner_primed = aligner_primed.load(kRelaxed);
   s.aligner_buffered_samples = aligner_buffered_samples.load(kRelaxed);
   s.aligner_underruns = aligner_underruns.load(kRelaxed);
@@ -382,6 +418,9 @@ void RootCaptureProcessor::Process(webrtc::AudioBuffer* audio) {
       slot != nullptr && state.denoiser_wanted.load(kRelaxed);
   settings.speech_detection = state.speech_detection.load(kRelaxed);
   settings.speech_probability = -1.0f;
+  settings.capture_silent = state.capture_silent.exchange(false, kRelaxed);
+  settings.auto_sensitivity_minimum_db =
+      state.auto_sensitivity_minimum_db.load(kRelaxed);
   const float power = state.denoise_power.load(kRelaxed);
 
   // The gain reset first: a session reset stored before it is then seen in
@@ -1431,6 +1470,10 @@ int RootApmDecorator::ProcessStream(const int16_t* const src,
               input_config, now_us);
     last_capture_ms_.store(clock_(), std::memory_order_relaxed);
   }
+  if (capture_) {
+    capture_->capture_silent.store(CaptureSilent(src, input_config),
+                                   std::memory_order_relaxed);
+  }
   int result = 0;
   {
     Use apm(*this);
@@ -1457,6 +1500,10 @@ int RootApmDecorator::ProcessStream(const float* const* src,
               capture_frames_kept_.load(std::memory_order_relaxed), src,
               input_config, now_us, WarmApi::kFloat);
     last_capture_ms_.store(clock_(), std::memory_order_relaxed);
+  }
+  if (capture_) {
+    capture_->capture_silent.store(CaptureSilent(src, input_config),
+                                   std::memory_order_relaxed);
   }
   int result = 0;
   {
@@ -1729,6 +1776,14 @@ void RootProcessorHarness::set_speech_detection(uint32_t mode) const {
   state_->speech_detection.store(mode);
 }
 
+void RootProcessorHarness::set_auto_sensitivity_minimum_db(float db) const {
+  state_->auto_sensitivity_minimum_db.store(db);
+}
+
+void RootProcessorHarness::set_capture_silent(bool silent) const {
+  state_->capture_silent.store(silent);
+}
+
 void RootProcessorHarness::set_denoiser_wanted(bool wanted) const {
   state_->denoiser_wanted.store(wanted);
 }
@@ -1842,6 +1897,7 @@ RootProcessorDsp DspProbe(RootCaptureState& state, bool take_maxima) {
   dsp.speech_frames = s.speech_frames;
   dsp.speech_closed_frames = s.speech_closed_frames;
   dsp.speech_unavailable_frames = s.speech_unavailable_frames;
+  dsp.auto_sensitivity_minimum_db = s.auto_sensitivity_minimum_db;
   return dsp;
 }
 
@@ -2254,6 +2310,32 @@ int16_t RootApmHarness::process_frame(int32_t rate,
     peak = std::max(peak, std::abs(static_cast<int>(sample)));
   }
   return static_cast<int16_t>(std::min(peak, 32767));
+}
+
+float RootApmHarness::process_float_frame(int32_t rate,
+                                          size_t channels,
+                                          float amplitude) const {
+  const size_t frames = static_cast<size_t>(rate / 100);
+  std::vector<std::vector<float>> data(channels, std::vector<float>(frames));
+  std::vector<float*> pointers(channels);
+  for (size_t c = 0; c < channels; ++c) {
+    for (size_t i = 0; i < frames; ++i) {
+      const double phase = 2.0 * 3.14159265358979 * 1000.0 *
+                           static_cast<double>(i) / static_cast<double>(rate);
+      data[c][i] = static_cast<float>(amplitude * std::sin(phase));
+    }
+    pointers[c] = data[c].data();
+  }
+  const webrtc::StreamConfig config(rate, channels);
+  decorator_->set_stream_delay_ms(0);
+  decorator_->ProcessStream(pointers.data(), config, config, pointers.data());
+  float peak = 0.0f;
+  for (const auto& channel : data) {
+    for (float sample : channel) {
+      peak = std::max(peak, std::fabs(sample));
+    }
+  }
+  return peak;
 }
 
 void RootApmHarness::set_mic_muted(bool muted) const {

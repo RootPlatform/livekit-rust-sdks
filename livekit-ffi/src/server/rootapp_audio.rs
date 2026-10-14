@@ -897,6 +897,7 @@ pub fn root_audio_control(control: &proto::RootAudioControl) -> RootAudioControl
         denoiser_wanted: control.denoiser_wanted,
         speech_detection: control.speech_detection.map(speech_detection),
         echo_model: control.echo_model.map(echo_model),
+        auto_sensitivity_minimum_db: control.auto_sensitivity_minimum_db,
     }
     .sanitized()
 }
@@ -1296,6 +1297,7 @@ impl From<RootAudioStats> for proto::RootAudioStats {
             dsp_flushes: stats.dsp_flushes,
             gate_open_delay_us: stats.gate_open_delay_us,
             ns_gap_frames: stats.ns_gap_frames,
+            auto_sensitivity_minimum_db: stats.auto_sensitivity_minimum_db,
             denoiser_rate: stats.denoiser_rate,
             denoiser_installs: stats.denoiser_installs,
             denoiser_bypassed_frames: stats.denoiser_bypassed_frames,
@@ -1551,7 +1553,9 @@ mod tests {
             denoiser_wanted: Some(true),
             speech_detection: Some(proto::RootAudioSpeechDetection::Gate as i32),
             echo_model: Some(proto::RootAudioEchoModel::Auto as i32),
+            auto_sensitivity_minimum_db: Some(-54.0),
         });
+        assert_eq!(control.auto_sensitivity_minimum_db, Some(-54.0));
         assert_eq!(control.denoiser_wanted, Some(true));
         assert_eq!(control.speech_detection, Some(SpeechDetection::Gate));
         assert_eq!(control.echo_model, Some(EchoModel::Auto));
@@ -1631,6 +1635,28 @@ mod tests {
         let absent: proto::RootAudioStats = RootAudioStats::default().into();
         assert_eq!((absent.speech_detection, absent.speech_probability), (None, None));
         assert_eq!((absent.speech, absent.speech_frames), (None, None));
+    }
+
+    #[test]
+    fn rootapp_audio_auto_sensitivity_minimum_passes_through_and_its_stat_converts() {
+        let minimum = |value: Option<f32>| {
+            root_audio_control(&proto::RootAudioControl {
+                auto_sensitivity_minimum_db: value,
+                ..Default::default()
+            })
+            .auto_sensitivity_minimum_db
+        };
+        assert_eq!(minimum(None), None);
+        assert_eq!(minimum(Some(-54.0)), Some(-54.0));
+        assert_eq!(minimum(Some(-120.0)), Some(-120.0), "clamped by the chain, not here");
+        assert!(minimum(Some(f32::NAN)).is_some_and(f32::is_nan), "the chain's default");
+
+        let p: proto::RootAudioStats =
+            RootAudioStats { auto_sensitivity_minimum_db: Some(-54.0), ..Default::default() }
+                .into();
+        assert_eq!(p.auto_sensitivity_minimum_db, Some(-54.0));
+        let absent: proto::RootAudioStats = RootAudioStats::default().into();
+        assert_eq!(absent.auto_sensitivity_minimum_db, None);
     }
 
     fn effect_request(data_ptr: u64, sample_count: u32) -> proto::RootAudioRegisterEffectRequest {

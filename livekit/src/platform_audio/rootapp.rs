@@ -343,10 +343,11 @@ pub struct EchoModelStats {
 /// `auto_sensitivity`, the `gain_reset_db` command and `denoiser_wanted` (the
 /// host's noise suppression mode is the Effects SDK: the startup hold waits
 /// for the denoiser and native WebRTC NS covers a denoiser that stops or does
-/// not arrive) and `speech_detection` (off until set, and after every session
-/// start). Builds without the chain only store them. `echo_model` is off until
-/// set and after every session start; without [`ECHO_MODEL_AVAILABLE`] it is
-/// not supported.
+/// not arrive), `speech_detection` (off until set, and after every session
+/// start) and `auto_sensitivity_minimum_db` (the chain's -54 dBFS until set,
+/// and after every session start). Builds without the chain only store them.
+/// `echo_model` is off until set and after every session start; without
+/// [`ECHO_MODEL_AVAILABLE`] it is not supported.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct RootAudioControl {
     pub mic_muted: Option<bool>,
@@ -370,6 +371,9 @@ pub struct RootAudioControl {
     pub denoiser_wanted: Option<bool>,
     pub speech_detection: Option<SpeechDetection>,
     pub echo_model: Option<EchoModel>,
+    /// Auto sensitivity's open minimum, dBFS before the voice gain: the chain
+    /// clamps it to -80..-30 and takes a non-finite one as its default (-54).
+    pub auto_sensitivity_minimum_db: Option<f32>,
 }
 
 impl RootAudioControl {
@@ -430,6 +434,8 @@ impl RootAudioControl {
             speech_detection: c.speech_detection.map(SpeechDetection::to_wire).unwrap_or_default(),
             has_echo_model: c.echo_model.is_some(),
             echo_model: c.echo_model.map(EchoModel::to_wire).unwrap_or_default(),
+            has_auto_sensitivity_minimum_db: c.auto_sensitivity_minimum_db.is_some(),
+            auto_sensitivity_minimum_db: c.auto_sensitivity_minimum_db.unwrap_or_default(),
         }
     }
 }
@@ -719,6 +725,9 @@ pub struct RootAudioStats {
     pub dsp_flushes: Option<u64>,
     pub gate_open_delay_us: Option<u64>,
     pub ns_gap_frames: Option<u64>,
+    /// The auto sensitivity minimum the chain applies, dBFS before the voice
+    /// gain.
+    pub auto_sensitivity_minimum_db: Option<f32>,
 
     // Denoiser details (Effects SDK slot); the histogram is empty without it.
     pub denoiser_rate: Option<u32>,
@@ -842,6 +851,7 @@ impl Default for RootAudioStats {
             dsp_flushes: None,
             gate_open_delay_us: None,
             ns_gap_frames: None,
+            auto_sensitivity_minimum_db: None,
             denoiser_rate: None,
             denoiser_installs: None,
             denoiser_bypassed_frames: None,
@@ -934,6 +944,7 @@ impl RootAudioStats {
             dsp_flushes: dsp.then_some(native.dsp_flushes),
             gate_open_delay_us: dsp.then_some(native.gate_open_delay_us),
             ns_gap_frames: dsp.then_some(native.ns_gap_frames),
+            auto_sensitivity_minimum_db: dsp.then_some(native.auto_sensitivity_minimum_db),
             denoiser_rate: denoiser.then_some(native.denoiser_rate),
             denoiser_installs: denoiser.then_some(native.denoiser_installs),
             denoiser_bypassed_frames: denoiser.then_some(native.denoiser_bypassed_frames),
@@ -1382,6 +1393,33 @@ mod tests {
         .to_native();
         assert!(native.has_speech_detection && native.speech_detection == 1);
         assert!(!RootAudioControl::default().to_native().has_speech_detection);
+    }
+
+    #[test]
+    fn the_auto_sensitivity_minimum_reaches_native_as_set_and_comes_back_with_the_chain() {
+        for db in [-54.0f32, -80.5, 10.0] {
+            let native =
+                RootAudioControl { auto_sensitivity_minimum_db: Some(db), ..Default::default() }
+                    .to_native();
+            assert!(native.has_auto_sensitivity_minimum_db);
+            assert_eq!(native.auto_sensitivity_minimum_db, db);
+        }
+        let nan =
+            RootAudioControl { auto_sensitivity_minimum_db: Some(f32::NAN), ..Default::default() };
+        assert!(nan.to_native().auto_sensitivity_minimum_db.is_nan());
+        assert!(!RootAudioControl::default().to_native().has_auto_sensitivity_minimum_db);
+
+        let stats = RootAudioStats::from_native(NativeAudioStats {
+            dsp_available: true,
+            auto_sensitivity_minimum_db: -54.0,
+            ..Default::default()
+        });
+        assert_eq!(stats.auto_sensitivity_minimum_db, Some(-54.0));
+        let without = RootAudioStats::from_native(NativeAudioStats {
+            auto_sensitivity_minimum_db: -54.0,
+            ..Default::default()
+        });
+        assert_eq!(without.auto_sensitivity_minimum_db, None);
     }
 
     #[test]

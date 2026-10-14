@@ -955,6 +955,8 @@ RootControlState AdmProxyHarness::control_state() const {
   state.deafened = mixer_->deafened();
   state.denoiser_wanted = capture_->denoiser_wanted.load();
   state.speech_detection = capture_->speech_detection.load();
+  state.auto_sensitivity_minimum_db =
+      capture_->auto_sensitivity_minimum_db.load();
   state.stream_epoch = capture_->stream_epoch.load();
   state.dsp_reset_seq = capture_->dsp_reset_seq.load();
   return state;
