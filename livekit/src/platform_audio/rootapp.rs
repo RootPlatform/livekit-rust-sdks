@@ -344,8 +344,10 @@ pub struct EchoModelStats {
 /// host's noise suppression mode is the Effects SDK: the startup hold waits
 /// for the denoiser and native WebRTC NS covers a denoiser that stops or does
 /// not arrive), `speech_detection` (off until set, and after every session
-/// start) and `auto_sensitivity_minimum_db` (the chain's -54 dBFS until set,
-/// and after every session start). Builds without the chain only store them.
+/// start), `auto_sensitivity_minimum_db` (the chain's -54 dBFS until set,
+/// and after every session start) and the voice gain's tunables (`voice_gain_*`,
+/// the chain's defaults until set and after every session start). Builds
+/// without the chain only store them.
 /// `echo_model` is off until set and after every session start; without
 /// [`ECHO_MODEL_AVAILABLE`] it is not supported.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -374,6 +376,17 @@ pub struct RootAudioControl {
     /// Auto sensitivity's open minimum, dBFS before the voice gain: the chain
     /// clamps it to -80..-30 and takes a non-finite one as its default (-54).
     pub auto_sensitivity_minimum_db: Option<f32>,
+    /// The voice gain's tunables: the chain clamps each to its range and takes
+    /// a non-finite one as its default (`rootapp_voice_dsp::VoiceGainTuning`):
+    /// most boost 0..18 dB (12), target -40..-10 dBFS (-25), rise and fall
+    /// 0.5..20 dB/s (3, 2), level time constant 500..20000 ms (4000) and the
+    /// speech probability from which a frame is speech 0..1 (0.5).
+    pub voice_gain_max_db: Option<f32>,
+    pub voice_gain_target_db: Option<f32>,
+    pub voice_gain_rise_db_per_second: Option<f32>,
+    pub voice_gain_fall_db_per_second: Option<f32>,
+    pub voice_gain_level_time_constant_ms: Option<f32>,
+    pub voice_gain_min_speech_probability: Option<f32>,
 }
 
 impl RootAudioControl {
@@ -436,6 +449,22 @@ impl RootAudioControl {
             echo_model: c.echo_model.map(EchoModel::to_wire).unwrap_or_default(),
             has_auto_sensitivity_minimum_db: c.auto_sensitivity_minimum_db.is_some(),
             auto_sensitivity_minimum_db: c.auto_sensitivity_minimum_db.unwrap_or_default(),
+            has_voice_gain_max_db: c.voice_gain_max_db.is_some(),
+            voice_gain_max_db: c.voice_gain_max_db.unwrap_or_default(),
+            has_voice_gain_target_db: c.voice_gain_target_db.is_some(),
+            voice_gain_target_db: c.voice_gain_target_db.unwrap_or_default(),
+            has_voice_gain_rise_db_per_second: c.voice_gain_rise_db_per_second.is_some(),
+            voice_gain_rise_db_per_second: c.voice_gain_rise_db_per_second.unwrap_or_default(),
+            has_voice_gain_fall_db_per_second: c.voice_gain_fall_db_per_second.is_some(),
+            voice_gain_fall_db_per_second: c.voice_gain_fall_db_per_second.unwrap_or_default(),
+            has_voice_gain_level_time_constant_ms: c.voice_gain_level_time_constant_ms.is_some(),
+            voice_gain_level_time_constant_ms: c
+                .voice_gain_level_time_constant_ms
+                .unwrap_or_default(),
+            has_voice_gain_min_speech_probability: c.voice_gain_min_speech_probability.is_some(),
+            voice_gain_min_speech_probability: c
+                .voice_gain_min_speech_probability
+                .unwrap_or_default(),
         }
     }
 }
@@ -728,6 +757,14 @@ pub struct RootAudioStats {
     /// The auto sensitivity minimum the chain applies, dBFS before the voice
     /// gain.
     pub auto_sensitivity_minimum_db: Option<f32>,
+    /// The voice gain's tunables the chain applies (the control's after
+    /// clamping, the defaults when unset).
+    pub voice_gain_max_db: Option<f32>,
+    pub voice_gain_target_db: Option<f32>,
+    pub voice_gain_rise_db_per_second: Option<f32>,
+    pub voice_gain_fall_db_per_second: Option<f32>,
+    pub voice_gain_level_time_constant_ms: Option<f32>,
+    pub voice_gain_min_speech_probability: Option<f32>,
 
     // Denoiser details (Effects SDK slot); the histogram is empty without it.
     pub denoiser_rate: Option<u32>,
@@ -852,6 +889,12 @@ impl Default for RootAudioStats {
             gate_open_delay_us: None,
             ns_gap_frames: None,
             auto_sensitivity_minimum_db: None,
+            voice_gain_max_db: None,
+            voice_gain_target_db: None,
+            voice_gain_rise_db_per_second: None,
+            voice_gain_fall_db_per_second: None,
+            voice_gain_level_time_constant_ms: None,
+            voice_gain_min_speech_probability: None,
             denoiser_rate: None,
             denoiser_installs: None,
             denoiser_bypassed_frames: None,
@@ -945,6 +988,14 @@ impl RootAudioStats {
             gate_open_delay_us: dsp.then_some(native.gate_open_delay_us),
             ns_gap_frames: dsp.then_some(native.ns_gap_frames),
             auto_sensitivity_minimum_db: dsp.then_some(native.auto_sensitivity_minimum_db),
+            voice_gain_max_db: dsp.then_some(native.voice_gain_max_db),
+            voice_gain_target_db: dsp.then_some(native.voice_gain_target_db),
+            voice_gain_rise_db_per_second: dsp.then_some(native.voice_gain_rise_db_per_second),
+            voice_gain_fall_db_per_second: dsp.then_some(native.voice_gain_fall_db_per_second),
+            voice_gain_level_time_constant_ms: dsp
+                .then_some(native.voice_gain_level_time_constant_ms),
+            voice_gain_min_speech_probability: dsp
+                .then_some(native.voice_gain_min_speech_probability),
             denoiser_rate: denoiser.then_some(native.denoiser_rate),
             denoiser_installs: denoiser.then_some(native.denoiser_installs),
             denoiser_bypassed_frames: denoiser.then_some(native.denoiser_bypassed_frames),
@@ -1393,6 +1444,78 @@ mod tests {
         .to_native();
         assert!(native.has_speech_detection && native.speech_detection == 1);
         assert!(!RootAudioControl::default().to_native().has_speech_detection);
+    }
+
+    #[test]
+    fn the_voice_gain_tunables_reach_native_as_set_and_come_back_with_the_chain() {
+        let control = RootAudioControl {
+            voice_gain_max_db: Some(40.0),
+            voice_gain_target_db: Some(-25.0),
+            voice_gain_rise_db_per_second: Some(3.0),
+            voice_gain_fall_db_per_second: Some(f32::NAN),
+            voice_gain_level_time_constant_ms: Some(4000.0),
+            voice_gain_min_speech_probability: Some(0.5),
+            ..Default::default()
+        };
+        let kept = control.sanitized();
+        assert_eq!(
+            (kept.voice_gain_max_db, kept.voice_gain_target_db),
+            (Some(40.0), Some(-25.0)),
+            "the chain clamps them"
+        );
+        assert!(kept.voice_gain_fall_db_per_second.is_some_and(f32::is_nan));
+        let native = control.to_native();
+        assert!(native.has_voice_gain_max_db && native.voice_gain_max_db == 40.0);
+        assert!(native.has_voice_gain_target_db && native.voice_gain_target_db == -25.0);
+        assert!(
+            native.has_voice_gain_rise_db_per_second && native.voice_gain_rise_db_per_second == 3.0
+        );
+        assert!(
+            native.has_voice_gain_fall_db_per_second
+                && native.voice_gain_fall_db_per_second.is_nan()
+        );
+        assert!(native.has_voice_gain_level_time_constant_ms);
+        assert_eq!(native.voice_gain_level_time_constant_ms, 4000.0);
+        assert!(native.has_voice_gain_min_speech_probability);
+        assert_eq!(native.voice_gain_min_speech_probability, 0.5);
+        let unset = RootAudioControl::default().to_native();
+        assert!(!unset.has_voice_gain_max_db && !unset.has_voice_gain_target_db);
+        assert!(
+            !unset.has_voice_gain_rise_db_per_second && !unset.has_voice_gain_fall_db_per_second
+        );
+        assert!(
+            !unset.has_voice_gain_level_time_constant_ms
+                && !unset.has_voice_gain_min_speech_probability
+        );
+
+        let applied = |dsp_available: bool| NativeAudioStats {
+            dsp_available,
+            voice_gain_max_db: 12.0,
+            voice_gain_target_db: -25.0,
+            voice_gain_rise_db_per_second: 3.0,
+            voice_gain_fall_db_per_second: 2.0,
+            voice_gain_level_time_constant_ms: 4000.0,
+            voice_gain_min_speech_probability: 0.5,
+            ..Default::default()
+        };
+        let stats = RootAudioStats::from_native(applied(true));
+        assert_eq!(
+            (stats.voice_gain_max_db, stats.voice_gain_target_db),
+            (Some(12.0), Some(-25.0))
+        );
+        assert_eq!(
+            (stats.voice_gain_rise_db_per_second, stats.voice_gain_fall_db_per_second),
+            (Some(3.0), Some(2.0))
+        );
+        assert_eq!(
+            (stats.voice_gain_level_time_constant_ms, stats.voice_gain_min_speech_probability),
+            (Some(4000.0), Some(0.5))
+        );
+        let without = RootAudioStats::from_native(applied(false));
+        assert_eq!(
+            (without.voice_gain_max_db, without.voice_gain_min_speech_probability),
+            (None, None)
+        );
     }
 
     #[test]

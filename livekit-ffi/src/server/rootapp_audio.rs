@@ -898,6 +898,12 @@ pub fn root_audio_control(control: &proto::RootAudioControl) -> RootAudioControl
         speech_detection: control.speech_detection.map(speech_detection),
         echo_model: control.echo_model.map(echo_model),
         auto_sensitivity_minimum_db: control.auto_sensitivity_minimum_db,
+        voice_gain_max_db: control.voice_gain_max_db,
+        voice_gain_target_db: control.voice_gain_target_db,
+        voice_gain_rise_db_per_second: control.voice_gain_rise_db_per_second,
+        voice_gain_fall_db_per_second: control.voice_gain_fall_db_per_second,
+        voice_gain_level_time_constant_ms: control.voice_gain_level_time_constant_ms,
+        voice_gain_min_speech_probability: control.voice_gain_min_speech_probability,
     }
     .sanitized()
 }
@@ -1298,6 +1304,12 @@ impl From<RootAudioStats> for proto::RootAudioStats {
             gate_open_delay_us: stats.gate_open_delay_us,
             ns_gap_frames: stats.ns_gap_frames,
             auto_sensitivity_minimum_db: stats.auto_sensitivity_minimum_db,
+            voice_gain_max_db: stats.voice_gain_max_db,
+            voice_gain_target_db: stats.voice_gain_target_db,
+            voice_gain_rise_db_per_second: stats.voice_gain_rise_db_per_second,
+            voice_gain_fall_db_per_second: stats.voice_gain_fall_db_per_second,
+            voice_gain_level_time_constant_ms: stats.voice_gain_level_time_constant_ms,
+            voice_gain_min_speech_probability: stats.voice_gain_min_speech_probability,
             denoiser_rate: stats.denoiser_rate,
             denoiser_installs: stats.denoiser_installs,
             denoiser_bypassed_frames: stats.denoiser_bypassed_frames,
@@ -1554,8 +1566,26 @@ mod tests {
             speech_detection: Some(proto::RootAudioSpeechDetection::Gate as i32),
             echo_model: Some(proto::RootAudioEchoModel::Auto as i32),
             auto_sensitivity_minimum_db: Some(-54.0),
+            voice_gain_max_db: Some(12.0),
+            voice_gain_target_db: Some(-25.0),
+            voice_gain_rise_db_per_second: Some(3.0),
+            voice_gain_fall_db_per_second: Some(2.0),
+            voice_gain_level_time_constant_ms: Some(4000.0),
+            voice_gain_min_speech_probability: Some(0.5),
         });
         assert_eq!(control.auto_sensitivity_minimum_db, Some(-54.0));
+        assert_eq!(
+            (control.voice_gain_max_db, control.voice_gain_target_db),
+            (Some(12.0), Some(-25.0))
+        );
+        assert_eq!(
+            (control.voice_gain_rise_db_per_second, control.voice_gain_fall_db_per_second),
+            (Some(3.0), Some(2.0))
+        );
+        assert_eq!(
+            (control.voice_gain_level_time_constant_ms, control.voice_gain_min_speech_probability),
+            (Some(4000.0), Some(0.5))
+        );
         assert_eq!(control.denoiser_wanted, Some(true));
         assert_eq!(control.speech_detection, Some(SpeechDetection::Gate));
         assert_eq!(control.echo_model, Some(EchoModel::Auto));
@@ -1657,6 +1687,54 @@ mod tests {
         assert_eq!(p.auto_sensitivity_minimum_db, Some(-54.0));
         let absent: proto::RootAudioStats = RootAudioStats::default().into();
         assert_eq!(absent.auto_sensitivity_minimum_db, None);
+    }
+
+    /// Fields 17-22 reach the chain as set (it clamps them) and stats 126-131 convert.
+    #[test]
+    fn rootapp_audio_voice_gain_tunables_pass_through_and_their_stats_convert() {
+        let control = root_audio_control(&proto::RootAudioControl {
+            voice_gain_max_db: Some(40.0),
+            voice_gain_level_time_constant_ms: Some(f32::NAN),
+            voice_gain_min_speech_probability: Some(0.7),
+            ..Default::default()
+        });
+        assert_eq!(control.voice_gain_max_db, Some(40.0), "clamped by the chain, not here");
+        assert!(control.voice_gain_level_time_constant_ms.is_some_and(f32::is_nan));
+        assert_eq!(control.voice_gain_min_speech_probability, Some(0.7));
+        assert_eq!(
+            (control.voice_gain_target_db, control.voice_gain_rise_db_per_second),
+            (None, None)
+        );
+        assert_eq!(control.voice_gain_fall_db_per_second, None);
+        assert_eq!(
+            root_audio_control(&proto::RootAudioControl::default()),
+            RootAudioControl::default()
+        );
+
+        let p: proto::RootAudioStats = RootAudioStats {
+            voice_gain_max_db: Some(12.0),
+            voice_gain_target_db: Some(-25.0),
+            voice_gain_rise_db_per_second: Some(3.0),
+            voice_gain_fall_db_per_second: Some(2.0),
+            voice_gain_level_time_constant_ms: Some(4000.0),
+            voice_gain_min_speech_probability: Some(0.5),
+            ..Default::default()
+        }
+        .into();
+        assert_eq!((p.voice_gain_max_db, p.voice_gain_target_db), (Some(12.0), Some(-25.0)));
+        assert_eq!(
+            (p.voice_gain_rise_db_per_second, p.voice_gain_fall_db_per_second),
+            (Some(3.0), Some(2.0))
+        );
+        assert_eq!(
+            (p.voice_gain_level_time_constant_ms, p.voice_gain_min_speech_probability),
+            (Some(4000.0), Some(0.5))
+        );
+        let absent: proto::RootAudioStats = RootAudioStats::default().into();
+        assert_eq!(
+            (absent.voice_gain_max_db, absent.voice_gain_min_speech_probability),
+            (None, None)
+        );
     }
 
     fn effect_request(data_ptr: u64, sample_count: u32) -> proto::RootAudioRegisterEffectRequest {

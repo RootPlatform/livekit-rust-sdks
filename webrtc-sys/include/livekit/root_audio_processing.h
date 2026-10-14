@@ -44,6 +44,7 @@ class TaskQueueBase;
 
 namespace livekit_ffi {
 struct RootDspSettings;
+struct RootVoiceGainTuning;
 struct RootDspCommands;
 struct RootDspPre;
 struct RootDspOutputs;
@@ -68,8 +69,13 @@ enum class RootPushToTalk : uint32_t {
   kReleased = 2,
 };
 
-// The app's VoiceGain only boosts, up to 18 dB.
+// The app's VoiceGain only boosts: a gain reset is clamped to 0..18 dB here,
+// and the chain clamps it to its maximum (12 dB unless the host sets another,
+// at most this).
 constexpr float kRootMaxVoiceGainDb = 18.0f;
+
+// Every voice gain tunable unset (NaN): the chain's defaults.
+RootVoiceGainTuning RootVoiceGainTuningUnset();
 
 // A raw capture frame whose every sample is at or below -100 dBFS (a ±1
 // signal) is digital silence: a hardware mute. Under one int16 step
@@ -164,6 +170,8 @@ struct RootDspStatsSnapshot {
   uint64_t speech_unavailable_frames = 0;
   // The stored setting (NaN: none, the chain's default).
   float auto_sensitivity_minimum_db = std::numeric_limits<float>::quiet_NaN();
+  // The stored voice gain tunables (NaN: none, the chain's defaults).
+  RootVoiceGainTuning voice_gain = RootVoiceGainTuningUnset();
 };
 
 struct RootSpeakingSnapshot {
@@ -199,6 +207,19 @@ struct RootCaptureState {
   // Auto sensitivity's open minimum as the host set it, dBFS before the
   // voice gain; the chain clamps it, and NaN (none) is its default.
   std::atomic<float> auto_sensitivity_minimum_db{
+      std::numeric_limits<float>::quiet_NaN()};
+  // The voice gain's tunables as the host set them (RootVoiceGainTuning); the
+  // chain clamps them, and NaN (none) is the default.
+  std::atomic<float> voice_gain_max_db{std::numeric_limits<float>::quiet_NaN()};
+  std::atomic<float> voice_gain_target_db{
+      std::numeric_limits<float>::quiet_NaN()};
+  std::atomic<float> voice_gain_rise_db_per_second{
+      std::numeric_limits<float>::quiet_NaN()};
+  std::atomic<float> voice_gain_fall_db_per_second{
+      std::numeric_limits<float>::quiet_NaN()};
+  std::atomic<float> voice_gain_level_time_constant_ms{
+      std::numeric_limits<float>::quiet_NaN()};
+  std::atomic<float> voice_gain_min_speech_probability{
       std::numeric_limits<float>::quiet_NaN()};
   // Stored by the APM decorator before each capture frame it forwards: that
   // frame's raw input was digital silence (kRootCaptureSilencePeak). The
@@ -320,6 +341,8 @@ struct RootCaptureState {
   // envelope maxima.
   RootDspStatsSnapshot ReadDspStats(bool take_maxima);
   RootSpeakingSnapshot ReadSpeaking() const;
+  // The stored voice gain tunables (relaxed loads; NaN: none).
+  RootVoiceGainTuning ReadVoiceGainTuning() const;
   // Speaking and heard: a change that would be audible mid-word (a pipeline
   // swap, an AEC/NS re-init) waits for this to clear. Inside the startup hold
   // nothing is heard, also with push-to-talk held, and with no frame for
@@ -343,10 +366,11 @@ RootCaptureFormatSnapshot ReadCaptureFormat(const RootCaptureState& state);
 // denoiser slot and copies the result to the other channels:
 //   sanitise, voice gain level -> speech detector (while speech_detection is
 //   set; 16, 32 and 48 kHz) -> denoiser slot (Effects SDK) -> aligner ->
-//   voice gain -> auto sensitivity (learning nothing from a frame whose raw
-//   input the decorator found digitally silent) -> startup hold -> noise
-//   gate (with the speech gate) -> input volume (20 ms ramp) -> mute/PTT gate
-//   (5 ms fade each way).
+//   voice gain (its level from the frames the detector rates as speech, with
+//   the host's tunables) -> auto sensitivity (learning nothing from a frame
+//   whose raw input the decorator found digitally silent) -> startup hold ->
+//   noise gate (with the speech gate) -> input volume (20 ms ramp) ->
+//   mute/PTT gate (5 ms fade each way).
 // Real-time code: no locks, allocation, logging or APM calls. Initialize runs
 // under both APM locks on up to four threads and only stores the format.
 class RootCaptureProcessor : public webrtc::CustomProcessing {
@@ -886,6 +910,7 @@ class RootProcessorHarness {
   // RootSpeechDetection, stored as the controller stores it.
   void set_speech_detection(uint32_t mode) const;
   void set_auto_sensitivity_minimum_db(float db) const;
+  void set_voice_gain_tuning(RootVoiceGainTuning tuning) const;
   // As the APM decorator does before the next frame.
   void set_capture_silent(bool silent) const;
   void set_webrtc_ns_applied(bool applied) const;

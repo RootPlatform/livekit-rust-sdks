@@ -189,6 +189,18 @@ bool root_dsp_supported() {
 // RootCaptureState
 // =============================================================================
 
+RootVoiceGainTuning RootVoiceGainTuningUnset() {
+  constexpr float kNone = std::numeric_limits<float>::quiet_NaN();
+  RootVoiceGainTuning t{};
+  t.max_gain_db = kNone;
+  t.target_db = kNone;
+  t.rise_db_per_second = kNone;
+  t.fall_db_per_second = kNone;
+  t.level_time_constant_ms = kNone;
+  t.min_speech_probability = kNone;
+  return t;
+}
+
 bool RootCaptureState::GateOpen(uint32_t gate) {
   return (gate & kGateMuted) == 0 &&
          (gate >> kGatePushToTalkShift) !=
@@ -236,6 +248,14 @@ void RootCaptureState::ResetControls(bool close_gate) {
   speech_detection.store(0, std::memory_order_relaxed);
   auto_sensitivity_minimum_db.store(std::numeric_limits<float>::quiet_NaN(),
                                     std::memory_order_relaxed);
+  for (std::atomic<float>* tunable :
+       {&voice_gain_max_db, &voice_gain_target_db,
+        &voice_gain_rise_db_per_second, &voice_gain_fall_db_per_second,
+        &voice_gain_level_time_constant_ms,
+        &voice_gain_min_speech_probability}) {
+    tunable->store(std::numeric_limits<float>::quiet_NaN(),
+                   std::memory_order_relaxed);
+  }
   // A press of the last session that no frame saw is no delay of this one.
   gate_open_stamp_us.store(0, std::memory_order_relaxed);
   ClearSpeaking();
@@ -318,6 +338,7 @@ RootDspStatsSnapshot RootCaptureState::ReadDspStats(bool take_maxima) {
   s.speech_closed_frames = speech_closed_frames.load(kRelaxed);
   s.speech_unavailable_frames = speech_unavailable_frames.load(kRelaxed);
   s.auto_sensitivity_minimum_db = auto_sensitivity_minimum_db.load(kRelaxed);
+  s.voice_gain = ReadVoiceGainTuning();
   s.aligner_primed = aligner_primed.load(kRelaxed);
   s.aligner_buffered_samples = aligner_buffered_samples.load(kRelaxed);
   s.aligner_underruns = aligner_underruns.load(kRelaxed);
@@ -326,6 +347,18 @@ RootDspStatsSnapshot RootCaptureState::ReadDspStats(bool take_maxima) {
   s.aligner_drained_samples = aligner_drained_samples.load(kRelaxed);
   s.aligner_latency_ms = aligner_latency_ms.load(kRelaxed);
   return s;
+}
+
+RootVoiceGainTuning RootCaptureState::ReadVoiceGainTuning() const {
+  constexpr auto kRelaxed = std::memory_order_relaxed;
+  RootVoiceGainTuning t{};
+  t.max_gain_db = voice_gain_max_db.load(kRelaxed);
+  t.target_db = voice_gain_target_db.load(kRelaxed);
+  t.rise_db_per_second = voice_gain_rise_db_per_second.load(kRelaxed);
+  t.fall_db_per_second = voice_gain_fall_db_per_second.load(kRelaxed);
+  t.level_time_constant_ms = voice_gain_level_time_constant_ms.load(kRelaxed);
+  t.min_speech_probability = voice_gain_min_speech_probability.load(kRelaxed);
+  return t;
 }
 
 RootSpeakingSnapshot RootCaptureState::ReadSpeaking() const {
@@ -421,6 +454,7 @@ void RootCaptureProcessor::Process(webrtc::AudioBuffer* audio) {
   settings.capture_silent = state.capture_silent.exchange(false, kRelaxed);
   settings.auto_sensitivity_minimum_db =
       state.auto_sensitivity_minimum_db.load(kRelaxed);
+  settings.voice_gain = state.ReadVoiceGainTuning();
   const float power = state.denoise_power.load(kRelaxed);
 
   // The gain reset first: a session reset stored before it is then seen in
@@ -1780,6 +1814,18 @@ void RootProcessorHarness::set_auto_sensitivity_minimum_db(float db) const {
   state_->auto_sensitivity_minimum_db.store(db);
 }
 
+void RootProcessorHarness::set_voice_gain_tuning(
+    RootVoiceGainTuning tuning) const {
+  state_->voice_gain_max_db.store(tuning.max_gain_db);
+  state_->voice_gain_target_db.store(tuning.target_db);
+  state_->voice_gain_rise_db_per_second.store(tuning.rise_db_per_second);
+  state_->voice_gain_fall_db_per_second.store(tuning.fall_db_per_second);
+  state_->voice_gain_level_time_constant_ms.store(
+      tuning.level_time_constant_ms);
+  state_->voice_gain_min_speech_probability.store(
+      tuning.min_speech_probability);
+}
+
 void RootProcessorHarness::set_capture_silent(bool silent) const {
   state_->capture_silent.store(silent);
 }
@@ -1898,6 +1944,7 @@ RootProcessorDsp DspProbe(RootCaptureState& state, bool take_maxima) {
   dsp.speech_closed_frames = s.speech_closed_frames;
   dsp.speech_unavailable_frames = s.speech_unavailable_frames;
   dsp.auto_sensitivity_minimum_db = s.auto_sensitivity_minimum_db;
+  dsp.voice_gain = s.voice_gain;
   return dsp;
 }
 

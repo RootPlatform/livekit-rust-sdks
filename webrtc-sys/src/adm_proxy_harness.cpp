@@ -957,6 +957,16 @@ RootControlState AdmProxyHarness::control_state() const {
   state.speech_detection = capture_->speech_detection.load();
   state.auto_sensitivity_minimum_db =
       capture_->auto_sensitivity_minimum_db.load();
+  state.voice_gain_max_db = capture_->voice_gain_max_db.load();
+  state.voice_gain_target_db = capture_->voice_gain_target_db.load();
+  state.voice_gain_rise_db_per_second =
+      capture_->voice_gain_rise_db_per_second.load();
+  state.voice_gain_fall_db_per_second =
+      capture_->voice_gain_fall_db_per_second.load();
+  state.voice_gain_level_time_constant_ms =
+      capture_->voice_gain_level_time_constant_ms.load();
+  state.voice_gain_min_speech_probability =
+      capture_->voice_gain_min_speech_probability.load();
   state.stream_epoch = capture_->stream_epoch.load();
   state.dsp_reset_seq = capture_->dsp_reset_seq.load();
   return state;

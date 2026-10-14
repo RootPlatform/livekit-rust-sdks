@@ -845,6 +845,56 @@ fn adm_proxy_controller_stores_the_auto_sensitivity_minimum_until_a_reset_and_re
     assert_eq!(h.stats().auto_sensitivity_minimum_db, -54.0);
 }
 
+#[test]
+fn adm_proxy_controller_stores_the_voice_gain_tunables_until_a_reset_and_reports_them_clamped() {
+    let h = harness(&["{spk}"], &["{mic}"]);
+    let state = h.control_state();
+    assert!(state.voice_gain_max_db.is_nan() && state.voice_gain_min_speech_probability.is_nan());
+    let applied = |h: &AdmProxyHarness| {
+        let s = h.stats();
+        [
+            s.voice_gain_max_db,
+            s.voice_gain_target_db,
+            s.voice_gain_rise_db_per_second,
+            s.voice_gain_fall_db_per_second,
+            s.voice_gain_level_time_constant_ms,
+            s.voice_gain_min_speech_probability,
+        ]
+    };
+    assert_eq!(applied(&h), [12.0, -25.0, 3.0, 2.0, 4000.0, 0.5], "the chain's defaults");
+    assert!(h.apply_control(&RootAudioControlUpdate {
+        has_voice_gain_max_db: true,
+        voice_gain_max_db: 40.0,
+        has_voice_gain_target_db: true,
+        voice_gain_target_db: -22.0,
+        has_voice_gain_rise_db_per_second: true,
+        voice_gain_rise_db_per_second: 0.0,
+        has_voice_gain_fall_db_per_second: true,
+        voice_gain_fall_db_per_second: f32::NAN,
+        has_voice_gain_level_time_constant_ms: true,
+        voice_gain_level_time_constant_ms: 6000.0,
+        has_voice_gain_min_speech_probability: true,
+        voice_gain_min_speech_probability: 0.9,
+        ..Default::default()
+    }));
+    assert_eq!(applied(&h), [18.0, -22.0, 0.5, 2.0, 6000.0, 0.9]);
+    h.apply_control(&RootAudioControlUpdate {
+        has_voice_gain_max_db: true,
+        voice_gain_max_db: 9.0,
+        ..Default::default()
+    });
+    let state = h.control_state();
+    assert_eq!(
+        (state.voice_gain_max_db, state.voice_gain_target_db),
+        (9.0, -22.0),
+        "unset fields keep theirs"
+    );
+    h.reset_root_audio(false);
+    assert!(h.control_state().voice_gain_max_db.is_nan());
+    assert!(h.control_state().voice_gain_level_time_constant_ms.is_nan());
+    assert_eq!(applied(&h), [12.0, -25.0, 3.0, 2.0, 4000.0, 0.5]);
+}
+
 fn denoiser_completions(h: &AdmProxyHarness, count: usize) -> Vec<RootDenoiserCompletionItem> {
     let all = std::cell::RefCell::new(Vec::new());
     wait_until("denoiser completions", || {

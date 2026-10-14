@@ -160,6 +160,14 @@ pub mod ffi {
         /// The auto sensitivity minimum the chain applies (dBFS before the
         /// voice gain).
         pub auto_sensitivity_minimum_db: f32,
+        /// The voice gain's tunables the chain applies (the stored ones after
+        /// clamping, the defaults when unset).
+        pub voice_gain_max_db: f32,
+        pub voice_gain_target_db: f32,
+        pub voice_gain_rise_db_per_second: f32,
+        pub voice_gain_fall_db_per_second: f32,
+        pub voice_gain_level_time_constant_ms: f32,
+        pub voice_gain_min_speech_probability: f32,
         pub denoiser_installed: bool,
         pub denoiser_frames: u64,
         pub denoiser_misses: u64,
@@ -273,6 +281,20 @@ pub mod ffi {
         /// takes a non-finite value as its default (-54).
         pub has_auto_sensitivity_minimum_db: bool,
         pub auto_sensitivity_minimum_db: f32,
+        /// The voice gain's tunables (rootapp_voice_dsp::VoiceGainTuning); the
+        /// chain clamps each and takes a non-finite value as its default.
+        pub has_voice_gain_max_db: bool,
+        pub voice_gain_max_db: f32,
+        pub has_voice_gain_target_db: bool,
+        pub voice_gain_target_db: f32,
+        pub has_voice_gain_rise_db_per_second: bool,
+        pub voice_gain_rise_db_per_second: f32,
+        pub has_voice_gain_fall_db_per_second: bool,
+        pub voice_gain_fall_db_per_second: f32,
+        pub has_voice_gain_level_time_constant_ms: bool,
+        pub voice_gain_level_time_constant_ms: f32,
+        pub has_voice_gain_min_speech_probability: bool,
+        pub voice_gain_min_speech_probability: f32,
     }
 
     /// The stored controls (tests).
@@ -293,6 +315,13 @@ pub mod ffi {
         pub speech_detection: u32,
         /// As stored (NaN: none, the chain's default).
         pub auto_sensitivity_minimum_db: f32,
+        /// As stored (NaN: none, the chain's defaults).
+        pub voice_gain_max_db: f32,
+        pub voice_gain_target_db: f32,
+        pub voice_gain_rise_db_per_second: f32,
+        pub voice_gain_fall_db_per_second: f32,
+        pub voice_gain_level_time_constant_ms: f32,
+        pub voice_gain_min_speech_probability: f32,
         pub stream_epoch: u64,
         pub dsp_reset_seq: u64,
     }

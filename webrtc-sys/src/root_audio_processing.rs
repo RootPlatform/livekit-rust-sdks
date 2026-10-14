@@ -19,7 +19,7 @@
 
 use rootapp_voice_dsp::{
     sanitize, DenoiserOutput, DspChain, DspCommands, DspOutputs, DspSettings, PushToTalk,
-    SpeechDetection,
+    SpeechDetection, VoiceGainTuning,
 };
 
 #[cxx::bridge(namespace = "livekit_ffi")]
@@ -28,8 +28,8 @@ pub mod ffi {
     /// anything else released; speech_detection 0 off, 1 ring, 2 gate, anything
     /// else off; speech_probability the detector's for this frame (negative:
     /// it did not run); capture_silent the decorator found this frame's raw
-    /// input digitally silent; auto_sensitivity_minimum_db as the host set it
-    /// (NaN: the chain's default).
+    /// input digitally silent; auto_sensitivity_minimum_db and voice_gain as
+    /// the host set them (NaN: the chain's default).
     #[derive(Debug, Clone, Copy, Default)]
     pub struct RootDspSettings {
         pub sample_rate: u32,
@@ -44,6 +44,19 @@ pub mod ffi {
         pub speech_probability: f32,
         pub capture_silent: bool,
         pub auto_sensitivity_minimum_db: f32,
+        pub voice_gain: RootVoiceGainTuning,
+    }
+
+    /// `rootapp_voice_dsp::VoiceGainTuning`: the voice gain's tunables (dB, dBFS,
+    /// dB/s, ms, probability; NaN: the chain's default).
+    #[derive(Debug, Clone, Copy, Default, PartialEq)]
+    pub struct RootVoiceGainTuning {
+        pub max_gain_db: f32,
+        pub target_db: f32,
+        pub rise_db_per_second: f32,
+        pub fall_db_per_second: f32,
+        pub level_time_constant_ms: f32,
+        pub min_speech_probability: f32,
     }
 
     #[derive(Debug, Clone, Copy, Default)]
@@ -106,6 +119,9 @@ pub mod ffi {
         /// applies for a host's setting: non-finite is the default (-54), the
         /// rest clamped to -80..-30.
         fn root_auto_sensitivity_minimum_db(requested: f32) -> f32;
+        /// The voice gain's tunables the chain applies for a host's settings:
+        /// each clamped to its range, a non-finite one the default.
+        fn root_voice_gain_tuning(requested: RootVoiceGainTuning) -> RootVoiceGainTuning;
         fn new_root_dsp_chain(max_rate: u32) -> Box<RootDspChain>;
         fn pre_denoise(
             self: &mut RootDspChain,
@@ -216,6 +232,8 @@ pub mod ffi {
         pub speech_unavailable_frames: u64,
         /// The stored setting (NaN: none).
         pub auto_sensitivity_minimum_db: f32,
+        /// The stored settings (NaN: none).
+        pub voice_gain: RootVoiceGainTuning,
     }
 
     /// RootSpeechDetector over a synthetic signal (`root_speech_detector_probe`).
@@ -292,6 +310,8 @@ pub mod ffi {
         /// 0 off, 1 ring, 2 gate (as the controller stores it).
         fn set_speech_detection(self: &RootProcessorHarness, mode: u32);
         fn set_auto_sensitivity_minimum_db(self: &RootProcessorHarness, db: f32);
+        /// As the controller stores them (NaN: none).
+        fn set_voice_gain_tuning(self: &RootProcessorHarness, tuning: RootVoiceGainTuning);
         /// As the APM decorator does before the next frame.
         fn set_capture_silent(self: &RootProcessorHarness, silent: bool);
         fn set_webrtc_ns_applied(self: &RootProcessorHarness, applied: bool);
@@ -423,6 +443,29 @@ fn root_auto_sensitivity_minimum_db(requested: f32) -> f32 {
     sanitize::auto_sensitivity_minimum_db(requested)
 }
 
+fn voice_gain_tuning(t: &ffi::RootVoiceGainTuning) -> VoiceGainTuning {
+    VoiceGainTuning {
+        max_gain_db: t.max_gain_db,
+        target_db: t.target_db,
+        rise_db_per_second: t.rise_db_per_second,
+        fall_db_per_second: t.fall_db_per_second,
+        level_time_constant_ms: t.level_time_constant_ms,
+        min_speech_probability: t.min_speech_probability,
+    }
+}
+
+fn root_voice_gain_tuning(requested: ffi::RootVoiceGainTuning) -> ffi::RootVoiceGainTuning {
+    let t = voice_gain_tuning(&requested).sanitized();
+    ffi::RootVoiceGainTuning {
+        max_gain_db: t.max_gain_db,
+        target_db: t.target_db,
+        rise_db_per_second: t.rise_db_per_second,
+        fall_db_per_second: t.fall_db_per_second,
+        level_time_constant_ms: t.level_time_constant_ms,
+        min_speech_probability: t.min_speech_probability,
+    }
+}
+
 fn dsp_settings(settings: &ffi::RootDspSettings) -> DspSettings {
     DspSettings {
         sample_rate: settings.sample_rate,
@@ -437,6 +480,7 @@ fn dsp_settings(settings: &ffi::RootDspSettings) -> DspSettings {
         speech_probability: settings.speech_probability,
         capture_silent: settings.capture_silent,
         auto_sensitivity_minimum_db: settings.auto_sensitivity_minimum_db,
+        voice_gain: voice_gain_tuning(&settings.voice_gain),
     }
 }
 
@@ -521,7 +565,9 @@ impl RootDspChain {
 mod processor_tests {
     use super::ffi::{
         new_root_processor_harness, new_root_processor_harness_without_slot, RootProcessorHarness,
+        RootVoiceGainTuning,
     };
+    use super::root_voice_gain_tuning;
 
     const VOICE_ACTIVITY: u32 = 0;
     const HELD: u32 = 1;
@@ -926,22 +972,22 @@ mod processor_tests {
     #[test]
     fn root_capture_processor_gain_reset_restarts_the_voice_gain() {
         let h = started(48000, 1);
-        h.gain_reset(12.0);
+        h.gain_reset(8.0);
         run(&h, 48000, 1, 0.0);
         let dsp = h.dsp(false);
-        assert_eq!(dsp.voice_gain_db, 12.0);
+        assert_eq!(dsp.voice_gain_db, 8.0);
         assert!(!dsp.voice_gain_settled);
 
         h.gain_reset(30.0);
         run(&h, 48000, 1, 0.0);
-        assert_eq!(h.dsp(false).voice_gain_db, 18.0, "clamped to the voice gain's range");
+        assert_eq!(h.dsp(false).voice_gain_db, 12.0, "clamped to the voice gain's maximum");
         h.gain_reset(f32::NAN);
         run(&h, 48000, 1, 0.0);
-        assert_eq!(h.dsp(false).voice_gain_db, 18.0, "a non-finite reset is ignored");
+        assert_eq!(h.dsp(false).voice_gain_db, 12.0, "a non-finite reset is ignored");
 
         h.set_dsp(false, true, 0.025);
         run(&h, 48000, 1, 0.0);
-        assert_eq!(h.dsp(false).voice_gain_db, 18.0, "off keeps the last value");
+        assert_eq!(h.dsp(false).voice_gain_db, 12.0, "off keeps the last value");
         h.gain_reset(3.0);
         h.set_dsp(true, true, 0.025);
         run(&h, 48000, 1, 0.0);
@@ -1368,6 +1414,62 @@ mod processor_tests {
             run(&h, 48000, 1, 0.0);
         }
         assert!((threshold_db(&h) + 54.0).abs() < 1e-3, "{}", threshold_db(&h));
+    }
+
+    fn tuning(max_gain_db: f32) -> RootVoiceGainTuning {
+        RootVoiceGainTuning {
+            max_gain_db,
+            target_db: f32::NAN,
+            rise_db_per_second: f32::NAN,
+            fall_db_per_second: f32::NAN,
+            level_time_constant_ms: f32::NAN,
+            min_speech_probability: f32::NAN,
+        }
+    }
+
+    /// The stored tunables reach the chain on the next frame, before that frame's gain reset (so
+    /// a reset is clamped to the maximum it arrives with), and a reset of the controls forgets them.
+    #[test]
+    fn root_capture_processor_applies_the_voice_gain_tuning_it_is_given() {
+        let h = started(48000, 1);
+        h.set_dsp(true, true, 0.025);
+        for (max, reset, expected) in
+            [(f32::NAN, 15.0f32, 12.0f32), (6.0, 15.0, 6.0), (40.0, 15.0, 15.0), (-3.0, 15.0, 0.0)]
+        {
+            h.set_voice_gain_tuning(tuning(max));
+            h.gain_reset(reset);
+            run(&h, 48000, 1, 0.0);
+            assert_eq!(h.dsp(false).voice_gain_db, expected, "max {max}");
+        }
+        let stored = h.dsp(false).voice_gain;
+        assert_eq!(stored.max_gain_db, -3.0, "stored as set, clamped by the chain");
+        assert!(stored.target_db.is_nan());
+        h.reset_controls();
+        assert!(h.dsp(false).voice_gain.max_gain_db.is_nan(), "a reset forgets them");
+        h.set_dsp(true, true, 0.025);
+        h.gain_reset(15.0);
+        run(&h, 48000, 1, 0.0);
+        assert_eq!(h.dsp(false).voice_gain_db, 12.0);
+
+        let applied = root_voice_gain_tuning(RootVoiceGainTuning {
+            max_gain_db: 40.0,
+            target_db: f32::NEG_INFINITY,
+            rise_db_per_second: 0.1,
+            fall_db_per_second: 25.0,
+            level_time_constant_ms: 6000.0,
+            min_speech_probability: 0.75,
+        });
+        assert_eq!(
+            applied,
+            RootVoiceGainTuning {
+                max_gain_db: 18.0,
+                target_db: -25.0,
+                rise_db_per_second: 0.5,
+                fall_db_per_second: 20.0,
+                level_time_constant_ms: 6000.0,
+                min_speech_probability: 0.75,
+            }
+        );
     }
 }
 

@@ -408,6 +408,16 @@ RootAudioNativeStats AudioDeviceController::root_audio_stats() const {
     stats.speech_unavailable_frames = dsp.speech_unavailable_frames;
     stats.auto_sensitivity_minimum_db =
         root_auto_sensitivity_minimum_db(dsp.auto_sensitivity_minimum_db);
+    const RootVoiceGainTuning voice_gain =
+        root_voice_gain_tuning(dsp.voice_gain);
+    stats.voice_gain_max_db = voice_gain.max_gain_db;
+    stats.voice_gain_target_db = voice_gain.target_db;
+    stats.voice_gain_rise_db_per_second = voice_gain.rise_db_per_second;
+    stats.voice_gain_fall_db_per_second = voice_gain.fall_db_per_second;
+    stats.voice_gain_level_time_constant_ms =
+        voice_gain.level_time_constant_ms;
+    stats.voice_gain_min_speech_probability =
+        voice_gain.min_speech_probability;
   }
   if (denoiser_) {
     const RootDenoiserSlotStats slot = capture_->denoiser_slot->ReadStats(true);
@@ -477,7 +487,12 @@ bool AudioDeviceController::set_root_audio_control(
       control.has_auto_gain || control.has_gate_threshold ||
       control.has_auto_sensitivity || control.has_gain_reset_db ||
       control.has_denoiser_wanted || control.has_speech_detection ||
-      control.has_auto_sensitivity_minimum_db;
+      control.has_auto_sensitivity_minimum_db ||
+      control.has_voice_gain_max_db || control.has_voice_gain_target_db ||
+      control.has_voice_gain_rise_db_per_second ||
+      control.has_voice_gain_fall_db_per_second ||
+      control.has_voice_gain_level_time_constant_ms ||
+      control.has_voice_gain_min_speech_probability;
   const bool mixer_fields = control.has_master_volume || control.has_deafened;
   const bool apm_fields =
       control.has_echo_cancellation || control.has_noise_suppression;
@@ -530,6 +545,30 @@ bool AudioDeviceController::set_root_audio_control(
     if (control.has_auto_sensitivity_minimum_db) {
       capture_->auto_sensitivity_minimum_db.store(
           control.auto_sensitivity_minimum_db, std::memory_order_relaxed);
+    }
+    if (control.has_voice_gain_max_db) {
+      capture_->voice_gain_max_db.store(
+          control.voice_gain_max_db, std::memory_order_relaxed);
+    }
+    if (control.has_voice_gain_target_db) {
+      capture_->voice_gain_target_db.store(
+          control.voice_gain_target_db, std::memory_order_relaxed);
+    }
+    if (control.has_voice_gain_rise_db_per_second) {
+      capture_->voice_gain_rise_db_per_second.store(
+          control.voice_gain_rise_db_per_second, std::memory_order_relaxed);
+    }
+    if (control.has_voice_gain_fall_db_per_second) {
+      capture_->voice_gain_fall_db_per_second.store(
+          control.voice_gain_fall_db_per_second, std::memory_order_relaxed);
+    }
+    if (control.has_voice_gain_level_time_constant_ms) {
+      capture_->voice_gain_level_time_constant_ms.store(
+          control.voice_gain_level_time_constant_ms, std::memory_order_relaxed);
+    }
+    if (control.has_voice_gain_min_speech_probability) {
+      capture_->voice_gain_min_speech_probability.store(
+          control.voice_gain_min_speech_probability, std::memory_order_relaxed);
     }
     if (control.has_denoiser_wanted && control.denoiser_wanted) {
       capture_->denoiser_wanted.store(true, std::memory_order_relaxed);
