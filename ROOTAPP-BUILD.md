@@ -874,8 +874,8 @@ managed engine's `NativeAudioSource` tracks, which bypass it):
 - With no `RootAudioSetControl` the chain runs on its defaults: noise gate in auto sensitivity
   (threshold from the noise floor of the denoised voice before the voice gain, 8 dB over it but never
   below -54 dBFS (-60 before hw.11; see "Auto sensitivity"), plus the frame's voice gain; 5 blocks to
-  open), voice gain on from 0 dB (it only boosts, up to
-  18 dB), no denoiser. Every recording start silences its first 20 frames (200 ms, the startup
+  open), voice gain on from 0 dB (it only boosts, up to 12 dB; 18 before hw.12, see "Voice gain"),
+  no denoiser. Every recording start silences its first 20 frames (200 ms, the startup
   hold), and with `denoiser_wanted` up to 100 frames until the denoiser runs. Mute and push-to-talk
   key up silence after the 5 ms fade; the gate, voice gain and auto sensitivity keep running.
 - Speaking (`RootAudioEvent.speaking`, stats 74/42) is the noise gate's speaking (envelope plus a
@@ -1728,6 +1728,92 @@ Auto sensitivity only; caps stay 32767. The -54 dBFS minimum, hardware mute dete
 capture with a relearn after it, and the minimum as control field 16 with stat 125: see "Auto
 sensitivity" (bc267532 the voice chain and its golden vectors, b2980e32 the decorator, controller,
 livekit and livekit-ffi).
+
+## Voice gain (`rootapp/voice-gain`, hw.12)
+
+The voice chain's automatic gain (`rootapp-voice-dsp/src/voice_gain.rs`, bit for bit the desktop's
+`VoiceGain.cs` through the golden vectors) only boosts, towards a target for the talker's level, from
+the gain remembered for the mic. Senders got quieter for long stretches (a 10/13 call: 16 -> 1 dB within
+30 s of talking): the level was a 1.5 s power average of the speech frames, loud moments pulled the gain
+down at 6 dB/s, it came back only while talking, and one sound in a pause could hold the room cap down
+for 10 s or more. hw.12 follows WebRTC AGC2's adaptive digital controller:
+
+- The talker's level is the average frame level in dB of their speech over about 4 s of it (AGC2's
+  leaky weighted average: per speech frame sum = sum x leak + level x w, weight = weight x leak + w,
+  leak 1 - 10/4000), each frame weighted by its speech probability (1 without one). 4 s is AGC2's
+  value and a sentence or two of speech; a 1.5 s laugh 14 dB over the speech moves it about 2.5 dB
+  where the power average moved 8. Target -25 dBFS of that level: on real speech the dB average sits
+  about 3 dB under the power average (median 3.2 dB on 40 clean near-end clips, 3.1 on 24 real ones),
+  so steady talkers come out where -22 put them.
+- `VoiceGain::process_with_probability`: with the speech detector's probability only frames at
+  `min_speech_probability` (0.5) or above are speech; without one the level decides as before. The
+  chain passes `DspSettings::speech_probability` whenever it is valid, in every speech detection mode
+  (the processor computes one while detection is on, which the desktop always asks for). 0.5 is the
+  speech gate's confirm bound: on the hand-labelled 10/9 recordings 85-90% of speech frames over -60
+  dBFS reach it and none of 4,248 click, breath and noise frames; AGC2's 0.95 keeps 69-77% of the
+  speech and rejects nothing more.
+- At most 12 dB (was 18). 6 dB/s until 3 s of speech (was 10, which overshot more: 1.2/4.1 dB
+  median/max on the clean clips against 0.7/2.9), then up 3 dB/s on speech and down 2 dB/s (was 6);
+  silence holds the gain. The limiter (ceiling 0.9) clamps at once and releases at 100 dB/s (1 dB a
+  frame) instead of jumping back the next frame.
+- The room cap (room before the denoiser plus the gain under -50 dBFS) moves the gain no faster than
+  the phase's rate (`room_limit_fall_db_per_second` is gone), and a committed room frame counts at most
+  `room_burst_db` (6 dB) over the room's average (never under -90 dB): a 300 ms door slam in a pause
+  moves it under 2 dB instead of 26, while a room that stays louder is followed at up to 6.5 dB/s of
+  pauses. With the Effects SDK a sound the denoiser removes used to count in full: on the 10/9
+  recording rec1 the room estimate jumped 23 dB on such a sound and held the gain at 0 dB for 30 s.
+- Controls `RootAudioControl` 17-22 (`voice_gain_max_db`, `voice_gain_target_db`,
+  `voice_gain_rise_db_per_second`, `voice_gain_fall_db_per_second`,
+  `voice_gain_level_time_constant_ms`, `voice_gain_min_speech_probability`; optional floats) set the
+  tunables, so later tuning is a desktop change. The controller stores each as sent; the capture
+  processor hands all six to the chain every frame (`RootDspSettings.voice_gain`), which clamps them
+  (`VoiceGainTuning::sanitized`: 0..18 dB, -40..-10 dBFS, 0.5..20 dB/s twice, 500..20000 ms, 0..1; a
+  non-finite value is the default) before that frame's gain reset, so a remembered 15 dB starts at the
+  maximum. A session start forgets them. `RootAudioStats` 126-131 are the values applied, through the
+  same function (`root_voice_gain_tuning`). No capability bit (caps stay 32767): a library that
+  predates them skips them and keeps hw.11's voice gain, and the stats' absence tells the desktop so.
+  `MAX_VOICE_GAIN_DB` (18) stays the gain reset's bound and the highest maximum a host can set.
+
+Before/after (hw.11's voice gain replayed against hw.12's on synthetic scenes and recordings; gain range
+in the talker's speech, the dip after a burst as depth and time more than 1 dB under, and the spread of
+the output speech level over 1 s windows):
+
+| Scene | Gain range | Dip after the burst | Spread |
+|---|---|---|---|
+| Steady talker, 1.5 s laugh at +14 dB | 7.8 -> 3.2 dB | 8.0 dB, 7.1 s -> 2.7 dB, 10.8 s (2.2 dB with probabilities; 1.0 dB, 0.06 s when the detector rejects it) | 1.66 -> 1.36 dB |
+| Steady talker, 3 s shout at +12 dB | 11.1 -> 4.1 dB | 11.0 dB, 19.7 s -> 4.4 dB, 15 s | 4.50 -> 1.36 dB |
+| Door slam in a pause (Effects SDK) | 14.1 -> 0 dB | 14.0 dB, 19.6 s -> none | 6.84 -> 1.27 dB |
+| Fan rising -80 -> -50 dBFS (Effects SDK) | 12.3 -> 8.5 dB | - | 4.59 -> 3.43 dB |
+| 10/9 Effects SDK recording rec1 | 0 dB all along -> 12 dB | - | 1.56 -> 1.56 dB |
+| 40 clean near-end clips (median) | 2.5 -> 2.5 dB | - | 2.10 -> 2.25 dB |
+| 24 real near-end clips (median) | 0 -> 0 dB | - | 1.96 -> 1.94 dB |
+
+Quiet talkers reach the target down to about -37 dBFS (12 dB); a -40 dBFS talker comes out at -27.7
+instead of -21.9 dBFS.
+
+Golden vectors regenerated from desktop accc395bb (`VoiceDspGoldenVectors/3`): 30, 12,372,270 bytes
+(12 MiB limit). Bit 2 of the first settings byte marks a frame carrying a speech probability (an f32
+after gain_reset_db). New `voice_gain_burst_8k` and `_p_8k` (a laugh mid-sentence, a shout the
+limiter holds) and `voice_gain_room_8k` and `_p_8k` (a rising room, a door slam); `gain_reset_48k` and
+`quiet_talker_48k` became `gain_reset_16k` and `quiet_talker_16k` to make room. All 30 match bit for
+bit (0 ulp in every value). The speech detection check compares chains: Ring with each vector's own
+probabilities against the reference, Ring against Off with any probability, Gate against Off with
+constant speech.
+
+Tests: `voice_gain` (the level in dB, a laugh mid-sentence, rejected and weighted probabilities, a long
+silence, the start rate without overshoot, limiter attack and release, a door slam in a pause, a rising
+room at the fall rate, the tunables' clamps and defaults), `chain` (the probability in every mode, the
+host's minimum probability and target, a gain reset clamped to the host's maximum in the same frame),
+tunables and probabilities in the no-alloc and no-panic runs;
+`root_capture_processor_applies_the_voice_gain_tuning_it_is_given`,
+`adm_proxy_controller_stores_the_voice_gain_tunables_*`, and the livekit and livekit-ffi conversions.
+
+## hw.12 (2026-10-14)
+
+Voice gain only; caps stay 32767. A speech-only 4 s level in dB, 2 dB/s fall, 12 dB maximum, a
+burst-proof room cap and a smoother limiter, with the tunables as control fields 17-22 and stats
+126-131: see "Voice gain" (50d2872c the voice chain and its golden vectors, 95379f43 the controller,
+processor, livekit and livekit-ffi).
 
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
