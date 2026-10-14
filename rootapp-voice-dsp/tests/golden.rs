@@ -161,7 +161,8 @@ fn parse(bytes: &[u8]) -> Result<(Header, Vec<Record>), String> {
         records.push(Record {
             settings: DspSettings {
                 sample_rate: rate,
-                mic_muted: b[0] != 0,
+                mic_muted: b[0] & 1 != 0,
+                capture_silent: b[0] & 2 != 0,
                 push_to_talk: PushToTalk::from_wire(u32::from(b[1])),
                 input_volume,
                 auto_gain: b[2] != 0,

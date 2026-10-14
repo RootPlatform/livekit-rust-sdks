@@ -442,9 +442,17 @@ impl DspChain {
                 auto_sensitivity.reset();
                 *auto_sensitivity_active = true;
             }
+            auto_sensitivity.set_open_minimum_db(f64::from(sanitize::auto_sensitivity_minimum_db(
+                settings.auto_sensitivity_minimum_db,
+            )));
             // The level gate's own state: the speech gate never moves the threshold.
             let auto_open = gate.level_envelope() > 0.0;
-            gate.set_threshold(auto_sensitivity.update(denoised_rms, gain_db, auto_open));
+            gate.set_threshold(auto_sensitivity.update(
+                denoised_rms,
+                gain_db,
+                auto_open,
+                settings.capture_silent,
+            ));
             gate.set_min_open_blocks(AUTO_MIN_OPEN_BLOCKS);
         } else {
             *auto_sensitivity_active = false;

@@ -13,7 +13,7 @@ use rootapp_voice_dsp::{
     DenoiserOutput, DspChain, DspCommands, DspOutputs, DspSettings, PreDenoise, PushToTalk,
     AUTO_MIN_OPEN_BLOCKS, DENOISER_STALL_FRAMES, MAX_DENOISER_WAIT_FRAMES, STARTUP_HOLD_FRAMES,
 };
-use support::{in_range, silent, sine, Rng};
+use support::{in_range, near, silent, sine, Rng};
 
 const HOLD: usize = STARTUP_HOLD_FRAMES as usize;
 
@@ -229,11 +229,103 @@ fn a_voice_gain_jump_does_not_open_the_auto_gate_on_room_noise() {
     assert!(!h.out.speaking && !h.out.gate_open);
     let options = AutoSensitivityOptions::default();
     let threshold_db = 20.0 * f64::from(h.out.threshold).log10();
+    let minimum_db = options.open_minimum_db + options.voice_gain_cap_db.min(15.0);
     assert!(
-        threshold_db >= options.open_minimum_db + options.voice_gain_cap_db.min(15.0)
-            && threshold_db <= -70.0 + options.open_margin_db + 15.0 + 0.5,
+        threshold_db >= minimum_db
+            && threshold_db <= (-70.0 + options.open_margin_db + 15.0).max(minimum_db) + 0.5,
         "{threshold_db}"
     );
+}
+
+fn threshold_db(h: &Harness) -> f64 {
+    20.0 * f64::from(h.out.threshold).log10()
+}
+
+fn run_noise(h: &mut Harness, rng: &mut Rng, level_db: f64, frames: usize) {
+    let amplitude = (10f64.powf(level_db / 20.0) * 3f64.sqrt()) as f32 * 32768.0;
+    for _ in 0..frames {
+        let input: Vec<f32> = (0..h.n()).map(|_| amplitude * rng.symmetric()).collect();
+        h.run_input(&input);
+    }
+}
+
+/// A hardware mute: 30 s of digital silence (capture_silent) and room noise at -50 dBFS after it.
+/// The silence leaves the threshold where the room put it, and the unmute relearns at the startup
+/// rate: the threshold is back at the noise + 8 dB within 3 s (about 40 s when the silence was
+/// learned as a level).
+#[test]
+fn a_hardware_mute_neither_drops_the_threshold_nor_slows_the_unmute() {
+    for flagged in [true, false] {
+        let mut h = Harness::new(48000);
+        h.settings.auto_gain = false;
+        let mut rng = Rng::new(7);
+        run_noise(&mut h, &mut rng, -60.0, 500);
+        let before = threshold_db(&h);
+        assert!(in_range(before, -53.0, -51.0), "{before}");
+        h.settings.capture_silent = flagged;
+        for _ in 0..3000 {
+            h.run(0.0);
+        }
+        let muted = threshold_db(&h);
+        h.settings.capture_silent = false;
+        let mut seconds = f64::INFINITY;
+        for frame in 1..=6000u32 {
+            run_noise(&mut h, &mut rng, -50.0, 1);
+            if !h.out.gate_open && (threshold_db(&h) - -42.0).abs() <= 1.0 {
+                seconds = f64::from(frame) / 100.0;
+                break;
+            }
+        }
+        if flagged {
+            assert_eq!(muted, before, "the silence taught nothing");
+            assert!(seconds <= 3.0, "{seconds} s");
+        } else {
+            assert!(in_range(muted, -54.01, -53.99), "the minimum: {muted}");
+            assert!(seconds > 30.0, "{seconds} s");
+        }
+    }
+}
+
+/// Mute in the app closes the transmit gate after the chain: the mic still delivers the room (the
+/// raw capture is live), and auto sensitivity follows it exactly as unmuted.
+#[test]
+fn a_software_mute_leaves_auto_sensitivity_as_it_is() {
+    let mut muted = Harness::new(48000);
+    let mut open = Harness::new(48000);
+    muted.settings.mic_muted = true;
+    let (mut a, mut b) = (Rng::new(8), Rng::new(8));
+    for (level_db, frames) in [(-50.0, 300), (-65.0, 500), (-45.0, 300)] {
+        for _ in 0..frames {
+            run_noise(&mut muted, &mut a, level_db, 1);
+            run_noise(&mut open, &mut b, level_db, 1);
+            assert_eq!(muted.out.threshold, open.out.threshold);
+            assert!(!muted.out.transmitting);
+        }
+        if level_db == -50.0 {
+            assert!(in_range(threshold_db(&muted), -43.0, -41.0), "{}", threshold_db(&muted));
+        }
+    }
+}
+
+#[test]
+fn the_auto_sensitivity_minimum_follows_the_setting_within_its_range() {
+    for (setting, expected) in [
+        (f32::NAN, -54.0),
+        (-54.0, -54.0),
+        (-40.0, -40.0),
+        (-62.5, -62.5),
+        (-100.0, -80.0),
+        (0.0, -30.0),
+        (f32::INFINITY, -54.0),
+    ] {
+        let mut h = Harness::new(48000);
+        h.settings.auto_gain = false;
+        h.settings.auto_sensitivity_minimum_db = setting;
+        for _ in 0..500 {
+            h.run(0.0);
+        }
+        assert!(near(threshold_db(&h), expected, 1e-3), "{setting}: {}", threshold_db(&h));
+    }
 }
 
 #[test]

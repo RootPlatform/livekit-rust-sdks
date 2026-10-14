@@ -52,6 +52,16 @@ pub fn gate_threshold(threshold: f32) -> f32 {
     }
 }
 
+/// Non-finite → AUTO_SENSITIVITY_MINIMUM_DB, clamped to AUTO_SENSITIVITY_MINIMUM_RANGE_DB.
+pub fn auto_sensitivity_minimum_db(db: f32) -> f32 {
+    let (lowest, highest) = crate::AUTO_SENSITIVITY_MINIMUM_RANGE_DB;
+    if db.is_finite() {
+        db.clamp(lowest, highest)
+    } else {
+        crate::AUTO_SENSITIVITY_MINIMUM_DB
+    }
+}
+
 pub fn sum_squares(samples: &[f32]) -> f64 {
     let mut sum = 0.0f64;
     for &sample in samples {

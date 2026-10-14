@@ -1,4 +1,4 @@
-use crate::clamp_f64;
+use crate::{clamp_f64, AUTO_SENSITIVITY_MINIMUM_DB};
 
 const FRAME_MS: f64 = 10.0;
 
@@ -17,6 +17,8 @@ pub struct AutoSensitivityOptions {
     pub startup_ms: f64,
     pub open_window_ms: f64,
     pub voice_gain_cap_db: f64,
+    /// Digital silence at least this long (a hardware mute) is followed by a relearn.
+    pub relearn_silence_ms: f64,
 }
 
 impl Default for AutoSensitivityOptions {
@@ -26,7 +28,7 @@ impl Default for AutoSensitivityOptions {
             floor_minimum_db: -90.0,
             floor_maximum_db: -35.0,
             open_margin_db: 8.0,
-            open_minimum_db: -60.0,
+            open_minimum_db: f64::from(AUTO_SENSITIVITY_MINIMUM_DB),
             hysteresis_db: 3.0,
             fall_time_constant_ms: 1000.0,
             rise_db_per_second: 1.0,
@@ -34,6 +36,7 @@ impl Default for AutoSensitivityOptions {
             startup_ms: 2000.0,
             open_window_ms: 2000.0,
             voice_gain_cap_db: 11.0,
+            relearn_silence_ms: 500.0,
         }
     }
 }
@@ -42,12 +45,18 @@ impl Default for AutoSensitivityOptions {
 /// 10 ms frame. The floor and the thresholds are in dB of the denoised voice before the voice gain;
 /// `update` adds the frame's gain to the threshold it returns, and the minimum rises with at most
 /// `voice_gain_cap_db` of that gain.
+///
+/// Frames whose raw capture was digital silence (a hardware mute) teach it nothing: the floor and the
+/// window of recent levels keep what the live mic taught them. When such a silence lasted
+/// `relearn_silence_ms` or more, the next live frame starts a relearn as at the start of a call: the
+/// window empties and the floor rises at the startup rate for `startup_ms`.
 #[derive(Clone, Debug)]
 pub struct AutoSensitivity {
     options: AutoSensitivityOptions,
     recent_db: Vec<f64>,
     floor_db: f64,
     elapsed_ms: f64,
+    silent_ms: f64,
     recent_count: usize,
     recent_next: usize,
 }
@@ -60,6 +69,7 @@ impl AutoSensitivity {
             options,
             recent_db: vec![0.0; window],
             elapsed_ms: 0.0,
+            silent_ms: 0.0,
             recent_count: 0,
             recent_next: 0,
         }
@@ -67,6 +77,11 @@ impl AutoSensitivity {
 
     pub fn options(&self) -> &AutoSensitivityOptions {
         &self.options
+    }
+
+    /// The host's minimum (dB before the voice gain), for the next update on.
+    pub fn set_open_minimum_db(&mut self, db: f64) {
+        self.options.open_minimum_db = db;
     }
 
     pub fn floor_db(&self) -> f64 {
@@ -95,13 +110,33 @@ impl AutoSensitivity {
     pub fn reset(&mut self) {
         self.floor_db = self.options.initial_floor_db;
         self.elapsed_ms = 0.0;
+        self.silent_ms = 0.0;
         self.recent_count = 0;
         self.recent_next = 0;
     }
 
     /// input_rms: the frame before the voice gain; gain_db: the voice gain applied to it (0 without
-    /// one). Returns the RMS threshold the gate should use for the frame after the gain.
-    pub fn update(&mut self, input_rms: f32, gain_db: f64, gate_open: bool) -> f32 {
+    /// one); capture_silent: the frame's raw capture was digital silence. Returns the RMS threshold
+    /// the gate should use for the frame after the gain.
+    pub fn update(
+        &mut self,
+        input_rms: f32,
+        gain_db: f64,
+        gate_open: bool,
+        capture_silent: bool,
+    ) -> f32 {
+        let gain_db = if gain_db.is_finite() { gain_db } else { 0.0 };
+        if capture_silent {
+            self.silent_ms += FRAME_MS;
+            return self.threshold(gain_db, gate_open);
+        }
+        if self.silent_ms >= self.options.relearn_silence_ms {
+            self.elapsed_ms = 0.0;
+            self.recent_count = 0;
+            self.recent_next = 0;
+        }
+        self.silent_ms = 0.0;
+
         let level_db = to_db(input_rms);
         let len = self.recent_db.len();
         if let Some(slot) = self.recent_db.get_mut(self.recent_next) {
@@ -133,8 +168,13 @@ impl AutoSensitivity {
         self.floor_db =
             clamp_f64(self.floor_db, self.options.floor_minimum_db, self.options.floor_maximum_db);
         self.elapsed_ms += FRAME_MS;
-        let gain_db = if gain_db.is_finite() { gain_db } else { 0.0 };
-        to_rms(if gate_open { self.close_db_at(gain_db) } else { self.open_db_at(gain_db) } + gain_db)
+        self.threshold(gain_db, gate_open)
+    }
+
+    fn threshold(&self, gain_db: f64, gate_open: bool) -> f32 {
+        to_rms(
+            if gate_open { self.close_db_at(gain_db) } else { self.open_db_at(gain_db) } + gain_db,
+        )
     }
 
     fn recent_minimum(&self) -> f64 {

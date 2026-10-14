@@ -109,6 +109,8 @@ fn any_shape_settings_input_and_denoiser_output_leaves_finite_full_scale_audio()
                             speech_detection: SpeechDetection::from_wire((step % 3) as u32),
                             speech_probability: [f32::NAN, 0.9, -1.0, 2.0, f32::INFINITY, 0.2]
                                 [step % 6],
+                            capture_silent: step % 8 < 3,
+                            auto_sensitivity_minimum_db: FLOATS[(step / 5) % FLOATS.len()] * -50.0,
                         };
                         let commands = DspCommands {
                             reset: step % 29 == 0,
@@ -182,6 +184,9 @@ fn abrupt_changes_and_commands_in_every_state_never_panic() {
             denoiser_wanted: (v >> 36) % 2 == 0,
             speech_detection: SpeechDetection::from_wire(((v >> 38) % 3) as u32),
             speech_probability: [f32::NAN, 0.95, 0.05, -0.5, 1.5][((v >> 40) % 5) as usize],
+            capture_silent: (v >> 42) % 3 == 0,
+            auto_sensitivity_minimum_db: [-54.0, f32::NAN, f32::NEG_INFINITY, 20.0, -1e30]
+                [((v >> 46) % 5) as usize],
         };
         let commands = DspCommands {
             reset: (v >> 38) % 40 == 0,

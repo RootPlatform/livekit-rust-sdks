@@ -114,6 +114,8 @@ fn the_chain_never_allocates_or_frees_after_new() {
                 denoiser_wanted: f % 1000 < 600,
                 speech_detection: SpeechDetection::from_wire((f / 53 % 3) as u32),
                 speech_probability: [0.9, 0.1, -1.0, 0.6, 0.0][(f / 7) % 5],
+                capture_silent: f % 160 < 70,
+                auto_sensitivity_minimum_db: [-54.0, -40.0, f32::NAN, -100.0][(f / 130) % 4],
             };
             let commands = DspCommands {
                 reset: f % 997 == 3,

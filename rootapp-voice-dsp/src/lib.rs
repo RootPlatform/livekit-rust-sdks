@@ -42,6 +42,10 @@ pub const MAX_DENOISER_WAIT_FRAMES: u32 = 100;
 pub const DENOISER_STALL_FRAMES: u32 = 100;
 pub const TRANSMIT_FADE_MS: u32 = 5;
 pub const MAX_VOICE_GAIN_DB: f32 = 18.0;
+/// Auto sensitivity's open minimum (dBFS before the voice gain) while the host sets none.
+pub const AUTO_SENSITIVITY_MINIMUM_DB: f32 = -54.0;
+/// The range a host's minimum is clamped to.
+pub const AUTO_SENSITIVITY_MINIMUM_RANGE_DB: (f32, f32) = (-80.0, -30.0);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PushToTalk {
@@ -83,6 +87,12 @@ pub struct DspSettings {
     /// The speech detector's probability for this frame's pre-denoise input, 0..1; negative or
     /// non-finite when it did not run (the level gate alone decides, as with Off).
     pub speech_probability: f32,
+    /// The frame's raw capture (before the APM) was digital silence: no sample above -100 dBFS, so
+    /// every int16 sample 0. Auto sensitivity learns nothing from it (a hardware mute).
+    pub capture_silent: bool,
+    /// Auto sensitivity's open minimum, dBFS before the voice gain: non-finite is
+    /// AUTO_SENSITIVITY_MINIMUM_DB, the rest clamped to AUTO_SENSITIVITY_MINIMUM_RANGE_DB.
+    pub auto_sensitivity_minimum_db: f32,
 }
 
 impl Default for DspSettings {
@@ -98,6 +108,8 @@ impl Default for DspSettings {
             denoiser_wanted: false,
             speech_detection: SpeechDetection::Off,
             speech_probability: -1.0,
+            capture_silent: false,
+            auto_sensitivity_minimum_db: AUTO_SENSITIVITY_MINIMUM_DB,
         }
     }
 }
