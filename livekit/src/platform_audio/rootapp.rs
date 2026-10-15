@@ -375,6 +375,21 @@ impl OutputDeviceKind {
     }
 }
 
+/// The platform devices' formats (the FFI `RootAudioStats` fields 132-138),
+/// where native reads them (macOS). Rates and channels are each open
+/// direction's device as the ADM opened it, 0 while closed; the counters are
+/// cumulative for the engine's life.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeviceFormatStats {
+    pub playout_rate: u32,
+    pub playout_channels: u32,
+    pub recording_rate: u32,
+    pub recording_channels: u32,
+    pub playout_changes: u64,
+    pub playout_reopens: u64,
+    pub recording_changes: u64,
+}
+
 /// The echo model's state and costs (the FFI `RootAudioStats` fields 114-124).
 /// Counters are cumulative for the engine's life; the inference mean and
 /// maximum are since the previous read (NaN and 0 without an inference).
@@ -919,6 +934,9 @@ pub struct RootAudioStats {
 
     // Echo model; `None` without [`ECHO_MODEL_AVAILABLE`].
     pub echo_model: Option<EchoModelStats>,
+
+    // `None` where native does not read device formats.
+    pub device_formats: Option<DeviceFormatStats>,
 }
 
 impl Default for RootAudioStats {
@@ -1041,6 +1059,7 @@ impl Default for RootAudioStats {
             speech_closed_frames: None,
             speech_unavailable_frames: None,
             echo_model: None,
+            device_formats: None,
         }
     }
 }
@@ -1072,6 +1091,15 @@ impl RootAudioStats {
                 inference_p99_us: native.echo_model_inference_p99_us,
                 measured_echo: native.echo_model_measured_echo,
                 kill_switch: native.echo_model_kill_switch,
+            }),
+            device_formats: native.device_formats_available.then_some(DeviceFormatStats {
+                playout_rate: native.playout_device_rate,
+                playout_channels: native.playout_device_channels,
+                recording_rate: native.recording_device_rate,
+                recording_channels: native.recording_device_channels,
+                playout_changes: native.playout_format_changes,
+                playout_reopens: native.playout_format_reopens,
+                recording_changes: native.recording_format_changes,
             }),
             monitor_active: monitor.then_some(native.monitor_active),
             monitor_frames: monitor.then_some(native.monitor_frames),
@@ -1813,6 +1841,39 @@ mod tests {
         }
         assert!(!RootAudioControl::default().to_native().has_echo_model);
         assert_eq!(ECHO_MODEL_AVAILABLE, !cfg!(any(target_os = "ios", target_os = "android")));
+    }
+
+    #[test]
+    fn root_audio_stats_fill_the_device_formats_only_where_native_reads_them() {
+        let native = NativeAudioStats {
+            device_formats_available: true,
+            playout_device_rate: 24_000,
+            playout_device_channels: 1,
+            recording_device_rate: 16_000,
+            recording_device_channels: 1,
+            playout_format_changes: 2,
+            playout_format_reopens: 1,
+            recording_format_changes: 3,
+            ..Default::default()
+        };
+        assert_eq!(
+            RootAudioStats::from_native(native).device_formats,
+            Some(DeviceFormatStats {
+                playout_rate: 24_000,
+                playout_channels: 1,
+                recording_rate: 16_000,
+                recording_channels: 1,
+                playout_changes: 2,
+                playout_reopens: 1,
+                recording_changes: 3,
+            })
+        );
+        let without = RootAudioStats::from_native(NativeAudioStats {
+            playout_device_rate: 48_000,
+            ..Default::default()
+        });
+        assert_eq!(without.device_formats, None);
+        assert_eq!(RootAudioStats::default().device_formats, None);
     }
 
     #[test]

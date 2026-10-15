@@ -18,7 +18,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
+#include <string>
 #include <thread>
 #include <utility>
 
@@ -42,6 +44,9 @@
 #if defined(WEBRTC_MAC) && !defined(WEBRTC_IOS)
 #include <CoreAudio/CoreAudio.h>
 #include <CoreFoundation/CoreFoundation.h>
+
+#include <charconv>
+#include <system_error>
 #endif
 
 #if defined(__ANDROID__)
@@ -57,7 +62,9 @@ namespace {
 constexpr webrtc::TimeDelta kPlayoutDelayRefresh =
     webrtc::TimeDelta::Millis(100);
 constexpr webrtc::TimeDelta kStopFailureRetry = webrtc::TimeDelta::Seconds(1);
+constexpr webrtc::TimeDelta kFormatWatchPeriod = webrtc::TimeDelta::Millis(100);
 #endif
+constexpr int64_t kFormatReopenMinIntervalNs = 1'000'000'000;
 
 int64_t NowNs() {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -192,7 +199,64 @@ std::optional<std::string> CoreAudioUidToGuid(const std::string& uid) {
   }
   return std::to_string(device);
 }
+
+// What AudioDeviceMac reads at InitPlayout and InitRecording.
+std::optional<AdmDeviceFormat> CoreAudioDeviceFormat(bool playout,
+                                                     const std::string& guid) {
+  AudioObjectID device = kAudioObjectUnknown;
+  if (guid.empty()) {
+    const AudioObjectPropertyAddress address = {
+        playout ? kAudioHardwarePropertyDefaultOutputDevice
+                : kAudioHardwarePropertyDefaultInputDevice,
+        kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+    UInt32 size = static_cast<UInt32>(sizeof(device));
+    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &address, 0,
+                                   nullptr, &size, &device) != noErr) {
+      return std::nullopt;
+    }
+  } else {
+    const char* end = guid.data() + guid.size();
+    const std::from_chars_result parsed =
+        std::from_chars(guid.data(), end, device);
+    if (parsed.ec != std::errc() || parsed.ptr != end) {
+      return std::nullopt;
+    }
+  }
+  if (device == kAudioObjectUnknown) {
+    return std::nullopt;
+  }
+  const AudioObjectPropertyAddress address = {
+      kAudioDevicePropertyStreamFormat,
+      playout ? kAudioDevicePropertyScopeOutput : kAudioDevicePropertyScopeInput,
+      0};
+  AudioStreamBasicDescription format = {};
+  UInt32 size = static_cast<UInt32>(sizeof(format));
+  if (AudioObjectGetPropertyData(device, &address, 0, nullptr, &size,
+                                 &format) != noErr) {
+    return std::nullopt;
+  }
+  AdmDeviceFormat result;
+  result.device = std::to_string(device);
+  result.sample_rate = format.mSampleRate;
+  result.channels = format.mChannelsPerFrame;
+  result.bytes_per_frame = format.mBytesPerFrame;
+  result.format_flags = format.mFormatFlags;
+  return result;
+}
 #endif
+
+uint32_t RoundedRate(const AdmDeviceFormat& format) {
+  return format.sample_rate > 0
+             ? static_cast<uint32_t>(std::lround(format.sample_rate))
+             : 0;
+}
+
+std::string Describe(const AdmDeviceFormat& format) {
+  return std::to_string(RoundedRate(format)) + " Hz " +
+         std::to_string(format.channels) + " ch " +
+         std::to_string(format.bytes_per_frame) + " B/frame flags " +
+         std::to_string(format.format_flags);
+}
 
 webrtc::scoped_refptr<webrtc::AudioDeviceModule> CreatePlatformAdm(
     const webrtc::Environment& env) {
@@ -594,6 +658,9 @@ AdmProxy::AdmProxy(
       platform_adm_(std::move(platform_adm)) {
 #if defined(WEBRTC_MAC) && !defined(WEBRTC_IOS)
   uid_translator_ = CoreAudioUidToGuid;
+  format_reader_ = CoreAudioDeviceFormat;
+  format_watch_periodic_ = true;
+  device_formats_available_.store(true, std::memory_order_relaxed);
 #endif
   serialize_enumeration_.store(kSerializeEnumeration);
   enumeration_wait_ms_.store(kEnumerationWaitMs);
@@ -788,6 +855,7 @@ bool AdmProxy::StopDeviceLocked(bool playout, AdmDirectionOutcome* outcome) {
     capture_state_->ClearSpeaking();
   }
   if (result == 0) {
+    ForgetFormatLocked(playout);
 #if !LK_ADM_MOBILE
     if (playout && playout_opened_sink_) {
       AdmPlayoutOpened closed;
@@ -856,6 +924,10 @@ void AdmProxy::ReconcilePlayoutLocked(const DesiredState& desired,
     playout_opened_selection_gen_ = desired.playout_selection_gen;
     playout_opened_restart_gen_ = desired.playout_restart_gen;
     int32_t result = ApplySelectionLocked(true, desired.playout_selection);
+    std::optional<AdmDeviceFormat> before;
+    if (result == 0) {
+      before = ReadFormatLocked(true, last_playout_identity_.guid);
+    }
 #if !LK_ADM_MOBILE
     if (result == 0 &&
         platform_adm->SetStereoPlayout(
@@ -876,6 +948,7 @@ void AdmProxy::ReconcilePlayoutLocked(const DesiredState& desired,
       RTC_LOG(LS_WARNING) << "AdmProxy: InitPlayout failed: " << result;
       return;
     }
+    WatchOpenedLocked(true, before);
 #if !LK_ADM_MOBILE
     if (playout_opened_sink_) {
       playout_opened_ = last_playout_identity_;
@@ -933,7 +1006,9 @@ void AdmProxy::ReconcileRecordingLocked(const DesiredState& desired,
     recording_opened_selection_gen_ = desired.recording_selection_gen;
     recording_opened_restart_gen_ = desired.recording_restart_gen;
     int32_t result = ApplySelectionLocked(false, desired.recording_selection);
+    std::optional<AdmDeviceFormat> before;
     if (result == 0) {
+      before = ReadFormatLocked(false, last_recording_guid_);
       result = platform_adm->InitRecording();
     }
     recording_init_result_.store(result, std::memory_order_relaxed);
@@ -946,6 +1021,7 @@ void AdmProxy::ReconcileRecordingLocked(const DesiredState& desired,
       RTC_LOG(LS_WARNING) << "AdmProxy: InitRecording failed: " << result;
       return;
     }
+    WatchOpenedLocked(false, before);
   }
 
   if (!platform_adm->Recording()) {
@@ -1100,10 +1176,12 @@ int32_t AdmProxy::ApplySelectionLocked(
     return -1;
   }
   AdmPlayoutOpened matched;
-  const int index =
-      ResolveSelectionLocked(playout, selection, playout ? &matched : nullptr);
+  const int index = ResolveSelectionLocked(
+      playout, selection, playout || format_reader_ ? &matched : nullptr);
   if (playout) {
     last_playout_identity_ = std::move(matched);
+  } else {
+    last_recording_guid_ = matched.guid;
   }
   if (index == kAdmResolveNotFound) {
     RTC_LOG(LS_WARNING) << "AdmProxy: the selected "
@@ -1173,6 +1251,129 @@ void AdmProxy::ScheduleRetryLocked() {
 #endif
 }
 
+std::optional<AdmDeviceFormat> AdmProxy::ReadFormatLocked(
+    bool playout,
+    const std::string& guid) {
+  if (!format_reader_) {
+    return std::nullopt;
+  }
+  return format_reader_(playout, guid);
+}
+
+void AdmProxy::WatchOpenedLocked(bool playout,
+                                 const std::optional<AdmDeviceFormat>& before) {
+  FormatWatch& watch = playout ? playout_watch_ : recording_watch_;
+  watch = FormatWatch{};
+  if (!before) {
+    ForgetFormatLocked(playout);
+    return;
+  }
+  const std::optional<AdmDeviceFormat> after =
+      ReadFormatLocked(playout, before->device);
+  watch.opened = after ? after : before;
+  watch.unsettled = after && !(*after == *before);
+  const char* direction = playout ? "playout" : "recording";
+  if (watch.unsettled) {
+    (playout ? playout_format_changes_ : recording_format_changes_)
+        .fetch_add(1, std::memory_order_relaxed);
+    RTC_LOG(LS_WARNING) << "AdmProxy: " << direction << " device "
+                        << before->device << " changed format while opening, "
+                        << Describe(*before) << " -> " << Describe(*after);
+  } else {
+    RTC_LOG(LS_INFO) << "AdmProxy: " << direction << " device "
+                     << watch.opened->device << " opened at "
+                     << Describe(*watch.opened);
+  }
+  (playout ? playout_device_rate_ : recording_device_rate_)
+      .store(RoundedRate(*watch.opened), std::memory_order_relaxed);
+  (playout ? playout_device_channels_ : recording_device_channels_)
+      .store(watch.opened->channels, std::memory_order_relaxed);
+  ScheduleFormatWatchLocked();
+}
+
+void AdmProxy::ForgetFormatLocked(bool playout) {
+  (playout ? playout_watch_ : recording_watch_) = FormatWatch{};
+  (playout ? playout_device_rate_ : recording_device_rate_)
+      .store(0, std::memory_order_relaxed);
+  (playout ? playout_device_channels_ : recording_device_channels_)
+      .store(0, std::memory_order_relaxed);
+}
+
+// Once the format moved, whatever it settles on (even the opened one again:
+// the ADM may have taken the format in between) must hold for two reads, as a
+// Bluetooth profile switch passes through formats it does not keep.
+bool AdmProxy::PollFormatLocked(bool playout) {
+  FormatWatch& watch = playout ? playout_watch_ : recording_watch_;
+  if (!watch.opened) {
+    return false;
+  }
+  const std::optional<AdmDeviceFormat> now =
+      ReadFormatLocked(playout, watch.opened->device);
+  if (!now || (!watch.unsettled && *now == *watch.opened)) {
+    return false;
+  }
+  if (watch.pending && *watch.pending == *now) {
+    return playout;
+  }
+  if (!(*now == *watch.opened)) {
+    (playout ? playout_format_changes_ : recording_format_changes_)
+        .fetch_add(1, std::memory_order_relaxed);
+    RTC_LOG(LS_WARNING) << "AdmProxy: " << (playout ? "playout" : "recording")
+                        << " device " << now->device
+                        << " changed format while open, "
+                        << Describe(*watch.opened) << " -> " << Describe(*now);
+  }
+  watch.unsettled = true;
+  watch.pending = now;
+  return false;
+}
+
+void AdmProxy::PollDeviceFormatsLocked() {
+  if (terminated_ || !format_reader_) {
+    return;
+  }
+  PollFormatLocked(false);
+  if (!PollFormatLocked(true)) {
+    return;
+  }
+  const int64_t now = NowNs();
+  if (last_format_reopen_ns_ != 0 &&
+      now - last_format_reopen_ns_ < kFormatReopenMinIntervalNs) {
+    return;
+  }
+  last_format_reopen_ns_ = now;
+  playout_format_reopens_.fetch_add(1, std::memory_order_relaxed);
+  RTC_LOG(LS_WARNING) << "AdmProxy: reopening playout on device "
+                      << playout_watch_.opened->device << " at "
+                      << Describe(*playout_watch_.pending);
+  playout_watch_.pending.reset();
+  playout_watch_.unsettled = false;
+  {
+    AdmLock lock(&state_mutex_);
+    desired_.playout_restart_gen++;
+  }
+  RequestReconcile();
+}
+
+void AdmProxy::ScheduleFormatWatchLocked() {
+#if !LK_ADM_MOBILE
+  if (format_watch_scheduled_ || !format_reader_ || !format_watch_periodic_) {
+    return;
+  }
+  format_watch_scheduled_ = true;
+  device_thread_->PostDelayedTask(
+      [this] {
+        AdmLock lock(&mutex_);
+        format_watch_scheduled_ = false;
+        PollDeviceFormatsLocked();
+        if (!terminated_ && (playout_watch_.opened || recording_watch_.opened)) {
+          ScheduleFormatWatchLocked();
+        }
+      },
+      kFormatWatchPeriod);
+#endif
+}
+
 void AdmProxy::ShutdownLocked() {
   if (terminated_) {
     return;
@@ -1183,6 +1384,8 @@ void AdmProxy::ShutdownLocked() {
   if (webrtc::AudioDeviceModule* platform_adm = platform()) {
     platform_adm->StopPlayout();
     platform_adm->StopRecording();
+    ForgetFormatLocked(true);
+    ForgetFormatLocked(false);
     if (capture_state_) {
       capture_state_->ClearSpeaking();
     }
@@ -1466,6 +1669,22 @@ void AdmProxy::SetUidTranslatorForTest(AdmUidTranslator translator) {
   uid_translator_ = std::move(translator);
 }
 
+void AdmProxy::SetDeviceFormatReaderForTest(AdmDeviceFormatReader reader,
+                                            bool periodic) {
+  AdmLock lock(&mutex_);
+  device_formats_available_.store(static_cast<bool>(reader),
+                                  std::memory_order_relaxed);
+  format_reader_ = std::move(reader);
+  format_watch_periodic_ = periodic;
+}
+
+void AdmProxy::PollDeviceFormatsForTest() {
+  RunDeviceTaskAndWait([this] {
+    AdmLock lock(&mutex_);
+    PollDeviceFormatsLocked();
+  });
+}
+
 AdmNativeStats AdmProxy::ReadNativeStats() {
   AdmNativeStats stats;
   stats.tap = tap_.Read();
@@ -1488,6 +1707,22 @@ AdmNativeStats AdmProxy::ReadNativeStats() {
   stats.overlapping_callbacks = stats.tap.overlapping_callbacks;
   stats.device_stop_failures =
       device_stop_failures_.load(std::memory_order_relaxed);
+  stats.device_formats_available =
+      device_formats_available_.load(std::memory_order_relaxed);
+  stats.playout_device_rate =
+      playout_device_rate_.load(std::memory_order_relaxed);
+  stats.playout_device_channels =
+      playout_device_channels_.load(std::memory_order_relaxed);
+  stats.recording_device_rate =
+      recording_device_rate_.load(std::memory_order_relaxed);
+  stats.recording_device_channels =
+      recording_device_channels_.load(std::memory_order_relaxed);
+  stats.playout_format_changes =
+      playout_format_changes_.load(std::memory_order_relaxed);
+  stats.playout_format_reopens =
+      playout_format_reopens_.load(std::memory_order_relaxed);
+  stats.recording_format_changes =
+      recording_format_changes_.load(std::memory_order_relaxed);
   if (mixer_) {
     RootAudioMixerStats mix = mixer_->ReadStats();
     stats.mix_calls = mix.mix_calls;

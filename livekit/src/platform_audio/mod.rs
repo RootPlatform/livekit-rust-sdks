@@ -117,8 +117,8 @@ pub use error::{AudioError, AudioResult};
 pub use processing::{AudioProcessingOptions, AudioProcessingType};
 pub use rootapp::{
     sanitize_volume, AudioDeviceResults, AudioDeviceSelection, CaptureFormat, DenoiserCompletion,
-    DenoiserState, EchoModel, EchoModelReason, EchoModelState, EchoModelStats, EffectPlay,
-    GainEngine, GainLimit, LocalSpeaking, MixSourceLevel, MonitorError, OutputDeviceKind,
+    DenoiserState, DeviceFormatStats, EchoModel, EchoModelReason, EchoModelState, EchoModelStats,
+    EffectPlay, GainEngine, GainLimit, LocalSpeaking, MixSourceLevel, MonitorError, OutputDeviceKind,
     PushToTalk, ReturnedPipeline, ReturnedPipelines, RootAudioControl, RootAudioStats,
     SpeechDetection, ECHO_MODEL_AVAILABLE, MAX_VOICE_GAIN_DB, MAX_VOLUME,
 };

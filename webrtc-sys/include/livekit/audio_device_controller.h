@@ -16,7 +16,10 @@
 
 #pragma once
 
+#include <map>
 #include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "api/scoped_refptr.h"
@@ -253,6 +256,14 @@ class AdmProxyHarness {
   // Enumeration serialized with device operations (as on Linux), waiting at
   // most wait_ms for one in progress; or never waiting.
   void set_enumeration_lock(bool serialize, int32_t wait_ms) const;
+  // Device formats as CoreAudio would report them now (`guid` empty: the OS
+  // default); the first call gives the proxy a format reader that only
+  // poll_device_formats runs. A device without a format cannot be read.
+  void set_device_format(bool playout,
+                         rust::Str guid,
+                         uint32_t rate,
+                         uint32_t channels) const;
+  void poll_device_formats() const;
   // The next StartPlayout blocks the device thread (holding the device
   // mutex) until released.
   void block_next_start_playout() const;
@@ -368,6 +379,12 @@ class AdmProxyHarness {
     std::vector<std::string> entries;
   };
   std::shared_ptr<OpenedLog> opened_ = std::make_shared<OpenedLog>();
+  struct DeviceFormats {
+    webrtc::Mutex mutex;
+    std::map<std::pair<bool, std::string>, AdmDeviceFormat> formats;
+    bool installed = false;
+  };
+  std::shared_ptr<DeviceFormats> formats_ = std::make_shared<DeviceFormats>();
 };
 
 std::unique_ptr<AdmProxyHarness> new_adm_proxy_harness(

@@ -1232,7 +1232,15 @@ pub fn on_set_monitor(
 impl From<RootAudioStats> for proto::RootAudioStats {
     fn from(stats: RootAudioStats) -> Self {
         let echo = stats.echo_model;
+        let formats = stats.device_formats;
         Self {
+            playout_device_sample_rate: formats.map(|f| f.playout_rate),
+            playout_device_channels: formats.map(|f| f.playout_channels),
+            recording_device_sample_rate: formats.map(|f| f.recording_rate),
+            recording_device_channels: formats.map(|f| f.recording_channels),
+            playout_device_format_changes: formats.map(|f| f.playout_changes),
+            playout_device_format_reopens: formats.map(|f| f.playout_reopens),
+            recording_device_format_changes: formats.map(|f| f.recording_changes),
             echo_model: echo.map(|e| e.mode.to_wire() as i32),
             echo_model_state: echo.map(|e| e.state.to_wire() as i32),
             echo_model_reason: echo.map(|e| e.reason.to_wire() as i32),
@@ -1548,6 +1556,51 @@ mod tests {
         );
         assert_eq!(absent.echo_model_inference_max_us, None);
         assert_eq!((absent.echo_model_measured_echo, absent.echo_model_kill_switch), (None, None));
+    }
+
+    #[test]
+    fn rootapp_audio_device_format_stats_convert_and_stay_absent_where_not_read() {
+        let stats = RootAudioStats {
+            device_formats: Some(livekit::DeviceFormatStats {
+                playout_rate: 24_000,
+                playout_channels: 1,
+                recording_rate: 16_000,
+                recording_channels: 1,
+                playout_changes: 2,
+                playout_reopens: 1,
+                recording_changes: 3,
+            }),
+            ..Default::default()
+        };
+        let p: proto::RootAudioStats = stats.into();
+        assert_eq!(
+            (p.playout_device_sample_rate, p.playout_device_channels),
+            (Some(24_000), Some(1))
+        );
+        assert_eq!(
+            (p.recording_device_sample_rate, p.recording_device_channels),
+            (Some(16_000), Some(1))
+        );
+        assert_eq!(
+            (p.playout_device_format_changes, p.playout_device_format_reopens),
+            (Some(2), Some(1))
+        );
+        assert_eq!(p.recording_device_format_changes, Some(3));
+
+        let absent: proto::RootAudioStats = RootAudioStats::default().into();
+        assert_eq!(
+            (absent.playout_device_sample_rate, absent.playout_device_channels),
+            (None, None)
+        );
+        assert_eq!(
+            (absent.recording_device_sample_rate, absent.recording_device_channels),
+            (None, None)
+        );
+        assert_eq!(
+            (absent.playout_device_format_changes, absent.playout_device_format_reopens),
+            (None, None)
+        );
+        assert_eq!(absent.recording_device_format_changes, None);
     }
 
     #[test]
