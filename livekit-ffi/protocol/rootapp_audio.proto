@@ -573,6 +573,22 @@ message RootAudioStats {
   optional float voice_gain_fall_db_per_second = 129;
   optional float voice_gain_level_time_constant_ms = 130;
   optional float voice_gain_min_speech_probability = 131;
+
+  // Platform device formats, where native reads them (macOS; absent elsewhere and from libraries that
+  // predate them). Each open direction's device as the ADM opened it (the CoreAudio stream format it
+  // converts to: rate in Hz, channels), 0 while that direction is closed. The macOS ADM keeps converting to
+  // the output format it opened with, so a device that changes format under it (a Bluetooth headset
+  // entering its hands-free profile) plays the call at the wrong speed: native reads the open devices'
+  // formats every 100 ms, counts every change seen (cumulative for the engine's life, also a change during
+  // an open) and reopens playout once a change held for two reads (at most once a second). Recording
+  // changes are only counted.
+  optional uint32 playout_device_sample_rate = 132;
+  optional uint32 playout_device_channels = 133;
+  optional uint32 recording_device_sample_rate = 134;
+  optional uint32 recording_device_channels = 135;
+  optional uint64 playout_device_format_changes = 136;
+  optional uint64 playout_device_format_reopens = 137;
+  optional uint64 recording_device_format_changes = 138;
 }
 // One playout mixer source (a remote audio stream): its audio as it reached the mixer, decoded and
 // before its gain (tile volume, master volume, deafen; a muted frame counts as silence), as a sum of
