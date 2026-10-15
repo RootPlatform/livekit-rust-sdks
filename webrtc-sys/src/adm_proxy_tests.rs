@@ -265,6 +265,120 @@ fn adm_proxy_uid_selects_nothing_without_coreaudio() {
     );
 }
 
+/// macOS: AudioDeviceMac keeps converting to the output format it read at
+/// InitPlayout. A Bluetooth headset entering its hands-free profile under the
+/// hold (2 ch 48 kHz to 1 ch 24 kHz) is reopened once the new format held for
+/// two reads, so the ADM reads it again.
+#[test]
+fn adm_proxy_reopens_playout_when_the_device_format_changes_under_it() {
+    let h = platform(&["default", "73"], &["default", "74"]);
+    h.set_device_format(true, "", 48_000, 2);
+    h.hold(true);
+    let open = [default_device("Playout"), "InitPlayout".into(), "StartPlayout".into()];
+    assert_eq!(calls(&h), open);
+    let stats = h.stats();
+    assert!(stats.device_formats_available);
+    assert_eq!((stats.playout_device_rate, stats.playout_device_channels), (48_000, 2));
+    assert_eq!((stats.recording_device_rate, stats.recording_device_channels), (0, 0));
+    h.poll_device_formats();
+    h.poll_device_formats();
+    assert_eq!(calls(&h), Vec::<String>::new(), "an unchanged format reopens nothing");
+
+    h.set_device_format(true, "", 24_000, 1);
+    h.poll_device_formats();
+    assert_eq!(calls(&h), Vec::<String>::new(), "one read is not enough");
+    assert_eq!((h.stats().playout_format_changes, h.stats().playout_format_reopens), (1, 0));
+    h.poll_device_formats();
+    let mut reopen = vec!["StopPlayout".to_string()];
+    reopen.extend(open.iter().cloned());
+    assert_eq!(calls(&h), reopen);
+    let stats = h.stats();
+    assert_eq!((stats.playout_device_rate, stats.playout_device_channels), (24_000, 1));
+    assert_eq!((stats.playout_format_changes, stats.playout_format_reopens), (1, 1));
+    assert!(h.platform_playing());
+    h.poll_device_formats();
+    h.poll_device_formats();
+    assert_eq!(calls(&h), Vec::<String>::new(), "the new format is the opened one");
+
+    h.hold(false);
+    assert_eq!(calls(&h), ["StopPlayout"]);
+    assert_eq!((h.stats().playout_device_rate, h.stats().playout_device_channels), (0, 0));
+}
+
+/// A profile switch that comes back to the opened format still reopens (the
+/// ADM may have taken the format in between), a format must hold for two
+/// reads, and reopens are at least a second apart.
+#[test]
+fn adm_proxy_reopens_playout_after_a_format_bounce_at_most_once_a_second() {
+    let h = platform(&["default", "73"], &["default"]);
+    h.set_device_format(true, "73", 48_000, 2);
+    select_playout(&h, "73");
+    h.hold(true);
+    let open = ["SetPlayoutDevice(1)", "InitPlayout", "StartPlayout"];
+    assert_eq!(calls(&h), open);
+
+    h.set_device_format(true, "73", 16_000, 1);
+    h.poll_device_formats();
+    h.set_device_format(true, "73", 48_000, 2);
+    h.poll_device_formats();
+    assert_eq!(calls(&h), Vec::<String>::new(), "no format held for two reads yet");
+    h.poll_device_formats();
+    assert_eq!(calls(&h), ["StopPlayout", open[0], open[1], open[2]]);
+    assert_eq!((h.stats().playout_format_changes, h.stats().playout_format_reopens), (1, 1));
+
+    h.set_device_format(true, "73", 24_000, 1);
+    h.poll_device_formats();
+    h.poll_device_formats();
+    assert_eq!(calls(&h), Vec::<String>::new(), "within a second of the last reopen");
+    std::thread::sleep(Duration::from_millis(1_100));
+    h.poll_device_formats();
+    assert_eq!(calls(&h), ["StopPlayout", open[0], open[1], open[2]]);
+    let stats = h.stats();
+    assert_eq!((stats.playout_format_changes, stats.playout_format_reopens), (2, 2));
+    assert_eq!((stats.playout_device_rate, stats.playout_device_channels), (24_000, 1));
+}
+
+/// A device that cannot be read is not watched, and recording format changes
+/// are counted without reopening the microphone.
+#[test]
+fn adm_proxy_counts_recording_format_changes_and_skips_unreadable_devices() {
+    let h = platform(&["default", "73"], &["default", "74"]);
+    h.set_device_format(false, "74", 48_000, 1);
+    h.select(&guid("74"), true, &guid("73"), true);
+    h.hold(true);
+    assert_eq!(calls(&h), ["SetPlayoutDevice(1)", "InitPlayout", "StartPlayout"]);
+    h.app_recording(true);
+    assert_eq!(calls(&h), ["SetRecordingDevice(1)", "InitRecording", "StartRecording"]);
+    let stats = h.stats();
+    assert_eq!((stats.playout_device_rate, stats.playout_device_channels), (0, 0));
+    assert_eq!((stats.recording_device_rate, stats.recording_device_channels), (48_000, 1));
+
+    h.set_device_format(true, "73", 24_000, 1);
+    h.set_device_format(false, "74", 16_000, 1);
+    for _ in 0..3 {
+        h.poll_device_formats();
+    }
+    assert_eq!(calls(&h), Vec::<String>::new());
+    let stats = h.stats();
+    assert_eq!((stats.recording_format_changes, stats.playout_format_changes), (1, 0));
+    assert_eq!(stats.recording_device_rate, 48_000, "as the ADM opened it");
+
+    h.app_recording(false);
+    assert_eq!(calls(&h), ["StopRecording"]);
+    assert_eq!((h.stats().recording_device_rate, h.stats().recording_device_channels), (0, 0));
+}
+
+#[test]
+fn adm_proxy_without_a_format_reader_reports_no_device_formats() {
+    let h = platform(&["default"], &["default"]);
+    h.hold(true);
+    h.poll_device_formats();
+    assert_eq!(calls(&h), [default_device("Playout"), "InitPlayout".into(), "StartPlayout".into()]);
+    let stats = h.stats();
+    assert!(!stats.device_formats_available);
+    assert_eq!((stats.playout_device_rate, stats.playout_format_changes), (0, 0));
+}
+
 /// Linux serializes enumeration with device operations (the PulseAudio ADM
 /// is not thread-safe) but never waits long for one: past the wait it reports
 /// no devices, and the enumerations right after it give up at once.

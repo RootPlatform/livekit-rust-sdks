@@ -510,6 +510,7 @@ AdmProxyHarness::AdmProxyHarness(
       webrtc::CreateEnvironment(), nullptr, mixer_,
       with_platform ? webrtc::scoped_refptr<webrtc::AudioDeviceModule>(fake_)
                     : nullptr);
+  proxy_->SetDeviceFormatReaderForTest(nullptr, false);
   proxy_->SetCaptureState(capture_);
   proxy_->SetPlayoutOpenedSink(
       [log = opened_](const AdmPlayoutOpened& opened) {
@@ -582,6 +583,43 @@ void AdmProxyHarness::set_uid_map(rust::Slice<const rust::String> uids,
 void AdmProxyHarness::set_enumeration_lock(bool serialize,
                                            int32_t wait_ms) const {
   proxy_->SetEnumerationLockForTest(serialize, wait_ms);
+}
+
+void AdmProxyHarness::set_device_format(bool playout,
+                                        rust::Str guid,
+                                        uint32_t rate,
+                                        uint32_t channels) const {
+  const std::string device =
+      guid.empty() ? std::string("default") : std::string(guid);
+  bool install = false;
+  {
+    webrtc::MutexLock lock(&formats_->mutex);
+    AdmDeviceFormat format;
+    format.device = device;
+    format.sample_rate = rate;
+    format.channels = channels;
+    format.bytes_per_frame = channels * 4;
+    formats_->formats[{playout, device}] = format;
+    install = !std::exchange(formats_->installed, true);
+  }
+  if (install) {
+    proxy_->SetDeviceFormatReaderForTest(
+        [formats = formats_](bool playout, const std::string& guid)
+            -> std::optional<AdmDeviceFormat> {
+          webrtc::MutexLock lock(&formats->mutex);
+          const auto found = formats->formats.find(
+              {playout, guid.empty() ? std::string("default") : guid});
+          if (found == formats->formats.end()) {
+            return std::nullopt;
+          }
+          return found->second;
+        },
+        false);
+  }
+}
+
+void AdmProxyHarness::poll_device_formats() const {
+  proxy_->PollDeviceFormatsForTest();
 }
 
 void AdmProxyHarness::block_next_start_playout() const {
@@ -1129,6 +1167,7 @@ RootVoiceHarness::RootVoiceHarness()
   transport_ = std::make_unique<HarnessApmTransport>(apm_);
   proxy_ = webrtc::make_ref_counted<AdmProxy>(webrtc::CreateEnvironment(),
                                               nullptr, mixer_, fake_);
+  proxy_->SetDeviceFormatReaderForTest(nullptr, false);
   proxy_->SetCaptureState(capture_);
   controller_ = std::make_unique<AudioDeviceController>(proxy_, mixer_, apm_,
                                                         capture_);
@@ -1386,6 +1425,7 @@ RootEngineHarness::RootEngineHarness() : parts_(std::make_unique<Parts>()) {
     return webrtc::make_ref_counted<AdmProxy>(env, p.worker.get(), p.mixer,
                                               p.fake);
   });
+  p.proxy->SetDeviceFormatReaderForTest(nullptr, false);
   p.proxy->SetCaptureState(p.capture);
 
   webrtc::PeerConnectionFactoryDependencies dependencies;

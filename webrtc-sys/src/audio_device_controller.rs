@@ -131,6 +131,18 @@ pub mod ffi {
         pub overlapping_callbacks: u64,
         pub device_stop_failures: u64,
 
+        /// Device formats are read (macOS). Each open direction's device
+        /// format when the ADM opened it (0 while closed), the format changes
+        /// seen under an open direction, and playout reopened for one.
+        pub device_formats_available: bool,
+        pub playout_device_rate: u32,
+        pub playout_device_channels: u32,
+        pub recording_device_rate: u32,
+        pub recording_device_channels: u32,
+        pub playout_format_changes: u64,
+        pub playout_format_reopens: u64,
+        pub recording_format_changes: u64,
+
         /// The DSP chain, the denoiser slot and the APM decorator exist; the
         /// fields of the ones that do not stay at their defaults.
         pub dsp_available: bool,
@@ -555,6 +567,18 @@ pub mod ffi {
         /// Enumeration serialized with device operations (as on Linux),
         /// waiting at most `wait_ms` for one in progress; or never waiting.
         fn set_enumeration_lock(self: &AdmProxyHarness, serialize: bool, wait_ms: i32);
+        /// A device's format as CoreAudio would report it now (`guid`
+        /// empty: the OS default). The first call gives the proxy a format
+        /// reader that only `poll_device_formats` runs; a device without a
+        /// format cannot be read.
+        fn set_device_format(
+            self: &AdmProxyHarness,
+            playout: bool,
+            guid: &str,
+            rate: u32,
+            channels: u32,
+        );
+        fn poll_device_formats(self: &AdmProxyHarness);
         /// The next StartPlayout blocks the device thread (holding the
         /// device mutex) until released.
         fn block_next_start_playout(self: &AdmProxyHarness);

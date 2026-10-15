@@ -340,6 +340,14 @@ RootAudioNativeStats AudioDeviceController::root_audio_stats() const {
   stats.audio_thread_logs_dropped = native.audio_thread_logs_dropped;
   stats.overlapping_callbacks = native.overlapping_callbacks;
   stats.device_stop_failures = native.device_stop_failures;
+  stats.device_formats_available = native.device_formats_available;
+  stats.playout_device_rate = native.playout_device_rate;
+  stats.playout_device_channels = native.playout_device_channels;
+  stats.recording_device_rate = native.recording_device_rate;
+  stats.recording_device_channels = native.recording_device_channels;
+  stats.playout_format_changes = native.playout_format_changes;
+  stats.playout_format_reopens = native.playout_format_reopens;
+  stats.recording_format_changes = native.recording_format_changes;
 
   const double nan = std::numeric_limits<double>::quiet_NaN();
   stats.erl_db = nan;

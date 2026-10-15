@@ -122,6 +122,21 @@ struct AdmNameBuffers {
 using AdmUidTranslator =
     std::function<std::optional<std::string>(const std::string& uid)>;
 
+struct AdmDeviceFormat {
+  std::string device;
+  double sample_rate = 0;
+  uint32_t channels = 0;
+  uint32_t bytes_per_frame = 0;
+  uint32_t format_flags = 0;
+
+  bool operator==(const AdmDeviceFormat& other) const = default;
+};
+
+// An empty `guid` reads the OS default device of the direction.
+using AdmDeviceFormatReader = std::function<std::optional<AdmDeviceFormat>(
+    bool playout,
+    const std::string& guid)>;
+
 struct AdmDirectionOutcome {
   bool requested = false;
   bool found = true;
@@ -176,6 +191,14 @@ struct AdmNativeStats {
   uint64_t audio_thread_logs_dropped = 0;
   uint64_t overlapping_callbacks = 0;
   uint64_t device_stop_failures = 0;
+  bool device_formats_available = false;
+  uint32_t playout_device_rate = 0;
+  uint32_t playout_device_channels = 0;
+  uint32_t recording_device_rate = 0;
+  uint32_t recording_device_channels = 0;
+  uint64_t playout_format_changes = 0;
+  uint64_t playout_format_reopens = 0;
+  uint64_t recording_format_changes = 0;
 };
 
 // Registered with the platform ADM in place of libwebrtc's AudioTransport, from
@@ -383,6 +406,14 @@ enum class AdmMonitorResult : uint8_t {
 /// otherwise), since the hold can open playout before libwebrtc makes it. A device
 /// that fails to stop (the Windows ADM gives up joining its thread after 2 s)
 /// gets no second puller in that pass; the direction is retried a second later.
+///
+/// The macOS ADM keeps converting to the output format it read at InitPlayout
+/// (its format-change handler refuses an output channel count that differs
+/// from the recording one), so a device that changes format under a running
+/// playout, e.g. a Bluetooth headset entering its hands-free profile, plays
+/// the call at the wrong speed. There the device thread reads each open
+/// direction's format every 100 ms and reopens playout once a change held
+/// for two reads.
 class AdmProxy : public webrtc::AudioDeviceModule {
  public:
   AdmProxy(const webrtc::Environment& env,
@@ -471,6 +502,12 @@ class AdmProxy : public webrtc::AudioDeviceModule {
   bool SyntheticPlayingForTest() const;
   /// Replaces the UID translation (CoreAudio on macOS, none elsewhere).
   void SetUidTranslatorForTest(AdmUidTranslator translator);
+  /// Replaces the device format reader (CoreAudio on macOS, none
+  /// elsewhere); without `periodic` formats are read only by
+  /// PollDeviceFormatsForTest.
+  void SetDeviceFormatReaderForTest(AdmDeviceFormatReader reader,
+                                    bool periodic);
+  void PollDeviceFormatsForTest();
   /// Whether enumeration serializes with device operations (Linux) and how
   /// long it waits for one in progress.
   void SetEnumerationLockForTest(bool serialize, int wait_ms);
@@ -627,6 +664,22 @@ class AdmProxy : public webrtc::AudioDeviceModule {
                              AdmPlayoutOpened* matched = nullptr);
   void SchedulePlayoutDelayRefreshLocked();
   void ScheduleRetryLocked();
+
+  struct FormatWatch {
+    std::optional<AdmDeviceFormat> opened;
+    std::optional<AdmDeviceFormat> pending;
+    bool unsettled = false;
+  };
+  std::optional<AdmDeviceFormat> ReadFormatLocked(bool playout,
+                                                  const std::string& guid);
+  // After the ADM opened a direction: `before` is the device's format read
+  // just before the open.
+  void WatchOpenedLocked(bool playout,
+                         const std::optional<AdmDeviceFormat>& before);
+  void ForgetFormatLocked(bool playout);
+  void PollDeviceFormatsLocked();
+  bool PollFormatLocked(bool playout);
+  void ScheduleFormatWatchLocked();
   void ShutdownLocked();
   DesiredState Desired() const;
 
@@ -675,11 +728,27 @@ class AdmProxy : public webrtc::AudioDeviceModule {
   AdmPlayoutOpened last_playout_identity_;
   std::optional<AdmPlayoutOpened> playout_opened_;
   AdmPlayoutOpenedSink playout_opened_sink_;
+  // Guarded by mutex_. The recording GUID is only resolved with a reader.
+  AdmDeviceFormatReader format_reader_;
+  bool format_watch_periodic_ = false;
+  std::string last_recording_guid_;
+  FormatWatch playout_watch_;
+  FormatWatch recording_watch_;
+  int64_t last_format_reopen_ns_ = 0;
+  std::atomic<uint32_t> playout_device_rate_{0};
+  std::atomic<uint32_t> playout_device_channels_{0};
+  std::atomic<uint32_t> recording_device_rate_{0};
+  std::atomic<uint32_t> recording_device_channels_{0};
+  std::atomic<uint64_t> playout_format_changes_{0};
+  std::atomic<uint64_t> playout_format_reopens_{0};
+  std::atomic<uint64_t> recording_format_changes_{0};
+  std::atomic<bool> device_formats_available_{false};
   // capture_state_'s monitor, set with it.
   std::atomic<RootAudioMonitor*> monitor_{nullptr};
 #if !LK_ADM_MOBILE
   bool delay_refresh_scheduled_ = false;
   bool retry_scheduled_ = false;
+  bool format_watch_scheduled_ = false;
 #endif
   bool terminated_ = false;
 
