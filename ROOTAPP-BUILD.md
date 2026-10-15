@@ -1816,6 +1816,55 @@ burst-proof room cap and a smoother limiter, with the tunables as control fields
 126-131: see "Voice gain" (50d2872c the voice chain and its golden vectors, 95379f43 the controller,
 processor, livekit and livekit-ffi, 9b2409a6 the 15 dB default maximum).
 
+## macOS playout format changes (`rootapp/mac-playout`, 2026-10-15)
+
+Mac reports: on the first platform call after launch remote voices play far too deep ("monster"), a
+rejoin fixes it. libwebrtc's `AudioDeviceMac` (webrtc-sdk m150_release 89d790b, the pinned prebuilt)
+reads the output stream format at `InitPlayout` and converts every render callback to it
+(`SetDesiredPlayoutFormat`, `implDeviceIOProc`: frames per callback = bytes / the opened
+`mBytesPerFrame`). A later change is taken only through `HandleStreamFormatChange` on a
+`kAudioDevicePropertyStreamFormat` listener, which returns before touching the output side when the new
+channel count differs from `_recChannels` ("Changing channels not supported", a check meant for the
+input), is not thread-safe and leaks the old converter. A Bluetooth headset that enters its hands-free
+profile under a running playout (2 ch 48 kHz to 1 ch 16 or 24 kHz) while `_recChannels` is 2 (engine
+init's `SetStereoRecording(StereoRecordingIsAvailable())` on a 2-channel system default input), or
+whose change never reaches the listener, keeps its 2 ch 48 kHz converter: the device takes 4x (24 kHz)
+or 6x (16 kHz) fewer of the call's frames than it plays, two octaves and more down, with NetEq
+discarding the backlog; a return to stereo with `_recChannels` 1 plays 4x fast. The lease's playout
+hold opens playout before the voice engine initializes, the room connects and the mic opens, so on a
+headset the first open is in its stereo profile and the switch happens under the running playout.
+
+`AdmProxy` now reads the open devices' formats itself (macOS only: `CoreAudioDeviceFormat`, what the ADM
+reads; no reader and no change elsewhere). Before and after every successful `InitPlayout` and
+`InitRecording` it reads the device the selection resolved to (the OS default's current device for a
+default selection) and keeps that device's format; the device thread reads it again every 100 ms while a
+direction is open. Once a playout device's format moved, whatever it settles on (even the opened format
+again, since the ADM may have taken a format in between) that held for two reads reopens playout (the
+restart generation, as `RestartDevices`), at most once a second, so the ADM reads the format again.
+Recording changes are counted and logged only (a recording format change with the same channel count
+is taken by the ADM; reopening the mic would restart a Bluetooth switch). Logs: `AdmProxy: playout
+device <id> opened at <rate> Hz <ch> ch ...`, `changed format while open, A -> B`, `reopening playout
+on device <id> at B`.
+
+`RootAudioStats` 132-138 (optional, present where native reads formats, i.e. macOS):
+`playout_device_sample_rate`, `playout_device_channels`, `recording_device_sample_rate`,
+`recording_device_channels` (each open direction's device as the ADM opened it, 0 while closed),
+`playout_device_format_changes`, `playout_device_format_reopens`, `recording_device_format_changes`
+(cumulative). livekit: `RootAudioStats::device_formats: Option<DeviceFormatStats>`. No capability bit
+(caps stay 32767); a library that predates the fields reports none of them.
+
+Tests (Windows, a fake reader through the harness: `set_device_format`, `poll_device_formats`; the
+harnesses run without the CoreAudio reader): `adm_proxy_reopens_playout_when_the_device_format_changes_under_it`,
+`adm_proxy_reopens_playout_after_a_format_bounce_at_most_once_a_second`,
+`adm_proxy_counts_recording_format_changes_and_skips_unreadable_devices`,
+`adm_proxy_without_a_format_reader_reports_no_device_formats`, and the livekit and livekit-ffi
+conversions. The Mac branch of `adm_proxy.cpp` passed a clang-cl syntax-only check with the macOS
+define against stubbed CoreAudio declarations; not built with Apple's SDK or run on a Mac. To verify
+on a Mac: AirPods (or another headset with a mic) as output and a 2-channel default input, join a
+platform call; the log shows the change and the reopen, stats 132-133 go to 1 ch 16/24 kHz, voices
+play at the right pitch, and the render callbacks (`renderCallbacks` on the call diag line) stay at
+about 100/s.
+
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
 | Commit | Change |
