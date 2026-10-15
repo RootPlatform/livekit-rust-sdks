@@ -11,8 +11,8 @@ mod support;
 
 use rootapp_voice_dsp::voice_gain::{VoiceGain, VoiceGainOptions};
 use rootapp_voice_dsp::{
-    DenoiserOutput, DspChain, DspCommands, DspOutputs, DspSettings, PushToTalk, SpeechDetection,
-    VoiceGainTuning, MAX_FRAME,
+    Agc2Tuning, DenoiserOutput, DspChain, DspCommands, DspOutputs, DspSettings, GainEngine,
+    PushToTalk, SpeechDetection, VoiceGainTuning, MAX_FRAME,
 };
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -80,7 +80,8 @@ fn the_counter_sees_allocations() {
 const RATES: [u32; 8] = [8000, 11025, 16000, 22050, 24000, 32000, 44100, 48000];
 
 /// 10 000 frames: every rate, rate changes, every command, the three denoiser kinds (empty,
-/// short, burst and oversized outputs, restarts), unsupported shapes and changing settings.
+/// short, burst and oversized outputs, restarts), unsupported shapes, changing settings, and
+/// both gain engines through post_denoise_align and post_gain (a host's gain in between).
 #[test]
 fn the_chain_never_allocates_or_frees_after_new() {
     let mut chain = DspChain::new(48_000);
@@ -127,6 +128,8 @@ fn the_chain_never_allocates_or_frees_after_new() {
                         ..VoiceGainTuning::UNSET
                     },
                 ][(f / 170) % 5],
+                gain_engine: GainEngine::from_wire(((f / 230) % 2) as u32),
+                agc2: [Agc2Tuning::UNSET, Agc2Tuning::DEFAULT, Agc2Tuning::MAX][(f / 310) % 3],
             };
             let commands = DspCommands {
                 reset: f % 997 == 3,
@@ -154,7 +157,18 @@ fn the_chain_never_allocates_or_frees_after_new() {
                 _ => DenoiserOutput::Ran { samples: &denoised[..n], restart: false },
             };
             chain.pre_denoise(frame, &settings, &commands, &mut out);
-            chain.post_denoise(frame, output, &settings, &mut out);
+            if f % 3 == 0 {
+                chain.post_denoise(frame, output, &settings, &mut out);
+            } else {
+                let aligned = chain.post_denoise_align(frame, output, &settings, &mut out);
+                if aligned.supported {
+                    for s in frame.iter_mut() {
+                        *s *= 4.0;
+                    }
+                }
+                let gain_db = [12.0, f32::NAN, 25.0, -3.0][(f / 17) % 4];
+                chain.post_gain(frame, aligned.pre_gain_rms, gain_db, &settings, &mut out);
+            }
             if f % 41 == 0 {
                 chain.process(frame, &settings, &commands, &mut out);
             }

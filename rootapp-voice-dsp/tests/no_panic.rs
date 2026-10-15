@@ -9,8 +9,8 @@
 mod support;
 
 use rootapp_voice_dsp::{
-    DenoiserOutput, DspChain, DspCommands, DspOutputs, DspSettings, PushToTalk, SpeechDetection,
-    VoiceGainTuning,
+    Agc2Tuning, DenoiserOutput, DspChain, DspCommands, DspOutputs, DspSettings, GainEngine,
+    PushToTalk, SpeechDetection, VoiceGainTuning,
 };
 use support::Rng;
 
@@ -60,6 +60,21 @@ fn tuning(step: usize) -> VoiceGainTuning {
     }
 }
 
+/// AGC2 settings from FLOATS and the bounds.
+fn agc2(step: usize) -> Agc2Tuning {
+    let f = |k: usize, scale: f32| FLOATS[(step / 5 + k) % FLOATS.len()] * scale;
+    match step % 3 {
+        0 => Agc2Tuning::MIN,
+        1 => Agc2Tuning::MAX,
+        _ => Agc2Tuning {
+            headroom_db: f(0, 5.0),
+            max_gain_db: f(1, 30.0),
+            max_gain_change_db_per_second: f(2, 6.0),
+            max_output_noise_dbfs: f(3, -50.0),
+        },
+    }
+}
+
 fn denoiser_output(kind: usize, n: usize) -> usize {
     match kind {
         0 => 0,
@@ -94,7 +109,11 @@ fn check(frame: &[f32], out: &DspOutputs, context: &str) {
     assert!(!out.gate_in_block_peak_db.is_nan(), "{context}");
     assert!((0.0..=1.0).contains(&out.envelope), "{context}");
     assert!((0.0..=1.0).contains(&out.threshold), "{context}: {}", out.threshold);
-    assert!((0.0..=18.0).contains(&out.voice_gain_db), "{context}: {}", out.voice_gain_db);
+    assert!(
+        (0.0..=Agc2Tuning::MAX.max_gain_db).contains(&out.voice_gain_db),
+        "{context}: {}",
+        out.voice_gain_db
+    );
     assert!(!out.speaking || out.transmit_open, "{context}");
 }
 
@@ -130,6 +149,8 @@ fn any_shape_settings_input_and_denoiser_output_leaves_finite_full_scale_audio()
                             capture_silent: step % 8 < 3,
                             auto_sensitivity_minimum_db: FLOATS[(step / 5) % FLOATS.len()] * -50.0,
                             voice_gain: tuning(step),
+                            gain_engine: GainEngine::from_wire((step % 3) as u32),
+                            agc2: agc2(step),
                         };
                         let commands = DspCommands {
                             reset: step % 29 == 0,
@@ -207,6 +228,8 @@ fn abrupt_changes_and_commands_in_every_state_never_panic() {
             auto_sensitivity_minimum_db: [-54.0, f32::NAN, f32::NEG_INFINITY, 20.0, -1e30]
                 [((v >> 46) % 5) as usize],
             voice_gain: tuning((v >> 48) as usize),
+            gain_engine: GainEngine::from_wire(((v >> 18) % 2) as u32),
+            agc2: agc2((v >> 12) as usize),
         };
         let commands = DspCommands {
             reset: (v >> 38) % 40 == 0,
@@ -233,6 +256,19 @@ fn abrupt_changes_and_commands_in_every_state_never_panic() {
                 chain.pre_denoise(frame, &settings, &commands, &mut out);
             }
             2 => chain.process(frame, &settings, &commands, &mut out),
+            3 | 4 => {
+                chain.pre_denoise(frame, &settings, &commands, &mut out);
+                let aligned = chain.post_denoise_align(frame, output, &settings, &mut out);
+                for s in frame.iter_mut() {
+                    *s *= 30.0;
+                }
+                let gain_db = [30.0, f32::NAN, f32::INFINITY, -1e30, 1e30][(v % 5) as usize];
+                chain.post_gain(frame, aligned.pre_gain_rms, gain_db, &settings, &mut out);
+            }
+            5 => {
+                let gain_db = [12.0, f32::NAN][(v % 2) as usize];
+                chain.post_gain(frame, 0.1, gain_db, &settings, &mut out);
+            }
             _ => {
                 chain.pre_denoise(frame, &settings, &commands, &mut out);
                 chain.post_denoise(frame, output, &settings, &mut out);

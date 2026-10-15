@@ -546,6 +546,49 @@ fn run_chain(
     frames
 }
 
+/// The split the capture processor uses for a host's gain (post_denoise_align, then post_gain)
+/// with the chain's own voice gain is post_denoise: every vector's sent frames and every output,
+/// bit for bit.
+#[test]
+fn golden_vectors_align_and_post_gain_equal_post_denoise() {
+    let mut failed = Vec::new();
+    for path in vector_files() {
+        let name = path.file_stem().unwrap().to_string_lossy().to_string();
+        let (_, records) = parse(&std::fs::read(&path).unwrap()).unwrap();
+        let mut whole = DspChain::new(48_000);
+        let mut split = DspChain::new(48_000);
+        let mut whole_out = DspOutputs::default();
+        let mut split_out = DspOutputs::default();
+        for (index, record) in records.iter().enumerate() {
+            let denoised = match record.kind {
+                0 => DenoiserOutput::NotInUse,
+                1 => DenoiserOutput::Missed,
+                _ => DenoiserOutput::Ran { samples: &record.denoised, restart: record.restart },
+            };
+            let mut a = record.input.clone();
+            whole.pre_denoise(&mut a, &record.settings, &record.commands, &mut whole_out);
+            whole.post_denoise(&mut a, denoised, &record.settings, &mut whole_out);
+            let mut b = record.input.clone();
+            split.pre_denoise(&mut b, &record.settings, &record.commands, &mut split_out);
+            let aligned =
+                split.post_denoise_align(&mut b, denoised, &record.settings, &mut split_out);
+            split.post_gain(
+                &mut b,
+                aligned.pre_gain_rms,
+                f32::NAN,
+                &record.settings,
+                &mut split_out,
+            );
+            let same_frame = a.iter().map(|x| x.to_bits()).eq(b.iter().map(|x| x.to_bits()));
+            if !same_frame || format!("{whole_out:?}") != format!("{split_out:?}") {
+                failed.push(format!("{name}: frame {index} differs"));
+                break;
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
 /// The speech detector's paths leave the audio as it is when they change nothing: Ring mode (it
 /// qualifies the ring only) sends what the managed reference sent with each vector's own
 /// probabilities, and bit for bit what Off sends with any probability; Gate mode with a

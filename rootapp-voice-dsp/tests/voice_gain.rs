@@ -88,8 +88,8 @@ fn a_quiet_talker_is_brought_up_to_the_target_within_a_few_seconds() {
 #[test]
 fn a_very_quiet_talker_gets_at_most_the_maximum_boost() {
     let mut gain = new_gain(0.0);
-    talk_quiet_room(&mut gain, -46.0, 6.0);
-    assert_eq!(VoiceGainOptions::default().max_gain_db, 15.0);
+    talk_quiet_room(&mut gain, -56.0, 12.0);
+    assert_eq!(VoiceGainOptions::default().max_gain_db, 24.0);
     assert!(near(gain.gain_db(), VoiceGainOptions::default().max_gain_db, 1e-3));
 }
 
@@ -318,7 +318,7 @@ fn a_voice_well_under_the_person_counts_as_the_room() {
 #[test]
 fn a_remembered_gain_falls_in_a_noisy_room_before_anyone_speaks() {
     let mut gain = new_gain(VoiceGainOptions::default().max_gain_db);
-    room_talk(&mut gain, None, -45.0, 4.0, None);
+    room_talk(&mut gain, None, -45.0, 6.0, None);
     assert_eq!(gain.speech_ms(), 0.0);
     assert!(near(gain.gain_db(), 0.0, 0.05), "{}", gain.gain_db());
 }
@@ -354,7 +354,8 @@ fn a_noise_burst_in_a_pause_barely_moves_the_room() {
 /// A room that gets louder for good (a fan turning up) still caps the gain, which comes down no
 /// faster than the fall rate. The room is only measured in pauses, at most 6 dB over its estimate
 /// per frame: in this talk (a 0.5 s pause every 1.5 s) the estimate rises about 0.5 dB/s, in
-/// silence 6.5 dB/s.
+/// silence 6.5 dB/s. A room that jumps at once counts only when the input's floor has followed it
+/// (6 dB/s): 21 dB are learned about 3.5 s later than the 6.5 dB/s alone would.
 #[test]
 fn a_rising_room_caps_the_gain_at_the_fall_rate() {
     let mut gain = new_gain(0.0);
@@ -386,8 +387,72 @@ fn a_rising_room_caps_the_gain_at_the_fall_rate() {
 
     let mut silent = new_gain(0.0);
     room_talk(&mut silent, None, -75.0, 3.0, None);
+    room_talk(&mut silent, None, -54.0, 3.0, None);
+    assert!(
+        silent.room_noise_db() < -70.0,
+        "the input's floor is still rising: {}",
+        silent.room_noise_db()
+    );
     room_talk(&mut silent, None, -54.0, 5.0, None);
     assert!(in_range(silent.room_noise_db(), -55.5, -53.0), "{}", silent.room_noise_db());
+}
+
+/// The hw.12 dip: speech the denoiser erased (loud before it, silence after) used to count as the
+/// room, which then capped the gain near 0 dB for as long as the pause that followed. Erased speech
+/// is no room now, and the gain stays where the talker's level put it.
+#[test]
+fn speech_the_denoiser_erased_is_never_the_room() {
+    let mut gain = new_gain(0.0);
+    room_talk(&mut gain, Some(-40.0), -75.0, 8.0, None);
+    let talking = gain.gain_db();
+    let room = gain.room_noise_db();
+    assert!(in_range(talking, 13.0, 16.0), "{talking}");
+
+    let mut input = [0.0f32; FRAME];
+    let mut rng = Rng::new(8);
+    let residue = (10f64.powf(-85.0 / 20.0) * 3f64.sqrt()) as f32;
+    let floor = (10f64.powf(-75.0 / 20.0) * 3f64.sqrt()) as f32;
+    for f in 0..1000 {
+        let voiced = f % 150 < 100 && f % 30 < 20;
+        let a = if voiced { amplitude(-40.0) } else { 0.0 };
+        for (i, s) in input.iter_mut().enumerate() {
+            let n = (f * FRAME + i) as f32;
+            *s = a * (2.0 * PI * 220.0 * n / RATE).sin() + floor * rng.symmetric();
+        }
+        let mut output: Vec<f32> = (0..FRAME).map(|_| residue * rng.symmetric()).collect();
+        gain.observe_input(&input);
+        gain.process(&mut output);
+    }
+    assert!(gain.room_noise_db() - room < 1.0, "{room} -> {}", gain.room_noise_db());
+    assert!(gain.gain_db() > talking - 0.5, "{talking} -> {}", gain.gain_db());
+}
+
+#[test]
+fn the_limit_says_what_holds_the_gain() {
+    use rootapp_voice_dsp::GainLimit;
+    let mut gain = new_gain(6.0);
+    assert_eq!(gain.limit(), GainLimit::None);
+    talk_quiet_room(&mut gain, -35.0, 6.0);
+    assert_eq!(gain.limit(), GainLimit::Target);
+    let mut quiet = new_gain(0.0);
+    talk_quiet_room(&mut quiet, -56.0, 6.0);
+    assert_eq!(quiet.limit(), GainLimit::Max);
+
+    let mut noisy = new_gain(0.0);
+    talk(&mut noisy, -42.0, 8.0, -62.0, None);
+    assert_eq!(noisy.limit(), GainLimit::Noise);
+
+    let mut room = new_gain(0.0);
+    room_talk(&mut room, Some(-38.0), -58.0, 8.0, None);
+    assert_eq!(room.limit(), GainLimit::Room);
+    let mut before_speech = new_gain(VoiceGainOptions::default().max_gain_db);
+    room_talk(&mut before_speech, None, -45.0, 3.0, None);
+    assert_eq!(before_speech.limit(), GainLimit::Room);
+    assert_eq!(
+        [GainLimit::None, GainLimit::Target, GainLimit::Max, GainLimit::Noise, GainLimit::Room]
+            .map(GainLimit::to_wire),
+        [0, 1, 2, 3, 4]
+    );
 }
 
 /// The talker's level is the average of their frames in dB, not of their power: syllables at -30
@@ -518,6 +583,7 @@ fn the_start_moves_at_six_db_a_second_without_overshooting() {
 #[test]
 fn tuning_applies_on_the_next_frame_and_a_reset_clamps_to_the_maximum() {
     let mut gain = new_gain(0.0);
+    gain.set_tuning(&VoiceGainTuning { max_gain_db: 15.0, ..VoiceGainTuning::UNSET });
     talk_quiet_room(&mut gain, -46.0, 6.0);
     assert!(near(gain.gain_db(), 15.0, 1e-3));
     gain.set_tuning(&VoiceGainTuning { max_gain_db: 6.0, ..VoiceGainTuning::UNSET });
@@ -533,7 +599,7 @@ fn tuning_applies_on_the_next_frame_and_a_reset_clamps_to_the_maximum() {
         target_db: -100.0,
         ..VoiceGainTuning::UNSET
     });
-    assert_eq!(gain.options().max_gain_db, 18.0);
+    assert_eq!(gain.options().max_gain_db, 24.0);
     assert_eq!(gain.options().target_db, -40.0);
     gain.set_tuning(&VoiceGainTuning::UNSET);
     assert_eq!(*gain.options(), VoiceGainOptions::default());
@@ -549,7 +615,7 @@ fn tunables_are_clamped_and_non_finite_ones_are_the_defaults() {
     );
     assert!(unset.fall_db_per_second.is_nan() && unset.level_time_constant_ms.is_nan());
     assert!(unset.min_speech_probability.is_nan());
-    assert_eq!((d.max_gain_db, d.target_db), (15.0, -25.0));
+    assert_eq!((d.max_gain_db, d.target_db), (24.0, -25.0));
     assert_eq!((d.rise_db_per_second, d.fall_db_per_second), (3.0, 2.0));
     assert_eq!((d.level_time_constant_ms, d.min_speech_probability), (4000.0, 0.5));
     let low = VoiceGainTuning {
@@ -576,7 +642,7 @@ fn tunables_are_clamped_and_non_finite_ones_are_the_defaults() {
         ..VoiceGainTuning::DEFAULT
     };
     assert_eq!(infinite.sanitized(), d);
-    assert_eq!(VoiceGainTuning::MAX.max_gain_db, 18.0);
+    assert_eq!(VoiceGainTuning::MAX.max_gain_db, 24.0);
 }
 
 #[test]
@@ -595,7 +661,7 @@ fn reset_starts_over_from_the_given_gain() {
 fn start_gains_are_clamped_and_nan_is_zero() {
     assert_eq!(new_gain(f64::NAN).gain_db(), 0.0);
     assert_eq!(new_gain(-4.0).gain_db(), 0.0);
-    assert_eq!(new_gain(f64::INFINITY).gain_db(), 15.0);
+    assert_eq!(new_gain(f64::INFINITY).gain_db(), 24.0);
     assert!(new_gain(0.0).room_noise_db().is_nan());
     assert_eq!(new_gain(0.0).speech_level_db(), f64::NEG_INFINITY);
     assert_eq!(new_gain(0.0).noise_db(), -90.0);

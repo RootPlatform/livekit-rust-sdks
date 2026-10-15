@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod agc2;
 pub mod aligner;
 pub mod auto_sensitivity;
 mod chain;
@@ -10,9 +11,10 @@ pub mod speech_gate;
 pub mod transmit_gate;
 pub mod voice_gain;
 
+pub use agc2::Agc2Tuning;
 pub use chain::{DspChain, AUTO_MIN_OPEN_BLOCKS};
 pub use speech_gate::SpeechDetection;
-pub use voice_gain::VoiceGainTuning;
+pub use voice_gain::{GainLimit, VoiceGainTuning};
 
 /// Managed `Math.Pow(10, x)`: libm's pow. The base goes through black_box because LLVM turns a
 /// constant base of 10 into exp10 where libm has one (macOS, glibc), which can round 1 ulp away
@@ -42,9 +44,9 @@ pub const STARTUP_HOLD_FRAMES: u32 = 20;
 pub const MAX_DENOISER_WAIT_FRAMES: u32 = 100;
 pub const DENOISER_STALL_FRAMES: u32 = 100;
 pub const TRANSMIT_FADE_MS: u32 = 5;
-/// Gain resets are clamped to 0..=this, and so is the voice gain's maximum a host can set (the
-/// default maximum is VoiceGainTuning::DEFAULT, 15 dB).
-pub const MAX_VOICE_GAIN_DB: f32 = 18.0;
+/// Gain resets are clamped to 0..=this for the chain's own voice gain, and so is the maximum a host
+/// can set for it (the default maximum is VoiceGainTuning::DEFAULT, 24 dB).
+pub const MAX_VOICE_GAIN_DB: f32 = 24.0;
 /// Auto sensitivity's open minimum (dBFS before the voice gain) while the host sets none.
 pub const AUTO_SENSITIVITY_MINIMUM_DB: f32 = -54.0;
 /// The range a host's minimum is clamped to.
@@ -65,6 +67,35 @@ impl PushToTalk {
             0 => Self::VoiceActivity,
             1 => Self::Held,
             _ => Self::Released,
+        }
+    }
+}
+
+/// Which voice gain boosts the denoised voice.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GainEngine {
+    /// The chain's own (`voice_gain::VoiceGain`, the managed engine's twin).
+    #[default]
+    Legacy,
+    /// The host's, between `post_denoise_align` and `post_gain` (libwebrtc's AGC2), which hands the
+    /// gain it applied to `post_gain`. The chain's voice gain still measures the room and the
+    /// talker's level for the stats, and its speech heard says when the gain is settled.
+    External,
+}
+
+impl GainEngine {
+    /// 1 external, anything else legacy.
+    pub fn from_wire(value: u32) -> Self {
+        match value {
+            1 => Self::External,
+            _ => Self::Legacy,
+        }
+    }
+
+    pub fn to_wire(self) -> u32 {
+        match self {
+            Self::Legacy => 0,
+            Self::External => 1,
         }
     }
 }
@@ -101,6 +132,10 @@ pub struct DspSettings {
     /// The voice gain's tunables as the host set them: non-finite fields are the defaults, the rest
     /// clamped (VoiceGainTuning::sanitized).
     pub voice_gain: VoiceGainTuning,
+    /// Which voice gain boosts the voice on this frame.
+    pub gain_engine: GainEngine,
+    /// The AGC2 the host ran on this frame (External): which limit holds its gain.
+    pub agc2: Agc2Tuning,
 }
 
 impl Default for DspSettings {
@@ -119,6 +154,8 @@ impl Default for DspSettings {
             capture_silent: false,
             auto_sensitivity_minimum_db: AUTO_SENSITIVITY_MINIMUM_DB,
             voice_gain: VoiceGainTuning::UNSET,
+            gain_engine: GainEngine::Legacy,
+            agc2: Agc2Tuning::UNSET,
         }
     }
 }
@@ -142,6 +179,14 @@ pub struct PreDenoise {
     pub flush_denoiser: bool,
     /// The frame is supported (rate in MIN_RATE..=max_rate and len == rate/100 > 0).
     pub supported: bool,
+}
+
+/// What `post_denoise_align` left in the frame: the aligned voice before any gain (FloatS16) for the
+/// host's gain, and its RMS (±1 units) for `post_gain`. An unsupported frame is left as it came.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Aligned {
+    pub supported: bool,
+    pub pre_gain_rms: f32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -209,9 +254,18 @@ pub struct DspOutputs {
     pub transmit_open: bool,
     /// The transmit gate was above 0 for any sample of this frame.
     pub transmitting: bool,
-    /// Last value while auto gain is off (0 before any and after a reset).
+    /// Last value while auto gain is off (0 before any and after a reset). External: the host's.
     pub voice_gain_db: f32,
     pub voice_gain_settled: bool,
+    /// The engine that boosted this frame.
+    pub gain_engine: GainEngine,
+    /// The chain's voice gain's view, whichever engine boosts (last values while auto gain is off):
+    /// the room before the denoiser in the talker's pauses and the talker's level before the gain
+    /// (NaN until measured), the floor after the denoiser before the gain, and what held the gain.
+    pub voice_gain_room_db: f32,
+    pub voice_gain_speech_level_db: f32,
+    pub voice_gain_floor_db: f32,
+    pub voice_gain_limit: GainLimit,
     /// DenoiserOutput::Ran this frame.
     pub denoiser_ran: bool,
     /// ≥ DENOISER_STALL_FRAMES empty outputs in a row.

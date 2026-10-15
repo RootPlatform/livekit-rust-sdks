@@ -10,9 +10,9 @@ mod support;
 
 use rootapp_voice_dsp::auto_sensitivity::AutoSensitivityOptions;
 use rootapp_voice_dsp::{
-    DenoiserOutput, DspChain, DspCommands, DspOutputs, DspSettings, PreDenoise, PushToTalk,
-    SpeechDetection, AUTO_MIN_OPEN_BLOCKS, DENOISER_STALL_FRAMES, MAX_DENOISER_WAIT_FRAMES,
-    STARTUP_HOLD_FRAMES,
+    Agc2Tuning, DenoiserOutput, DspChain, DspCommands, DspOutputs, DspSettings, GainEngine,
+    GainLimit, PreDenoise, PushToTalk, SpeechDetection, AUTO_MIN_OPEN_BLOCKS,
+    DENOISER_STALL_FRAMES, MAX_DENOISER_WAIT_FRAMES, STARTUP_HOLD_FRAMES,
 };
 use support::{in_range, near, silent, sine, Rng};
 
@@ -161,13 +161,13 @@ fn gain_control_follows_the_setting_and_starts_from_the_remembered_gain() {
     assert_eq!(h.out.voice_gain_db, 4.0, "a reset while off only sets the start");
     h.settings.auto_gain = true;
     h.run(0.0);
-    assert_eq!(h.out.voice_gain_db, 15.0, "back on: from the newest reset, clamped to the maximum");
+    assert_eq!(h.out.voice_gain_db, 24.0, "back on: from the newest reset, clamped to the maximum");
 
     for db in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
         h.commands.gain_reset = true;
         h.commands.gain_reset_db = db;
         h.run(0.0);
-        assert_eq!(h.out.voice_gain_db, 15.0, "{db} is ignored");
+        assert_eq!(h.out.voice_gain_db, 24.0, "{db} is ignored");
     }
     h.commands.gain_reset = true;
     h.commands.gain_reset_db = -3.0;
@@ -473,13 +473,13 @@ fn a_gain_reset_with_a_reset_in_the_same_frame_survives_it() {
 }
 
 /// The host's maximum applies in the frame it arrives in, before that frame's gain reset: a reset
-/// clamps to it (and never above 18 dB), unset or non-finite is 15 dB.
+/// clamps to it (and never above 24 dB), unset or non-finite is 24 dB.
 #[test]
 fn a_gain_reset_is_clamped_to_the_hosts_maximum_from_the_same_frame() {
     for (max, reset, expected) in [
-        (f32::NAN, 30.0f32, 15.0f32),
+        (f32::NAN, 30.0f32, 24.0f32),
         (18.0, 30.0, 18.0),
-        (40.0, 30.0, 18.0),
+        (40.0, 30.0, 24.0),
         (6.0, 10.0, 6.0),
         (-5.0, 10.0, 0.0),
         (f32::INFINITY, 10.0, 10.0),
@@ -842,7 +842,7 @@ fn every_output_is_written_on_every_call() {
         };
         let b = fresh.run_input(&input);
         assert_eq!(a, b, "{i}");
-        assert_eq!(reused.out, fresh.out, "{i}");
+        assert_eq!(format!("{:?}", reused.out), format!("{:?}", fresh.out), "{i}");
     }
 }
 
@@ -1013,4 +1013,148 @@ fn input_is_sanitised_in_place_before_the_sdk_sees_it() {
     assert_eq!(&frame[..5], &[0.0, 0.0, 0.0, -131072.0, 131072.0]);
     assert_eq!(h.out.non_finite_samples, 2);
     assert_eq!(h.out.samples, 480);
+}
+
+/// A host's gain (GainEngine::External): `db` applied to the aligned frame between
+/// post_denoise_align and post_gain, as libwebrtc's AGC2 does in the capture processor.
+fn run_external(h: &mut Harness, input: &[f32], db: f32) -> Vec<f32> {
+    let mut frame = input.to_vec();
+    h.pre(&mut frame);
+    let aligned =
+        h.chain.post_denoise_align(&mut frame, DenoiserOutput::NotInUse, &h.settings, &mut h.out);
+    if aligned.supported {
+        let scale = 10f32.powf(db / 20.0);
+        for s in frame.iter_mut() {
+            *s *= scale;
+        }
+    }
+    h.chain.post_gain(&mut frame, aligned.pre_gain_rms, db, &h.settings, &mut h.out);
+    h.position += input.len();
+    frame
+}
+
+/// With the host's gain the chain sends what the host made of the frame, and auto sensitivity
+/// takes that gain: a 0 dB host gain sends exactly what the chain sends with its own gain off, and
+/// with 12 dB the threshold is 12 dB higher on the same input.
+#[test]
+fn an_external_gain_is_what_the_frame_and_auto_sensitivity_get() {
+    let mut off = Harness::new(48000);
+    off.settings.auto_gain = false;
+    let mut external = Harness::new(48000);
+    external.settings.gain_engine = GainEngine::External;
+    let mut boosted = Harness::new(48000);
+    boosted.settings.gain_engine = GainEngine::External;
+    let mut rng = Rng::new(4);
+    for f in 0..600 {
+        let level = if f % 30 < 20 { 0.02 } else { 0.0005 };
+        let input: Vec<f32> = (0..480).map(|_| level * 32768.0 * rng.symmetric()).collect();
+        let a = off.run_input(&input);
+        let b = run_external(&mut external, &input, 0.0);
+        let c = run_external(&mut boosted, &input, 12.0);
+        assert_eq!(a, b, "frame {f}");
+        assert_eq!(format!("{:?}", off.out.threshold), format!("{:?}", external.out.threshold));
+        if f > 300 {
+            let up = 20.0 * f64::from(boosted.out.threshold / external.out.threshold).log10();
+            assert!(near(up, 12.0, 0.6), "frame {f}: {up}");
+        }
+        assert!(c.iter().zip(&b).all(|(c, b)| c.abs() >= b.abs()));
+    }
+    assert_eq!(boosted.out.voice_gain_db, 12.0);
+    assert_eq!(boosted.out.gain_engine, GainEngine::External);
+    assert_eq!(off.out.gain_engine, GainEngine::Legacy);
+}
+
+/// The chain's own voice gain keeps measuring under a host's gain: the room, the talker's level,
+/// the floor and settled come from it, a gain reset starts it over, and the limit says which of the
+/// host's limits holds its gain.
+#[test]
+fn the_chain_gain_measures_for_an_external_gain() {
+    let mut h = Harness::new(48000);
+    h.settings.gain_engine = GainEngine::External;
+    h.settings.agc2 = Agc2Tuning::DEFAULT;
+    let amplitude = (10f64.powf(-40.0 / 20.0) * 2f64.sqrt()) as f32 * 32768.0;
+    for f in 0..600 {
+        let input = if f % 30 < 20 { h.tone(amplitude, 220.0) } else { vec![0.0; 480] };
+        run_external(&mut h, &input, 14.0);
+    }
+    assert!(h.out.voice_gain_settled);
+    assert!(
+        near(f64::from(h.out.voice_gain_speech_level_db), -40.0, 1.5),
+        "{}",
+        h.out.voice_gain_speech_level_db
+    );
+    assert_eq!(h.out.voice_gain_limit, GainLimit::Target);
+    assert_eq!(h.out.voice_gain_db, 14.0);
+    let floor = h.out.voice_gain_floor_db;
+    assert!(floor <= -80.0, "{floor}");
+
+    let input = h.tone(amplitude, 220.0);
+    run_external(&mut h, &input, 29.5);
+    assert_eq!(h.out.voice_gain_limit, GainLimit::Max, "within 1 dB of AGC2's 30 dB");
+    let mut noisy = Harness::new(48000);
+    noisy.settings.gain_engine = GainEngine::External;
+    let hiss: Vec<f32> = (0..480).map(|i| if i % 2 == 0 { 30.0 } else { -30.0 }).collect();
+    for _ in 0..50 {
+        run_external(&mut noisy, &hiss, 20.0);
+    }
+    let floor = noisy.out.voice_gain_floor_db;
+    assert!(floor > -62.0 && floor < -60.0, "{floor}");
+    assert_eq!(
+        noisy.out.voice_gain_limit,
+        GainLimit::Noise,
+        "AGC2's -50 dBFS over a -61 dBFS floor"
+    );
+
+    h.commands.gain_reset = true;
+    h.commands.gain_reset_db = 6.0;
+    run_external(&mut h, &input, 6.0);
+    assert!(!h.out.voice_gain_settled);
+    assert!(h.out.voice_gain_room_db.is_nan());
+
+    h.settings.auto_gain = false;
+    run_external(&mut h, &input, 0.0);
+    assert_eq!(h.out.voice_gain_db, 6.0, "off keeps the last value");
+    for db in [f32::NAN, f32::INFINITY, -4.0, 80.0] {
+        h.settings.auto_gain = true;
+        run_external(&mut h, &input, db);
+        let expected = if db == 80.0 { 50.0 } else { 0.0 };
+        assert_eq!(h.out.voice_gain_db, expected, "{db}");
+    }
+}
+
+/// post_denoise is post_denoise_align then post_gain with the chain's own gain, whatever engine
+/// the settings name; an unsupported frame passes post_denoise_align untouched and post_gain treats
+/// it as unsupported, as post_gain without post_denoise_align does.
+#[test]
+fn post_denoise_is_align_then_the_chain_gain() {
+    let mut whole = Harness::new(48000);
+    let mut split = Harness::new(48000);
+    split.settings.gain_engine = GainEngine::External;
+    whole.settings.gain_engine = GainEngine::External;
+    let mut rng = Rng::new(12);
+    for f in 0..400 {
+        let len = if f % 37 == 5 { 479 } else { 480 };
+        let level = if f % 30 < 20 { 0.03 } else { 0.001 };
+        let input: Vec<f32> = (0..len).map(|_| level * 32768.0 * rng.symmetric()).collect();
+        let a = whole.run_input(&input);
+        let mut frame = input.clone();
+        split.pre(&mut frame);
+        let legacy = DspSettings { gain_engine: GainEngine::Legacy, ..split.settings };
+        let aligned = split.chain.post_denoise_align(
+            &mut frame,
+            DenoiserOutput::NotInUse,
+            &legacy,
+            &mut split.out,
+        );
+        assert_eq!(aligned.supported, len == 480);
+        if !aligned.supported {
+            assert_eq!(frame, input);
+        }
+        split.chain.post_gain(&mut frame, aligned.pre_gain_rms, 99.0, &legacy, &mut split.out);
+        assert_eq!(a, frame, "frame {f}");
+        assert_eq!(format!("{:?}", whole.out), format!("{:?}", split.out), "frame {f}");
+    }
+    let mut frame = vec![100.0f32; 480];
+    split.chain.post_gain(&mut frame, 0.5, 12.0, &split.settings, &mut split.out);
+    assert!(split.out.unsupported, "post_gain without post_denoise_align");
 }

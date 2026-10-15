@@ -28,7 +28,7 @@ impl VoiceGainTuning {
         min_speech_probability: f32::NAN,
     };
     pub const DEFAULT: Self = Self {
-        max_gain_db: 15.0,
+        max_gain_db: 24.0,
         target_db: -25.0,
         rise_db_per_second: 3.0,
         fall_db_per_second: 2.0,
@@ -101,6 +101,35 @@ impl Default for VoiceGainTuning {
     }
 }
 
+/// What held the gain where it is on the last frame (`VoiceGain::limit`; RootAudioStats
+/// voice_gain_limit for both engines).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GainLimit {
+    /// Nothing yet: under MinSpeechMs of speech, holding the start gain.
+    #[default]
+    None,
+    /// The talker's level: the gain brings it to the target.
+    Target,
+    /// The most it boosts.
+    Max,
+    /// The noise after the denoiser stays under its cap.
+    Noise,
+    /// The room before the denoiser stays under its cap.
+    Room,
+}
+
+impl GainLimit {
+    pub fn to_wire(self) -> u32 {
+        match self {
+            Self::None => 0,
+            Self::Target => 1,
+            Self::Max => 2,
+            Self::Noise => 3,
+            Self::Room => 4,
+        }
+    }
+}
+
 /// Managed `VoiceGainOptions` (`VoiceGain.cs`); Default = the C# defaults.
 #[derive(Clone, Debug, PartialEq)]
 pub struct VoiceGainOptions {
@@ -112,6 +141,11 @@ pub struct VoiceGainOptions {
     pub room_noise_time_constant_ms: f64,
     pub room_guard_ms: f64,
     pub room_burst_db: f64,
+    /// A frame quiet after the denoiser is room only when, before it, it is at most this far over
+    /// the floor of the input: speech the denoiser erased never counts as the room.
+    pub room_input_margin_db: f64,
+    /// How fast that floor rises (it falls as the denoised floor does).
+    pub room_input_floor_rise_db_per_second: f64,
     pub speech_margin_db: f64,
     pub speech_minimum_db: f64,
     pub min_speech_probability: f64,
@@ -143,6 +177,8 @@ impl Default for VoiceGainOptions {
             room_noise_time_constant_ms: 2000.0,
             room_guard_ms: 200.0,
             room_burst_db: 6.0,
+            room_input_margin_db: 3.0,
+            room_input_floor_rise_db_per_second: 6.0,
             speech_margin_db: 10.0,
             speech_minimum_db: -62.0,
             min_speech_probability: f64::from(tuning.min_speech_probability),
@@ -184,8 +220,11 @@ pub struct VoiceGain {
     since_speech_ms: f64,
     room_power: f64,
     input_power: f64,
+    input_floor_db: f64,
+    input_floor_known: bool,
     pending_next: usize,
     limiter: f32,
+    limit: GainLimit,
 }
 
 impl VoiceGain {
@@ -210,8 +249,11 @@ impl VoiceGain {
             since_speech_ms: f64::MAX,
             room_power: -1.0,
             input_power: -1.0,
+            input_floor_db: -90.0,
+            input_floor_known: false,
             pending_next: 0,
             limiter: 1.0,
+            limit: GainLimit::None,
         };
         gain.reset(start_gain_db);
         gain
@@ -279,6 +321,16 @@ impl VoiceGain {
         self.limiter
     }
 
+    /// What held the gain on the last frame.
+    pub fn limit(&self) -> GainLimit {
+        self.limit
+    }
+
+    /// The floor of the input before the denoiser (-90 before any frame).
+    pub fn input_floor_db(&self) -> f64 {
+        self.input_floor_db
+    }
+
     /// Enough speech heard that the gain is worth remembering for this microphone.
     pub fn is_settled(&self) -> bool {
         self.speech_ms >= self.options.settled_speech_ms
@@ -299,9 +351,12 @@ impl VoiceGain {
         self.since_speech_ms = f64::MAX;
         self.room_power = -1.0;
         self.input_power = -1.0;
+        self.input_floor_db = -90.0;
+        self.input_floor_known = false;
         self.pending_room.fill(-1.0);
         self.pending_next = 0;
         self.limiter = 1.0;
+        self.limit = GainLimit::None;
     }
 
     /// The frame as it was before the denoiser; call it before `process` for the same frame.
@@ -314,6 +369,23 @@ impl VoiceGain {
             power += f64::from(s * s);
         }
         self.input_power = power / frame.len() as f64;
+        let level_db = 10.0 * self.input_power.max(1e-12).log10();
+        let rise = self.options.room_input_floor_rise_db_per_second;
+        track_floor(
+            &mut self.input_floor_db,
+            &mut self.input_floor_known,
+            level_db,
+            &self.options,
+            rise,
+        );
+    }
+
+    /// The input before the denoiser is no louder than its floor allows for the room.
+    fn input_is_room(&self) -> bool {
+        let level_db = 10.0 * self.input_power.max(1e-12).log10();
+        level_db
+            <= (self.input_floor_db + self.options.room_input_margin_db)
+                .max(self.options.speech_minimum_db)
     }
 
     /// A frame without a speech probability.
@@ -343,7 +415,8 @@ impl VoiceGain {
         if self.since_speech_ms < f64::MAX {
             self.since_speech_ms += FRAME_MS;
         }
-        self.track_floor(level_db);
+        let rise = self.options.floor_rise_db_per_second;
+        track_floor(&mut self.floor_db, &mut self.floor_known, level_db, &self.options, rise);
         let mut speech = false;
         let room;
         let speech_threshold =
@@ -376,7 +449,7 @@ impl VoiceGain {
             self.run = 0;
             self.run_power = 0.0;
             self.add_noise(power, 1);
-            room = true;
+            room = self.input_is_room();
         }
         self.track_room(room, speech);
 
@@ -397,10 +470,19 @@ impl VoiceGain {
             o.max_gain_db
         };
         if self.speech_ms >= o.min_speech_ms && self.level_weight > 0.0 {
-            let mut wanted = clamp_f64(o.target_db - self.speech_level_db(), 0.0, o.max_gain_db);
-            wanted =
-                wanted.min(0f64.max(o.max_output_noise_db - self.floor_db.max(self.noise_db())));
-            wanted = wanted.min(room_limit);
+            let wanted_level = o.target_db - self.speech_level_db();
+            let level_limit = clamp_f64(wanted_level, 0.0, o.max_gain_db);
+            let noise_limit = 0f64.max(o.max_output_noise_db - self.floor_db.max(self.noise_db()));
+            let wanted = level_limit.min(noise_limit).min(room_limit);
+            self.limit = if room_limit < level_limit.min(noise_limit) {
+                GainLimit::Room
+            } else if noise_limit < level_limit {
+                GainLimit::Noise
+            } else if wanted_level >= o.max_gain_db {
+                GainLimit::Max
+            } else {
+                GainLimit::Target
+            };
             if wanted > self.gain_db && speech {
                 self.gain_db = wanted.min(self.gain_db + up);
             } else if wanted < self.gain_db {
@@ -408,6 +490,9 @@ impl VoiceGain {
             }
         } else if room_limit < self.gain_db {
             self.gain_db = room_limit.max(self.gain_db - down);
+            self.limit = GainLimit::Room;
+        } else {
+            self.limit = GainLimit::None;
         }
 
         let from = to_linear(previous_db);
@@ -492,23 +577,29 @@ impl VoiceGain {
                 (power - self.noise_power) * (FRAME_MS / self.options.noise_time_constant_ms);
         }
     }
+}
 
-    /// Noise floor of the incoming (denoised) signal: falls quickly, rises slowly.
-    fn track_floor(&mut self, level_db: f64) {
-        if !self.floor_known {
-            self.floor_known = true;
-            self.floor_db = clamp_f64(level_db, -90.0, -20.0);
-            return;
-        }
-        if level_db < self.floor_db {
-            self.floor_db += (level_db - self.floor_db)
-                * (1.0 - (-FRAME_MS / self.options.floor_fall_time_constant_ms).exp());
-        } else {
-            self.floor_db = level_db
-                .min(self.floor_db + self.options.floor_rise_db_per_second * FRAME_MS / 1000.0);
-        }
-        self.floor_db = clamp_f64(self.floor_db, -90.0, -20.0);
+/// A noise floor (the denoised signal's, or the input's before the denoiser): falls quickly, rises
+/// at `rise_db_per_second`.
+fn track_floor(
+    floor_db: &mut f64,
+    known: &mut bool,
+    level_db: f64,
+    options: &VoiceGainOptions,
+    rise_db_per_second: f64,
+) {
+    if !*known {
+        *known = true;
+        *floor_db = clamp_f64(level_db, -90.0, -20.0);
+        return;
     }
+    if level_db < *floor_db {
+        *floor_db += (level_db - *floor_db)
+            * (1.0 - (-FRAME_MS / options.floor_fall_time_constant_ms).exp());
+    } else {
+        *floor_db = level_db.min(*floor_db + rise_db_per_second * FRAME_MS / 1000.0);
+    }
+    *floor_db = clamp_f64(*floor_db, -90.0, -20.0);
 }
 
 fn to_linear(db: f64) -> f32 {
