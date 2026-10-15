@@ -874,7 +874,8 @@ managed engine's `NativeAudioSource` tracks, which bypass it):
 - With no `RootAudioSetControl` the chain runs on its defaults: noise gate in auto sensitivity
   (threshold from the noise floor of the denoised voice before the voice gain, 8 dB over it but never
   below -54 dBFS (-60 before hw.11; see "Auto sensitivity"), plus the frame's voice gain; 5 blocks to
-  open), voice gain on from 0 dB (it only boosts, up to 15 dB; 18 before hw.12, see "Voice gain"),
+  open), the chain's voice gain on from 0 dB (it only boosts, up to 24 dB; 15 in hw.12, 18 before;
+  see "Voice gain" and "Voice gain: AGC2", whose engine the host has to ask for),
   no denoiser. Every recording start silences its first 20 frames (200 ms, the startup
   hold), and with `denoiser_wanted` up to 100 frames until the denoiser runs. Mute and push-to-talk
   key up silence after the 5 ms fade; the gate, voice gain and auto sensitivity keep running.
@@ -1815,6 +1816,120 @@ Voice gain only; caps stay 32767. A speech-only 4 s level in dB, 2 dB/s fall, 15
 burst-proof room cap and a smoother limiter, with the tunables as control fields 17-22 and stats
 126-131: see "Voice gain" (50d2872c the voice chain and its golden vectors, 95379f43 the controller,
 processor, livekit and livekit-ffi, 9b2409a6 the 15 dB default maximum).
+
+## Voice gain: AGC2 (`rootapp/agc2`, hw.14)
+
+Talkers still got quieter over a call with hw.12 (the gain-drift report, 2026-10-15: 30-minute
+conversations built from real recordings through the real Effects SDK at 0.60):
+- The room cap measured the room before the Effects SDK but chose its frames after it, so speech the
+  SDK erased (a turn's start after a pause, a quiet word, the first turn after a hardware mute) was
+  learned as a loud room, and the gain fell towards 0 dB and stayed there through the pauses (Jesse
+  15 -> 3.2 dB for about 90 s).
+- On noisier mics the cap held the gain near 12 dB for good, so a talker who faded over a long call
+  faded at the output too.
+- libwebrtc's AGC2 with Chrome's settings, after the denoiser, had neither problem on the same data.
+
+The platform engine's voice gain is now AGC2 when the host asks (`gain_engine`, the desktop does by
+default); the chain's own voice gain stays, fixed, for the managed engine and as the fallback.
+
+Pipeline: APM -> pre_denoise -> speech detector -> Effects SDK -> aligner (`post_denoise_align`) ->
+AGC2 -> `post_gain` (auto sensitivity, startup hold, noise gate, input volume, transmit gate).
+- `RootAgc2` (`root_agc2.{h,cpp}`) is a second `AudioProcessing` with only `gain_controller2`:
+  adaptive digital on, input volume controller off, high-pass filter, AEC, NS and AGC1 off. Settings
+  `rootapp_voice_dsp::Agc2Tuning`: headroom 5 dB, max gain 30 dB (Chrome: 50), 6 dB/s, max output
+  noise -50 dBFS; the initial gain is the last gain reset (the desktop's remembered gain for the mic).
+- It lives in `RootCaptureState::agc2` (set before the APM is built; the processor makes one when
+  nobody did), so the APM variants the echo model switches between share it with the voice chain.
+- Built off the audio thread: `RootCaptureState::ServiceAgc2` (the controller after every
+  `set_root_audio_control`, after `reset_root_audio`, and on the 10 ms speaking poll) builds an
+  instance for the processor's rate when one is needed: `Initialize` at that rate and one frame of
+  silence, so nothing the APM sets up on its first frames runs on the audio thread. The audio thread
+  takes a staged instance at its next frame and leaves the one it replaced for the control side to
+  free; nothing is taken while a replaced one waits. A gain reset is a new instance from that gain
+  (clamped to the max), new settings or a new processor rate one from the gain applied last, and the
+  engine or auto gain turned back on one from the last reset (as the chain's own gain). A frame at a
+  rate no instance is built for yet (at most one poll after a rate change, inside the stream's 200 ms
+  startup hold in practice) gets the chain's voice gain.
+- The gain `post_gain` takes is measured: 10 log10(sum out^2 / sum in^2) of the frame, held while the
+  input is under -70 dBFS (the instance's initial gain before any). Auto sensitivity and the gate
+  learn before the gain exactly as before and add that gain. `voice_gain_db` is AGC2's gain;
+  `voice_gain_settled` is the chain's voice gain having heard 3 s of speech (it keeps running on a
+  copy of the frame before AGC2, measuring the room, the talker's level and the floor).
+- Rates: the processor runs at the APM's rate (16, 32 or 48 kHz for 8 to 48 kHz devices; 44.1 kHz
+  devices run at 48 kHz). AGC2 also runs on 8, 11.025, 22.05, 24 and 44.1 kHz frames (the APM
+  resamples internally), as the processor harness can feed them.
+
+`rootapp-voice-dsp`: `post_denoise` is now `post_denoise_align` (returns the aligned frame before any
+gain in `frame` and its RMS) then `post_gain(frame, pre_gain_rms, gain_db)`; `DspSettings::gain_engine`
+(`Legacy`, `External`) and `DspSettings::agc2` (the AGC2 that ran, for the limit). With `External`
+`gain_db` is the host's gain (clamped 0..50, non-finite 0). The chain's voice gain (both engines):
+- A frame quiet after the denoiser is room only when it was within `room_input_margin_db` (3 dB) of
+  the input's own floor before it (tracked like the denoised floor: 300 ms fall,
+  `room_input_floor_rise_db_per_second` 6 dB/s rise). Voices well under the talker's (loud after the
+  denoiser too) still count as before. A room that jumps 21 dB at once is learned about 3.5 s later.
+  Chosen on the gain-drift harness over a speech-detector bound (p < 0.3: JD 12.7 % low talk seconds
+  against 12.4 %) and a 2 dB/s input floor (11.7 %, but a room rising 5.5 dB/s is missed).
+- At most 24 dB (was 15); `MAX_VOICE_GAIN_DB` (the reset's and the host maximum's bound) is 24.
+- `VoiceGain::limit` (`GainLimit`: none, target, max, noise, room) says what held the gain; with
+  `External` the chain infers AGC2's from its gain: within 1 dB of its max, within 1 dB of its noise cap
+  over the floor the chain measures, else the target.
+
+Golden vectors `VoiceDspGoldenVectors/4` (desktop 34d9ccba7): 31, 12,573,491 bytes (12 MiB limit), all
+bit for bit (0 ulp in every value); new `voice_gain_erased_8k` (the fake SDK erases a turn's first
+400 ms and last 250 ms). `golden_vectors_align_and_post_gain_equal_post_denoise` runs every vector both
+ways and compares frames and every output bit for bit.
+
+Controls (`RootAudioControl`): `gain_engine` 23 (`RootAudioGainEngine` LEGACY, AGC2; legacy until set
+and after every session start), `agc2_headroom_db` 24 (0..20), `agc2_max_gain_db` 25 (1..50),
+`agc2_max_gain_change_db_per_second` 26 (1..20), `agc2_max_output_noise_dbfs` 27 (-80..-30), each
+clamped where it applies, a non-finite value the default. `gain_reset_db` is clamped to 0..50 (was 18)
+and then by the engine. Stats (`RootAudioStats`, after the Mac format fields 132-138): `gain_engine`
+139 (the engine that ran the last frame), AGC2's settings applied 140-143, `agc2_builds` 144, and the
+chain's view for both engines: `voice_gain_room_db` 145, `voice_gain_speech_level_db` 146,
+`voice_gain_floor_db` 147, `voice_gain_limit` 148 (what would have shown hw.12's failure: the room
+estimate jumping to speech levels and the limit at ROOM). No capability bit (caps stay 32767): a
+library that predates the fields ignores them and keeps its own voice gain, and the stats' absence
+tells the desktop so.
+
+Numbers (the gain-drift harness; talk-second output p10 / p50 dBFS and the share of talk seconds 6 dB
+or more under the median; dips: runs of 5 s or more at least 6 dB under the median gain). AGC2 ran in
+the capture processor (`root_capture_processor_agc2_replays_a_recording`, ignored: the SDK's output of
+each capture through the processor with the gate open, from 15 dB), the chain's gain through the crate
+on the capture and the SDK output:
+
+| Input | hw.12 | chain's gain (room fix, 24 dB) | AGC2 in the processor (30 dB) | AGC2 offline (Chrome, 50 dB) |
+|---|---|---|---|---|
+| J | -42.2 / -30.7, 20.0 % | -36.8 / -27.6, 18.0 %, dips 2 (34 s) | -32.9 / -25.7, 12.4 %, dips 1 (5 s) | -32.9 / -25.7, 12.0 % |
+| J8 | -35.7 / -27.4, 13.9 % | -32.4 / -26.8, 9.0 %, dips 1 (19 s) | -30.9 / -25.7, 8.5 %, dips 1 (6 s) | -31.0 / -25.6, 8.7 % |
+| JD | -39.6 / -28.9, 17.2 % | -34.9 / -27.6, 12.4 %, dips 1 (19 s) | -32.3 / -25.6, 10.7 %, no dips | -32.4 / -25.6, 10.7 % |
+| L | -28.3 / -24.3, 5.7 % | -28.0 / -24.2, 5.7 %, dips 1 (20 s) | -25.7 / -21.3, 5.2 %, no dips | -25.6 / -21.3, 5.4 % |
+
+JD (the talker falls 6 dB over the call), first and last 5 minutes: chain -24.8 -> -32.6, AGC2 -23.0
+-> -27.5 dBFS. The 30 dB maximum changes nothing on these recordings. A clean voice at -45 dBFS comes
+out of the processor at -22.4 to -22.8 dBFS (its frames' average in dB) at 48, 44.1 and 16 kHz.
+
+Tests: the crate (`chain`: a host's gain is what the frame and auto sensitivity get, the chain's gain
+measures under it, `post_denoise` is align then the chain's gain; `voice_gain`: erased speech is no
+room, the limit, the room step; the split and both engines in the no-alloc and no-panic runs);
+`agc2_tests` (a -45 dBFS voice reaches -25 +-3 dBFS at 48, 44.1 and 16 kHz; room noise at 20-30 dB of
+AGC2 gain never opens the gate; every gain reset is a new AGC2 from it, clamped to its max, settings a
+new one from the gain applied last, auto gain back on from the last reset; every rate and a rate
+change after the poll); `root_echo_switches_keep_agc2_and_its_gain` (two echo-model switches: same
+instance, the gain goes on); `root_engine_runs_agc2_from_the_controls` (the factory's wiring);
+`adm_proxy_controller_stores_the_gain_engine_and_agc2_settings_until_a_reset`; the livekit and
+livekit-ffi conversions.
+
+Risks: AGC2 has no foreground gate (a TV or other voices can raise its gain; the 30 dB max and the
+gate limit it); pauses and residual echo come out 2-5 dB louder; auto sensitivity's -54 dBFS minimum
+gives way above 11 dB of gain, so at 25-30 dB a sound the SDK leaves at -70 dBFS before the gain opens
+the gate (stationary room noise never does: the floor plus 8 dB holds); the first seconds of a call
+ramp from the remembered gain; the platform and managed engines now differ.
+
+## hw.14 (2026-10-15)
+
+AGC2 as the platform engine's voice gain, and the chain's voice gain without the erased-speech room
+(controls 23-27, stats 139-148, caps 32767): see "Voice gain: AGC2". Carries the macOS playout fix
+released alone as hw.13.
 
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
