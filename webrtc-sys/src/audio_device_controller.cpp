@@ -24,6 +24,7 @@
 #include <string>
 #include <utility>
 
+#include "livekit/root_agc2.h"
 #include "livekit/root_echo_model.h"
 
 namespace livekit_ffi {
@@ -418,6 +419,18 @@ RootAudioNativeStats AudioDeviceController::root_audio_stats() const {
         voice_gain.level_time_constant_ms;
     stats.voice_gain_min_speech_probability =
         voice_gain.min_speech_probability;
+    stats.gain_engine = dsp.gain_engine_applied;
+    const RootAgc2Tuning agc2 = root_agc2_tuning(dsp.agc2);
+    stats.agc2_headroom_db = agc2.headroom_db;
+    stats.agc2_max_gain_db = agc2.max_gain_db;
+    stats.agc2_max_gain_change_db_per_second =
+        agc2.max_gain_change_db_per_second;
+    stats.agc2_max_output_noise_dbfs = agc2.max_output_noise_dbfs;
+    stats.agc2_builds = dsp.agc2_builds;
+    stats.voice_gain_room_db = dsp.voice_gain_room_db;
+    stats.voice_gain_speech_level_db = dsp.voice_gain_speech_level_db;
+    stats.voice_gain_floor_db = dsp.voice_gain_floor_db;
+    stats.voice_gain_limit = dsp.voice_gain_limit;
   }
   if (denoiser_) {
     const RootDenoiserSlotStats slot = capture_->denoiser_slot->ReadStats(true);
@@ -492,7 +505,11 @@ bool AudioDeviceController::set_root_audio_control(
       control.has_voice_gain_rise_db_per_second ||
       control.has_voice_gain_fall_db_per_second ||
       control.has_voice_gain_level_time_constant_ms ||
-      control.has_voice_gain_min_speech_probability;
+      control.has_voice_gain_min_speech_probability ||
+      control.has_gain_engine || control.has_agc2_headroom_db ||
+      control.has_agc2_max_gain_db ||
+      control.has_agc2_max_gain_change_db_per_second ||
+      control.has_agc2_max_output_noise_dbfs;
   const bool mixer_fields = control.has_master_volume || control.has_deafened;
   const bool apm_fields =
       control.has_echo_cancellation || control.has_noise_suppression;
@@ -529,10 +546,37 @@ bool AudioDeviceController::set_root_audio_control(
                                        std::memory_order_relaxed);
     }
     if (control.has_gain_reset_db && std::isfinite(control.gain_reset_db)) {
-      capture_->gain_reset_db.store(
-          std::min(kRootMaxVoiceGainDb, std::max(0.0f, control.gain_reset_db)),
-          std::memory_order_relaxed);
+      const float db =
+          std::min(kRootMaxGainResetDb, std::max(0.0f, control.gain_reset_db));
+      if (capture_->agc2) {
+        capture_->agc2->Reset(db);
+      }
+      capture_->gain_reset_db.store(db, std::memory_order_relaxed);
       capture_->gain_reset_seq.fetch_add(1, std::memory_order_release);
+    }
+    if (control.has_gain_engine) {
+      capture_->gain_engine.store(
+          control.gain_engine == static_cast<uint32_t>(RootGainEngine::kAgc2)
+              ? control.gain_engine
+              : static_cast<uint32_t>(RootGainEngine::kLegacy),
+          std::memory_order_relaxed);
+    }
+    if (control.has_agc2_headroom_db) {
+      capture_->agc2_headroom_db.store(control.agc2_headroom_db,
+                                       std::memory_order_relaxed);
+    }
+    if (control.has_agc2_max_gain_db) {
+      capture_->agc2_max_gain_db.store(control.agc2_max_gain_db,
+                                       std::memory_order_relaxed);
+    }
+    if (control.has_agc2_max_gain_change_db_per_second) {
+      capture_->agc2_max_gain_change_db_per_second.store(
+          control.agc2_max_gain_change_db_per_second,
+          std::memory_order_relaxed);
+    }
+    if (control.has_agc2_max_output_noise_dbfs) {
+      capture_->agc2_max_output_noise_dbfs.store(
+          control.agc2_max_output_noise_dbfs, std::memory_order_relaxed);
     }
     if (control.has_speech_detection) {
       const uint32_t mode =
@@ -599,6 +643,9 @@ bool AudioDeviceController::set_root_audio_control(
   if (capture_ && control.has_denoiser_wanted && !control.denoiser_wanted) {
     capture_->denoiser_wanted.store(false, std::memory_order_relaxed);
   }
+  if (capture_ && capture_fields) {
+    capture_->ServiceAgc2();
+  }
   return (capture_ || !capture_fields) && (mixer_ || !mixer_fields) &&
          (apm_ || !apm_fields) && (echo_model || !control.has_echo_model);
 }
@@ -656,6 +703,10 @@ uint64_t AudioDeviceController::root_audio_sources_added() const {
 void AudioDeviceController::reset_root_audio(bool close_gate) const {
   if (capture_) {
     capture_->ResetControls(close_gate);
+    if (capture_->agc2) {
+      capture_->agc2->ResetSession();
+    }
+    capture_->ServiceAgc2();
   }
   if (close_gate) {
     adm_proxy_->SetMonitor(false);
@@ -755,8 +806,9 @@ RootSpeakingInfo AudioDeviceController::root_audio_speaking() const {
   RootSpeakingInfo info{};
   if (capture_) {
     // Polled every 10 ms while a session lives: frames that stopped without
-    // a stop never leave the ring lit.
+    // a stop never leave the ring lit, and AGC2 follows the processor's rate.
     capture_->ClearStaleSpeaking();
+    capture_->ServiceAgc2();
     const RootSpeakingSnapshot speaking = capture_->ReadSpeaking();
     info.speaking = speaking.speaking;
     info.seq = speaking.seq;

@@ -329,3 +329,55 @@ fn root_engine_managed_calls_never_open_the_device_and_each_gets_the_pump() {
         "{calls:?}"
     );
 }
+
+/// AGC2 from the controls, through the factory's wiring: a control with the
+/// gain engine and a gain reset builds it at once (off the audio thread), the
+/// captured voice runs through it, and the stats report it with its settings
+/// until a session start puts the chain's gain back.
+#[test]
+fn root_engine_runs_agc2_from_the_controls() {
+    let h = new_root_engine_harness();
+    let c = h.controller();
+    assert!(h.acquire());
+    control(
+        &h,
+        RootAudioControlUpdate {
+            has_auto_sensitivity: true,
+            auto_sensitivity: false,
+            has_gate_threshold: true,
+            gate_threshold: 0.0,
+            has_gain_engine: true,
+            gain_engine: 1,
+            has_gain_reset_db: true,
+            gain_reset_db: 12.0,
+            has_agc2_max_gain_db: true,
+            agc2_max_gain_db: 99.0,
+            ..Default::default()
+        },
+    );
+    let built = c.root_audio_stats();
+    assert_eq!(built.agc2_builds, 1, "built with the control, before any frame");
+    assert_eq!(
+        (built.agc2_headroom_db, built.agc2_max_gain_db),
+        (5.0, 50.0),
+        "the default headroom, the maximum clamped"
+    );
+    assert_eq!(
+        (built.agc2_max_gain_change_db_per_second, built.agc2_max_output_noise_dbfs),
+        (6.0, -50.0)
+    );
+    assert_eq!(h.monitor(true), MONITOR_APPLIED);
+    mic_test(&h, 0, 60);
+    let stats = c.root_audio_stats();
+    assert_eq!((stats.gain_engine, stats.agc2_builds), (1, 1));
+    assert!(
+        stats.voice_gain_db > 0.0 && stats.voice_gain_db <= 12.5,
+        "AGC2's gain from the 12 dB reset: {}",
+        stats.voice_gain_db
+    );
+    assert!(stats.voice_gain_floor_db.is_finite());
+    h.monitor(false);
+    c.reset_root_audio(false);
+    assert!(c.root_audio_stats().agc2_max_gain_db == 30.0, "a session start forgets the settings");
+    h.release();
+}

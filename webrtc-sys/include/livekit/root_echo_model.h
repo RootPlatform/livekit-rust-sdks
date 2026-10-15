@@ -475,6 +475,8 @@ class RootEchoHarness {
   void set_stream_delay(int32_t delay_ms) const;
   // The DSP chain passes the APM output on (no voice gain, gate open).
   void open_dsp_chain() const;
+  // AGC2 as the voice gain from gain_reset_db, built as the controller does.
+  void use_agc2(float gain_reset_db) const;
   void prepare_model() const;
   void set_mode(uint32_t mode) const;
   // A playout open classified as `kind`.

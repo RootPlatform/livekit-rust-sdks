@@ -45,6 +45,8 @@ class TaskQueueBase;
 namespace livekit_ffi {
 struct RootDspSettings;
 struct RootVoiceGainTuning;
+struct RootAgc2Tuning;
+struct RootDspAligned;
 struct RootDspCommands;
 struct RootDspPre;
 struct RootDspOutputs;
@@ -69,13 +71,26 @@ enum class RootPushToTalk : uint32_t {
   kReleased = 2,
 };
 
-// The app's VoiceGain only boosts: a gain reset is clamped to 0..18 dB here,
-// and the chain clamps it to its maximum (15 dB unless the host sets another,
-// at most this).
-constexpr float kRootMaxVoiceGainDb = 18.0f;
+// The voice gain only boosts: a gain reset is clamped to 0..50 dB here (AGC2's
+// highest maximum), and each engine clamps it to its own maximum (the chain's:
+// 24 dB unless the host sets less; AGC2's: 30 dB unless the host sets another).
+constexpr float kRootMaxGainResetDb = 50.0f;
+
+// RootCaptureState::gain_engine (rootapp_voice_dsp::GainEngine); other values
+// are kLegacy.
+enum class RootGainEngine : uint32_t {
+  // The chain's own voice gain (the managed engine's twin).
+  kLegacy = 0,
+  // libwebrtc's AGC2 (RootAgc2) between the aligner and auto sensitivity.
+  kAgc2 = 1,
+};
 
 // Every voice gain tunable unset (NaN): the chain's defaults.
 RootVoiceGainTuning RootVoiceGainTuningUnset();
+// Every AGC2 setting unset (NaN): the defaults.
+RootAgc2Tuning RootAgc2TuningUnset();
+
+class RootAgc2;
 
 // A raw capture frame whose every sample is at or below -100 dBFS (a ±1
 // signal) is digital silence: a hardware mute. Under one int16 step
@@ -172,6 +187,20 @@ struct RootDspStatsSnapshot {
   float auto_sensitivity_minimum_db = std::numeric_limits<float>::quiet_NaN();
   // The stored voice gain tunables (NaN: none, the chain's defaults).
   RootVoiceGainTuning voice_gain = RootVoiceGainTuningUnset();
+  // The stored gain engine and the one that ran the last frame, and the
+  // chain's voice gain's view on it (RootDspOutputs).
+  uint32_t gain_engine = 0;
+  uint32_t gain_engine_applied = 0;
+  float voice_gain_room_db = std::numeric_limits<float>::quiet_NaN();
+  float voice_gain_speech_level_db = std::numeric_limits<float>::quiet_NaN();
+  float voice_gain_floor_db = std::numeric_limits<float>::quiet_NaN();
+  uint32_t voice_gain_limit = 0;
+  // The stored AGC2 settings (NaN: none); the AGC2 built last (its settings
+  // after clamping, its rate, 0 before any) and how many were built.
+  RootAgc2Tuning agc2 = RootAgc2TuningUnset();
+  RootAgc2Tuning agc2_applied = RootAgc2TuningUnset();
+  uint32_t agc2_rate = 0;
+  uint64_t agc2_builds = 0;
 };
 
 struct RootSpeakingSnapshot {
@@ -221,6 +250,15 @@ struct RootCaptureState {
       std::numeric_limits<float>::quiet_NaN()};
   std::atomic<float> voice_gain_min_speech_probability{
       std::numeric_limits<float>::quiet_NaN()};
+  // RootGainEngine; the chain's until the host asks.
+  std::atomic<uint32_t> gain_engine{0};
+  // AGC2's settings as the host set them (RootAgc2Tuning; NaN: the default).
+  std::atomic<float> agc2_headroom_db{std::numeric_limits<float>::quiet_NaN()};
+  std::atomic<float> agc2_max_gain_db{std::numeric_limits<float>::quiet_NaN()};
+  std::atomic<float> agc2_max_gain_change_db_per_second{
+      std::numeric_limits<float>::quiet_NaN()};
+  std::atomic<float> agc2_max_output_noise_dbfs{
+      std::numeric_limits<float>::quiet_NaN()};
   // Stored by the APM decorator before each capture frame it forwards: that
   // frame's raw input was digital silence (kRootCaptureSilencePeak). The
   // processor takes it, so a frame that did not come through the decorator
@@ -242,6 +280,9 @@ struct RootCaptureState {
   // The mic test monitor, fed every processed frame while it is enabled. Set
   // once before the APM is built; may be null.
   std::shared_ptr<RootAudioMonitor> monitor;
+  // AGC2 (gain_engine kAgc2), built by the control side. Set once before the
+  // APM is built (the capture processor makes one when nobody did).
+  std::shared_ptr<RootAgc2> agc2;
 
   // From CustomProcessing::Initialize to Process.
   std::atomic<int> init_rate{0};
@@ -278,6 +319,12 @@ struct RootCaptureState {
   std::atomic<float> threshold{0.0f};
   std::atomic<float> voice_gain_db{0.0f};
   std::atomic<bool> voice_gain_settled{false};
+  std::atomic<uint32_t> gain_engine_applied{0};
+  std::atomic<float> voice_gain_room_db{std::numeric_limits<float>::quiet_NaN()};
+  std::atomic<float> voice_gain_speech_level_db{
+      std::numeric_limits<float>::quiet_NaN()};
+  std::atomic<float> voice_gain_floor_db{std::numeric_limits<float>::quiet_NaN()};
+  std::atomic<uint32_t> voice_gain_limit{0};
   std::atomic<bool> gate_speaking{false};
   // The published speaking flag and its transition count in one word:
   // seq << 1 | speaking. Two writers, both by compare-and-swap: the audio
@@ -343,6 +390,15 @@ struct RootCaptureState {
   RootSpeakingSnapshot ReadSpeaking() const;
   // The stored voice gain tunables (relaxed loads; NaN: none).
   RootVoiceGainTuning ReadVoiceGainTuning() const;
+  // The stored AGC2 settings (relaxed loads; NaN: none).
+  RootAgc2Tuning ReadAgc2Tuning() const;
+  // AGC2 runs when the host asked for it with auto gain on.
+  bool Agc2Wanted() const;
+  // Control side (never the audio thread): AGC2 for the processor's rate and
+  // the stored settings, built here when it is wanted and missing (a gain
+  // reset, other settings, another rate); frees what the audio thread let go
+  // of. After every control change and on the 10 ms speaking poll.
+  void ServiceAgc2();
   // Speaking and heard: a change that would be audible mid-word (a pipeline
   // swap, an AEC/NS re-init) waits for this to clear. Inside the startup hold
   // nothing is heard, also with push-to-talk held, and with no frame for
@@ -366,13 +422,16 @@ RootCaptureFormatSnapshot ReadCaptureFormat(const RootCaptureState& state);
 // denoiser slot and copies the result to the other channels:
 //   sanitise, voice gain level -> speech detector (while speech_detection is
 //   set; 16, 32 and 48 kHz) -> denoiser slot (Effects SDK) -> aligner ->
-//   voice gain (its level from the frames the detector rates as speech, with
-//   the host's tunables) -> auto sensitivity (learning nothing from a frame
-//   whose raw input the decorator found digitally silent) -> startup hold ->
-//   noise gate (with the speech gate) -> input volume (20 ms ramp) ->
-//   mute/PTT gate (5 ms fade each way).
-// Real-time code: no locks, allocation, logging or APM calls. Initialize runs
-// under both APM locks on up to four threads and only stores the format.
+//   voice gain: AGC2 (gain_engine kAgc2, RootAgc2) or the chain's (its level
+//   from the frames the detector rates as speech, with the host's tunables;
+//   also the frames AGC2 has no instance at their rate for yet) -> auto
+//   sensitivity (learning nothing from a frame whose raw input the decorator
+//   found digitally silent) -> startup hold -> noise gate (with the speech
+//   gate) -> input volume (20 ms ramp) -> mute/PTT gate (5 ms fade each way).
+// Real-time code: no locks, allocation, logging or APM calls (AGC2's own APM,
+// built and initialized off the audio thread, is the one this thread uses
+// alone). Initialize runs under both APM locks on up to four threads and only
+// stores the format.
 class RootCaptureProcessor : public webrtc::CustomProcessing {
  public:
   static constexpr int kMaxRate = 48000;
@@ -917,6 +976,9 @@ class RootProcessorHarness {
   void set_ns_fallback_decided(bool on) const;
   void bump_stream_epoch() const;
   void gain_reset(float db) const;
+  void set_gain_engine(uint32_t engine) const;
+  void set_agc2_tuning(RootAgc2Tuning tuning) const;
+  void service_agc2() const;
   // One frame through Process on a buffer of `rate` / 100 frames and
   // `channels` channels: channel 0 gets `input` (zero-padded), the others
   // something Process must overwrite. Returns channel 0.

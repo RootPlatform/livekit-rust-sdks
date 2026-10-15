@@ -65,8 +65,9 @@ pub(crate) fn monitor_result(result: MonitorResult) -> Result<(), MonitorError> 
 
 /// Slider volumes (input, master, tile) are linear 0..2.
 pub const MAX_VOLUME: f32 = 2.0;
-/// The app's voice gain only boosts, up to 18 dB.
-pub const MAX_VOICE_GAIN_DB: f32 = 18.0;
+/// The voice gain only boosts: a gain reset is clamped to 0..50 dB (AGC2's
+/// highest maximum), and each engine clamps it to its own maximum.
+pub const MAX_VOICE_GAIN_DB: f32 = 50.0;
 
 /// A slider volume made safe for the audio thread: NaN is 0 (silent), the
 /// rest is clamped to 0..[`MAX_VOLUME`].
@@ -144,6 +145,72 @@ impl SpeechDetection {
             Self::Off => 0,
             Self::Ring => 1,
             Self::Gate => 2,
+        }
+    }
+}
+
+/// Which voice gain boosts the denoised voice (DSP chain).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GainEngine {
+    /// The chain's own (the managed engine's twin).
+    Legacy,
+    /// libwebrtc's AGC2 (adaptive digital) between the denoiser's aligner and
+    /// auto sensitivity.
+    Agc2,
+}
+
+impl GainEngine {
+    /// The wire value (0, 1). Unknown values are legacy.
+    pub fn from_wire(value: u32) -> Self {
+        match value {
+            1 => Self::Agc2,
+            _ => Self::Legacy,
+        }
+    }
+
+    pub fn to_wire(self) -> u32 {
+        match self {
+            Self::Legacy => 0,
+            Self::Agc2 => 1,
+        }
+    }
+}
+
+/// What held the voice gain on the last frame (the chain's view, whichever
+/// engine boosts).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GainLimit {
+    /// Not enough speech heard yet: the start gain holds.
+    None,
+    /// The talker's level: the gain brings it to the target.
+    Target,
+    /// The most it boosts.
+    Max,
+    /// The noise after the denoiser stays under its cap.
+    Noise,
+    /// The room before the denoiser stays under its cap (the chain's only).
+    Room,
+}
+
+impl GainLimit {
+    /// The wire value (0..4). Unknown values are none.
+    pub fn from_wire(value: u32) -> Self {
+        match value {
+            1 => Self::Target,
+            2 => Self::Max,
+            3 => Self::Noise,
+            4 => Self::Room,
+            _ => Self::None,
+        }
+    }
+
+    pub fn to_wire(self) -> u32 {
+        match self {
+            Self::None => 0,
+            Self::Target => 1,
+            Self::Max => 2,
+            Self::Noise => 3,
+            Self::Room => 4,
         }
     }
 }
@@ -345,9 +412,11 @@ pub struct EchoModelStats {
 /// for the denoiser and native WebRTC NS covers a denoiser that stops or does
 /// not arrive), `speech_detection` (off until set, and after every session
 /// start), `auto_sensitivity_minimum_db` (the chain's -54 dBFS until set,
-/// and after every session start) and the voice gain's tunables (`voice_gain_*`,
-/// the chain's defaults until set and after every session start). Builds
-/// without the chain only store them.
+/// and after every session start), the voice gain's tunables (`voice_gain_*`,
+/// the chain's defaults until set and after every session start), the
+/// `gain_engine` (the chain's until set and after every session start) and
+/// AGC2's settings (`agc2_*`, the defaults until set and after every session
+/// start). Builds without the chain only store them.
 /// `echo_model` is off until set and after every session start; without
 /// [`ECHO_MODEL_AVAILABLE`] it is not supported.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -378,7 +447,7 @@ pub struct RootAudioControl {
     pub auto_sensitivity_minimum_db: Option<f32>,
     /// The voice gain's tunables: the chain clamps each to its range and takes
     /// a non-finite one as its default (`rootapp_voice_dsp::VoiceGainTuning`):
-    /// most boost 0..18 dB (15), target -40..-10 dBFS (-25), rise and fall
+    /// most boost 0..24 dB (24), target -40..-10 dBFS (-25), rise and fall
     /// 0.5..20 dB/s (3, 2), level time constant 500..20000 ms (4000) and the
     /// speech probability from which a frame is speech 0..1 (0.5).
     pub voice_gain_max_db: Option<f32>,
@@ -387,6 +456,15 @@ pub struct RootAudioControl {
     pub voice_gain_fall_db_per_second: Option<f32>,
     pub voice_gain_level_time_constant_ms: Option<f32>,
     pub voice_gain_min_speech_probability: Option<f32>,
+    pub gain_engine: Option<GainEngine>,
+    /// AGC2's settings: native clamps each to its range and takes a
+    /// non-finite one as its default (`rootapp_voice_dsp::Agc2Tuning`):
+    /// headroom 0..20 dB (5), most boost 1..50 dB (30), most change 1..20
+    /// dB/s (6) and the noise it may lift to -80..-30 dBFS (-50).
+    pub agc2_headroom_db: Option<f32>,
+    pub agc2_max_gain_db: Option<f32>,
+    pub agc2_max_gain_change_db_per_second: Option<f32>,
+    pub agc2_max_output_noise_dbfs: Option<f32>,
 }
 
 impl RootAudioControl {
@@ -465,6 +543,18 @@ impl RootAudioControl {
             voice_gain_min_speech_probability: c
                 .voice_gain_min_speech_probability
                 .unwrap_or_default(),
+            has_gain_engine: c.gain_engine.is_some(),
+            gain_engine: c.gain_engine.map(GainEngine::to_wire).unwrap_or_default(),
+            has_agc2_headroom_db: c.agc2_headroom_db.is_some(),
+            agc2_headroom_db: c.agc2_headroom_db.unwrap_or_default(),
+            has_agc2_max_gain_db: c.agc2_max_gain_db.is_some(),
+            agc2_max_gain_db: c.agc2_max_gain_db.unwrap_or_default(),
+            has_agc2_max_gain_change_db_per_second: c.agc2_max_gain_change_db_per_second.is_some(),
+            agc2_max_gain_change_db_per_second: c
+                .agc2_max_gain_change_db_per_second
+                .unwrap_or_default(),
+            has_agc2_max_output_noise_dbfs: c.agc2_max_output_noise_dbfs.is_some(),
+            agc2_max_output_noise_dbfs: c.agc2_max_output_noise_dbfs.unwrap_or_default(),
         }
     }
 }
@@ -765,6 +855,23 @@ pub struct RootAudioStats {
     pub voice_gain_fall_db_per_second: Option<f32>,
     pub voice_gain_level_time_constant_ms: Option<f32>,
     pub voice_gain_min_speech_probability: Option<f32>,
+    /// The engine that boosted the last frame, AGC2's settings native applies
+    /// (the control's after clamping, the defaults when unset) and the AGC2
+    /// instances built so far.
+    pub gain_engine: Option<GainEngine>,
+    pub agc2_headroom_db: Option<f32>,
+    pub agc2_max_gain_db: Option<f32>,
+    pub agc2_max_gain_change_db_per_second: Option<f32>,
+    pub agc2_max_output_noise_dbfs: Option<f32>,
+    pub agc2_builds: Option<u64>,
+    /// The chain's voice gain's view, whichever engine boosts: the room
+    /// before the denoiser in the talker's pauses and the talker's level
+    /// before the gain (NaN until measured), the floor after the denoiser
+    /// before the gain, and what held the gain.
+    pub voice_gain_room_db: Option<f32>,
+    pub voice_gain_speech_level_db: Option<f32>,
+    pub voice_gain_floor_db: Option<f32>,
+    pub voice_gain_limit: Option<GainLimit>,
 
     // Denoiser details (Effects SDK slot); the histogram is empty without it.
     pub denoiser_rate: Option<u32>,
@@ -895,6 +1002,16 @@ impl Default for RootAudioStats {
             voice_gain_fall_db_per_second: None,
             voice_gain_level_time_constant_ms: None,
             voice_gain_min_speech_probability: None,
+            gain_engine: None,
+            agc2_headroom_db: None,
+            agc2_max_gain_db: None,
+            agc2_max_gain_change_db_per_second: None,
+            agc2_max_output_noise_dbfs: None,
+            agc2_builds: None,
+            voice_gain_room_db: None,
+            voice_gain_speech_level_db: None,
+            voice_gain_floor_db: None,
+            voice_gain_limit: None,
             denoiser_rate: None,
             denoiser_installs: None,
             denoiser_bypassed_frames: None,
@@ -996,6 +1113,17 @@ impl RootAudioStats {
                 .then_some(native.voice_gain_level_time_constant_ms),
             voice_gain_min_speech_probability: dsp
                 .then_some(native.voice_gain_min_speech_probability),
+            gain_engine: dsp.then_some(GainEngine::from_wire(native.gain_engine)),
+            agc2_headroom_db: dsp.then_some(native.agc2_headroom_db),
+            agc2_max_gain_db: dsp.then_some(native.agc2_max_gain_db),
+            agc2_max_gain_change_db_per_second: dsp
+                .then_some(native.agc2_max_gain_change_db_per_second),
+            agc2_max_output_noise_dbfs: dsp.then_some(native.agc2_max_output_noise_dbfs),
+            agc2_builds: dsp.then_some(native.agc2_builds),
+            voice_gain_room_db: dsp.then_some(native.voice_gain_room_db),
+            voice_gain_speech_level_db: dsp.then_some(native.voice_gain_speech_level_db),
+            voice_gain_floor_db: dsp.then_some(native.voice_gain_floor_db),
+            voice_gain_limit: dsp.then_some(GainLimit::from_wire(native.voice_gain_limit)),
             denoiser_rate: denoiser.then_some(native.denoiser_rate),
             denoiser_installs: denoiser.then_some(native.denoiser_installs),
             denoiser_bypassed_frames: denoiser.then_some(native.denoiser_bypassed_frames),
@@ -1447,6 +1575,84 @@ mod tests {
     }
 
     #[test]
+    fn the_gain_engine_and_agc2_settings_reach_native_as_set_and_come_back_with_the_chain() {
+        let control = RootAudioControl {
+            gain_engine: Some(GainEngine::Agc2),
+            agc2_headroom_db: Some(40.0),
+            agc2_max_gain_db: Some(30.0),
+            agc2_max_gain_change_db_per_second: Some(f32::NAN),
+            agc2_max_output_noise_dbfs: Some(-50.0),
+            ..Default::default()
+        };
+        assert_eq!(control.sanitized().agc2_headroom_db, Some(40.0), "native clamps them");
+        let native = control.to_native();
+        assert!(native.has_gain_engine && native.gain_engine == 1);
+        assert!(native.has_agc2_headroom_db && native.agc2_headroom_db == 40.0);
+        assert!(native.has_agc2_max_gain_db && native.agc2_max_gain_db == 30.0);
+        assert!(
+            native.has_agc2_max_gain_change_db_per_second
+                && native.agc2_max_gain_change_db_per_second.is_nan()
+        );
+        assert!(
+            native.has_agc2_max_output_noise_dbfs && native.agc2_max_output_noise_dbfs == -50.0
+        );
+        let legacy =
+            RootAudioControl { gain_engine: Some(GainEngine::Legacy), ..Default::default() };
+        assert!(legacy.to_native().has_gain_engine && legacy.to_native().gain_engine == 0);
+        let unset = RootAudioControl::default().to_native();
+        assert!(
+            !unset.has_gain_engine && !unset.has_agc2_headroom_db && !unset.has_agc2_max_gain_db
+        );
+        assert!(
+            !unset.has_agc2_max_gain_change_db_per_second && !unset.has_agc2_max_output_noise_dbfs
+        );
+        assert_eq!(
+            (GainEngine::from_wire(7), GainLimit::from_wire(9)),
+            (GainEngine::Legacy, GainLimit::None)
+        );
+        for limit in
+            [GainLimit::None, GainLimit::Target, GainLimit::Max, GainLimit::Noise, GainLimit::Room]
+        {
+            assert_eq!(GainLimit::from_wire(limit.to_wire()), limit);
+        }
+
+        let applied = |dsp_available: bool| NativeAudioStats {
+            dsp_available,
+            gain_engine: 1,
+            agc2_headroom_db: 5.0,
+            agc2_max_gain_db: 30.0,
+            agc2_max_gain_change_db_per_second: 6.0,
+            agc2_max_output_noise_dbfs: -50.0,
+            agc2_builds: 3,
+            voice_gain_room_db: -62.0,
+            voice_gain_speech_level_db: -41.0,
+            voice_gain_floor_db: -88.0,
+            voice_gain_limit: 2,
+            ..Default::default()
+        };
+        let stats = RootAudioStats::from_native(applied(true));
+        assert_eq!((stats.gain_engine, stats.agc2_builds), (Some(GainEngine::Agc2), Some(3)));
+        assert_eq!((stats.agc2_headroom_db, stats.agc2_max_gain_db), (Some(5.0), Some(30.0)));
+        assert_eq!(
+            (stats.agc2_max_gain_change_db_per_second, stats.agc2_max_output_noise_dbfs),
+            (Some(6.0), Some(-50.0))
+        );
+        assert_eq!(
+            (stats.voice_gain_room_db, stats.voice_gain_speech_level_db),
+            (Some(-62.0), Some(-41.0))
+        );
+        assert_eq!(
+            (stats.voice_gain_floor_db, stats.voice_gain_limit),
+            (Some(-88.0), Some(GainLimit::Max))
+        );
+        let without = RootAudioStats::from_native(applied(false));
+        assert_eq!(
+            (without.gain_engine, without.agc2_builds, without.voice_gain_limit),
+            (None, None, None)
+        );
+    }
+
+    #[test]
     fn the_voice_gain_tunables_reach_native_as_set_and_come_back_with_the_chain() {
         let control = RootAudioControl {
             voice_gain_max_db: Some(40.0),
@@ -1704,7 +1910,7 @@ mod tests {
             master_volume: Some(-3.0),
             denoise_power: Some(7.0),
             gate_threshold: Some(0.05),
-            gain_reset_db: Some(40.0),
+            gain_reset_db: Some(60.0),
             ..Default::default()
         }
         .sanitized();

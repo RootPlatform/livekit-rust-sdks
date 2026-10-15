@@ -61,6 +61,11 @@ pub mod ffi {
         pub processed_frames: u64,
         pub dsp_resets: u64,
         pub dsp_flushes: u64,
+        /// The voice gain on the last frame, the engine that applied it (0
+        /// the chain's, 1 AGC2) and the AGC2 instances built.
+        pub voice_gain_db: f32,
+        pub gain_engine: u32,
+        pub agc2_builds: u64,
         pub format_seq: u64,
         pub erle_db: f64,
         pub pending_tasks: u32,
@@ -186,6 +191,8 @@ pub mod ffi {
         fn initialize(self: &RootEchoHarness, rate: i32, render_channels: u32);
         fn set_stream_delay(self: &RootEchoHarness, delay_ms: i32);
         fn open_dsp_chain(self: &RootEchoHarness);
+        /// AGC2 as the voice gain from a gain reset, built as the controller does.
+        fn use_agc2(self: &RootEchoHarness, gain_reset_db: f32);
         fn prepare_model(self: &RootEchoHarness);
         fn set_mode(self: &RootEchoHarness, mode: u32);
         fn set_device(self: &RootEchoHarness, kind: u32, key: &str);

@@ -484,6 +484,46 @@ fn root_echo_int16_switches_at_a_frame_boundary_without_a_glitch() {
     switch_twice_without_a_glitch(true);
 }
 
+/// AGC2 lives in the capture state the variants' shared processor uses: a
+/// voice at -42 dBFS, the model on at frame 600 and off at 1100, and AGC2
+/// (from 0 dB) keeps running the same instance, its gain going on across
+/// both switches.
+#[test]
+fn root_echo_switches_keep_agc2_and_its_gain() {
+    let clip = crate::root_audio_processing::test_speech::at_level(RATE, -42.0);
+    let clip_frames = clip.len() / FRAME;
+    let silence = vec![0.0f32; 2 * FRAME];
+    let h = with_variants();
+    h.open_dsp_chain();
+    h.use_agc2(0.0);
+    h.prepare_model();
+    let mut gains = Vec::new();
+    let mut swaps_at = Vec::new();
+    for f in 0..1600 {
+        if f == 600 {
+            h.set_mode(MODE_ON);
+        }
+        if f == 1100 {
+            h.set_mode(MODE_OFF);
+        }
+        let at = (f % clip_frames) * FRAME;
+        h.process(RATE, 2, &silence, &clip[at..at + FRAME]);
+        h.advance(10);
+        let p = h.probe();
+        if p.swaps as usize > swaps_at.len() {
+            swaps_at.push(f);
+        }
+        assert_eq!((p.gain_engine, p.agc2_builds), (1, 1), "frame {f}");
+        gains.push(p.voice_gain_db);
+    }
+    assert_eq!(swaps_at.len(), 2, "{swaps_at:?}");
+    assert!(gains[590] > 10.0, "AGC2 rose from 0 dB before the switch: {}", gains[590]);
+    for &swap in &swaps_at {
+        let step = (gains[swap + 1] - gains[swap - 1]).abs();
+        assert!(step < 1.0, "frame {swap}: {} -> {} dB", gains[swap - 1], gains[swap + 1]);
+    }
+}
+
 /// Through the int16 interface, an unset mode is today's APM sample for
 /// sample too.
 #[test]

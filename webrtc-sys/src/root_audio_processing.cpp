@@ -30,6 +30,7 @@
 #include "api/make_ref_counted.h"
 #include "api/task_queue/task_queue_base.h"
 #include "api/units/time_delta.h"
+#include "livekit/root_agc2.h"
 #include "livekit/root_audio_monitor.h"
 #include "livekit/root_denoiser.h"
 #include "livekit/root_echo_model.h"
@@ -201,6 +202,16 @@ RootVoiceGainTuning RootVoiceGainTuningUnset() {
   return t;
 }
 
+RootAgc2Tuning RootAgc2TuningUnset() {
+  constexpr float kNone = std::numeric_limits<float>::quiet_NaN();
+  RootAgc2Tuning t{};
+  t.headroom_db = kNone;
+  t.max_gain_db = kNone;
+  t.max_gain_change_db_per_second = kNone;
+  t.max_output_noise_dbfs = kNone;
+  return t;
+}
+
 bool RootCaptureState::GateOpen(uint32_t gate) {
   return (gate & kGateMuted) == 0 &&
          (gate >> kGatePushToTalkShift) !=
@@ -252,10 +263,14 @@ void RootCaptureState::ResetControls(bool close_gate) {
        {&voice_gain_max_db, &voice_gain_target_db,
         &voice_gain_rise_db_per_second, &voice_gain_fall_db_per_second,
         &voice_gain_level_time_constant_ms,
-        &voice_gain_min_speech_probability}) {
+        &voice_gain_min_speech_probability, &agc2_headroom_db,
+        &agc2_max_gain_db, &agc2_max_gain_change_db_per_second,
+        &agc2_max_output_noise_dbfs}) {
     tunable->store(std::numeric_limits<float>::quiet_NaN(),
                    std::memory_order_relaxed);
   }
+  gain_engine.store(static_cast<uint32_t>(RootGainEngine::kLegacy),
+                    std::memory_order_relaxed);
   // A press of the last session that no frame saw is no delay of this one.
   gate_open_stamp_us.store(0, std::memory_order_relaxed);
   ClearSpeaking();
@@ -339,6 +354,19 @@ RootDspStatsSnapshot RootCaptureState::ReadDspStats(bool take_maxima) {
   s.speech_unavailable_frames = speech_unavailable_frames.load(kRelaxed);
   s.auto_sensitivity_minimum_db = auto_sensitivity_minimum_db.load(kRelaxed);
   s.voice_gain = ReadVoiceGainTuning();
+  s.gain_engine = gain_engine.load(kRelaxed);
+  s.gain_engine_applied = gain_engine_applied.load(kRelaxed);
+  s.voice_gain_room_db = voice_gain_room_db.load(kRelaxed);
+  s.voice_gain_speech_level_db = voice_gain_speech_level_db.load(kRelaxed);
+  s.voice_gain_floor_db = voice_gain_floor_db.load(kRelaxed);
+  s.voice_gain_limit = voice_gain_limit.load(kRelaxed);
+  s.agc2 = ReadAgc2Tuning();
+  if (agc2) {
+    const RootAgc2::Stats built = agc2->ReadStats();
+    s.agc2_applied = built.tuning;
+    s.agc2_rate = static_cast<uint32_t>(built.rate);
+    s.agc2_builds = built.builds;
+  }
   s.aligner_primed = aligner_primed.load(kRelaxed);
   s.aligner_buffered_samples = aligner_buffered_samples.load(kRelaxed);
   s.aligner_underruns = aligner_underruns.load(kRelaxed);
@@ -359,6 +387,31 @@ RootVoiceGainTuning RootCaptureState::ReadVoiceGainTuning() const {
   t.level_time_constant_ms = voice_gain_level_time_constant_ms.load(kRelaxed);
   t.min_speech_probability = voice_gain_min_speech_probability.load(kRelaxed);
   return t;
+}
+
+RootAgc2Tuning RootCaptureState::ReadAgc2Tuning() const {
+  constexpr auto kRelaxed = std::memory_order_relaxed;
+  RootAgc2Tuning t{};
+  t.headroom_db = agc2_headroom_db.load(kRelaxed);
+  t.max_gain_db = agc2_max_gain_db.load(kRelaxed);
+  t.max_gain_change_db_per_second =
+      agc2_max_gain_change_db_per_second.load(kRelaxed);
+  t.max_output_noise_dbfs = agc2_max_output_noise_dbfs.load(kRelaxed);
+  return t;
+}
+
+bool RootCaptureState::Agc2Wanted() const {
+  return gain_engine.load(std::memory_order_relaxed) ==
+             static_cast<uint32_t>(RootGainEngine::kAgc2) &&
+         auto_gain.load(std::memory_order_relaxed);
+}
+
+void RootCaptureState::ServiceAgc2() {
+  if (agc2) {
+    agc2->Service(Agc2Wanted(),
+                  static_cast<int>(ReadCaptureFormat(*this).sample_rate),
+                  ReadAgc2Tuning());
+  }
 }
 
 RootSpeakingSnapshot RootCaptureState::ReadSpeaking() const {
@@ -391,7 +444,11 @@ RootCaptureProcessor::RootCaptureProcessor(
     std::shared_ptr<RootCaptureState> state)
     : state_(std::move(state)),
       dsp_(new_root_dsp_chain(kMaxRate)),
-      speech_(std::make_unique<RootSpeechDetector>()) {}
+      speech_(std::make_unique<RootSpeechDetector>()) {
+  if (!state_->agc2) {
+    state_->agc2 = std::make_shared<RootAgc2>(webrtc::CreateEnvironment());
+  }
+}
 
 RootCaptureProcessor::~RootCaptureProcessor() = default;
 
@@ -455,6 +512,8 @@ void RootCaptureProcessor::Process(webrtc::AudioBuffer* audio) {
   settings.auto_sensitivity_minimum_db =
       state.auto_sensitivity_minimum_db.load(kRelaxed);
   settings.voice_gain = state.ReadVoiceGainTuning();
+  settings.gain_engine = state.gain_engine.load(kRelaxed);
+  settings.agc2 = RootAgc2TuningUnset();
   const float power = state.denoise_power.load(kRelaxed);
 
   // The gain reset first: a session reset stored before it is then seen in
@@ -509,10 +568,26 @@ void RootCaptureProcessor::Process(webrtc::AudioBuffer* audio) {
       denoised.kind == RootDenoiseKind::kRan
           ? std::min(denoised.samples, denoise_out_.size())
           : 0;
-  dsp_->post_denoise(
+  const RootDspAligned aligned = dsp_->post_denoise_align(
       frame, static_cast<uint8_t>(denoised.kind),
       rust::Slice<const float>(denoise_out_.data(), denoised_samples),
       denoised.restart, settings, outputs);
+  float gain_db = std::numeric_limits<float>::quiet_NaN();
+  if (settings.gain_engine == static_cast<uint32_t>(RootGainEngine::kAgc2) &&
+      aligned.supported && settings.auto_gain) {
+    RootAgc2* agc2 = state.agc2.get();
+    const RootAgc2::Frame applied =
+        agc2 != nullptr ? agc2->Process(samples, frames, rate)
+                        : RootAgc2::Frame{};
+    if (applied.ran) {
+      gain_db = applied.gain_db;
+      settings.agc2 = applied.tuning;
+    } else {
+      // No AGC2 at this rate yet (the control side builds it within 10 ms).
+      settings.gain_engine = static_cast<uint32_t>(RootGainEngine::kLegacy);
+    }
+  }
+  dsp_->post_gain(frame, aligned.pre_gain_rms, gain_db, settings, outputs);
   if (slot != nullptr && outputs.denoiser_stalled && !stalled_) {
     slot->LatchBypass(RootDenoiserBypass::kOutputStalled);
   }
@@ -586,6 +661,12 @@ void RootCaptureProcessor::Publish(const RootDspOutputs& outputs,
   state.threshold.store(outputs.threshold, kRelaxed);
   state.voice_gain_db.store(outputs.voice_gain_db, kRelaxed);
   state.voice_gain_settled.store(outputs.voice_gain_settled, kRelaxed);
+  state.gain_engine_applied.store(outputs.gain_engine, kRelaxed);
+  state.voice_gain_room_db.store(outputs.voice_gain_room_db, kRelaxed);
+  state.voice_gain_speech_level_db.store(outputs.voice_gain_speech_level_db,
+                                         kRelaxed);
+  state.voice_gain_floor_db.store(outputs.voice_gain_floor_db, kRelaxed);
+  state.voice_gain_limit.store(outputs.voice_gain_limit, kRelaxed);
   state.gate_speaking.store(outputs.gate_speaking, kRelaxed);
   if (supported) {
     RaiseTo(state.gate_in_block_peak_db_max, outputs.gate_in_block_peak_db);
@@ -1712,6 +1793,9 @@ webrtc::scoped_refptr<RootApmDecorator> CreateRootAudioProcessing(
     const webrtc::Environment& env,
     std::shared_ptr<RootCaptureState> capture_state,
     webrtc::TaskQueueBase* policy_queue) {
+  if (capture_state && !capture_state->agc2) {
+    capture_state->agc2 = std::make_shared<RootAgc2>(env);
+  }
   auto processor = std::make_shared<RootCaptureProcessor>(capture_state);
   webrtc::scoped_refptr<webrtc::AudioProcessing> apm =
       BuildRootApmVariant(env, processor, nullptr);
@@ -1798,12 +1882,15 @@ void RootProcessorHarness::set_input_volume(float volume) const {
 
 void RootProcessorHarness::reset_controls() const {
   state_->ResetControls(false);
+  state_->agc2->ResetSession();
+  state_->ServiceAgc2();
 }
 
 void RootProcessorHarness::set_dsp(bool auto_gain,
                                    bool auto_sensitivity,
                                    float gate_threshold) const {
   SetDsp(*state_, auto_gain, auto_sensitivity, gate_threshold);
+  state_->ServiceAgc2();
 }
 
 void RootProcessorHarness::set_speech_detection(uint32_t mode) const {
@@ -1851,8 +1938,30 @@ void RootProcessorHarness::bump_stream_epoch() const {
 }
 
 void RootProcessorHarness::gain_reset(float db) const {
+  if (std::isfinite(db)) {
+    state_->agc2->Reset(db);
+    state_->ServiceAgc2();
+  }
   state_->gain_reset_db.store(db, std::memory_order_relaxed);
   state_->gain_reset_seq.fetch_add(1, std::memory_order_release);
+}
+
+void RootProcessorHarness::set_gain_engine(uint32_t engine) const {
+  state_->gain_engine.store(engine);
+  state_->ServiceAgc2();
+}
+
+void RootProcessorHarness::set_agc2_tuning(RootAgc2Tuning tuning) const {
+  state_->agc2_headroom_db.store(tuning.headroom_db);
+  state_->agc2_max_gain_db.store(tuning.max_gain_db);
+  state_->agc2_max_gain_change_db_per_second.store(
+      tuning.max_gain_change_db_per_second);
+  state_->agc2_max_output_noise_dbfs.store(tuning.max_output_noise_dbfs);
+  state_->ServiceAgc2();
+}
+
+void RootProcessorHarness::service_agc2() const {
+  state_->ServiceAgc2();
 }
 
 RootProcessorFrame RootProcessorHarness::process(
@@ -1945,6 +2054,16 @@ RootProcessorDsp DspProbe(RootCaptureState& state, bool take_maxima) {
   dsp.speech_unavailable_frames = s.speech_unavailable_frames;
   dsp.auto_sensitivity_minimum_db = s.auto_sensitivity_minimum_db;
   dsp.voice_gain = s.voice_gain;
+  dsp.gain_engine = s.gain_engine;
+  dsp.gain_engine_applied = s.gain_engine_applied;
+  dsp.voice_gain_room_db = s.voice_gain_room_db;
+  dsp.voice_gain_speech_level_db = s.voice_gain_speech_level_db;
+  dsp.voice_gain_floor_db = s.voice_gain_floor_db;
+  dsp.voice_gain_limit = s.voice_gain_limit;
+  dsp.agc2 = s.agc2;
+  dsp.agc2_applied = s.agc2_applied;
+  dsp.agc2_rate = s.agc2_rate;
+  dsp.agc2_builds = s.agc2_builds;
   return dsp;
 }
 

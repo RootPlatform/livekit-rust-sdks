@@ -94,6 +94,37 @@ enum RootAudioEchoModel {
   ROOT_AUDIO_ECHO_MODEL_AUTO = 2;
 }
 
+// Which voice gain boosts the denoised voice (RootAudioControl.gain_engine, RootAudioStats.gain_engine).
+enum RootAudioGainEngine {
+  // The chain's own voice gain (the managed engine's VoiceGain). Native's value until a control sets
+  // another, and again when the first platform audio handle opens and when the last one closes.
+  ROOT_AUDIO_GAIN_ENGINE_LEGACY = 0;
+  // libwebrtc's AGC2 (GainController2, adaptive digital only, as Chrome runs it) on the aligned voice
+  // after the Effects SDK, before auto sensitivity: a second APM with nothing else enabled, built off the
+  // audio thread for the processor's rate. Each gain reset (gain_reset_db), each change of the agc2_*
+  // settings and each processor rate is a new AGC2 starting from that gain (a rate change: from the gain
+  // applied last); frames at a rate it has no AGC2 for yet (at most one 10 ms poll after a rate change)
+  // get the chain's voice gain.
+  ROOT_AUDIO_GAIN_ENGINE_AGC2 = 1;
+}
+
+// What held the voice gain on the last frame (RootAudioStats.voice_gain_limit), as the chain's voice gain
+// sees it. With AGC2 it is inferred from AGC2's applied gain: MAX within 1 dB of agc2_max_gain_db, NOISE
+// within 1 dB of agc2_max_output_noise_dbfs over voice_gain_floor_db, else TARGET (NONE before 0.5 s of
+// speech).
+enum RootAudioGainLimit {
+  // Under 0.5 s of speech heard: the start gain holds (the chain's room cap may still lower it: ROOM).
+  ROOT_AUDIO_GAIN_LIMIT_NONE = 0;
+  // The talker's level: the gain brings it to the target.
+  ROOT_AUDIO_GAIN_LIMIT_TARGET = 1;
+  // The most it boosts.
+  ROOT_AUDIO_GAIN_LIMIT_MAX = 2;
+  // The noise after the denoiser stays under its cap.
+  ROOT_AUDIO_GAIN_LIMIT_NOISE = 3;
+  // The room before the denoiser stays under -50 dBFS (the chain's voice gain only).
+  ROOT_AUDIO_GAIN_LIMIT_ROOM = 4;
+}
+
 // What the APM runs (RootAudioStats.echo_model_state).
 enum RootAudioEchoModelState {
   ROOT_AUDIO_ECHO_MODEL_STATE_OFF = 0;
@@ -180,8 +211,8 @@ message RootAudioControl {
   // silence (a hardware mute: every raw sample at or below -100 dBFS, before the APM) teach it
   // nothing, and after 500 ms or more of them it relearns the floor as at the start of a call.
   optional bool auto_sensitivity = 11;
-  // Command: restart the voice gain from this gain in dB (0..18, then at most voice_gain_max_db);
-  // every set value restarts it once.
+  // Command: restart the voice gain from this gain in dB (0..50, then at most the engine's maximum:
+  // voice_gain_max_db, or agc2_max_gain_db for AGC2); every set value restarts it once.
   optional float gain_reset_db = 12;
   // The host's noise suppression mode is the Effects SDK: a stream's startup hold waits for the
   // denoiser (at most 1 s), and native WebRTC NS covers a denoiser that stops or does not arrive.
@@ -203,7 +234,9 @@ message RootAudioControl {
   // when the first platform audio handle opens and when the last one closes (as the other DSP
   // settings). Libraries that predate them keep hw.11's voice gain (18 dB, the power-averaged level).
   // RootAudioStats fields 126-131 are the values applied.
-  // The most it boosts, dB: 0..18, default 15. A gain reset is clamped to it in the frame it arrives in.
+  // The most it boosts, dB: 0..24, default 24 (15 in hw.12). A gain reset is clamped to it in the frame it
+  // arrives in. Since hw.14 a frame quiet after the denoiser counts as the room only when it was within
+  // 3 dB of the input's own floor before it, so speech the Effects SDK erased no longer caps the gain.
   optional float voice_gain_max_db = 17;
   // The talker's level it aims for (its average frame level in dB), dBFS: -40..-10, default -25.
   optional float voice_gain_target_db = 18;
@@ -216,6 +249,21 @@ message RootAudioControl {
   // The speech detector's probability from which a frame counts as speech for the level: 0..1, default
   // 0.5 (0 takes every frame with a probability; without a probability level alone decides).
   optional float voice_gain_min_speech_probability = 22;
+  // Which voice gain boosts the voice; LEGACY until set (and in libraries that predate it, which ignore
+  // the field), and again when the first platform audio handle opens and when the last one closes.
+  // RootAudioStats.gain_engine is the engine that ran the last frame.
+  optional RootAudioGainEngine gain_engine = 23;
+  // AGC2's settings (adaptive digital), each clamped to its range, a non-finite value the default; the
+  // defaults until set, and again when the first platform audio handle opens and when the last one
+  // closes. RootAudioStats fields 140-143 are the values applied.
+  // Headroom, dB: 0..20, default 5.
+  optional float agc2_headroom_db = 24;
+  // The most it boosts, dB: 1..50, default 30 (Chrome: 50).
+  optional float agc2_max_gain_db = 25;
+  // How fast its gain moves, dB/s: 1..20, default 6.
+  optional float agc2_max_gain_change_db_per_second = 26;
+  // The noise it may lift to, dBFS: -80..-30, default -50.
+  optional float agc2_max_output_noise_dbfs = 27;
 }
 message RootAudioSetControlRequest {
   required uint64 platform_audio_handle = 1;
@@ -573,6 +621,27 @@ message RootAudioStats {
   optional float voice_gain_fall_db_per_second = 129;
   optional float voice_gain_level_time_constant_ms = 130;
   optional float voice_gain_min_speech_probability = 131;
+
+  // DSP chain (absent without it and from libraries that predate them): the voice gain engine that ran
+  // the last frame (LEGACY for frames AGC2 had no instance for), AGC2's settings native applies
+  // (RootAudioControl fields 24-27 after clamping, the defaults when unset), and the AGC2 instances built
+  // so far (gain resets, settings and rate changes; cumulative for the engine's life).
+  optional RootAudioGainEngine gain_engine = 139;
+  optional float agc2_headroom_db = 140;
+  optional float agc2_max_gain_db = 141;
+  optional float agc2_max_gain_change_db_per_second = 142;
+  optional float agc2_max_output_noise_dbfs = 143;
+  optional uint64 agc2_builds = 144;
+  // The chain's voice gain's view on the last frame, whichever engine boosts (it keeps measuring under
+  // AGC2; last values while auto gain is off): the room before the denoiser in the talker's pauses
+  // (frames quiet after the denoiser and within 3 dB of the input's floor before it, or voices well under
+  // the talker's) and the talker's level before the gain (the probability-weighted average frame level
+  // of their speech over about 4 s of it), both dBFS and NaN until measured; the floor after the denoiser
+  // before the gain, dBFS; and what held the gain.
+  optional float voice_gain_room_db = 145;
+  optional float voice_gain_speech_level_db = 146;
+  optional float voice_gain_floor_db = 147;
+  optional RootAudioGainLimit voice_gain_limit = 148;
 }
 // One playout mixer source (a remote audio stream): its audio as it reached the mixer, decoded and
 // before its gain (tile volume, master volume, deafen; a muted frame counts as silence), as a sum of

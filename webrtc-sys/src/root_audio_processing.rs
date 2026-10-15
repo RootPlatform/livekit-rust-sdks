@@ -18,8 +18,8 @@
 //! only reachable through libwebrtc.
 
 use rootapp_voice_dsp::{
-    sanitize, DenoiserOutput, DspChain, DspCommands, DspOutputs, DspSettings, PushToTalk,
-    SpeechDetection, VoiceGainTuning,
+    sanitize, Agc2Tuning, DenoiserOutput, DspChain, DspCommands, DspOutputs, DspSettings,
+    GainEngine, PushToTalk, SpeechDetection, VoiceGainTuning,
 };
 
 #[cxx::bridge(namespace = "livekit_ffi")]
@@ -29,7 +29,9 @@ pub mod ffi {
     /// else off; speech_probability the detector's for this frame (negative:
     /// it did not run); capture_silent the decorator found this frame's raw
     /// input digitally silent; auto_sensitivity_minimum_db and voice_gain as
-    /// the host set them (NaN: the chain's default).
+    /// the host set them (NaN: the chain's default); gain_engine 0 the chain's
+    /// voice gain, 1 AGC2 between post_denoise_align and post_gain (anything
+    /// else 0), with the AGC2 that ran in agc2.
     #[derive(Debug, Clone, Copy, Default)]
     pub struct RootDspSettings {
         pub sample_rate: u32,
@@ -45,6 +47,25 @@ pub mod ffi {
         pub capture_silent: bool,
         pub auto_sensitivity_minimum_db: f32,
         pub voice_gain: RootVoiceGainTuning,
+        pub gain_engine: u32,
+        pub agc2: RootAgc2Tuning,
+    }
+
+    /// `rootapp_voice_dsp::Agc2Tuning`: AGC2's adaptive digital settings (dB,
+    /// dB, dB/s, dBFS; NaN: the default).
+    #[derive(Debug, Clone, Copy, Default, PartialEq)]
+    pub struct RootAgc2Tuning {
+        pub headroom_db: f32,
+        pub max_gain_db: f32,
+        pub max_gain_change_db_per_second: f32,
+        pub max_output_noise_dbfs: f32,
+    }
+
+    /// `rootapp_voice_dsp::Aligned`.
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct RootDspAligned {
+        pub supported: bool,
+        pub pre_gain_rms: f32,
     }
 
     /// `rootapp_voice_dsp::VoiceGainTuning`: the voice gain's tunables (dB, dBFS,
@@ -110,6 +131,15 @@ pub mod ffi {
         pub speech_probability: f32,
         pub speech: bool,
         pub speech_closed: bool,
+        /// The engine that boosted the frame (0 the chain's, 1 AGC2), and the
+        /// chain's voice gain's view: the room before the denoiser and the
+        /// talker's level (NaN until measured), the floor after it, and what
+        /// held the gain (0 none yet, 1 target, 2 max, 3 noise, 4 room).
+        pub gain_engine: u32,
+        pub voice_gain_room_db: f32,
+        pub voice_gain_speech_level_db: f32,
+        pub voice_gain_floor_db: f32,
+        pub voice_gain_limit: u32,
     }
 
     extern "Rust" {
@@ -122,6 +152,9 @@ pub mod ffi {
         /// The voice gain's tunables the chain applies for a host's settings:
         /// each clamped to its range, a non-finite one the default.
         fn root_voice_gain_tuning(requested: RootVoiceGainTuning) -> RootVoiceGainTuning;
+        /// AGC2's settings for a host's: each clamped to its range, a
+        /// non-finite one the default.
+        fn root_agc2_tuning(requested: RootAgc2Tuning) -> RootAgc2Tuning;
         fn new_root_dsp_chain(max_rate: u32) -> Box<RootDspChain>;
         fn pre_denoise(
             self: &mut RootDspChain,
@@ -131,13 +164,22 @@ pub mod ffi {
             outputs: &mut RootDspOutputs,
         ) -> RootDspPre;
         /// kind: 0 not in use, 1 missed, 2 ran (denoised and restart are used
-        /// only for 2).
-        fn post_denoise(
+        /// only for 2). Leaves the aligned voice before any gain in `frame`.
+        fn post_denoise_align(
             self: &mut RootDspChain,
             frame: &mut [f32],
             kind: u8,
             denoised: &[f32],
             restart: bool,
+            settings: &RootDspSettings,
+            outputs: &mut RootDspOutputs,
+        ) -> RootDspAligned;
+        /// gain_db: the gain AGC2 applied to `frame` (gain_engine 1).
+        fn post_gain(
+            self: &mut RootDspChain,
+            frame: &mut [f32],
+            pre_gain_rms: f32,
+            gain_db: f32,
             settings: &RootDspSettings,
             outputs: &mut RootDspOutputs,
         );
@@ -234,6 +276,20 @@ pub mod ffi {
         pub auto_sensitivity_minimum_db: f32,
         /// The stored settings (NaN: none).
         pub voice_gain: RootVoiceGainTuning,
+        /// The stored gain engine (0 the chain's, 1 AGC2) and the one that ran
+        /// the last frame.
+        pub gain_engine: u32,
+        pub gain_engine_applied: u32,
+        pub voice_gain_room_db: f32,
+        pub voice_gain_speech_level_db: f32,
+        pub voice_gain_floor_db: f32,
+        pub voice_gain_limit: u32,
+        /// The stored AGC2 settings (NaN: none), and the AGC2 built last: its
+        /// settings, its rate (0 none) and how many were built.
+        pub agc2: RootAgc2Tuning,
+        pub agc2_applied: RootAgc2Tuning,
+        pub agc2_rate: u32,
+        pub agc2_builds: u64,
     }
 
     /// RootSpeechDetector over a synthetic signal (`root_speech_detector_probe`).
@@ -319,8 +375,15 @@ pub mod ffi {
         fn set_ns_fallback_decided(self: &RootProcessorHarness, on: bool);
         /// As AdmProxy does before each StartRecording.
         fn bump_stream_epoch(self: &RootProcessorHarness);
-        /// As the controller does: payload, then the sequence number.
+        /// As the controller does: payload, then the sequence number (and AGC2
+        /// starts over from it).
         fn gain_reset(self: &RootProcessorHarness, db: f32);
+        /// 0 the chain's voice gain, 1 AGC2, as the controller stores it (and
+        /// builds what AGC2 needs at once, as it does).
+        fn set_gain_engine(self: &RootProcessorHarness, engine: u32);
+        fn set_agc2_tuning(self: &RootProcessorHarness, tuning: RootAgc2Tuning);
+        /// The control side's 10 ms poll: AGC2 for the processor's rate.
+        fn service_agc2(self: &RootProcessorHarness);
         fn process(
             self: &RootProcessorHarness,
             rate: i32,
@@ -466,6 +529,25 @@ fn root_voice_gain_tuning(requested: ffi::RootVoiceGainTuning) -> ffi::RootVoice
     }
 }
 
+fn agc2_tuning(t: &ffi::RootAgc2Tuning) -> Agc2Tuning {
+    Agc2Tuning {
+        headroom_db: t.headroom_db,
+        max_gain_db: t.max_gain_db,
+        max_gain_change_db_per_second: t.max_gain_change_db_per_second,
+        max_output_noise_dbfs: t.max_output_noise_dbfs,
+    }
+}
+
+fn root_agc2_tuning(requested: ffi::RootAgc2Tuning) -> ffi::RootAgc2Tuning {
+    let t = agc2_tuning(&requested).sanitized();
+    ffi::RootAgc2Tuning {
+        headroom_db: t.headroom_db,
+        max_gain_db: t.max_gain_db,
+        max_gain_change_db_per_second: t.max_gain_change_db_per_second,
+        max_output_noise_dbfs: t.max_output_noise_dbfs,
+    }
+}
+
 fn dsp_settings(settings: &ffi::RootDspSettings) -> DspSettings {
     DspSettings {
         sample_rate: settings.sample_rate,
@@ -481,6 +563,8 @@ fn dsp_settings(settings: &ffi::RootDspSettings) -> DspSettings {
         capture_silent: settings.capture_silent,
         auto_sensitivity_minimum_db: settings.auto_sensitivity_minimum_db,
         voice_gain: voice_gain_tuning(&settings.voice_gain),
+        gain_engine: GainEngine::from_wire(settings.gain_engine),
+        agc2: agc2_tuning(&settings.agc2),
     }
 }
 
@@ -520,6 +604,11 @@ fn copy_outputs(from: &DspOutputs, to: &mut ffi::RootDspOutputs) {
         speech_probability: from.speech_probability,
         speech: from.speech,
         speech_closed: from.speech_closed,
+        gain_engine: from.gain_engine.to_wire(),
+        voice_gain_room_db: from.voice_gain_room_db,
+        voice_gain_speech_level_db: from.voice_gain_speech_level_db,
+        voice_gain_floor_db: from.voice_gain_floor_db,
+        voice_gain_limit: from.voice_gain_limit.to_wire(),
     };
 }
 
@@ -542,7 +631,7 @@ impl RootDspChain {
         ffi::RootDspPre { flush_denoiser: pre.flush_denoiser, supported: pre.supported }
     }
 
-    fn post_denoise(
+    fn post_denoise_align(
         &mut self,
         frame: &mut [f32],
         kind: u8,
@@ -550,13 +639,27 @@ impl RootDspChain {
         restart: bool,
         settings: &ffi::RootDspSettings,
         outputs: &mut ffi::RootDspOutputs,
-    ) {
+    ) -> ffi::RootDspAligned {
         let denoised = match kind {
             1 => DenoiserOutput::Missed,
             2 => DenoiserOutput::Ran { samples: denoised, restart },
             _ => DenoiserOutput::NotInUse,
         };
-        self.chain.post_denoise(frame, denoised, &dsp_settings(settings), &mut self.out);
+        let aligned =
+            self.chain.post_denoise_align(frame, denoised, &dsp_settings(settings), &mut self.out);
+        copy_outputs(&self.out, outputs);
+        ffi::RootDspAligned { supported: aligned.supported, pre_gain_rms: aligned.pre_gain_rms }
+    }
+
+    fn post_gain(
+        &mut self,
+        frame: &mut [f32],
+        pre_gain_rms: f32,
+        gain_db: f32,
+        settings: &ffi::RootDspSettings,
+        outputs: &mut ffi::RootDspOutputs,
+    ) {
+        self.chain.post_gain(frame, pre_gain_rms, gain_db, &dsp_settings(settings), &mut self.out);
         copy_outputs(&self.out, outputs);
     }
 }
@@ -980,14 +1083,14 @@ mod processor_tests {
 
         h.gain_reset(30.0);
         run(&h, 48000, 1, 0.0);
-        assert_eq!(h.dsp(false).voice_gain_db, 15.0, "clamped to the voice gain's maximum");
+        assert_eq!(h.dsp(false).voice_gain_db, 24.0, "clamped to the voice gain's maximum");
         h.gain_reset(f32::NAN);
         run(&h, 48000, 1, 0.0);
-        assert_eq!(h.dsp(false).voice_gain_db, 15.0, "a non-finite reset is ignored");
+        assert_eq!(h.dsp(false).voice_gain_db, 24.0, "a non-finite reset is ignored");
 
         h.set_dsp(false, true, 0.025);
         run(&h, 48000, 1, 0.0);
-        assert_eq!(h.dsp(false).voice_gain_db, 15.0, "off keeps the last value");
+        assert_eq!(h.dsp(false).voice_gain_db, 24.0, "off keeps the last value");
         h.gain_reset(3.0);
         h.set_dsp(true, true, 0.025);
         run(&h, 48000, 1, 0.0);
@@ -1434,7 +1537,7 @@ mod processor_tests {
         let h = started(48000, 1);
         h.set_dsp(true, true, 0.025);
         for (max, reset, expected) in
-            [(f32::NAN, 17.0f32, 15.0f32), (6.0, 17.0, 6.0), (40.0, 17.0, 17.0), (-3.0, 17.0, 0.0)]
+            [(f32::NAN, 30.0f32, 24.0f32), (6.0, 17.0, 6.0), (40.0, 17.0, 17.0), (-3.0, 17.0, 0.0)]
         {
             h.set_voice_gain_tuning(tuning(max));
             h.gain_reset(reset);
@@ -1447,9 +1550,9 @@ mod processor_tests {
         h.reset_controls();
         assert!(h.dsp(false).voice_gain.max_gain_db.is_nan(), "a reset forgets them");
         h.set_dsp(true, true, 0.025);
-        h.gain_reset(17.0);
+        h.gain_reset(30.0);
         run(&h, 48000, 1, 0.0);
-        assert_eq!(h.dsp(false).voice_gain_db, 15.0);
+        assert_eq!(h.dsp(false).voice_gain_db, 24.0);
 
         let applied = root_voice_gain_tuning(RootVoiceGainTuning {
             max_gain_db: 40.0,
@@ -1462,7 +1565,7 @@ mod processor_tests {
         assert_eq!(
             applied,
             RootVoiceGainTuning {
-                max_gain_db: 18.0,
+                max_gain_db: 24.0,
                 target_db: -25.0,
                 rise_db_per_second: 0.5,
                 fall_db_per_second: 20.0,
@@ -1470,6 +1573,345 @@ mod processor_tests {
                 min_speech_probability: 0.75,
             }
         );
+    }
+}
+
+/// Real speech for AGC2 (its speech detector wants a voice, not a tone).
+#[cfg(test)]
+pub(crate) mod test_speech {
+    /// examples/play_from_disk/change-sophie.wav: about 5.9 s of a voice,
+    /// 48 kHz mono int16, as FloatS16.
+    pub fn sophie() -> Vec<f32> {
+        let bytes: &[u8] = include_bytes!("../../examples/play_from_disk/change-sophie.wav");
+        let mut at = 12;
+        while at + 8 <= bytes.len() {
+            let len =
+                u32::from_le_bytes([bytes[at + 4], bytes[at + 5], bytes[at + 6], bytes[at + 7]])
+                    as usize;
+            if &bytes[at..at + 4] == b"data" {
+                let end = (at + 8 + len).min(bytes.len());
+                return bytes[at + 8..end]
+                    .chunks_exact(2)
+                    .map(|b| f32::from(i16::from_le_bytes([b[0], b[1]])))
+                    .collect();
+            }
+            at += 8 + len + (len & 1);
+        }
+        panic!("change-sophie.wav has no data chunk");
+    }
+
+    /// 48 kHz samples at `rate` (linear interpolation).
+    pub fn resample(samples: &[f32], rate: i32) -> Vec<f32> {
+        if rate == 48_000 {
+            return samples.to_vec();
+        }
+        let step = 48_000.0 / f64::from(rate);
+        let count = ((samples.len() - 1) as f64 / step) as usize;
+        (0..count)
+            .map(|i| {
+                let x = i as f64 * step;
+                let k = x as usize;
+                let t = (x - k as f64) as f32;
+                samples[k] * (1.0 - t) + samples[(k + 1).min(samples.len() - 1)] * t
+            })
+            .collect()
+    }
+
+    pub fn power(frame: &[f32]) -> f64 {
+        frame.iter().map(|&s| f64::from(s) * f64::from(s)).sum::<f64>() / frame.len().max(1) as f64
+    }
+
+    pub fn dbfs(power: f64) -> f64 {
+        10.0 * (power / (32768.0 * 32768.0)).max(1e-30).log10()
+    }
+
+    /// The voice's level: the mean power of its frames within 20 dB of the
+    /// loudest, in dBFS.
+    pub fn speech_db(samples: &[f32], n: usize) -> f64 {
+        let levels: Vec<f64> = samples.chunks_exact(n).map(power).collect();
+        let loudest = levels.iter().cloned().fold(0.0, f64::max);
+        let active: Vec<f64> = levels.into_iter().filter(|&p| p > loudest * 0.01).collect();
+        dbfs(active.iter().sum::<f64>() / active.len() as f64)
+    }
+
+    /// The clip at `rate` with its voice at `db` dBFS.
+    pub fn at_level(rate: i32, db: f64) -> Vec<f32> {
+        let clip = resample(&sophie(), rate);
+        let n = (rate / 100) as usize;
+        let scale = 10f64.powf((db - speech_db(&clip, n)) / 20.0) as f32;
+        clip.into_iter().map(|s| s * scale).collect()
+    }
+}
+
+/// libwebrtc's AGC2 as the voice gain (gain engine 1) in the capture
+/// processor, with the control side's builds as the controller makes them.
+#[cfg(test)]
+mod agc2_tests {
+    use super::ffi::{new_root_processor_harness, RootAgc2Tuning, RootProcessorHarness};
+    use super::test_speech::{at_level, dbfs, power, speech_db};
+
+    const AGC2: u32 = 1;
+    const RATES: [i32; 8] = [8000, 11025, 16000, 22050, 24000, 32000, 44100, 48000];
+
+    fn frames(rate: i32) -> usize {
+        (rate / 100) as usize
+    }
+
+    /// AGC2 from a gain reset of `reset_db`, built for `rate` as the poll
+    /// does once the processor runs at it.
+    fn agc2(
+        rate: i32,
+        reset_db: f32,
+        auto_sensitivity: bool,
+    ) -> cxx::UniquePtr<RootProcessorHarness> {
+        agc2_with(rate, reset_db, auto_sensitivity, tuning(f32::NAN, f32::NAN))
+    }
+
+    fn tuning(max_gain_db: f32, max_output_noise_dbfs: f32) -> RootAgc2Tuning {
+        RootAgc2Tuning {
+            headroom_db: f32::NAN,
+            max_gain_db,
+            max_gain_change_db_per_second: f32::NAN,
+            max_output_noise_dbfs,
+        }
+    }
+
+    fn agc2_with(
+        rate: i32,
+        reset_db: f32,
+        auto_sensitivity: bool,
+        settings: RootAgc2Tuning,
+    ) -> cxx::UniquePtr<RootProcessorHarness> {
+        let h = new_root_processor_harness();
+        h.initialize(rate, 1);
+        h.set_dsp(true, auto_sensitivity, 0.0);
+        h.set_agc2_tuning(settings);
+        h.gain_reset(reset_db);
+        h.set_gain_engine(AGC2);
+        h.process(rate, 1, &vec![0.0; frames(rate)]);
+        h.service_agc2();
+        h
+    }
+
+    fn tone(rate: i32, db: f64, position: &mut usize) -> Vec<f32> {
+        let a = (32768.0 * 10f64.powf(db / 20.0) * 2f64.sqrt()) as f32;
+        let start = *position;
+        *position += frames(rate);
+        (0..frames(rate))
+            .map(|i| {
+                a * (2.0 * std::f32::consts::PI * 300.0 * (start + i) as f32 / rate as f32).sin()
+            })
+            .collect()
+    }
+
+    /// The output level of the voice's frames (within 20 dB of the loudest),
+    /// their average level in dB as the chain's target counts it, once AGC2
+    /// had `settle` passes of the clip, over `passes` more.
+    fn talker_out_db(
+        h: &RootProcessorHarness,
+        rate: i32,
+        clip: &[f32],
+        settle: usize,
+        passes: usize,
+    ) -> f64 {
+        let n = frames(rate);
+        let loudest = clip.chunks_exact(n).map(power).fold(0.0, f64::max);
+        let (mut sum, mut count) = (0.0, 0usize);
+        for pass in 0..settle + passes {
+            for frame in clip.chunks_exact(n) {
+                let out = h.process(rate, 1, frame).samples;
+                if pass >= settle && power(frame) > loudest * 0.01 {
+                    sum += dbfs(power(&out));
+                    count += 1;
+                }
+            }
+            h.service_agc2();
+        }
+        sum / count as f64
+    }
+
+    /// A quiet talker (-45 dBFS) comes out at about -25 dBFS, from 0 dB and
+    /// at 48, 44.1 and 16 kHz (the processor's rate for 44.1 kHz devices is
+    /// 48 kHz, but AGC2 also runs on a 44.1 kHz frame).
+    #[test]
+    fn root_capture_processor_agc2_brings_a_quiet_talker_to_about_minus_25_dbfs() {
+        for rate in [48000, 44100, 16000] {
+            let clip = at_level(rate, -45.0);
+            assert!((speech_db(&clip, frames(rate)) + 45.0).abs() < 0.01);
+            let h = agc2(rate, 0.0, true);
+            let out = talker_out_db(&h, rate, &clip, 4, 2);
+            let dsp = h.dsp(false);
+            assert!(
+                (out + 25.0).abs() <= 3.0,
+                "{rate}: {out:.1} dBFS at {:.1} dB",
+                dsp.voice_gain_db
+            );
+            assert_eq!((dsp.gain_engine_applied, dsp.agc2_rate), (AGC2, rate as u32), "{rate}");
+            assert!(dsp.voice_gain_settled, "{rate}");
+        }
+    }
+
+    /// Room noise never opens the gate at 20-30 dB of AGC2 gain: auto
+    /// sensitivity learns the floor before the gain and adds the gain AGC2
+    /// applied, and its -54 dBFS minimum gives way only to the room's floor
+    /// plus 8 dB. The room is a fan drifting ±3 dB over 2 s.
+    #[test]
+    fn root_capture_processor_agc2_room_noise_never_opens_the_gate_at_20_to_30_db() {
+        for (reset, room_db) in [(20.0f32, -75.0f64), (25.0, -80.0), (30.0, -85.0), (30.0, -70.0)] {
+            let h = agc2(48000, reset, true);
+            let mut seed = 0x2545_F491_4F6C_DD1Du64;
+            let mut open_after_learning = 0;
+            let mut gains = Vec::new();
+            for f in 0..3000 {
+                let db = room_db + 3.0 * (2.0 * std::f64::consts::PI * f as f64 / 200.0).sin();
+                let a = (32768.0 * 10f64.powf(db / 20.0) * 3f64.sqrt()) as f32;
+                let frame: Vec<f32> = (0..480)
+                    .map(|_| {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        a * ((seed >> 11) as f32 / (1u64 << 53) as f32 * 2.0 - 1.0)
+                    })
+                    .collect();
+                h.process(48000, 1, &frame);
+                if f == 500 {
+                    open_after_learning = h.dsp(false).gate_open_frames;
+                }
+                if f >= 500 {
+                    gains.push(h.dsp(false).voice_gain_db);
+                }
+            }
+            let dsp = h.dsp(false);
+            let lowest = gains.iter().cloned().fold(f32::MAX, f32::min);
+            assert!(lowest >= 19.5 || room_db > -75.0, "{reset} dB over {room_db}: {lowest}");
+            assert_eq!(
+                dsp.gate_open_frames, open_after_learning,
+                "{reset} dB over {room_db} dBFS: the gate opened"
+            );
+            assert_eq!(dsp.gain_engine_applied, AGC2);
+        }
+    }
+
+    /// A tone AGC2 takes for noise (its detector hears no voice), at -65 dBFS,
+    /// under the tests' -30 dBFS noise cap: its gain stays where it started.
+    fn steady_gain(h: &RootProcessorHarness, rate: i32, position: &mut usize) -> f64 {
+        let (mut input, mut output) = (0.0, 0.0);
+        for f in 0..60 {
+            let frame = tone(rate, -65.0, position);
+            let out = h.process(rate, 1, &frame).samples;
+            if f >= 30 {
+                input += power(&frame);
+                output += power(&out);
+            }
+        }
+        10.0 * (output / input).log10()
+    }
+
+    /// A gain reset is a new AGC2 starting from it (clamped to AGC2's
+    /// maximum); other settings are a new one from the gain applied last;
+    /// turning auto gain back on starts over from the last reset.
+    #[test]
+    fn root_capture_processor_agc2_starts_from_each_gain_reset() {
+        let h = agc2_with(48000, 18.0, false, tuning(f32::NAN, -30.0));
+        let mut position = 0;
+        assert!((steady_gain(&h, 48000, &mut position) - 18.0).abs() < 0.3);
+        let dsp = h.dsp(false);
+        assert!((dsp.voice_gain_db - 18.0).abs() < 0.3, "{}", dsp.voice_gain_db);
+        assert_eq!((dsp.agc2_builds, dsp.gain_engine_applied), (1, AGC2));
+
+        h.gain_reset(6.0);
+        assert!((steady_gain(&h, 48000, &mut position) - 6.0).abs() < 0.3);
+        assert!(!h.dsp(false).voice_gain_settled);
+        h.gain_reset(45.0);
+        assert!((steady_gain(&h, 48000, &mut position) - 30.0).abs() < 0.3, "AGC2's 30 dB maximum");
+        h.set_agc2_tuning(tuning(12.0, -30.0));
+        assert!((steady_gain(&h, 48000, &mut position) - 12.0).abs() < 0.3);
+        let dsp = h.dsp(false);
+        assert_eq!(
+            (dsp.agc2_builds, dsp.agc2_applied.max_gain_db, dsp.agc2_applied.headroom_db),
+            (4, 12.0, 5.0)
+        );
+
+        h.set_dsp(false, false, 0.0);
+        assert!(steady_gain(&h, 48000, &mut position).abs() < 0.01, "auto gain off");
+        h.gain_reset(9.0);
+        h.set_dsp(true, false, 0.0);
+        assert!((steady_gain(&h, 48000, &mut position) - 9.0).abs() < 0.3);
+        h.set_gain_engine(0);
+        h.gain_reset(4.0);
+        h.process(48000, 1, &tone(48000, -65.0, &mut position));
+        assert_eq!((h.dsp(false).gain_engine_applied, h.dsp(false).voice_gain_db), (0, 4.0));
+        h.reset_controls();
+        assert_eq!(h.dsp(false).gain_engine, 0, "a session start forgets the engine");
+    }
+
+    /// Not a unit test: a recording through AGC2 in the processor (the gate
+    /// open). ROOTAPP_AGC2_REPLAY_IN is a 48 kHz mono float32 WAV of the
+    /// Effects SDK's output; ROOTAPP_AGC2_REPLAY_OUT gets the processor's
+    /// output (float32 ±1, raw) and `<out>.gain` the gain of each frame (f32
+    /// dB). AGC2 starts at ROOTAPP_AGC2_REPLAY_START_DB (15).
+    #[test]
+    #[ignore]
+    fn root_capture_processor_agc2_replays_a_recording() {
+        let input = std::env::var("ROOTAPP_AGC2_REPLAY_IN").expect("ROOTAPP_AGC2_REPLAY_IN");
+        let output = std::env::var("ROOTAPP_AGC2_REPLAY_OUT").expect("ROOTAPP_AGC2_REPLAY_OUT");
+        let start = std::env::var("ROOTAPP_AGC2_REPLAY_START_DB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(15.0f32);
+        let bytes = std::fs::read(input).unwrap();
+        let mut at = 12;
+        let mut samples = Vec::new();
+        while at + 8 <= bytes.len() {
+            let len = u32::from_le_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+            if &bytes[at..at + 4] == b"data" {
+                samples = bytes[at + 8..(at + 8 + len).min(bytes.len())]
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes(b.try_into().unwrap()) * 32768.0)
+                    .collect();
+                break;
+            }
+            at += 8 + len + (len & 1);
+        }
+        let h = agc2(48000, start, false);
+        let mut out = Vec::with_capacity(samples.len() * 4);
+        let mut gains = Vec::with_capacity(samples.len() / 120);
+        for frame in samples.chunks_exact(480) {
+            for s in h.process(48000, 1, frame).samples {
+                out.extend_from_slice(&(s / 32768.0).to_le_bytes());
+            }
+            gains.extend_from_slice(&h.dsp(false).voice_gain_db.to_le_bytes());
+        }
+        std::fs::write(&output, out).unwrap();
+        std::fs::write(format!("{output}.gain"), gains).unwrap();
+    }
+
+    /// AGC2 runs at every rate the chain does, from the gain reset, once the
+    /// poll built it for the processor's rate; until then (a rate change) the
+    /// chain's own gain covers the frames.
+    #[test]
+    fn root_capture_processor_agc2_runs_at_every_rate_and_follows_a_rate_change() {
+        for rate in RATES {
+            let h = agc2_with(rate, 12.0, false, tuning(f32::NAN, -30.0));
+            let mut position = 0;
+            let gain = steady_gain(&h, rate, &mut position);
+            assert!((gain - 12.0).abs() < 0.3, "{rate}: {gain}");
+            let dsp = h.dsp(false);
+            assert_eq!((dsp.agc2_rate, dsp.gain_engine_applied), (rate as u32, AGC2), "{rate}");
+        }
+        let h = agc2_with(48000, 10.0, false, tuning(f32::NAN, -30.0));
+        let mut position = 0;
+        steady_gain(&h, 48000, &mut position);
+        let builds = h.dsp(false).agc2_builds;
+        h.initialize(16000, 1);
+        h.process(16000, 1, &tone(16000, -65.0, &mut position));
+        assert_eq!(h.dsp(false).gain_engine_applied, 0, "no AGC2 at 16 kHz until the poll");
+        h.service_agc2();
+        let dsp = h.dsp(false);
+        assert_eq!((dsp.agc2_rate, dsp.agc2_builds), (16000, builds + 1));
+        let gain = steady_gain(&h, 16000, &mut position);
+        assert!((gain - 10.0).abs() < 0.3, "from the gain applied last: {gain}");
+        assert_eq!(h.dsp(false).gain_engine_applied, AGC2);
     }
 }
 

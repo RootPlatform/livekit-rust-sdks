@@ -597,7 +597,7 @@ fn adm_proxy_controller_clamps_what_reaches_the_audio_threads() {
     assert_eq!(state.master_volume, 2.0);
     assert!(state.deafened);
     assert_eq!((state.denoise_power, state.gate_threshold), (1.0, 0.0));
-    assert_eq!((state.gain_reset_db, state.gain_reset_seq), (18.0, 1));
+    assert_eq!((state.gain_reset_db, state.gain_reset_seq), (50.0, 1), "AGC2's highest maximum");
     assert!(!state.auto_gain && !state.auto_sensitivity);
 
     h.apply_control(&RootAudioControlUpdate {
@@ -861,7 +861,7 @@ fn adm_proxy_controller_stores_the_voice_gain_tunables_until_a_reset_and_reports
             s.voice_gain_min_speech_probability,
         ]
     };
-    assert_eq!(applied(&h), [15.0, -25.0, 3.0, 2.0, 4000.0, 0.5], "the chain's defaults");
+    assert_eq!(applied(&h), [24.0, -25.0, 3.0, 2.0, 4000.0, 0.5], "the chain's defaults");
     assert!(h.apply_control(&RootAudioControlUpdate {
         has_voice_gain_max_db: true,
         voice_gain_max_db: 40.0,
@@ -877,7 +877,7 @@ fn adm_proxy_controller_stores_the_voice_gain_tunables_until_a_reset_and_reports
         voice_gain_min_speech_probability: 0.9,
         ..Default::default()
     }));
-    assert_eq!(applied(&h), [18.0, -22.0, 0.5, 2.0, 6000.0, 0.9]);
+    assert_eq!(applied(&h), [24.0, -22.0, 0.5, 2.0, 6000.0, 0.9]);
     h.apply_control(&RootAudioControlUpdate {
         has_voice_gain_max_db: true,
         voice_gain_max_db: 9.0,
@@ -892,7 +892,57 @@ fn adm_proxy_controller_stores_the_voice_gain_tunables_until_a_reset_and_reports
     h.reset_root_audio(false);
     assert!(h.control_state().voice_gain_max_db.is_nan());
     assert!(h.control_state().voice_gain_level_time_constant_ms.is_nan());
-    assert_eq!(applied(&h), [15.0, -25.0, 3.0, 2.0, 4000.0, 0.5]);
+    assert_eq!(applied(&h), [24.0, -25.0, 3.0, 2.0, 4000.0, 0.5]);
+}
+
+#[test]
+fn adm_proxy_controller_stores_the_gain_engine_and_agc2_settings_until_a_reset() {
+    let h = harness(&["{spk}"], &["{mic}"]);
+    let state = h.control_state();
+    assert_eq!(state.gain_engine, 0, "the chain's voice gain until the host asks");
+    assert!(state.agc2_headroom_db.is_nan() && state.agc2_max_output_noise_dbfs.is_nan());
+    let applied = |h: &AdmProxyHarness| {
+        let s = h.stats();
+        [
+            s.agc2_headroom_db,
+            s.agc2_max_gain_db,
+            s.agc2_max_gain_change_db_per_second,
+            s.agc2_max_output_noise_dbfs,
+        ]
+    };
+    assert_eq!(applied(&h), [5.0, 30.0, 6.0, -50.0], "Chrome's, at most 30 dB");
+    assert!(h.apply_control(&RootAudioControlUpdate {
+        has_gain_engine: true,
+        gain_engine: 1,
+        has_agc2_headroom_db: true,
+        agc2_headroom_db: 40.0,
+        has_agc2_max_gain_db: true,
+        agc2_max_gain_db: 0.0,
+        has_agc2_max_gain_change_db_per_second: true,
+        agc2_max_gain_change_db_per_second: f32::NAN,
+        has_agc2_max_output_noise_dbfs: true,
+        agc2_max_output_noise_dbfs: -10.0,
+        ..Default::default()
+    }));
+    let state = h.control_state();
+    assert_eq!((state.gain_engine, state.agc2_headroom_db, state.agc2_max_gain_db), (1, 40.0, 0.0));
+    assert_eq!(applied(&h), [20.0, 1.0, 6.0, -30.0], "clamped where they apply");
+    h.apply_control(&RootAudioControlUpdate {
+        has_gain_engine: true,
+        gain_engine: 7,
+        ..Default::default()
+    });
+    assert_eq!(h.control_state().gain_engine, 0, "an unknown engine is the chain's");
+    h.apply_control(&RootAudioControlUpdate {
+        has_gain_engine: true,
+        gain_engine: 1,
+        ..Default::default()
+    });
+    h.reset_root_audio(false);
+    let state = h.control_state();
+    assert_eq!(state.gain_engine, 0);
+    assert!(state.agc2_headroom_db.is_nan() && state.agc2_max_gain_db.is_nan());
+    assert_eq!(applied(&h), [5.0, 30.0, 6.0, -50.0]);
 }
 
 fn denoiser_completions(h: &AdmProxyHarness, count: usize) -> Vec<RootDenoiserCompletionItem> {

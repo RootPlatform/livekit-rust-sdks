@@ -40,8 +40,9 @@ use std::{
 
 use livekit::{
     prelude::*, sanitize_volume, webrtc::stats::RtcStats, AudioDeviceResults, AudioDeviceSelection,
-    CaptureFormat, DenoiserCompletion, DenoiserState, EchoModel, EffectPlay, LocalSpeaking,
-    PlatformAudio, PushToTalk, ReturnedPipeline, RootAudioControl, RootAudioStats, SpeechDetection,
+    CaptureFormat, DenoiserCompletion, DenoiserState, EchoModel, EffectPlay, GainEngine,
+    LocalSpeaking, PlatformAudio, PushToTalk, ReturnedPipeline, RootAudioControl, RootAudioStats,
+    SpeechDetection,
 };
 use parking_lot::Mutex;
 use tokio::time::MissedTickBehavior;
@@ -904,8 +905,18 @@ pub fn root_audio_control(control: &proto::RootAudioControl) -> RootAudioControl
         voice_gain_fall_db_per_second: control.voice_gain_fall_db_per_second,
         voice_gain_level_time_constant_ms: control.voice_gain_level_time_constant_ms,
         voice_gain_min_speech_probability: control.voice_gain_min_speech_probability,
+        gain_engine: control.gain_engine.map(gain_engine),
+        agc2_headroom_db: control.agc2_headroom_db,
+        agc2_max_gain_db: control.agc2_max_gain_db,
+        agc2_max_gain_change_db_per_second: control.agc2_max_gain_change_db_per_second,
+        agc2_max_output_noise_dbfs: control.agc2_max_output_noise_dbfs,
     }
     .sanitized()
+}
+
+/// The proto's RootAudioGainEngine; a value this build does not know is legacy.
+fn gain_engine(value: i32) -> GainEngine {
+    u32::try_from(value).map_or(GainEngine::Legacy, GainEngine::from_wire)
 }
 
 /// The proto's RootAudioSpeechDetection; a value this build does not know is off.
@@ -1310,6 +1321,16 @@ impl From<RootAudioStats> for proto::RootAudioStats {
             voice_gain_fall_db_per_second: stats.voice_gain_fall_db_per_second,
             voice_gain_level_time_constant_ms: stats.voice_gain_level_time_constant_ms,
             voice_gain_min_speech_probability: stats.voice_gain_min_speech_probability,
+            gain_engine: stats.gain_engine.map(|engine| engine.to_wire() as i32),
+            agc2_headroom_db: stats.agc2_headroom_db,
+            agc2_max_gain_db: stats.agc2_max_gain_db,
+            agc2_max_gain_change_db_per_second: stats.agc2_max_gain_change_db_per_second,
+            agc2_max_output_noise_dbfs: stats.agc2_max_output_noise_dbfs,
+            agc2_builds: stats.agc2_builds,
+            voice_gain_room_db: stats.voice_gain_room_db,
+            voice_gain_speech_level_db: stats.voice_gain_speech_level_db,
+            voice_gain_floor_db: stats.voice_gain_floor_db,
+            voice_gain_limit: stats.voice_gain_limit.map(|limit| limit.to_wire() as i32),
             denoiser_rate: stats.denoiser_rate,
             denoiser_installs: stats.denoiser_installs,
             denoiser_bypassed_frames: stats.denoiser_bypassed_frames,
@@ -1572,8 +1593,17 @@ mod tests {
             voice_gain_fall_db_per_second: Some(2.0),
             voice_gain_level_time_constant_ms: Some(4000.0),
             voice_gain_min_speech_probability: Some(0.5),
+            gain_engine: Some(proto::RootAudioGainEngine::Agc2 as i32),
+            agc2_headroom_db: Some(5.0),
+            agc2_max_gain_db: Some(30.0),
+            agc2_max_gain_change_db_per_second: Some(6.0),
+            agc2_max_output_noise_dbfs: Some(-50.0),
         });
         assert_eq!(control.auto_sensitivity_minimum_db, Some(-54.0));
+        assert_eq!(
+            (control.gain_engine, control.agc2_max_gain_db),
+            (Some(GainEngine::Agc2), Some(30.0))
+        );
         assert_eq!(
             (control.voice_gain_max_db, control.voice_gain_target_db),
             (Some(15.0), Some(-25.0))
@@ -1734,6 +1764,67 @@ mod tests {
         assert_eq!(
             (absent.voice_gain_max_db, absent.voice_gain_min_speech_probability),
             (None, None)
+        );
+    }
+
+    /// Fields 23-27 reach native as set (it clamps them) and stats 139-148 convert.
+    #[test]
+    fn rootapp_audio_gain_engine_and_agc2_pass_through_and_their_stats_convert() {
+        use livekit::GainLimit;
+        let control = root_audio_control(&proto::RootAudioControl {
+            gain_engine: Some(proto::RootAudioGainEngine::Agc2 as i32),
+            agc2_headroom_db: Some(40.0),
+            agc2_max_gain_db: Some(30.0),
+            agc2_max_gain_change_db_per_second: Some(f32::NAN),
+            agc2_max_output_noise_dbfs: Some(-50.0),
+            ..Default::default()
+        });
+        assert_eq!(control.gain_engine, Some(GainEngine::Agc2));
+        assert_eq!(control.agc2_headroom_db, Some(40.0), "clamped by native, not here");
+        assert_eq!(control.agc2_max_gain_db, Some(30.0));
+        assert!(control.agc2_max_gain_change_db_per_second.is_some_and(f32::is_nan));
+        assert_eq!(control.agc2_max_output_noise_dbfs, Some(-50.0));
+        for (wire, engine) in
+            [(0, GainEngine::Legacy), (1, GainEngine::Agc2), (9, GainEngine::Legacy)]
+        {
+            let control = root_audio_control(&proto::RootAudioControl {
+                gain_engine: Some(wire),
+                ..Default::default()
+            });
+            assert_eq!(control.gain_engine, Some(engine), "{wire}");
+        }
+
+        let p: proto::RootAudioStats = RootAudioStats {
+            gain_engine: Some(GainEngine::Agc2),
+            agc2_headroom_db: Some(5.0),
+            agc2_max_gain_db: Some(30.0),
+            agc2_max_gain_change_db_per_second: Some(6.0),
+            agc2_max_output_noise_dbfs: Some(-50.0),
+            agc2_builds: Some(2),
+            voice_gain_room_db: Some(-61.5),
+            voice_gain_speech_level_db: Some(-43.0),
+            voice_gain_floor_db: Some(-90.0),
+            voice_gain_limit: Some(GainLimit::Noise),
+            ..Default::default()
+        }
+        .into();
+        assert_eq!(p.gain_engine, Some(proto::RootAudioGainEngine::Agc2 as i32));
+        assert_eq!((p.agc2_headroom_db, p.agc2_max_gain_db), (Some(5.0), Some(30.0)));
+        assert_eq!(
+            (p.agc2_max_gain_change_db_per_second, p.agc2_max_output_noise_dbfs),
+            (Some(6.0), Some(-50.0))
+        );
+        assert_eq!(p.agc2_builds, Some(2));
+        assert_eq!(
+            (p.voice_gain_room_db, p.voice_gain_speech_level_db),
+            (Some(-61.5), Some(-43.0))
+        );
+        assert_eq!(p.voice_gain_floor_db, Some(-90.0));
+        assert_eq!(p.voice_gain_limit, Some(proto::RootAudioGainLimit::Noise as i32));
+        let absent: proto::RootAudioStats = RootAudioStats::default().into();
+        assert_eq!(
+            (absent.gain_engine, absent.agc2_builds, absent.voice_gain_limit),
+            (None, None, None)
         );
     }
 

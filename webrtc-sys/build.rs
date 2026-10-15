@@ -100,6 +100,7 @@ fn main() {
         "src/audio_thread.cpp",
         "src/root_audio_mixer.cpp",
         "src/root_audio_monitor.cpp",
+        "src/root_agc2.cpp",
         "src/root_audio_processing.cpp",
         "src/root_denoiser.cpp",
         "src/root_screen_audio.cpp",

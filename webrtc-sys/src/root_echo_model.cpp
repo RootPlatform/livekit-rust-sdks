@@ -26,6 +26,7 @@
 #include "api/audio/echo_canceller3_config.h"
 #include "api/environment/environment_factory.h"
 #include "api/make_ref_counted.h"
+#include "livekit/root_agc2.h"
 #include "livekit/root_audio_processing.h"
 #include "modules/audio_processing/aec3/block.h"
 
@@ -1125,6 +1126,13 @@ void RootEchoHarness::open_dsp_chain() const {
   capture_->gate_threshold.store(0.0f);
 }
 
+void RootEchoHarness::use_agc2(float gain_reset_db) const {
+  capture_->auto_gain.store(true);
+  capture_->agc2->Reset(gain_reset_db);
+  capture_->gain_engine.store(static_cast<uint32_t>(RootGainEngine::kAgc2));
+  capture_->ServiceAgc2();
+}
+
 void RootEchoHarness::prepare_model() const {
   root_echo_model_prepare();
 }
@@ -1208,6 +1216,9 @@ RootEchoHarnessProbe RootEchoHarness::probe() const {
   probe.processed_frames = dsp.processed_frames;
   probe.dsp_resets = dsp.dsp_resets;
   probe.dsp_flushes = dsp.dsp_flushes;
+  probe.voice_gain_db = dsp.voice_gain_db;
+  probe.gain_engine = dsp.gain_engine_applied;
+  probe.agc2_builds = dsp.agc2_builds;
   probe.format_seq = capture_->format_seq.load();
   probe.erle_db = decorator_->ReadStats().erle_db;
   probe.pending_tasks = static_cast<uint32_t>(tasks_->size());

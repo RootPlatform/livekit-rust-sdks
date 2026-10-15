@@ -168,6 +168,23 @@ pub mod ffi {
         pub voice_gain_fall_db_per_second: f32,
         pub voice_gain_level_time_constant_ms: f32,
         pub voice_gain_min_speech_probability: f32,
+        /// The engine that boosted the last frame (0 the chain's, 1 AGC2),
+        /// AGC2's settings native applies (the stored ones after clamping, the
+        /// defaults when unset) and the AGC2 instances built so far.
+        pub gain_engine: u32,
+        pub agc2_headroom_db: f32,
+        pub agc2_max_gain_db: f32,
+        pub agc2_max_gain_change_db_per_second: f32,
+        pub agc2_max_output_noise_dbfs: f32,
+        pub agc2_builds: u64,
+        /// The chain's voice gain's view, whichever engine boosts: the room
+        /// before the denoiser and the talker's level before the gain (NaN
+        /// until measured), the floor after the denoiser, and what held the
+        /// gain (0 none yet, 1 target, 2 max, 3 noise, 4 room).
+        pub voice_gain_room_db: f32,
+        pub voice_gain_speech_level_db: f32,
+        pub voice_gain_floor_db: f32,
+        pub voice_gain_limit: u32,
         pub denoiser_installed: bool,
         pub denoiser_frames: u64,
         pub denoiser_misses: u64,
@@ -295,6 +312,19 @@ pub mod ffi {
         pub voice_gain_level_time_constant_ms: f32,
         pub has_voice_gain_min_speech_probability: bool,
         pub voice_gain_min_speech_probability: f32,
+        /// 0 the chain's voice gain, 1 AGC2; other values are the chain's.
+        pub has_gain_engine: bool,
+        pub gain_engine: u32,
+        /// AGC2's settings (rootapp_voice_dsp::Agc2Tuning); clamped when an
+        /// instance is built, a non-finite value the default.
+        pub has_agc2_headroom_db: bool,
+        pub agc2_headroom_db: f32,
+        pub has_agc2_max_gain_db: bool,
+        pub agc2_max_gain_db: f32,
+        pub has_agc2_max_gain_change_db_per_second: bool,
+        pub agc2_max_gain_change_db_per_second: f32,
+        pub has_agc2_max_output_noise_dbfs: bool,
+        pub agc2_max_output_noise_dbfs: f32,
     }
 
     /// The stored controls (tests).
@@ -322,6 +352,12 @@ pub mod ffi {
         pub voice_gain_fall_db_per_second: f32,
         pub voice_gain_level_time_constant_ms: f32,
         pub voice_gain_min_speech_probability: f32,
+        pub gain_engine: u32,
+        /// As stored (NaN: none, the defaults).
+        pub agc2_headroom_db: f32,
+        pub agc2_max_gain_db: f32,
+        pub agc2_max_gain_change_db_per_second: f32,
+        pub agc2_max_output_noise_dbfs: f32,
         pub stream_epoch: u64,
         pub dsp_reset_seq: u64,
     }
