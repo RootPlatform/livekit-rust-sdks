@@ -884,10 +884,11 @@ fn unsupported_frames_report_the_last_state_and_no_per_frame_flags() {
     assert_eq!(h.out.sent_sumsq, 0.0);
 }
 
-/// A stream the chain cannot process never leaves speaking stuck on: the gate releases and its
-/// hold runs out as on silence.
+/// A stream the chain cannot process: the gate releases and its hold runs out as on silence, and
+/// speaking follows what is actually sent (the audio goes out ungated, so it rings until muted or
+/// silent).
 #[test]
-fn unsupported_frames_let_the_gate_run_out() {
+fn unsupported_frames_let_the_gate_run_out_and_ring_while_sent() {
     let mut h = Harness::new(48000);
     for _ in 0..40 {
         h.run_tone(3000.0);
@@ -897,11 +898,17 @@ fn unsupported_frames_let_the_gate_run_out() {
     let mut frames = 0;
     while h.out.gate_speaking {
         assert_eq!(h.run_input(&input), input, "the audio itself still goes out");
+        assert!(h.out.speaking, "what goes out rings");
         frames += 1;
         assert!(frames < 100);
     }
     assert!((68..=72).contains(&frames), "{frames}: as many as for supported silence");
-    assert!(!h.out.speaking && h.out.transmitting);
+    assert!(h.out.speaking && h.out.transmitting);
+    assert!(silent(&h.run_input(&[0.0f32; 479])));
+    assert!(!h.out.speaking, "silence sent does not ring");
+    h.settings.mic_muted = true;
+    assert!(silent(&h.run_input(&input)));
+    assert!(!h.out.speaking && !h.out.transmitting);
 }
 
 #[test]

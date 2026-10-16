@@ -242,7 +242,9 @@ pub struct DspOutputs {
     pub envelope: f32,
     /// NoiseGate.IsSpeaking after this frame.
     pub gate_speaking: bool,
-    /// gate_speaking && transmit_open.
+    /// Audio goes out: gate_speaking (the gate passes audio, or its hold after it did) while the
+    /// transmit gate is open, outside the startup hold (unsupported frames: whatever is sent). The
+    /// ring and the speaking byte follow it, so what is sent rings (but the fade of a mute).
     pub speaking: bool,
     /// envelope > 0.
     pub gate_open: bool,

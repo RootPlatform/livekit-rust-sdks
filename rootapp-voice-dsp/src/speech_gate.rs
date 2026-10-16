@@ -36,9 +36,9 @@ pub enum SpeechDetection {
     /// Level gate only (the managed engine's behaviour).
     #[default]
     Off,
-    /// The ring and the speaking byte need confirmed speech; the audio follows the level gate.
+    /// The detector is observed and reported only; the audio follows the level gate.
     Ring,
-    /// The ring as Ring; the audio gate also closes on what the detector does not confirm.
+    /// The audio gate also closes on what the detector does not confirm.
     Gate,
 }
 

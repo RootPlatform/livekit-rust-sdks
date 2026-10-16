@@ -240,7 +240,7 @@ fn speech_fixture(signal: u32, frames: u32) -> Vec<Vec<i16>> {
 }
 
 #[test]
-fn root_voice_speech_detection_keeps_keys_off_the_ring_and_rings_for_a_voice() {
+fn root_voice_speech_detection_rings_for_keys_only_while_sent_and_rings_for_a_voice() {
     const KEYS: u32 = 6;
     const VOWEL: u32 = 0;
     let h = started();
@@ -260,8 +260,10 @@ fn root_voice_speech_detection_keeps_keys_off_the_ring_and_rings_for_a_voice() {
         },
     );
     for frame in speech_fixture(KEYS, 300) {
-        h.capture(48_000, 1, &frame);
-        assert!(!speaking(c), "typing never rings");
+        let sent = h.capture(48_000, 1, &frame);
+        if sent.iter().any(|&s| s != 0) {
+            assert!(speaking(c), "typing that is sent rings");
+        }
     }
     let keys = c.root_audio_stats();
     assert_eq!((keys.speech_detection, keys.speech_frames), (2, 0));

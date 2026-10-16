@@ -162,13 +162,16 @@ fn level_gate_holds_open_on_noise_the_detector_rejects() {
 }
 
 #[test]
-fn ring_ends_a_hang_after_speech_and_the_gate_closes() {
+fn ring_follows_the_audio_through_the_hang_and_the_close() {
     let script = speech_then_noise();
     let end = START + 100;
     let gate = run(SpeechDetection::Gate, &script, |_, _| {});
     assert!(gate.speaking[end - 1]);
-    let off_at = (end..end + 400).find(|&f| !gate.speaking[f]).unwrap();
-    assert_eq!(off_at - end, HANG_FRAMES as usize);
+    assert!(
+        (0..script.len()).all(|f| silent(&gate.sent[f]) || gate.speaking[f]),
+        "every frame that sends audio rings"
+    );
+    assert!(!gate.speaking[end + 399], "the ring ends with the gate");
     let closed_at = (end..end + 400).find(|&f| silent(&gate.sent[f])).unwrap();
     assert!(
         closed_at - end <= HANG_FRAMES as usize + 7,
@@ -182,39 +185,59 @@ fn ring_ends_a_hang_after_speech_and_the_gate_closes() {
 }
 
 #[test]
-fn ring_mode_changes_only_the_ring() {
+fn ring_mode_matches_the_level_gate() {
     let script = speech_then_noise();
     let off = run(SpeechDetection::Off, &script, |_, _| {});
     let ring = run(SpeechDetection::Ring, &script, |_, _| {});
     assert_eq!(off.sent, ring.sent);
-    let end = START + 100;
-    assert!(!ring.speaking[end + HANG_FRAMES as usize + 1]);
+    assert_eq!(off.speaking, ring.speaking);
 }
 
 #[test]
-fn noise_burst_never_lights_the_ring_and_closes_after_the_provisional_window() {
+fn noise_burst_rings_only_while_its_provisional_open_sends() {
     let burst = START + 50;
     let script = vec![(false, 0.0f32); burst + 200];
     let gate = run(SpeechDetection::Gate, &script, |f, s| {
         s.gate_threshold = if f < burst { 0.5 } else { 0.01 };
     });
-    assert!(gate.speaking.iter().all(|&s| !s));
     let open: Vec<usize> = (burst..burst + 200).filter(|&f| !silent(&gate.sent[f])).collect();
     assert!(!open.is_empty(), "the level opens provisionally");
     assert!(open.len() <= PROVISIONAL_FRAMES as usize + 7, "open {} frames", open.len());
+    assert!(open.iter().all(|&f| gate.speaking[f]), "what the provisional open sends rings");
+    assert!(!gate.speaking[burst + 199], "the ring ends with the provisional open");
 }
 
 #[test]
-fn confirmed_speech_lights_the_ring_after_the_confirm_frames() {
+fn the_ring_lights_with_the_first_frame_sent_before_the_detector_confirms() {
     let mut script = vec![(false, 0.0f32); START];
     script.extend(std::iter::repeat_n((true, 0.1), 3));
     script.extend(std::iter::repeat_n((true, SPEECH), 50));
     let gate = run(SpeechDetection::Gate, &script, |f, s| {
         s.gate_threshold = if f < START { 0.5 } else { 0.01 };
     });
-    let first = (0..script.len()).find(|&f| gate.speaking[f]).unwrap();
-    assert_eq!(first, START + 3 + CONFIRM_FRAMES as usize - 1);
-    assert!(!silent(&gate.sent[START + 1]), "the level opened before the detector confirmed");
+    let first_sent = (0..script.len()).find(|&f| !silent(&gate.sent[f])).unwrap();
+    let first_ring = (0..script.len()).find(|&f| gate.speaking[f]).unwrap();
+    assert_eq!(first_ring, first_sent);
+    assert!(first_sent < START + 3 + CONFIRM_FRAMES as usize - 1, "before the detector confirmed");
+}
+
+#[test]
+fn every_frame_that_sends_audio_rings_in_every_mode() {
+    let mut script = speech_then_noise();
+    script.extend(std::iter::repeat_n((true, 0.4), 200));
+    script.extend(std::iter::repeat_n((true, 0.1), 200));
+    script.extend(std::iter::repeat_n((false, NOISE), 100));
+    script.extend(std::iter::repeat_n((true, SPEECH), 100));
+    for detection in [SpeechDetection::Off, SpeechDetection::Ring, SpeechDetection::Gate] {
+        let r = run(detection, &script, |f, s| {
+            s.gate_threshold = if f % 700 < 350 { 0.01 } else { 0.03 };
+        });
+        let sent = (0..script.len()).filter(|&f| !silent(&r.sent[f])).count();
+        assert!(sent > 100, "{detection:?} sent {sent} frames");
+        for f in 0..script.len() {
+            assert!(silent(&r.sent[f]) || r.speaking[f], "{detection:?}: frame {f} sends audio without ringing");
+        }
+    }
 }
 
 #[test]

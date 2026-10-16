@@ -640,14 +640,12 @@ impl DspChain {
         let envelope = gate.envelope();
         let gate_speaking = gate.is_speaking();
         let speech_confirmed = probability.is_some() && speech.confirmed();
-        let speaking =
-            if probability.is_some() { gate_speaking && speech_confirmed } else { gate_speaking };
         out.sent_sumsq = sanitize::sum_squares(frame);
         out.gate_in_rms = input_rms;
         out.threshold = threshold;
         out.envelope = envelope;
         out.gate_speaking = gate_speaking;
-        out.speaking = speaking && open;
+        out.speaking = open && !held && (gate_speaking || out.sent_sumsq > 0.0);
         out.speech_probability = probability.unwrap_or(-1.0);
         out.speech = speech_confirmed;
         out.speech_closed = control.fast_close || (!control.allow_open && above);
@@ -694,7 +692,7 @@ impl DspChain {
         out.envelope = self.gate.envelope();
         self.speech.reset();
         out.gate_speaking = self.gate.is_speaking();
-        out.speaking = out.gate_speaking && open;
+        out.speaking = transmitting && out.sent_sumsq > 0.0;
         out.speech_probability = -1.0;
         out.speech = false;
         out.speech_closed = false;

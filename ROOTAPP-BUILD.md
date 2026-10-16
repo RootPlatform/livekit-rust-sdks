@@ -1218,7 +1218,10 @@ and evaluation: the desktop's `docs/native-platform-audio.md` ("Speech detection
   and hands the probability to the chain (`RootDspSettings.speech_probability`).
 - `rootapp-voice-dsp`: `SpeechGate` (`speech_gate.rs`) and `NoiseGate::process_controlled`. Speech
   is confirmed after 3 frames in a row at p >= 0.5 and ends 300 ms after the last frame at p >= 0.3.
-  The ring (`speaking`) is the level gate's speaking AND confirmed speech. In `Gate` mode:
+  The ring (`speaking`) follows what is sent (hw.15): any frame that sends audio, plus the level gate's
+  300 ms hold, while the transmit gate is open and outside the startup hold (unsupported frames: whatever
+  goes out). Until hw.14 it was the level gate's speaking AND confirmed speech, so audio the detector did
+  not confirm went out without a ring. In `Gate` mode:
   - an open the detector has not confirmed within 200 ms of frames under 0.3 is released over 50 ms
     (40 ms at full gain, then a 10 ms ramp; about 260 ms of it is sent) without the speaking hold;
   - when confirmed speech ends, `control` decides with that frame's level: input still held above

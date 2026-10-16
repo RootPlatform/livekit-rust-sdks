@@ -2052,7 +2052,7 @@ mod speech_tests {
     }
 
     #[test]
-    fn root_capture_processor_speech_gate_never_rings_on_breath_clicks_or_keys() {
+    fn root_capture_processor_speech_gate_rings_breath_clicks_and_keys_only_while_sent() {
         for rate in [16000, 48000] {
             for (signal, name) in NOISES {
                 let input = script(signal, rate, 30, 400, 0);
@@ -2061,7 +2061,10 @@ mod speech_tests {
 
                 let h = harness(rate, GATE);
                 let gate = run(&h, rate, &input);
-                assert!(gate.iter().all(|&(ring, _)| !ring), "{rate} {name}: never rings");
+                assert!(
+                    gate.iter().all(|&(ring, sent)| ring || !sent),
+                    "{rate} {name}: what is sent rings"
+                );
                 let dsp = h.dsp(true);
                 assert_eq!(dsp.speech_frames, 0, "{rate} {name}");
                 assert!(dsp.speech_detector_running && !dsp.speech, "{rate} {name}");
