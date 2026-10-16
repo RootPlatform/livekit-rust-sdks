@@ -970,6 +970,12 @@ void AdmProxy::ReconcilePlayoutLocked(const DesiredState& desired,
     }
     if (result != 0) {
       RTC_LOG(LS_WARNING) << "AdmProxy: StartPlayout failed: " << result;
+      // The macOS ADM spawns its render thread before starting the device and
+      // keeps it when the start fails (a device that is going away); its next
+      // StartPlayout joins that thread in a move assignment and aborts when
+      // the join fails (a device swap on 10/16). Stop now, so the next pass
+      // opens playout from scratch.
+      StopDeviceLocked(true, nullptr);
       return;
     }
     uint16_t delay_ms = 0;
@@ -1038,6 +1044,9 @@ void AdmProxy::ReconcileRecordingLocked(const DesiredState& desired,
     }
     if (result != 0) {
       RTC_LOG(LS_WARNING) << "AdmProxy: StartRecording failed: " << result;
+      // As for playout: the macOS ADM keeps the capture thread of a failed
+      // start, and starting again joins it.
+      StopDeviceLocked(false, nullptr);
     }
   }
 }

@@ -624,6 +624,8 @@ pub mod ffi {
         fn release_start_playout(self: &AdmProxyHarness, after_ms: u32);
         fn fail_next_stop_playout(self: &AdmProxyHarness, result: i32);
         fn fail_next_stop_recording(self: &AdmProxyHarness, result: i32);
+        fn fail_next_start_playout(self: &AdmProxyHarness, result: i32);
+        fn fail_next_start_recording(self: &AdmProxyHarness, result: i32);
         fn set_device_playout_delay(self: &AdmProxyHarness, delay_ms: u16);
         fn acquire(self: &AdmProxyHarness);
         fn release(self: &AdmProxyHarness);

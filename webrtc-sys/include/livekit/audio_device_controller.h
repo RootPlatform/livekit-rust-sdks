@@ -276,6 +276,10 @@ class AdmProxyHarness {
   void fail_next_stop_playout(int32_t result) const;
   // The same for StopRecording.
   void fail_next_stop_recording(int32_t result) const;
+  // The next StartPlayout / StartRecording fails with `result` after the
+  // device was opened, leaving its worker as the macOS ADM does.
+  void fail_next_start_playout(int32_t result) const;
+  void fail_next_start_recording(int32_t result) const;
   void set_device_playout_delay(uint16_t delay_ms) const;
 
   void acquire() const;

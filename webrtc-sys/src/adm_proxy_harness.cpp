@@ -151,6 +151,16 @@ class FakePlatformAdm
   void FailNextStopPlayout(int32_t result) {
     next_stop_playout_result_.store(result);
   }
+  // As the macOS ADM: the start spawns its worker thread, then the device
+  // fails to start, so the worker stays until a Stop joins it. A Start while
+  // one stays records "StartPlayout over a worker" (libwebrtc's move
+  // assignment joins it there and aborts when that join fails).
+  void FailNextStartPlayout(int32_t result) {
+    next_start_playout_result_.store(result);
+  }
+  void FailNextStartRecording(int32_t result) {
+    next_start_recording_result_.store(result);
+  }
   void SetPlayoutDelay(uint16_t delay_ms) { playout_delay_ms_.store(delay_ms); }
   webrtc::AudioTransport* callback() const { return callback_.load(); }
 
@@ -303,13 +313,18 @@ class FakePlatformAdm
     return playout_initialized_.load();
   }
   int32_t StartPlayout() override {
-    Record("StartPlayout");
+    Record(playout_worker_left_.exchange(false) ? "StartPlayout over a worker"
+                                                : "StartPlayout");
     if (block_start_.exchange(false)) {
       start_entered_.Set();
       start_release_.Wait(webrtc::TimeDelta::Seconds(10));
     }
     if (!playout_initialized_.load()) {
       return -1;
+    }
+    if (const int32_t failed = next_start_playout_result_.exchange(0)) {
+      playout_worker_left_.store(true);
+      return failed;
     }
     buffer_.StartPlayout();
     playing_.store(true);
@@ -318,6 +333,7 @@ class FakePlatformAdm
   int32_t StopPlayout() override {
     Record("StopPlayout");
     const bool open = playout_initialized_.exchange(false);
+    playout_worker_left_.store(false);
     playing_.store(false);
     buffer_.StopPlayout();
     return open ? next_stop_playout_result_.exchange(0) : 0;
@@ -332,9 +348,14 @@ class FakePlatformAdm
     return recording_initialized_.load();
   }
   int32_t StartRecording() override {
-    Record("StartRecording");
+    Record(recording_worker_left_.exchange(false) ? "StartRecording over a worker"
+                                                  : "StartRecording");
     if (!recording_initialized_.load()) {
       return -1;
+    }
+    if (const int32_t failed = next_start_recording_result_.exchange(0)) {
+      recording_worker_left_.store(true);
+      return failed;
     }
     recording_.store(true);
     return 0;
@@ -342,6 +363,7 @@ class FakePlatformAdm
   int32_t StopRecording() override {
     Record("StopRecording");
     const bool open = recording_initialized_.exchange(false);
+    recording_worker_left_.store(false);
     recording_.store(false);
     return open ? next_stop_recording_result_.exchange(0) : 0;
   }
@@ -397,6 +419,10 @@ class FakePlatformAdm
   std::atomic<bool> recording_{false};
   std::atomic<int32_t> next_stop_playout_result_{0};
   std::atomic<int32_t> next_stop_recording_result_{0};
+  std::atomic<int32_t> next_start_playout_result_{0};
+  std::atomic<int32_t> next_start_recording_result_{0};
+  std::atomic<bool> playout_worker_left_{false};
+  std::atomic<bool> recording_worker_left_{false};
   std::atomic<uint16_t> playout_delay_ms_{0};
   std::atomic<bool> block_start_{false};
   webrtc::Event start_entered_;
@@ -643,6 +669,14 @@ void AdmProxyHarness::fail_next_stop_recording(int32_t result) const {
 
 void AdmProxyHarness::fail_next_stop_playout(int32_t result) const {
   fake_->FailNextStopPlayout(result);
+}
+
+void AdmProxyHarness::fail_next_start_playout(int32_t result) const {
+  fake_->FailNextStartPlayout(result);
+}
+
+void AdmProxyHarness::fail_next_start_recording(int32_t result) const {
+  fake_->FailNextStartRecording(result);
 }
 
 void AdmProxyHarness::set_device_playout_delay(uint16_t delay_ms) const {

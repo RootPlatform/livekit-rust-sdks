@@ -577,6 +577,43 @@ fn adm_proxy_failed_stop_starts_no_second_puller_until_the_retry() {
 }
 
 #[test]
+fn adm_proxy_stops_a_failed_playout_start_before_it_starts_again() {
+    let h = platform(&["{spk}"], &["{mic}"]);
+    h.fail_next_start_playout(-1);
+    h.hold(true);
+    assert_eq!(
+        calls(&h),
+        [default_device("Playout"), "InitPlayout".into(), "StartPlayout".into(), "StopPlayout".into()]
+    );
+    assert!(!h.platform_playing() && !h.playout_initialized());
+
+    h.app_playout(true);
+    assert_eq!(calls(&h), [default_device("Playout"), "InitPlayout".into(), "StartPlayout".into()]);
+    assert!(h.platform_playing());
+}
+
+#[test]
+fn adm_proxy_stops_a_failed_recording_start_before_it_starts_again() {
+    let h = platform(&["{spk}"], &["{mic}"]);
+    h.fail_next_start_recording(-1);
+    h.app_recording(true);
+    assert_eq!(
+        calls(&h),
+        [
+            default_device("Recording"),
+            "InitRecording".into(),
+            "StartRecording".into(),
+            "StopRecording".into()
+        ]
+    );
+    assert!(!h.platform_recording() && !h.recording_initialized());
+
+    h.engine_start_recording();
+    assert_eq!(calls(&h), [default_device("Recording"), "InitRecording".into(), "StartRecording".into()]);
+    assert!(h.platform_recording());
+}
+
+#[test]
 fn adm_proxy_keeps_the_apps_requests_apart_from_libwebrtcs() {
     let h = platform(&["{spk}"], &["{mic}"]);
     h.app_playout(true);
