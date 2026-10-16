@@ -562,11 +562,7 @@ impl DspChain {
         }
 
         let input_rms = rms(w);
-        let detection = if gate.push_to_talk().is_none() {
-            settings.speech_detection
-        } else {
-            SpeechDetection::Off
-        };
+        let detection = settings.speech_detection;
         if detection != *speech_mode {
             speech.reset();
             *speech_mode = detection;
@@ -577,10 +573,14 @@ impl DspChain {
                 speech_gate::probability(settings.speech_probability)
             }
         };
-        let gate_audio = probability.is_some() && detection == SpeechDetection::Gate;
+        // Push-to-talk leaves the audio to the key; the verdict keeps running, so speech that
+        // continues when the key mode ends is already confirmed.
+        let gate_audio = probability.is_some()
+            && detection == SpeechDetection::Gate
+            && gate.push_to_talk().is_none();
         let level_open = gate.envelope() > 0.0;
         match probability {
-            Some(p) => speech.observe(p, level_open, gate_audio),
+            Some(p) => speech.observe(p),
             None => speech.reset(),
         }
         if settings.auto_sensitivity {
@@ -618,7 +618,7 @@ impl DspChain {
         let released = gate.push_to_talk() == Some(false);
         let above = input_rms > gate.threshold();
         let control = match probability {
-            Some(p) if gate_audio => speech.control(p, input_rms, gate.threshold(), level_open),
+            Some(_) if gate_audio => speech.control(input_rms, level_open),
             _ => GateControl::LEVEL,
         };
         gate.process_controlled(w, !released, control);

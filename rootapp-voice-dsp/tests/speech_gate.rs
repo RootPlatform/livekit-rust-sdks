@@ -8,8 +8,7 @@
 mod support;
 
 use rootapp_voice_dsp::speech_gate::{
-    probability, GateControl, SpeechGate, CONFIRM_FRAMES, HANG_FRAMES, ONSET_QUIET_FRAMES,
-    ONSET_RUN_FRAMES, PROVISIONAL_FRAMES, REARM_FRAMES, SPEECH_OFF, SPEECH_ON,
+    probability, SpeechGate, CONFIRM_FRAMES, HANG_FRAMES, QUIET_RMS, SPEECH_OFF, SPEECH_ON,
 };
 use rootapp_voice_dsp::{
     DspChain, DspCommands, DspOutputs, DspSettings, PushToTalk, SpeechDetection,
@@ -162,63 +161,12 @@ fn level_gate_holds_open_on_noise_the_detector_rejects() {
 }
 
 #[test]
-fn ring_follows_the_audio_through_the_hang_and_the_close() {
-    let script = speech_then_noise();
-    let end = START + 100;
-    let gate = run(SpeechDetection::Gate, &script, |_, _| {});
-    assert!(gate.speaking[end - 1]);
-    assert!(
-        (0..script.len()).all(|f| silent(&gate.sent[f]) || gate.speaking[f]),
-        "every frame that sends audio rings"
-    );
-    assert!(!gate.speaking[end + 399], "the ring ends with the gate");
-    let closed_at = (end..end + 400).find(|&f| silent(&gate.sent[f])).unwrap();
-    assert!(
-        closed_at - end <= HANG_FRAMES as usize + 7,
-        "closed {} frames after speech",
-        closed_at - end
-    );
-    assert!(
-        (closed_at..end + 400).all(|f| silent(&gate.sent[f])),
-        "stays shut while the noise lasts"
-    );
-}
-
-#[test]
 fn ring_mode_matches_the_level_gate() {
     let script = speech_then_noise();
     let off = run(SpeechDetection::Off, &script, |_, _| {});
     let ring = run(SpeechDetection::Ring, &script, |_, _| {});
     assert_eq!(off.sent, ring.sent);
     assert_eq!(off.speaking, ring.speaking);
-}
-
-#[test]
-fn noise_burst_rings_only_while_its_provisional_open_sends() {
-    let burst = START + 50;
-    let script = vec![(false, 0.0f32); burst + 200];
-    let gate = run(SpeechDetection::Gate, &script, |f, s| {
-        s.gate_threshold = if f < burst { 0.5 } else { 0.01 };
-    });
-    let open: Vec<usize> = (burst..burst + 200).filter(|&f| !silent(&gate.sent[f])).collect();
-    assert!(!open.is_empty(), "the level opens provisionally");
-    assert!(open.len() <= PROVISIONAL_FRAMES as usize + 7, "open {} frames", open.len());
-    assert!(open.iter().all(|&f| gate.speaking[f]), "what the provisional open sends rings");
-    assert!(!gate.speaking[burst + 199], "the ring ends with the provisional open");
-}
-
-#[test]
-fn the_ring_lights_with_the_first_frame_sent_before_the_detector_confirms() {
-    let mut script = vec![(false, 0.0f32); START];
-    script.extend(std::iter::repeat_n((true, 0.1), 3));
-    script.extend(std::iter::repeat_n((true, SPEECH), 50));
-    let gate = run(SpeechDetection::Gate, &script, |f, s| {
-        s.gate_threshold = if f < START { 0.5 } else { 0.01 };
-    });
-    let first_sent = (0..script.len()).find(|&f| !silent(&gate.sent[f])).unwrap();
-    let first_ring = (0..script.len()).find(|&f| gate.speaking[f]).unwrap();
-    assert_eq!(first_ring, first_sent);
-    assert!(first_sent < START + 3 + CONFIRM_FRAMES as usize - 1, "before the detector confirmed");
 }
 
 #[test]
@@ -238,198 +186,6 @@ fn every_frame_that_sends_audio_rings_in_every_mode() {
             assert!(silent(&r.sent[f]) || r.speaking[f], "{detection:?}: frame {f} sends audio without ringing");
         }
     }
-}
-
-#[test]
-fn after_a_detector_close_the_level_reopens_only_after_a_quiet_spell() {
-    let closed = START + 100 + 100;
-    for (quiet, reopens) in [(REARM_FRAMES as usize - 1, false), (REARM_FRAMES as usize, true)] {
-        let mut script = speech_then_noise();
-        script.truncate(closed + quiet + 60);
-        let gate = run(SpeechDetection::Gate, &script, |f, s| {
-            s.gate_threshold = if (closed..closed + quiet).contains(&f) { 0.5 } else { 0.01 };
-        });
-        assert!(silent(&gate.sent[closed - 1]), "loud but rejected: shut");
-        let after = closed + quiet;
-        let opened = (after..after + 60).any(|f| !silent(&gate.sent[f]));
-        assert_eq!(opened, reopens, "{quiet} quiet frames");
-    }
-}
-
-/// Noise held shut by the detector from `held` on (speech, then rejected noise).
-fn held_noise(extra: usize) -> (Vec<(Sound, f32)>, usize) {
-    let mut s = vec![(Sound::Quiet, NOISE); START];
-    s.extend(std::iter::repeat_n((Sound::Voice, SPEECH), 100));
-    s.extend(std::iter::repeat_n((Sound::Noise, NOISE), 100 + extra));
-    (s, START + 200)
-}
-
-#[test]
-fn a_held_gate_opens_on_a_frame_at_speech_off() {
-    let (mut script, held) = held_noise(0);
-    script.extend(std::iter::repeat_n((Sound::Noise, 0.1), 4));
-    script.push((Sound::Noise, SPEECH_OFF));
-    script.extend(std::iter::repeat_n((Sound::Noise, 0.1), 10));
-    let gate = run_sounds(SpeechDetection::Gate, &script, |_, _| {});
-    assert!(silent(&gate.sent[held - 1]), "held");
-    assert!(
-        (held..held + 4).all(|f| silent(&gate.sent[f])),
-        "input as loud as what was rejected, below SPEECH_OFF, stays held"
-    );
-    assert!(!silent(&gate.sent[held + 4]), "the frame at SPEECH_OFF opens it");
-}
-
-#[test]
-fn a_held_gate_opens_on_input_6_db_above_what_was_rejected() {
-    let (mut script, held) = held_noise(0);
-    // The noise is held; a tone 12 dB louder rises above it.
-    script.extend(std::iter::repeat_n((Sound::Voice, 0.05), 10));
-    let gate = run_sounds(SpeechDetection::Gate, &script, |_, _| {});
-    assert!(silent(&gate.sent[held - 1]));
-    assert!(!silent(&gate.sent[held]), "the louder input opens it at once");
-}
-
-#[test]
-fn an_onset_that_lasts_opens_a_held_gate_and_clicks_or_flicker_do_not() {
-    // Held noise, then the input goes quiet (under REARM_FRAMES) and comes back.
-    let quiet = ONSET_QUIET_FRAMES as usize + 1;
-    let cases: [(&str, Sound, Vec<Sound>, Option<usize>); 3] = [
-        ("an onset", Sound::Quiet, vec![Sound::Soft; 8], Some(ONSET_RUN_FRAMES as usize - 1)),
-        (
-            "a click",
-            Sound::Quiet,
-            vec![Sound::Soft, Sound::Quiet, Sound::Quiet, Sound::Quiet, Sound::Quiet],
-            None,
-        ),
-        ("flicker", Sound::Noise, vec![Sound::Noise; 8], None),
-    ];
-    for (name, between, after, opens_at) in cases {
-        let (mut script, held) = held_noise(0);
-        script.extend(std::iter::repeat_n((between, NOISE), quiet));
-        script.extend(after.iter().map(|&s| (s, 0.1f32)));
-        let gate = run_sounds(SpeechDetection::Gate, &script, |f, s| {
-            // Flicker: the "quiet" frames are the same noise under a raised threshold.
-            if between == Sound::Noise && (held..held + quiet).contains(&f) {
-                s.gate_threshold = 0.02;
-            }
-        });
-        let start = held + quiet;
-        let first = (start..script.len()).find(|&f| !silent(&gate.sent[f]));
-        match opens_at {
-            Some(k) => assert_eq!(first, Some(start + k), "{name}"),
-            None => assert_eq!(first, None, "{name}"),
-        }
-    }
-}
-
-#[test]
-fn frames_at_speech_off_do_not_use_up_the_provisional_window() {
-    // The first 20 frames of the open alternate SPEECH_OFF and 0.1: only 10 of them count.
-    let burst = START + 50;
-    let window = PROVISIONAL_FRAMES as usize;
-    let script: Vec<(Sound, f32)> = (0..burst + 4 * window)
-        .map(|f| {
-            let p = if (burst..burst + window).contains(&f) && f % 2 == 0 { SPEECH_OFF } else { 0.1 };
-            (if f < burst { Sound::Quiet } else { Sound::Noise }, p)
-        })
-        .collect();
-    let gate = run_sounds(SpeechDetection::Gate, &script, |_, _| {});
-    let open = (burst..script.len()).filter(|&f| !silent(&gate.sent[f])).count();
-    assert!(open >= window + window / 2, "only the frames below SPEECH_OFF count: open {open}");
-    assert!(open <= window + window / 2 + 8, "the window still ends: open {open}");
-}
-
-/// Speech, a soft tail, a quiet gap of `gap` frames, then a word whose detector needs `latency`
-/// frames (p 0.1) before p 0.9.
-fn two_words(tail: usize, gap: usize, latency: usize) -> (Vec<(Sound, f32)>, usize) {
-    let mut s = vec![(Sound::Quiet, 0.0f32); START];
-    s.extend(std::iter::repeat_n((Sound::Voice, SPEECH), 100 - tail));
-    s.extend(std::iter::repeat_n((Sound::Soft, 0.2), tail));
-    s.extend(std::iter::repeat_n((Sound::Quiet, 0.0), gap));
-    let word = s.len();
-    s.extend(std::iter::repeat_n((Sound::Voice, 0.1), latency));
-    s.extend(std::iter::repeat_n((Sound::Voice, SPEECH), 100 - latency));
-    (s, word)
-}
-
-#[test]
-fn a_word_where_the_hang_runs_out_is_sent_whole() {
-    // The hang ends HANG_FRAMES + 1 frames after the last frame at SPEECH_OFF: on the word's first
-    // frame after a quiet gap of that length, or inside its first frames after shorter gaps and
-    // soft tails (the review's trace: a word at the hang's end muted until p >= 0.5).
-    let hang = HANG_FRAMES as usize;
-    for tail in [0usize, 10, 16] {
-        for gap in [hang - tail - 12, hang - tail - 6, hang - tail - 3, hang - tail, hang - tail + 2, hang + 10] {
-            for latency in [3usize, 6, 9] {
-                let (script, word) = two_words(tail, gap, latency);
-                let off = run_sounds(SpeechDetection::Off, &script, |_, _| {});
-                let gate = run_sounds(SpeechDetection::Gate, &script, |_, _| {});
-                let lost = lost(&off, &gate, word..word + 30);
-                assert!(lost.is_empty(), "tail {tail} gap {gap} latency {latency}: lost {lost:?}");
-            }
-        }
-    }
-}
-
-#[test]
-fn a_hang_that_runs_out_in_a_pause_releases_the_tail_fast() {
-    let (script, word) = two_words(0, 60, 3);
-    let off = run_sounds(SpeechDetection::Off, &script, |_, _| {});
-    let gate = run_sounds(SpeechDetection::Gate, &script, |_, _| {});
-    let end = word - 60;
-    let hang_end = end + HANG_FRAMES as usize;
-    assert!(!silent(&off.sent[hang_end + 5]), "the level gate alone is still releasing");
-    assert!(silent(&gate.sent[hang_end + 3]), "the tail is released over 50 ms");
-    assert!(lost(&off, &gate, word..word + 30).is_empty(), "the next word is sent whole");
-}
-
-#[test]
-fn a_louder_word_after_held_noise_is_sent_at_once() {
-    // Noise-filled pauses of 200-700 ms between two words: whether the hang runs out in the
-    // noise or on the next word, a word 12 dB above the noise loses at most its first frame.
-    for gap in [20usize, 25, 30, 35, 40, 50, 70] {
-        for latency in [3usize, 6, 9] {
-            let mut script = vec![(Sound::Quiet, 0.0f32); START];
-            script.extend(std::iter::repeat_n((Sound::Voice, SPEECH), 100));
-            script.extend(std::iter::repeat_n((Sound::Noise, 0.0), gap));
-            let word = script.len();
-            script.extend(std::iter::repeat_n((Sound::Voice, 0.1), latency));
-            script.extend(std::iter::repeat_n((Sound::Voice, SPEECH), 60));
-            let off = run_sounds(SpeechDetection::Off, &script, |_, _| {});
-            let gate = run_sounds(SpeechDetection::Gate, &script, |_, _| {});
-            let lost = lost(&off, &gate, word..word + 30);
-            assert!(lost.len() <= 1, "gap {gap} latency {latency}: lost {lost:?}");
-        }
-    }
-}
-
-#[test]
-fn a_mode_change_starts_the_verdict_over() {
-    let (script, held) = held_noise(100);
-    let gate = run_sounds(SpeechDetection::Gate, &script, |_, _| {});
-    let switched = run_sounds(SpeechDetection::Gate, &script, |f, s| {
-        if f == held + 20 {
-            s.speech_detection = SpeechDetection::Ring;
-        }
-    });
-    assert!((held..script.len()).all(|f| silent(&gate.sent[f])), "held while Gate stays on");
-    assert!(
-        (held + 21..held + 30).any(|f| !silent(&switched.sent[f])),
-        "back in Gate, the held state is gone and the level opens again"
-    );
-}
-
-#[test]
-fn a_threshold_of_zero_still_rearms_and_near_silence_never_opens() {
-    let (mut script, held) = held_noise(0);
-    script.extend(std::iter::repeat_n((Sound::Hush, 0.0), REARM_FRAMES as usize + 20));
-    script.extend(std::iter::repeat_n((Sound::Noise, 0.0), 10));
-    let gate = run_sounds(SpeechDetection::Gate, &script, |_, s| s.gate_threshold = 0.0);
-    let hush = held;
-    let noise = hush + REARM_FRAMES as usize + 20;
-    assert!(silent(&gate.sent[hush - 1]), "held at threshold 0");
-    assert!((hush..noise).all(|f| silent(&gate.sent[f])), "near silence does not open it");
-    assert!(!silent(&gate.sent[noise + 1]), "after the quiet spell the level opens again");
 }
 
 /// One random run for the property test: segments of noise floors and (modulated) tones with a
@@ -562,176 +318,6 @@ fn gate_mode_leaves_auto_sensitivity_as_off_has_it() {
     }
 }
 
-#[test]
-fn speech_gate_confirms_only_a_run_of_confirm_frames() {
-    let mut g = SpeechGate::default();
-    for _ in 0..CONFIRM_FRAMES - 1 {
-        g.observe(SPEECH_ON, false, true);
-    }
-    g.observe(SPEECH_ON - 0.01, false, true);
-    for _ in 0..CONFIRM_FRAMES - 1 {
-        g.observe(1.0, false, true);
-        assert!(!g.confirmed(), "a frame below SPEECH_ON starts the run over");
-    }
-    g.observe(1.0, false, true);
-    assert!(g.confirmed());
-}
-
-#[test]
-fn speech_gate_continues_at_the_lower_level_and_ends_a_hang_after() {
-    let mut g = SpeechGate::default();
-    for _ in 0..CONFIRM_FRAMES {
-        g.observe(0.9, true, false);
-    }
-    for _ in 0..200 {
-        g.observe(SPEECH_OFF, true, false);
-        assert!(g.confirmed(), "SPEECH_OFF and above continue");
-    }
-    for _ in 0..HANG_FRAMES {
-        g.observe(SPEECH_OFF - 0.01, true, false);
-        assert!(g.confirmed());
-    }
-    g.observe(0.0, true, false);
-    assert!(!g.confirmed());
-    assert!(!g.detector_required(), "Ring mode never closes the gate");
-}
-
-const THRESHOLD: f32 = 0.01;
-const ABOVE: f32 = 0.02;
-const BELOW: f32 = 0.002;
-
-/// Confirmed speech whose hang runs out on the next frame, with `before` gate inputs first.
-fn hang_running_out(before: &[f32]) -> SpeechGate {
-    let mut g = SpeechGate::default();
-    for _ in 0..CONFIRM_FRAMES {
-        g.observe(0.9, true, true);
-        g.control(0.9, ABOVE, THRESHOLD, true);
-    }
-    for k in 0..HANG_FRAMES as usize {
-        g.observe(0.0, true, true);
-        let rms = before.get(k + before.len().saturating_sub(HANG_FRAMES as usize)).copied();
-        g.control(0.0, rms.unwrap_or(ABOVE), THRESHOLD, true);
-    }
-    assert!(g.confirmed());
-    g.observe(0.0, true, true);
-    assert!(!g.confirmed(), "the hang ran out");
-    g
-}
-
-#[test]
-fn speech_gate_decides_the_end_of_the_hang_with_the_frame_s_level() {
-    // Held above the threshold: close at once and hold.
-    let mut g = hang_running_out(&[ABOVE; 30]);
-    let control = g.control(0.0, ABOVE, THRESHOLD, true);
-    assert!(control.fast_close && !control.allow_open && g.detector_required());
-    g.after_gate(0.0);
-    assert_eq!(
-        g.control(0.0, ABOVE, THRESHOLD, false),
-        GateControl { allow_open: false, fast_close: false, eager_open: false }
-    );
-
-    // Already quiet: release the tail fast, without a hold.
-    let mut g = hang_running_out(&[BELOW; 30]);
-    let control = g.control(0.0, BELOW, THRESHOLD, true);
-    assert!(control.fast_close && control.allow_open && !g.detector_required());
-
-    // A new word after a pause: its own provisional window, no close.
-    let mut quiet_then_word = [BELOW; 30];
-    quiet_then_word[29] = BELOW;
-    let mut g = hang_running_out(&quiet_then_word);
-    let control = g.control(0.1, ABOVE, THRESHOLD, true);
-    assert!(!control.fast_close && control.allow_open && control.eager_open);
-    let mut closed_after = None;
-    for f in 1..PROVISIONAL_FRAMES + 5 {
-        g.observe(0.1, true, true);
-        if g.control(0.1, ABOVE, THRESHOLD, true).fast_close {
-            closed_after = Some(f);
-            break;
-        }
-    }
-    // The step from the quiet gap counts as a rise for its first frames (they join the
-    // rejected level two frames late), which restarts the window: at most 2 frames later.
-    let closed_after = closed_after.unwrap();
-    assert!(
-        (PROVISIONAL_FRAMES..=PROVISIONAL_FRAMES + 2).contains(&closed_after),
-        "the window still ends: {closed_after}"
-    );
-
-    // A hang that ends with the gate shut needs nothing.
-    let mut closed = SpeechGate::default();
-    for _ in 0..CONFIRM_FRAMES {
-        closed.observe(0.9, false, true);
-    }
-    for _ in 0..=HANG_FRAMES {
-        closed.observe(0.0, false, true);
-    }
-    assert_eq!(closed.control(0.0, ABOVE, THRESHOLD, false), GateControl::LEVEL);
-}
-
-#[test]
-fn speech_gate_ends_a_tail_release_on_a_new_onset() {
-    let mut g = hang_running_out(&[BELOW; 30]);
-    assert!(g.control(0.0, BELOW, THRESHOLD, true).fast_close);
-    for _ in 0..ONSET_QUIET_FRAMES - 1 {
-        g.observe(0.0, true, true);
-        assert!(g.control(0.0, BELOW, THRESHOLD, true).fast_close);
-    }
-    g.observe(0.1, true, true);
-    let control = g.control(0.1, ABOVE, THRESHOLD, true);
-    assert!(!control.fast_close && control.allow_open && control.eager_open);
-}
-
-#[test]
-fn speech_gate_releases_an_open_it_never_confirmed_after_the_provisional_window() {
-    let mut g = SpeechGate::default();
-    for f in 1..=PROVISIONAL_FRAMES {
-        g.observe(0.1, true, true);
-        assert_eq!(g.control(0.1, ABOVE, THRESHOLD, true), GateControl::LEVEL, "frame {f}");
-    }
-    g.observe(0.1, true, true);
-    let control = g.control(0.1, ABOVE, THRESHOLD, true);
-    assert!(control.fast_close && !control.allow_open && g.detector_required());
-}
-
-#[test]
-fn speech_gate_lets_speech_quiet_or_a_louder_input_open_again() {
-    let rejected = || {
-        let mut g = SpeechGate::default();
-        for _ in 0..=PROVISIONAL_FRAMES {
-            g.observe(0.0, true, true);
-            g.control(0.0, ABOVE, THRESHOLD, true);
-        }
-        g.after_gate(0.0);
-        assert!(g.detector_required());
-        g
-    };
-
-    let mut g = rejected();
-    assert!(!g.control(SPEECH_OFF - 0.01, ABOVE, THRESHOLD, false).allow_open);
-    assert!(g.control(SPEECH_OFF, ABOVE, THRESHOLD, false).allow_open, "a frame at SPEECH_OFF");
-    g.after_gate(0.5);
-    assert!(!g.detector_required(), "reopened: a new provisional open");
-
-    let mut g = rejected();
-    for _ in 0..CONFIRM_FRAMES {
-        g.observe(0.9, false, true);
-    }
-    assert!(g.confirmed() && !g.detector_required());
-
-    let mut g = rejected();
-    for _ in 0..REARM_FRAMES - 1 {
-        assert!(!g.control(0.0, BELOW, THRESHOLD, false).allow_open);
-    }
-    assert!(g.control(0.0, BELOW, THRESHOLD, false).allow_open, "REARM_FRAMES quiet frames");
-    assert!(!g.detector_required());
-
-    let mut g = rejected();
-    assert!(!g.control(0.0, ABOVE * 1.9, THRESHOLD, false).allow_open, "under 6 dB louder");
-    let mut g2 = rejected();
-    let control = g2.control(0.0, ABOVE * 2.1, THRESHOLD, false);
-    assert!(control.allow_open && control.eager_open, "6 dB louder than what was rejected");
-    assert!(g.detector_required() && !g2.detector_required());
-}
 
 #[test]
 fn speech_gate_reads_only_finite_non_negative_probabilities() {
@@ -776,4 +362,153 @@ fn a_flush_starts_the_verdict_over() {
     }
     assert!(speaking[START + 29]);
     assert!(!speaking[START + 30], "the startup hold and the confirmation start over");
+}
+
+#[test]
+fn gate_sends_nothing_before_speech_is_confirmed() {
+    let mut script = vec![(false, 0.0f32); START];
+    script.extend(std::iter::repeat_n((true, 0.1), 3));
+    script.extend(std::iter::repeat_n((true, SPEECH), 50));
+    let gate = run(SpeechDetection::Gate, &script, |f, s| {
+        s.gate_threshold = if f < START { 0.5 } else { 0.01 };
+    });
+    let confirmed = START + 3 + CONFIRM_FRAMES as usize - 1;
+    assert!((0..confirmed).all(|f| silent(&gate.sent[f]) && !gate.speaking[f]), "nothing before the confirmation");
+    let first = (0..script.len()).find(|&f| !silent(&gate.sent[f])).unwrap();
+    assert_eq!(first, confirmed, "the confirmed frame opens the gate at once");
+    assert!(gate.speaking[first]);
+    assert!((first + 2..script.len()).all(|f| !silent(&gate.sent[f])), "confirmed speech goes out");
+}
+
+#[test]
+fn noise_clicks_and_maybe_speech_never_go_out_unconfirmed() {
+    for (sound, p, frames) in [
+        (Sound::Noise, NOISE, 1usize),
+        (Sound::Noise, NOISE, 2),
+        (Sound::Voice, 0.0, 5),
+        (Sound::Noise, NOISE, 400),
+        (Sound::Voice, SPEECH_OFF, 400),
+        (Sound::Voice, 0.45, 400),
+        (Sound::Voice, SPEECH_ON, (CONFIRM_FRAMES - 1) as usize),
+    ] {
+        let mut script = vec![(Sound::Quiet, NOISE); START];
+        for _ in 0..20 {
+            script.extend(std::iter::repeat_n((sound, p), frames));
+            script.extend(std::iter::repeat_n((Sound::Quiet, NOISE), 15));
+        }
+        let gate = run_sounds(SpeechDetection::Gate, &script, |_, _| {});
+        let off = run_sounds(SpeechDetection::Off, &script, |_, _| {});
+        assert!(
+            (START..script.len()).any(|f| !silent(&off.sent[f])),
+            "{sound:?} p {p} x{frames}: the level gate alone sends it"
+        );
+        assert!(
+            (0..script.len()).all(|f| silent(&gate.sent[f]) && !gate.speaking[f]),
+            "{sound:?} p {p} x{frames}: Gate sends none of it and never rings"
+        );
+    }
+}
+
+#[test]
+fn confirmed_speech_continues_through_uncertain_frames_and_ends_a_hang_after() {
+    let mut script = vec![(false, 0.0f32); START];
+    script.extend(std::iter::repeat_n((true, SPEECH), 20));
+    script.extend(std::iter::repeat_n((true, SPEECH_OFF), 100));
+    let uncertain_end = script.len();
+    script.extend(std::iter::repeat_n((true, 0.0), 200));
+    let gate = run(SpeechDetection::Gate, &script, |f, s| {
+        s.gate_threshold = if f < START { 0.5 } else { 0.01 };
+    });
+    let off = run(SpeechDetection::Off, &script, |f, s| {
+        s.gate_threshold = if f < START { 0.5 } else { 0.01 };
+    });
+    let confirmed = START + CONFIRM_FRAMES as usize - 1;
+    assert!(lost(&off, &gate, confirmed + 1..uncertain_end + HANG_FRAMES as usize).is_empty(), "sent through the hang");
+    let closed = (uncertain_end..script.len()).find(|&f| silent(&gate.sent[f])).unwrap();
+    assert!(
+        closed - uncertain_end <= HANG_FRAMES as usize + 7,
+        "closed {} frames after the last uncertain frame",
+        closed - uncertain_end
+    );
+    assert!((closed..script.len()).all(|f| silent(&gate.sent[f]) && !gate.speaking[f]), "stays shut");
+}
+
+#[test]
+fn after_speech_rejected_noise_is_cut_and_a_new_word_opens_on_its_confirmation() {
+    let mut script = speech_then_noise();
+    let word = script.len();
+    script.extend(std::iter::repeat_n((true, SPEECH), 50));
+    let gate = run(SpeechDetection::Gate, &script, |_, _| {});
+    let end = START + 100;
+    let closed = (end..word).find(|&f| silent(&gate.sent[f])).unwrap();
+    assert!(closed - end <= HANG_FRAMES as usize + 7, "closed {} frames after speech", closed - end);
+    assert!((closed..word).all(|f| silent(&gate.sent[f])), "the noise stays cut");
+    let reopened = (word..script.len()).find(|&f| !silent(&gate.sent[f])).unwrap();
+    assert_eq!(reopened, word + CONFIRM_FRAMES as usize - 1, "the word goes out from its confirmation");
+}
+
+#[test]
+fn speech_gate_confirms_only_a_run_of_confirm_frames() {
+    let mut g = SpeechGate::default();
+    for _ in 0..CONFIRM_FRAMES - 1 {
+        g.observe(SPEECH_ON);
+    }
+    g.observe(SPEECH_ON - 0.01);
+    for _ in 0..CONFIRM_FRAMES - 1 {
+        g.observe(1.0);
+        assert!(!g.confirmed(), "a frame below SPEECH_ON starts the run over");
+    }
+    g.observe(1.0);
+    assert!(g.confirmed());
+}
+
+#[test]
+fn speech_gate_continues_at_the_lower_level_and_ends_a_hang_after() {
+    let mut g = SpeechGate::default();
+    for _ in 0..CONFIRM_FRAMES {
+        g.observe(0.9);
+    }
+    for _ in 0..200 {
+        g.observe(SPEECH_OFF);
+        assert!(g.confirmed(), "SPEECH_OFF and above continue");
+    }
+    for _ in 0..HANG_FRAMES {
+        g.observe(SPEECH_OFF - 0.01);
+        assert!(g.confirmed());
+    }
+    g.observe(0.0);
+    assert!(!g.confirmed());
+}
+
+#[test]
+fn speech_gate_opens_only_on_confirmed_speech_and_closes_fast_once_it_ends() {
+    let mut g = SpeechGate::default();
+    let loud = 0.02;
+    let closed = g.control(loud, false);
+    assert!(!closed.allow_open && !closed.fast_close, "unconfirmed: the gate may not open");
+    assert!(!g.control(QUIET_RMS / 2.0, false).allow_open);
+
+    for _ in 0..CONFIRM_FRAMES {
+        g.observe(0.9);
+    }
+    let open = g.control(loud, false);
+    assert!(open.allow_open && open.eager_open && !open.fast_close);
+    assert!(!g.control(QUIET_RMS, false).allow_open, "near silence opens nothing");
+
+    for _ in 0..=HANG_FRAMES {
+        g.observe(0.0);
+    }
+    assert!(!g.confirmed());
+    let closing = g.control(loud, true);
+    assert!(closing.fast_close && !closing.allow_open, "an open gate past the hang closes fast");
+    g.after_gate(0.5);
+    assert!(g.control(loud, true).fast_close, "until it is shut");
+    g.after_gate(0.0);
+    let shut = g.control(loud, false);
+    assert!(!shut.fast_close && !shut.allow_open);
+
+    for _ in 0..CONFIRM_FRAMES {
+        g.observe(0.9);
+    }
+    assert!(g.control(loud, true).allow_open && !g.control(loud, true).fast_close, "confirmed again");
 }

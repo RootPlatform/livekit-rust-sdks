@@ -1221,24 +1221,25 @@ and evaluation: the desktop's `docs/native-platform-audio.md` ("Speech detection
   The ring (`speaking`) follows what is sent (hw.15): any frame that sends audio, plus the level gate's
   300 ms hold, while the transmit gate is open and outside the startup hold (unsupported frames: whatever
   goes out). Until hw.14 it was the level gate's speaking AND confirmed speech, so audio the detector did
-  not confirm went out without a ring. In `Gate` mode:
-  - an open the detector has not confirmed within 200 ms of frames under 0.3 is released over 50 ms
-    (40 ms at full gain, then a 10 ms ramp; about 260 ms of it is sent) without the speaking hold;
-  - when confirmed speech ends, `control` decides with that frame's level: input still held above
-    the threshold is released the same way; a quiet frame only shortens the tail's release to 50 ms
-    (a new onset ends it); a word that began after 30 ms of quiet, or rose 6 dB over what was
-    rejected, keeps its own provisional window;
-  - a released gate is held shut until a frame at p >= 0.3, an input 6 dB louder than the loudest
-    input rejected since the last frame at 0.3, an onset (3 quiet frames, then 6 dB up) that stays
-    above the threshold 3 frames, or 100 ms below the threshold. During an onset it opens on its
-    first block above the threshold while the level gate alone would still be open
-    (`GateControl::eager_open`). At or below -66 dBFS a frame counts as quiet and opens nothing
-    whatever the threshold (a manual 0 still re-arms);
+  not confirm went out without a ring. In `Gate` mode (hw.17, strict: Jesse 10/16) only confirmed
+  speech goes out:
+  - the gate may open only while speech is confirmed (`GateControl::allow_open`), and opens on the
+    confirming frame's first block above the threshold while the level gate alone is open
+    (`eager_open`). Keys, clicks, a trackpad, breath, noise and speech the detector rates under 0.5
+    never go out; the first frames of a word wait for the confirmation. Measured on real captures
+    (Effects SDK at 0.60): 4-12% of sentence starts lose 20 ms or more, p90 0-20 ms; 0.3-0.4% of later
+    speech; laughter 99% kept. Until hw.16 the level opened provisionally (up to 200 ms, longer while
+    frames stayed at 0.3 or more), which sent every keystroke and uncertain speech;
+  - when confirmed speech ends (300 ms below 0.3) with the gate open, it is released over 50 ms
+    without the speaking hold and opens again only on newly confirmed speech. A verdict that starts
+    over (a flush, a mode change) closes nothing: an open gate keeps its level release;
+  - at or below -66 dBFS a frame opens nothing whatever the threshold;
   - auto sensitivity follows the level gate alone (`NoiseGate::level_envelope`), so the threshold is
     Off's and Gate never sends a sample louder than Off.
   Push-to-talk, frames without a probability (off, other rates, NaN or negative) and unsupported
-  frames leave the chain bit for bit as the level gate; mute does not bypass the speech gate (nothing
-  is sent while muted anyway). A change of mode starts the verdict over.
+  frames leave the chain bit for bit as the level gate; the verdict keeps running under push-to-talk,
+  so speech that continues when the key mode ends is already confirmed. Mute does not bypass the speech
+  gate (nothing is sent while muted anyway). A change of mode starts the verdict over.
 - Control `RootAudioControl.speech_detection` (`RootAudioSpeechDetection` OFF/RING/GATE; unknown
   values off), stored in `RootCaptureState::speech_detection`, back to off when the first handle
   opens and when the last closes (`reset_root_audio`, as the other DSP settings).

@@ -2102,7 +2102,10 @@ mod speech_tests {
                 "{rate}: rings {} ms after the voice starts",
                 (onset as i64 - quiet as i64) * 10
             );
-            assert!(gate[quiet + 1].1, "{rate}: the level opens before the detector confirms");
+            assert!(
+                (0..onset).all(|f| !gate[f].1) && gate[onset].1,
+                "{rate}: nothing goes out before the detector confirms, and the confirmation opens it"
+            );
 
             let end = quiet + voice;
             let ring_off = |frames: &[(bool, bool)]| (end..frames.len()).find(|&f| !frames[f].0);
@@ -2168,7 +2171,10 @@ mod speech_tests {
         assert!(held[30..].iter().all(|&(ring, sent)| ring && sent), "the key decides");
         assert!(held[HOLD_FRAMES + 2..30].iter().all(|&(ring, _)| ring));
         let dsp = h.dsp(true);
-        assert!(!dsp.speech_detector_running && dsp.speech_probability_max >= 0.0);
+        assert!(
+            dsp.speech_detector_running && dsp.speech_probability_max >= 0.0,
+            "the verdict keeps running under push-to-talk"
+        );
         assert_eq!((dsp.speech_closed_frames, dsp.speech_unavailable_frames), (0, 0));
 
         let h = harness(48000, GATE);
