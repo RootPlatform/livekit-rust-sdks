@@ -333,10 +333,18 @@ still apply. Flags accept `1/true/yes/on`. `LK_MF_ALLOW_AMD` also accepts `0/fal
 | `LK_DISABLE_MF_DECODE=1` | The MF decoder factory reports no H.264 decoder, so decoding uses FFmpeg. |
 | `LK_MF_ENCODER_ADAPTER=nvidia\|amd\|intel` | Try that vendor's encoder MFT first. |
 | `LK_MF_ALLOW_AMD=0` | Skip AMD encoder MFTs (browser-parity workaround for AMD CBP black remote video). Allowed by default. |
-| `LK_MF_D3D11_SHARING=off\|user` | `off` gives every MF encoder and decoder, and every host acquire of the shared device, its own D3D11 device again; `user` shares one device per adapter among encoders and the host and another among decoders. The default shares one device per adapter between all of them. Read once per process. |
-| `LK_MF_D3D11_DRIVER_THREADING=on` | Create the shared D3D11 devices without `D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS`, as before `rootapp/fx4-dev` (see "Sharing the D3D11 device with the host"). Read once per process. |
 
-Fault injection, for testing recovery only:
+The library's other support switches are `LK_FFI_LOG_LEVEL` (see Logging) and
+`LK_FFI_WORKER_THREADS` (see Tokio runtime size). The D3D11 sharing A/B switches
+(`LK_MF_D3D11_SHARING`, `LK_MF_D3D11_DRIVER_THREADING`) were removed in `rootapp/prod-cleanup`.
+
+Fault injection, for testing recovery only. A release library does not read these: they are
+compiled in only with webrtc-sys's `mf-fault-injection` feature (off by default; the release
+workflow and the build scripts never turn it on). webrtc-sys's own tests turn it on through a
+dev-dependency on itself. For a DLL that reads them, build with
+`cargo build --release -p livekit-ffi --target x86_64-pc-windows-msvc --features webrtc-sys/mf-fault-injection`
+(the variables are read once per process, except `LK_MF_FAULT_HOST_DEVICE_REMOVED`, which is read on
+every host acquire):
 
 | Variable | Effect |
 |---|---|
@@ -536,8 +544,8 @@ release:
 
 - The session still counts as open (`webrtc-sys/src/mf/mf_encoder_sessions.h`), since the driver
   may hold the NVENC session until then; the encoder logs `MF encoder sessions open: N` (and
-  `(M closing)`) on every open and final release, and `LK_MF_MAX_SESSIONS` counts closing
-  sessions too.
+  `(M closing)`) on every open and final release, and `LK_MF_MAX_SESSIONS` (fault injection,
+  `mf-fault-injection` builds only) counts closing sessions too.
 - When no hardware MFT accepts a new session while sessions are closing, `InitEncode` (or the
   bitrate re-init) still succeeds, `Encode()` drops frames until those sessions' final release
   (at most 2.5 s) and then tries once more before falling back to software. Nothing blocks: the
@@ -633,8 +641,6 @@ The contract:
   on Windows N/KN, or `MFStartup` failed), `DXGI_ERROR_NOT_FOUND` (no adapter with that LUID), or
   the `D3D11CreateDevice` error. The host then creates its own device, as it would against the
   official FFI, which has no such export.
-- `LK_MF_D3D11_SHARING` applies: `user` puts the host on the encoders' device, `off` gives every
-  acquire a device of its own.
 - The immediate context is shared with the encoders' uploads and the decoders' readbacks. The host
   must not block in `Map` (signal a fence or poll with `DO_NOT_WAIT`, as above), must hold
   `ID3D11Multithread::Enter`/`Leave` around call sequences that bind pipeline state, and must not
@@ -649,10 +655,16 @@ The contract:
   2K screen share, a 3-layer HW camera and an MF-decoded remote camera, the flag left encode and
   decode times unchanged (screen 3.3-3.5 ms/frame, camera 0.8-1.2, decode 0.11 vs 0.15) and cut
   the capture's arrival-to-delivered latency from 6.8 ms to 1.9 ms at the median.
-  `LK_MF_D3D11_DRIVER_THREADING=on` drops the flag.
 - Test: `cargo test -p webrtc-sys mf_device` covers the contract on a real adapter and skips on a
   machine without a hardware D3D11 video device. `LK_MF_FAULT_HOST_DEVICE_REMOVED=1` makes acquire
-  report the device as removed.
+  report the device as removed (fault injection: webrtc-sys's tests build with it, a release
+  library never reads the variable).
+
+Until `rootapp/prod-cleanup`, `LK_MF_D3D11_SHARING=off|user` (a device per codec, or one per adapter
+for the encoders and the host and another for the decoders) and `LK_MF_D3D11_DRIVER_THREADING=on`
+(the driver's threading optimizations back on) kept the behaviour from before the shared device as
+an A/B. Both are gone: one device per adapter, always created with
+`PREVENT_INTERNAL_THREADING_OPTIMIZATIONS`.
 
 The desktop's Windows screen capture (`WgcCaptureDevice.cs` and `FfiSharedDevice.cs` in
 `RootApp.Client.Avalonia.Desktop.Windows/Helpers`) resolves both exports with
@@ -739,6 +751,23 @@ libwebrtc records have the target `libwebrtc` and the message `(file.cc:line): t
 `info` adds the Rust SDK's info records only. In a 20 s two-room harness session (camera, screen
 and mic published, camera republished once) the FFI forwarded 76,507 records before, 517 at the
 default level and about 6,500 at `debug`.
+
+libwebrtc's global minimum severity (`LogMessage::IsNoop`, which every `RTC_LOG` checks before it
+builds a line) is the minimum over its debug severity, its `LoggingConfig`'s `min_severity` and
+every sink's minimum (`UpdateMinLogSeverity` in m150's `rtc_base/logging.cc`). m150 creates the
+`LoggingConfig` on the first call that reads it, adding a sink included, and its defaults are
+`min_severity` and `debug_severity` `LS_INFO` and `log_to_stderr` on. Up to hw.18 the sink only
+called `LogToDebug(LS_NONE)` and `SetLogToStderr(false)`, which change neither config field, so the
+global minimum stayed `LS_INFO` whatever `LK_FFI_LOG_LEVEL` said, `off` included: every `LS_INFO`
+line (about 300 a second in that session) was built, passed through `OutputToDebug` (its
+`DefaultLogLine` string, and on macOS a `CFPreferencesGetAppBooleanValue` call per line) and handed
+to the sinks under libwebrtc's global logging lock, device threads included, then dropped. Since
+`rootapp/prod-cleanup` the sink's constructor first installs a `LoggingConfig` with both severities
+`LS_NONE` and no stderr (`webrtc::InitializeLogging`, before anything else reads the config), so the
+sink's minimum alone is the global minimum: at the default `warn` libwebrtc builds no `LS_INFO`
+line, and with `off` none at all. What reaches the host is unchanged.
+`cargo test -p webrtc-sys --lib webrtc::tests` checks the global minimum and which lines are
+formatted and forwarded at each sink level (it fails against the hw.18 constructor).
 
 The variable is read through the C runtime's environment. On Windows, .NET's
 `Environment.SetEnvironmentVariable` before `livekit_ffi_initialize` is enough; on macOS and Linux
@@ -875,8 +904,8 @@ managed engine's `NativeAudioSource` tracks, which bypass it):
   (threshold from the noise floor of the denoised voice before the voice gain, 8 dB over it but never
   below -54 dBFS (-60 before hw.11; see "Auto sensitivity"), plus the frame's voice gain; 5 blocks to
   open), the chain's voice gain on from 0 dB (it only boosts, up to 24 dB; 15 in hw.12, 18 before;
-  see "Voice gain" and "Voice gain: AGC2", whose engine the host has to ask for),
-  no denoiser. Every recording start silences its first 20 frames (200 ms, the startup
+  see "Voice gain" and "Voice gain: AGC2"; since `rootapp/prod-cleanup` a session starts with AGC2
+  and the speech gate, see "Production cleanup"), no denoiser. Every recording start silences its first 20 frames (200 ms, the startup
   hold), and with `denoiser_wanted` up to 100 frames until the denoiser runs. Mute and push-to-talk
   key up silence after the 5 ms fade; the gate, voice gain and auto sensitivity keep running.
 - Speaking (`RootAudioEvent.speaking`, stats 74/42) is the noise gate's speaking (envelope plus a
@@ -988,7 +1017,9 @@ pipelines and a worker thread), `cargo test -p rootapp-voice-dsp` (ported manage
 vectors from the desktop's reference, no-allocation and no-panic sweeps; `cargo clippy -p
 rootapp-voice-dsp --all-targets -- -D warnings`), `cargo test -p libwebrtc --lib imp::rtp_sender`,
 `cargo test -p livekit platform_audio`, and `cargo test -p livekit-ffi --lib rootapp_audio` and
-`platform_audio`. Run them with `--release`. Every test that creates the platform ADM
+`platform_audio`. Run them with `--release`. The harnesses are behind webrtc-sys's `harness`
+feature, which the dev-dependencies turn on for these commands (see "Production cleanup"); a
+`cargo build` of the library never has them. Every test that creates the platform ADM
 (`test_audio_device_controller_bridge`, `test_new_platform_audio`, the device tests in
 `livekit/tests/platform_audio_test.rs`) runs only with `LK_HW_AUDIO_TESTS=1`.
 
@@ -1245,7 +1276,9 @@ and evaluation: the desktop's `docs/native-platform-audio.md` ("Speech detection
   gate (nothing is sent while muted anyway). A change of mode starts the verdict over.
 - Control `RootAudioControl.speech_detection` (`RootAudioSpeechDetection` OFF/RING/GATE; unknown
   values off), stored in `RootCaptureState::speech_detection`, back to off when the first handle
-  opens and when the last closes (`reset_root_audio`, as the other DSP settings).
+  opens and when the last closes (`reset_root_audio`, as the other DSP settings). Since
+  `rootapp/prod-cleanup` RING is gone (the wire value is applied as GATE) and a session starts with
+  GATE; see "Production cleanup".
   Stats 107-113: the mode, the highest probability since the previous read (-1 none), whether the
   speech gate judged the last frame and confirmed speech on it, and frames with confirmed speech,
   closed by the speech gate, and with detection on but no probability. Caps bit 12 SPEECH_DETECTION
@@ -1511,7 +1544,8 @@ What runs:
   warm or release an APM. A switch still starts AEC3 over.
 - `RootEchoModelController` (worker thread; posted runs and a 250 ms poll, 20 ms while a switch is
   under way): mode from `RootAudioControl.echo_model` (OFF until set, back to OFF at every session
-  start and end); AUTO by the playout device's kind (on for SPEAKERS, LINE_OUT, DISPLAY_AUDIO); the
+  start and end; since `rootapp/prod-cleanup` AUTO from every session start, OFF outside a session);
+  AUTO by the playout device's kind (on for SPEAKERS, LINE_OUT, DISPLAY_AUDIO); the
   measured-echo rule (AUTO while AEC3 runs alone: AEC3's fullband ERLE from `GetStatistics` every
   250 ms, a sample counting after 20 new capture frames, 8 samples of 3 dB or more within the last 40
   latch the device on until the session ends; never off by measurement; a device without a key is
@@ -1537,7 +1571,8 @@ What runs:
 
 Env override: none natively. The desktop reads `ROOTAPP_ECHO_MODEL=off|on|auto` and sends it as
 `RootAudioControl.echo_model` (its default is AUTO); an old desktop never sets the field, and native
-then runs exactly the APM of builds without the model.
+then runs exactly the APM of builds without the model (up to hw.18; since `rootapp/prod-cleanup` a
+session starts in AUTO, so a host that sends nothing, such as the desktop's mic test, gets AUTO).
 
 Measured on this machine (Ryzen 9 9950X3D, Windows, release, one thread; `cargo run --release -p
 rootapp-echo-model --example bench`): a block that runs the model 105 µs mean, 117 µs p99 with
@@ -1936,7 +1971,8 @@ bit for bit (0 ulp in every value); new `voice_gain_erased_8k` (the fake SDK era
 ways and compares frames and every output bit for bit.
 
 Controls (`RootAudioControl`): `gain_engine` 23 (`RootAudioGainEngine` LEGACY, AGC2; legacy until set
-and after every session start), `agc2_headroom_db` 24 (0..20), `agc2_max_gain_db` 25 (1..50),
+and after every session start; since `rootapp/prod-cleanup` AGC2 from every session start and legacy
+outside a session), `agc2_headroom_db` 24 (0..20), `agc2_max_gain_db` 25 (1..50),
 `agc2_max_gain_change_db_per_second` 26 (1..20), `agc2_max_output_noise_dbfs` 27 (-80..-30), each
 clamped where it applies, a non-finite value the default. `gain_reset_db` is clamped to 0..50 (was 18)
 and then by the engine. Stats (`RootAudioStats`, after the Mac format fields 132-138): `gain_engine`
@@ -2105,6 +2141,73 @@ conversions.
 
 The speech gate's 40 ms look-ahead (control 28), the Effects SDK no longer fed digital silence, and
 the tuning stats 149-154 (caps 32767): see "Speech gate look-ahead, hardware mute and tuning stats".
+
+## Production cleanup (`rootapp/prod-cleanup`, after hw.18)
+
+Before the native call engine ships as an opt-in. Caps stay 32767; no FFI request, proto message or
+field, or C export the desktop uses changed (proto enum values are kept for wire compatibility).
+
+Test-only code out of release builds:
+
+- **MF fault injection** (`LK_MF_FAULT_*`, `LK_MF_MAX_SESSIONS`): compiled in only with webrtc-sys's
+  `mf-fault-injection` feature (define `LK_MF_FAULT_INJECTION`); see "Runtime switches". The support
+  switches `LK_DISABLE_MF_ENCODE`, `LK_DISABLE_MF_DECODE`, `LK_MF_ENCODER_ADAPTER`, `LK_MF_ALLOW_AMD`,
+  `LK_FFI_LOG_LEVEL` and `LK_FFI_WORKER_THREADS` are unchanged.
+- **Test harnesses** behind webrtc-sys's `harness` feature (define `ROOTAPP_HARNESS`), off by
+  default: `adm_proxy_harness.cpp` (AdmProxy/voice/engine/monitor harnesses, `FakePlatformAdm`,
+  `HarnessTransport`), `root_screen_audio_harness.cpp` (the fake tone backend, `ScriptedBackend`, the
+  pipe and capture harnesses), the "Test hooks" sections of `root_audio_processing.cpp` (processor and
+  APM harnesses, `FakeApm`), `root_speech_detector.cpp` (the speech test signals and probes),
+  `root_denoiser.cpp` (`RootFakeFxPipeline`, the denoiser harness), `root_echo_model.cpp` (echo
+  harness and probes) and `root_audio_mixer.cpp` (mixer harness), the `*ForTest` members of
+  `AdmProxy`, `RootAudioMixer`, `RootDenoiserSlot` and `RootApmDecorator`, the harness classes in the
+  headers, and the harness halves of the cxx bridges (`#[cfg(feature = "harness")]` blocks and
+  structs, which cxx-build evaluates from `CARGO_FEATURE_*`). The `root_audio_mixer` bridge is
+  test-only and joins the bridge list only with the feature. Upstream's always-on `LIVEKIT_TEST`
+  define (two serialisation test hooks) goes with it. A release library therefore no longer links
+  the screen-audio tone backend and its `g_fake_backend` switch, and no longer exports the 33 cxx
+  glue functions of test-only shared structs (`RootDenoiserTest*`, `RootMixLevel`,
+  `RootVoiceFakeCounts`, `RootControlState`, `RootMonitorStats`).
+- Tests need no flag: webrtc-sys has a dev-dependency on itself with `harness` and
+  `mf-fault-injection`, and livekit-ffi one on webrtc-sys with `harness`. With resolver 2 a
+  dev-dependency's features only apply to builds of tests, examples and benches, so
+  `cargo build -p livekit-ffi` (the build scripts and the release workflow) never enables either;
+  `cargo tree -p livekit-ffi -e no-dev,features -i webrtc-sys` shows only `default`.
+
+libwebrtc's log floor: see "Logging" (the sink's minimum is now the global minimum; at the default
+`warn` no `LS_INFO` line is formatted).
+
+A/B switches removed, and the native defaults are the desktop's choices (its
+`PlatformControlState`/`PlatformGainEngine`/`PlatformSpeechDetection`/`PlatformEchoModel`):
+
+- Speech detection RING is gone. The wire value 1 is applied as GATE (livekit-ffi, livekit,
+  the controller and `rootapp_voice_dsp::SpeechDetection::from_wire`); other unknown values stay off.
+- A platform audio session (the first handle's `reset_root_audio(false)`) starts with AGC2, GATE
+  and the echo model's AUTO. Outside a session (before the first handle and after the last one
+  closes) native holds LEGACY, OFF and OFF as before, so the managed engine and an idle library run
+  no speech detector, build no AGC2 and poll no echo model. LEGACY stays selectable (live tuning),
+  as do OFF detection (the desktop sends it for an open mic) and the echo model's OFF and ON; the
+  shadow legacy gain and the tuning stats 125-131 and 140-154 are kept.
+- The desktop sends AGC2, GATE (OFF for an open mic) and AUTO on calls, so calls are unchanged. Its
+  mic test sends no `echo_model`; it now runs in AUTO (it ran OFF). The monitor is mixed outside the
+  echo canceller's reference, so the model sees no far end there and its output is AEC3's.
+- The other defaults already matched what the desktop sends: auto sensitivity minimum -54 dBFS,
+  voice gain 24 dB / -25 dBFS / 3 and 2 dB/s / 4000 ms / 0.5, AGC2 5 dB / 30 dB / 6 dB/s / -50
+  dBFS, look-ahead 40 ms (never sent), gate threshold 0.025, auto gain and auto sensitivity on.
+  `denoise_power` stays 0.75 natively (the desktop's setting defaults to 0.6 and is always sent with
+  a denoiser).
+- `LK_MF_D3D11_SHARING` and `LK_MF_D3D11_DRIVER_THREADING` are gone (see "Sharing the D3D11 device
+  with the host").
+
+Repeating logs in the video and capture paths log the first occurrence, then at most one every 10 s
+with ` (N more since the last report)`: the MF encoder's pending upload copy, MFT-dropped frames,
+output without frame metadata and `SetRates` while uninitialized or with an invalid frame rate;
+libwebrtc's unconvertible remote video frames; livekit-ffi's failed capture callbacks.
+
+Tests: `cargo test -p webrtc-sys --lib --release` (the harness tests, `webrtc::tests` for the log
+floor, `mf_device` with fault injection), `cargo test -p rootapp-voice-dsp --release` (golden vectors
+unchanged), `cargo test -p livekit-ffi --lib --release`, `cargo test -p libwebrtc --lib --release
+video_stream`, `cargo test -p livekit --lib --release platform_audio`.
 
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
