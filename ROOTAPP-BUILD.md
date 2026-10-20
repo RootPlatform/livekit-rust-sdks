@@ -2313,6 +2313,11 @@ To verify on a Mac, platform engine, `ROOTAPP_CALL_DIAG=1`, in a call:
 Each should end with audio on the expected device and no abort. The log should show no "listeners
 are not routed" warning.
 
+## hw.20 (2026-10-20)
+
+hw.19's production cleanup plus the macOS ADM's CoreAudio listeners on the device thread (see
+above). Caps stay 32767.
+
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
 | Commit | Change |
