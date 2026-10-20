@@ -444,11 +444,13 @@ HRESULT AcquireSharedD3D11DeviceForHost(const LUID* luid, ID3D11Device** out) {
     return hr;
   }
   HRESULT removed = shared->device->GetDeviceRemovedReason();
+#if defined(LK_MF_FAULT_INJECTION)
   if (SUCCEEDED(removed) && EnvFlagSet("LK_MF_FAULT_HOST_DEVICE_REMOVED")) {
     RTC_LOG(LS_WARNING) << "LK_MF_FAULT_HOST_DEVICE_REMOVED: reporting the "
                            "shared D3D11 device as removed.";
     removed = DXGI_ERROR_DEVICE_REMOVED;
   }
+#endif
   if (FAILED(removed)) {
     RTC_LOG(LS_WARNING) << "Shared D3D11 device was removed ("
                         << HResultToString(removed)

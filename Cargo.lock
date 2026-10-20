@@ -8704,6 +8704,7 @@ dependencies = [
  "rootapp-echo-model",
  "rootapp-voice-dsp",
  "rustfft",
+ "webrtc-sys",
  "webrtc-sys-build",
 ]
 

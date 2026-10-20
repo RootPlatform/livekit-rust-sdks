@@ -89,7 +89,8 @@ constexpr uint32_t kVbvMaxMs = 1000;
 // which cannot recover when H.264 is the only negotiated codec.
 constexpr int32_t kHardwareFailure = WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
 
-// Test-only fault injection, read once per process:
+// Test-only fault injection, compiled in only with webrtc-sys's
+// mf-fault-injection feature and read once per process:
 //   LK_MF_FAULT_INIT=1           InitEncode fails.
 //   LK_MF_FAULT_AFTER_FRAMES=N   ProcessInput reports DXGI_ERROR_DEVICE_REMOVED
 //                                from the (N+1)th frame after InitEncode.
@@ -112,6 +113,13 @@ struct FaultInjection {
   std::optional<int64_t> init_bps;
 };
 
+#if !defined(LK_MF_FAULT_INJECTION)
+constexpr FaultInjection kNoFaults{};
+
+constexpr const FaultInjection& Faults() {
+  return kNoFaults;
+}
+#else
 const FaultInjection& Faults() {
   static const FaultInjection faults = [] {
     FaultInjection f;
@@ -138,6 +146,7 @@ const FaultInjection& Faults() {
   }();
   return faults;
 }
+#endif
 
 livekit_ffi::EncoderSessionCount& Sessions() {
   static auto* sessions = new livekit_ffi::EncoderSessionCount();

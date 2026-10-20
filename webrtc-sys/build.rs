@@ -124,6 +124,10 @@ fn main() {
         builder.file("src/desktop_capturer.cpp");
     }
 
+    if env::var_os("CARGO_FEATURE_MF_FAULT_INJECTION").is_some() {
+        builder.define("LK_MF_FAULT_INJECTION", None);
+    }
+
     // Native screen-share audio: exactly one backend per target OS
     // (include/livekit/root_screen_audio_backend.h).
     builder.file(match target_os.as_str() {

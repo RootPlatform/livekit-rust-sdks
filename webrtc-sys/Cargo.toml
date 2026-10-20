@@ -9,6 +9,7 @@ repository.workspace = true
 
 [features]
 default = []
+mf-fault-injection = []
 
 [dependencies]
 cxx = "1.0"
@@ -31,3 +32,4 @@ pkg-config = "0.3.22"
 [dev-dependencies]
 env_logger = { workspace = true }
 rustfft = "6"
+webrtc-sys = { path = ".", features = ["mf-fault-injection"] }

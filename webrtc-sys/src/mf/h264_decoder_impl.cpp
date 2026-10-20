@@ -72,7 +72,8 @@ int32_t DecodeFailure(HRESULT hr) {
 constexpr int kMaxConsecutiveDecodeErrors = 30;
 constexpr int kMaxFailedKeyframes = 2;
 
-// Test-only: once LK_MF_FAULT_DECODE_AFTER_FRAMES=N frames have been decoded,
+// Test-only (webrtc-sys's mf-fault-injection feature): once
+// LK_MF_FAULT_DECODE_AFTER_FRAMES=N frames have been decoded,
 // LK_MF_FAULT_DECODE_MODE picks the failure:
 //   device-removed (default)  ProcessInput reports DXGI_ERROR_DEVICE_REMOVED.
 //   unlisted                  ProcessInput reports E_FAIL.
@@ -85,6 +86,13 @@ struct DecodeFault {
   DecodeFaultMode mode = DecodeFaultMode::kDeviceRemoved;
 };
 
+#if !defined(LK_MF_FAULT_INJECTION)
+constexpr DecodeFault kNoDecodeFault{};
+
+constexpr const DecodeFault& DecodeFaults() {
+  return kNoDecodeFault;
+}
+#else
 const DecodeFault& DecodeFaults() {
   static const DecodeFault fault = [] {
     DecodeFault f;
@@ -105,6 +113,7 @@ const DecodeFault& DecodeFaults() {
   }();
   return fault;
 }
+#endif
 
 bool FaultReached(DecodeFaultMode mode, int64_t frames_decoded) {
   return DecodeFaults().after_frames && DecodeFaults().mode == mode &&
