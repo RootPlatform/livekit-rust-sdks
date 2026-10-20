@@ -62,10 +62,11 @@ message RootAudioSetPlayoutHoldResponse {
 enum RootAudioSpeechDetection {
   // The noise gate alone decides (the managed engine's behaviour).
   ROOT_AUDIO_SPEECH_DETECTION_OFF = 0;
-  // The speaking state (RootAudioEvent.speaking) needs confirmed speech; the audio follows the noise
-  // gate.
+  // Removed (an A/B mode: the speaking state needed confirmed speech, the audio followed the noise
+  // gate). Native applies GATE for it.
   ROOT_AUDIO_SPEECH_DETECTION_RING = 1;
-  // As RING, and only confirmed speech goes out (hw.17): the noise gate may open only while speech
+  // The speaking state (RootAudioEvent.speaking) needs confirmed speech, and only confirmed speech
+  // goes out (hw.17): the noise gate may open only while speech
   // is confirmed (3 frames at 0.5 or more; it continues while frames stay at 0.3 or more and ends
   // 300 ms after the last). When confirmed speech ends with the gate open it is released over 50 ms
   // and opens again only on newly confirmed speech. The gate decides on each frame and applies the
@@ -82,29 +83,31 @@ enum RootAudioSpeechDetection {
 // audio threads and switches at an audio frame boundary; AEC3 starts over at each switch. In every mode the CPU kill
 // switch (RootAudioStats.echo_model_kill_switch) turns the model off for the rest of the session.
 enum RootAudioEchoModel {
-  // AEC3 alone. Native's value until a control sets another, and again when the first platform audio handle opens
-  // and when the last one closes.
+  // AEC3 alone. Native's value while no platform audio handle is open (before the first and after the last one
+  // closes), so nothing runs for the model then.
   ROOT_AUDIO_ECHO_MODEL_OFF = 0;
   // The model on every output device.
   ROOT_AUDIO_ECHO_MODEL_ON = 1;
   // The platform playout device's kind decides at every open: the model for loudspeakers (SPEAKERS, LINE_OUT,
   // DISPLAY_AUDIO), AEC3 alone for the other kinds. While AEC3 runs alone, an echo path it measures on the device
   // (fullband ERLE of 3 dB or more in 2 s of capture within 10 s) turns the model on for that device until the session
-  // ends; a measurement never turns it off.
+  // ends; a measurement never turns it off. Native's value from the first platform audio handle's open until a
+  // control sets another (the desktop's choice).
   ROOT_AUDIO_ECHO_MODEL_AUTO = 2;
 }
 
 // Which voice gain boosts the denoised voice (RootAudioControl.gain_engine, RootAudioStats.gain_engine).
 enum RootAudioGainEngine {
-  // The chain's own voice gain (the managed engine's VoiceGain). Native's value until a control sets
-  // another, and again when the first platform audio handle opens and when the last one closes.
+  // The chain's own voice gain (the managed engine's VoiceGain). Native's value while no platform audio
+  // handle is open (before the first and after the last one closes).
   ROOT_AUDIO_GAIN_ENGINE_LEGACY = 0;
   // libwebrtc's AGC2 (GainController2, adaptive digital only, as Chrome runs it) on the aligned voice
   // after the Effects SDK, before auto sensitivity: a second APM with nothing else enabled, built off the
   // audio thread for the processor's rate. Each gain reset (gain_reset_db), each change of the agc2_*
   // settings and each processor rate is a new AGC2 starting from that gain (a rate change: from the gain
   // applied last); frames at a rate it has no AGC2 for yet (at most one 10 ms poll after a rate change)
-  // get the chain's voice gain.
+  // get the chain's voice gain. Native's value from the first platform audio handle's open until a
+  // control sets another (the desktop's choice).
   ROOT_AUDIO_GAIN_ENGINE_AGC2 = 1;
 }
 
@@ -230,11 +233,11 @@ message RootAudioControl {
   // The host's noise suppression mode is the Effects SDK: a stream's startup hold waits for the
   // denoiser (at most 1 s), and native WebRTC NS covers a denoiser that stops or does not arrive.
   optional bool denoiser_wanted = 13;
-  // OFF until set, and again when the first platform audio handle opens and when the last one
-  // closes (as the other DSP settings).
+  // GATE from the first platform audio handle's open until set, OFF while no handle is open. RING
+  // (removed) is GATE; values this build does not know are OFF.
   optional RootAudioSpeechDetection speech_detection = 14;
-  // OFF until set, and again when the first platform audio handle opens and when the last one closes (as
-  // the other DSP settings). Values this build does not know are OFF.
+  // AUTO from the first platform audio handle's open until set, OFF while no handle is open. Values
+  // this build does not know are OFF.
   optional RootAudioEchoModel echo_model = 15;
   // Automatic sensitivity's open minimum, dBFS before the voice gain (it rises with at most 11 dB of
   // the gain): the noise gate never opens below it, whatever the noise floor. Clamped to -80..-30; a
@@ -262,9 +265,10 @@ message RootAudioControl {
   // The speech detector's probability from which a frame counts as speech for the level: 0..1, default
   // 0.5 (0 takes every frame with a probability; without a probability level alone decides).
   optional float voice_gain_min_speech_probability = 22;
-  // Which voice gain boosts the voice; LEGACY until set (and in libraries that predate it, which ignore
-  // the field), and again when the first platform audio handle opens and when the last one closes.
-  // RootAudioStats.gain_engine is the engine that ran the last frame.
+  // Which voice gain boosts the voice; AGC2 from the first platform audio handle's open until set,
+  // LEGACY while no handle is open (and in libraries that predate it, which ignore the field).
+  // Values this build does not know are LEGACY. RootAudioStats.gain_engine is the engine that ran the
+  // last frame.
   optional RootAudioGainEngine gain_engine = 23;
   // AGC2's settings (adaptive digital), each clamped to its range, a non-finite value the default; the
   // defaults until set, and again when the first platform audio handle opens and when the last one
@@ -719,7 +723,7 @@ message RootAudioStatsResponse {
 }
 
 // The local user's speaking state (capability DSP): the noise gate's speaking while the transmit gate
-// is open (with speech detection RING or GATE, and push-to-talk not in use, also only while the
+// is open (with speech detection GATE, and push-to-talk not in use, also only while the
 // detector confirms speech). Sent when it differs from the last value sent to this handle (polled every 10 ms, so
 // transitions shorter than that are merged); seq is RootAudioStats.speaking_seq at that time.
 message RootAudioSpeaking {

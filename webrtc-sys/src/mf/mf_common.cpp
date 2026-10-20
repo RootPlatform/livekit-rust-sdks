@@ -283,14 +283,9 @@ HRESULT CreateD3D11DeviceBundle(const LUID& luid, D3D11DeviceBundle* out) {
   // driver threads instead of 37, compiles shaders on the calling thread
   // instead of starting a pool of one thread per CPU with the first one, and
   // completes the host capture's GPU work about 5 ms sooner.
-  // LK_MF_D3D11_DRIVER_THREADING=on turns them back on.
-  static const bool driver_threading =
-      EnvFlagSet("LK_MF_D3D11_DRIVER_THREADING");
   const UINT flags =
       D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT |
-      (driver_threading
-           ? 0
-           : D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS);
+      D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS;
   D3D11DeviceBundle bundle;
   hr = D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
                          flags, feature_levels, ARRAYSIZE(feature_levels),
@@ -321,25 +316,8 @@ HRESULT CreateD3D11DeviceBundle(const LUID& luid, D3D11DeviceBundle* out) {
   return S_OK;
 }
 
-enum class SharingMode { kPerAdapter, kPerUser, kOff };
-
-SharingMode D3D11SharingMode() {
-  static const SharingMode mode = [] {
-    std::optional<std::string> value = GetEnvVar("LK_MF_D3D11_SHARING");
-    if (value && _stricmp(value->c_str(), "user") == 0) {
-      return SharingMode::kPerUser;
-    }
-    if (value && _stricmp(value->c_str(), "off") == 0) {
-      return SharingMode::kOff;
-    }
-    return SharingMode::kPerAdapter;
-  }();
-  return mode;
-}
-
 struct SharedDeviceEntry {
   uint64_t luid = 0;
-  int user = 0;
   std::weak_ptr<const D3D11DeviceBundle> device;
 };
 
@@ -360,9 +338,7 @@ uint64_t LuidKey(const LUID& luid) {
 
 }  // namespace
 
-HRESULT AcquireD3D11Device(const LUID* luid,
-                           D3D11DeviceUser user,
-                           SharedD3D11Device* out) {
+HRESULT AcquireD3D11Device(const LUID* luid, SharedD3D11Device* out) {
   out->reset();
   LUID resolved = {};
   if (luid) {
@@ -375,19 +351,7 @@ HRESULT AcquireD3D11Device(const LUID* luid,
     }
   }
 
-  const SharingMode mode = D3D11SharingMode();
-  if (mode == SharingMode::kOff) {
-    auto bundle = std::make_shared<D3D11DeviceBundle>();
-    HRESULT hr = CreateD3D11DeviceBundle(resolved, bundle.get());
-    if (SUCCEEDED(hr)) {
-      *out = std::move(bundle);
-    }
-    return hr;
-  }
-
   const uint64_t key = LuidKey(resolved);
-  const int user_key =
-      mode == SharingMode::kPerUser ? static_cast<int>(user) : 0;
   std::lock_guard<std::mutex> lock(SharedDeviceMutex());
   std::vector<SharedDeviceEntry>& entries = SharedDevices();
   for (auto it = entries.begin(); it != entries.end();) {
@@ -396,7 +360,7 @@ HRESULT AcquireD3D11Device(const LUID* luid,
       it = entries.erase(it);
       continue;
     }
-    if (it->luid == key && it->user == user_key) {
+    if (it->luid == key) {
       const HRESULT removed = existing->device->GetDeviceRemovedReason();
       if (SUCCEEDED(removed)) {
         *out = std::move(existing);
@@ -417,7 +381,7 @@ HRESULT AcquireD3D11Device(const LUID* luid,
     return hr;
   }
   SharedD3D11Device shared = std::move(bundle);
-  entries.push_back({key, user_key, shared});
+  entries.push_back({key, shared});
   *out = std::move(shared);
   return S_OK;
 }
@@ -436,8 +400,7 @@ HRESULT AcquireD3D11DeviceForActivate(IMFActivate* activate,
                                          sizeof(luid), nullptr))) {
     has_luid = true;
   }
-  return AcquireD3D11Device(has_luid ? &luid : nullptr,
-                            D3D11DeviceUser::kEncoder, out);
+  return AcquireD3D11Device(has_luid ? &luid : nullptr, out);
 }
 
 namespace {
@@ -464,7 +427,7 @@ HRESULT AcquireSharedD3D11DeviceForHost(const LUID* luid, ID3D11Device** out) {
   }
 
   SharedD3D11Device shared;
-  HRESULT hr = AcquireD3D11Device(luid, D3D11DeviceUser::kEncoder, &shared);
+  HRESULT hr = AcquireD3D11Device(luid, &shared);
   if (FAILED(hr)) {
     return hr;
   }

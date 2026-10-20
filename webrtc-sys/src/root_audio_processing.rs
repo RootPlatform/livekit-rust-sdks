@@ -25,7 +25,7 @@ use rootapp_voice_dsp::{
 #[cxx::bridge(namespace = "livekit_ffi")]
 pub mod ffi {
     /// `rootapp_voice_dsp::DspSettings`; push_to_talk 0 voice activity, 1 held,
-    /// anything else released; speech_detection 0 off, 1 ring, 2 gate, anything
+    /// anything else released; speech_detection 0 off, 1 or 2 gate, anything
     /// else off; speech_probability the detector's for this frame (negative:
     /// it did not run); capture_silent the decorator found this frame's raw
     /// input digitally silent; auto_sensitivity_minimum_db, voice_gain and
@@ -400,7 +400,7 @@ pub mod ffi {
         );
         fn set_denoiser_wanted(self: &RootProcessorHarness, wanted: bool);
         fn set_denoise_power(self: &RootProcessorHarness, power: f32);
-        /// 0 off, 1 ring, 2 gate (as the controller stores it).
+        /// 0 off, 2 gate (as the controller stores it).
         fn set_speech_detection(self: &RootProcessorHarness, mode: u32);
         fn set_auto_sensitivity_minimum_db(self: &RootProcessorHarness, db: f32);
         /// As the controller stores them (NaN: none).
@@ -755,6 +755,14 @@ mod processor_tests {
         let h = new_root_processor_harness();
         h.initialize(rate, channels);
         h
+    }
+
+    /// A session start (which takes AGC2 and the speech gate), then the chain's
+    /// own voice gain and the level gate alone, as these tests run.
+    fn reset_to_the_chain(h: &RootProcessorHarness) {
+        h.reset_controls();
+        h.set_gain_engine(0);
+        h.set_speech_detection(0);
     }
 
     /// No voice gain and a manual threshold of 0: whatever is not silent opens
@@ -1587,7 +1595,7 @@ mod processor_tests {
         h.set_mic_muted(true);
         h.set_push_to_talk(RELEASED);
         h.set_input_volume(0.5);
-        h.reset_controls();
+        reset_to_the_chain(&h);
         h.set_dsp(false, false, 0.0);
         for _ in 0..WARM_FRAMES {
             run(&h, 48000, 1, 1.0);
@@ -1671,7 +1679,7 @@ mod processor_tests {
         let stored = h.dsp(false).voice_gain;
         assert_eq!(stored.max_gain_db, -3.0, "stored as set, clamped by the chain");
         assert!(stored.target_db.is_nan());
-        h.reset_controls();
+        reset_to_the_chain(&h);
         assert!(h.dsp(false).voice_gain.max_gain_db.is_nan(), "a reset forgets them");
         h.set_dsp(true, true, 0.025);
         h.gain_reset(30.0);
@@ -1966,7 +1974,7 @@ mod agc2_tests {
         h.process(48000, 1, &tone(48000, -65.0, &mut position));
         assert_eq!((h.dsp(false).gain_engine_applied, h.dsp(false).voice_gain_db), (0, 4.0));
         h.reset_controls();
-        assert_eq!(h.dsp(false).gain_engine, 0, "a session start forgets the engine");
+        assert_eq!(h.dsp(false).gain_engine, AGC2, "a session start takes AGC2 again");
     }
 
     /// Not a unit test: a recording through AGC2 in the processor (the gate
@@ -2058,7 +2066,6 @@ mod speech_tests {
     const NOISES: [(u32, &str); 3] = [(BREATH, "breath"), (CLICKS, "clicks"), (KEYS, "keys")];
 
     const OFF: u32 = 0;
-    const RING: u32 = 1;
     const GATE: u32 = 2;
     const HELD: u32 = 1;
     /// rootapp_voice_dsp::speech_gate::{CONFIRM_FRAMES, HANG_FRAMES}.
@@ -2258,30 +2265,6 @@ mod speech_tests {
     }
 
     #[test]
-    fn root_capture_processor_ring_mode_leaves_the_audio_to_the_level_gate() {
-        let input = script(CLICKS, 48000, 30, 200, 0);
-        let mut input = input;
-        input.extend(root_speech_test_signal(VOWEL, 48000, 100));
-        let off = harness(48000, OFF);
-        let ring = harness(48000, RING);
-        let mut rang = false;
-        for chunk in input.chunks(480) {
-            let a = off.process(48000, 1, chunk);
-            let b = ring.process(48000, 1, chunk);
-            assert_eq!(a.samples, b.samples);
-            let (off_dsp, ring_dsp) = (off.dsp(false), ring.dsp(false));
-            assert!(!ring_dsp.published_speaking || off_dsp.published_speaking);
-            rang |= ring_dsp.published_speaking;
-        }
-        assert!(rang, "the voice rings");
-        let (off_dsp, ring_dsp) = (off.dsp(true), ring.dsp(true));
-        assert_eq!(ring_dsp.speech_closed_frames, 0);
-        assert!(ring_dsp.speech_frames > 50);
-        assert!(!off_dsp.speech_detector_running && off_dsp.speech_probability_max.is_nan());
-        assert_eq!((off_dsp.speech_frames, off_dsp.speech_unavailable_frames), (0, 0));
-    }
-
-    #[test]
     fn root_capture_processor_speech_detection_needs_a_rate_the_detector_runs_at() {
         for rate in [8000, 44100] {
             let input = script(CLICKS, rate, 30, 100, 0);
@@ -2331,20 +2314,19 @@ mod speech_tests {
     }
 
     #[test]
-    fn root_capture_processor_a_reset_turns_speech_detection_off() {
-        let h = harness(48000, GATE);
+    fn root_capture_processor_a_session_start_turns_speech_detection_to_gate() {
+        let h = harness(48000, OFF);
         run(&h, 48000, &script(VOWEL, 48000, 30, 10, 0));
-        assert_eq!(h.dsp(false).speech_detection, GATE);
-        let before = h.dsp(true);
+        assert_eq!(h.dsp(false).speech_detection, OFF);
         h.reset_controls();
         h.set_dsp(false, false, 0.002);
-        let input = script(CLICKS, 48000, 30, 100, 0);
-        let after = run(&h, 48000, &input);
+        run(&h, 48000, &script(BREATH, 48000, 30, 400, 0));
         let dsp = h.dsp(true);
-        assert_eq!(dsp.speech_detection, OFF);
-        assert!(!dsp.speech_detector_running && dsp.speech_probability_max.is_nan());
-        assert_eq!(dsp.speech_closed_frames, before.speech_closed_frames);
-        assert_eq!(after, run(&harness(48000, OFF), 48000, &input), "the level gate alone");
+        assert_eq!(dsp.speech_detection, GATE);
+        assert!(
+            dsp.speech_detector_running && dsp.speech_closed_frames > 0,
+            "the speech gate keeps the breath out"
+        );
     }
 
     #[test]

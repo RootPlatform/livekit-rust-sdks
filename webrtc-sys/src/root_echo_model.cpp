@@ -601,8 +601,8 @@ void RootEchoModelPolicy::SetDevice(RootOutputDevice device) {
   RestartMeasurement();
 }
 
-void RootEchoModelPolicy::ResetSession() {
-  mode_ = RootEchoModelMode::kOff;
+void RootEchoModelPolicy::ResetSession(RootEchoModelMode mode) {
+  mode_ = mode;
   kill_switch_ = false;
   unavailable_ = false;
   latched_.clear();
@@ -754,9 +754,9 @@ void RootEchoModelController::OnPlayoutClosed() {
   playout_open_ = false;
 }
 
-void RootEchoModelController::ResetSession() {
+void RootEchoModelController::ResetSession(RootEchoModelMode mode) {
   webrtc::MutexLock lock(&mutex_);
-  policy_.ResetSession();
+  policy_.ResetSession(mode);
   if (!playout_open_) {
     policy_.ForgetDevice();
     kind_.store(static_cast<uint32_t>(RootOutputDeviceKind::kNone),
@@ -766,8 +766,7 @@ void RootEchoModelController::ResetSession() {
   counters_->inference_p99_us.store(std::numeric_limits<float>::quiet_NaN(),
                                     std::memory_order_relaxed);
   counters_->session.fetch_add(1, std::memory_order_relaxed);
-  mode_.store(static_cast<uint32_t>(RootEchoModelMode::kOff),
-              std::memory_order_relaxed);
+  mode_.store(static_cast<uint32_t>(mode), std::memory_order_relaxed);
   change_since_ms_.reset();
   Schedule(0);
 }
@@ -1163,7 +1162,7 @@ void RootEchoHarness::set_echo_cancellation(bool on) const {
 
 void RootEchoHarness::reset_session() const {
   if (RootEchoModelController* echo = decorator_->echo_model()) {
-    echo->ResetSession();
+    echo->ResetSession(RootEchoModelMode::kOff);
   }
 }
 

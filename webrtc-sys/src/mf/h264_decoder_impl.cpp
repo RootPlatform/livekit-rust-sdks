@@ -177,8 +177,7 @@ VideoDecoder::DecoderInfo MFH264DecoderImpl::GetDecoderInfo() const {
 
 HRESULT MFH264DecoderImpl::SetupD3D() {
   readback_fence_.Reset();
-  HRESULT hr = livekit_ffi::AcquireD3D11Device(
-      nullptr, livekit_ffi::D3D11DeviceUser::kDecoder, &d3d_);
+  HRESULT hr = livekit_ffi::AcquireD3D11Device(nullptr, &d3d_);
   if (FAILED(hr)) {
     return hr;
   }

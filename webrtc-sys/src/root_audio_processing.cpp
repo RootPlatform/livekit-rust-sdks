@@ -256,7 +256,10 @@ void RootCaptureState::ResetControls(bool close_gate) {
   gate_threshold.store(0.025f, std::memory_order_relaxed);
   auto_sensitivity.store(true, std::memory_order_relaxed);
   denoiser_wanted.store(false, std::memory_order_relaxed);
-  speech_detection.store(0, std::memory_order_relaxed);
+  speech_detection.store(
+      static_cast<uint32_t>(close_gate ? RootSpeechDetection::kOff
+                                       : RootSpeechDetection::kGate),
+      std::memory_order_relaxed);
   auto_sensitivity_minimum_db.store(std::numeric_limits<float>::quiet_NaN(),
                                     std::memory_order_relaxed);
   speech_lookahead_ms.store(std::numeric_limits<float>::quiet_NaN(),
@@ -271,7 +274,8 @@ void RootCaptureState::ResetControls(bool close_gate) {
     tunable->store(std::numeric_limits<float>::quiet_NaN(),
                    std::memory_order_relaxed);
   }
-  gain_engine.store(static_cast<uint32_t>(RootGainEngine::kLegacy),
+  gain_engine.store(static_cast<uint32_t>(close_gate ? RootGainEngine::kLegacy
+                                                     : RootGainEngine::kAgc2),
                     std::memory_order_relaxed);
   // A press of the last session that no frame saw is no delay of this one.
   gate_open_stamp_us.store(0, std::memory_order_relaxed);

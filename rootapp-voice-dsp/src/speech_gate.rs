@@ -21,18 +21,15 @@ pub enum SpeechDetection {
     /// Level gate only (the managed engine's behaviour).
     #[default]
     Off,
-    /// The detector is observed and reported only; the audio follows the level gate.
-    Ring,
     /// Only confirmed speech goes out.
     Gate,
 }
 
 impl SpeechDetection {
-    /// 1 ring, 2 gate, anything else off.
+    /// 2 gate (and 1, the removed ring mode), anything else off.
     pub fn from_wire(value: u32) -> Self {
         match value {
-            1 => Self::Ring,
-            2 => Self::Gate,
+            1 | 2 => Self::Gate,
             _ => Self::Off,
         }
     }

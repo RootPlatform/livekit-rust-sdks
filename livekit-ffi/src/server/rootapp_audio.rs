@@ -920,7 +920,8 @@ fn gain_engine(value: i32) -> GainEngine {
     u32::try_from(value).map_or(GainEngine::Legacy, GainEngine::from_wire)
 }
 
-/// The proto's RootAudioSpeechDetection; a value this build does not know is off.
+/// The proto's RootAudioSpeechDetection; RING (removed) is GATE and a value this
+/// build does not know is off.
 fn speech_detection(value: i32) -> SpeechDetection {
     u32::try_from(value).map_or(SpeechDetection::Off, SpeechDetection::from_wire)
 }
@@ -1724,7 +1725,8 @@ mod tests {
         );
         assert_eq!(
             mode(Some(proto::RootAudioSpeechDetection::Ring as i32)),
-            Some(SpeechDetection::Ring)
+            Some(SpeechDetection::Gate),
+            "the removed ring mode is gate"
         );
         assert_eq!(
             mode(Some(proto::RootAudioSpeechDetection::Gate as i32)),
@@ -1737,7 +1739,7 @@ mod tests {
     #[test]
     fn rootapp_audio_speech_stats_convert_and_stay_absent_without_the_detector() {
         let stats = RootAudioStats {
-            speech_detection: Some(SpeechDetection::Ring),
+            speech_detection: Some(SpeechDetection::Gate),
             speech_probability: Some(0.5),
             speech_detector_running: Some(true),
             speech: Some(false),
@@ -1747,7 +1749,7 @@ mod tests {
             ..Default::default()
         };
         let p: proto::RootAudioStats = stats.into();
-        assert_eq!(p.speech_detection, Some(proto::RootAudioSpeechDetection::Ring as i32));
+        assert_eq!(p.speech_detection, Some(proto::RootAudioSpeechDetection::Gate as i32));
         assert_eq!((p.speech_probability, p.speech_detector_running), (Some(0.5), Some(true)));
         assert_eq!(p.speech, Some(false));
         assert_eq!(

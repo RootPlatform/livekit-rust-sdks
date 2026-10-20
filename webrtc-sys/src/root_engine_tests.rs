@@ -72,8 +72,8 @@ fn control(h: &RootEngineHarness, update: RootAudioControlUpdate) {
     assert!(h.controller().set_root_audio_control(&update), "{update:?}");
 }
 
-/// The gate fully open and no voice gain, so what a call sends follows the
-/// voice once the startup hold ends.
+/// The gate fully open, no voice gain and no speech gate, so what a call sends
+/// follows the voice once the startup hold ends.
 fn open_gate(h: &RootEngineHarness) {
     control(
         h,
@@ -84,6 +84,8 @@ fn open_gate(h: &RootEngineHarness) {
             auto_sensitivity: false,
             has_gate_threshold: true,
             gate_threshold: 0.0,
+            has_speech_detection: true,
+            speech_detection: 0,
             ..Default::default()
         },
     );
@@ -330,15 +332,17 @@ fn root_engine_managed_calls_never_open_the_device_and_each_gets_the_pump() {
     );
 }
 
-/// AGC2 from the controls, through the factory's wiring: a control with the
-/// gain engine and a gain reset builds it at once (off the audio thread), the
-/// captured voice runs through it, and the stats report it with its settings
-/// until a session start puts the chain's gain back.
+/// AGC2 from the controls, through the factory's wiring: the session start
+/// builds the session's AGC2, a control with a gain reset and settings builds
+/// another at once (off the audio thread), the captured voice runs through it,
+/// and the stats report it with its settings until a session start puts the
+/// defaults back.
 #[test]
 fn root_engine_runs_agc2_from_the_controls() {
     let h = new_root_engine_harness();
     let c = h.controller();
     assert!(h.acquire());
+    assert_eq!(c.root_audio_stats().agc2_builds, 1, "a session starts with AGC2");
     control(
         &h,
         RootAudioControlUpdate {
@@ -356,7 +360,7 @@ fn root_engine_runs_agc2_from_the_controls() {
         },
     );
     let built = c.root_audio_stats();
-    assert_eq!(built.agc2_builds, 1, "built with the control, before any frame");
+    assert_eq!(built.agc2_builds, 2, "built with the control, before any frame");
     assert_eq!(
         (built.agc2_headroom_db, built.agc2_max_gain_db),
         (5.0, 50.0),
@@ -369,7 +373,7 @@ fn root_engine_runs_agc2_from_the_controls() {
     assert_eq!(h.monitor(true), MONITOR_APPLIED);
     mic_test(&h, 0, 60);
     let stats = c.root_audio_stats();
-    assert_eq!((stats.gain_engine, stats.agc2_builds), (1, 1));
+    assert_eq!((stats.gain_engine, stats.agc2_builds), (1, 2));
     assert!(
         stats.voice_gain_db > 0.0 && stats.voice_gain_db <= 12.5,
         "AGC2's gain from the 12 dB reset: {}",

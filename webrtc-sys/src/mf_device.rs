@@ -111,12 +111,10 @@ mod tests {
                 D3D11_CREATE_DEVICE_VIDEO_SUPPORT
             );
             assert_eq!(flags & D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_BGRA_SUPPORT);
-            if std::env::var_os("LK_MF_D3D11_DRIVER_THREADING").is_none() {
-                assert_eq!(
-                    flags & D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS,
-                    D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS
-                );
-            }
+            assert_eq!(
+                flags & D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS,
+                D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS
+            );
 
             let (hr, second) = acquire(None);
             assert_eq!(hr, S_OK);

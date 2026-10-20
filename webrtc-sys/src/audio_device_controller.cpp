@@ -594,12 +594,14 @@ bool AudioDeviceController::set_root_audio_control(
           control.agc2_max_output_noise_dbfs, std::memory_order_relaxed);
     }
     if (control.has_speech_detection) {
-      const uint32_t mode =
-          control.speech_detection <=
-                  static_cast<uint32_t>(RootSpeechDetection::kGate)
-              ? control.speech_detection
-              : static_cast<uint32_t>(RootSpeechDetection::kOff);
-      capture_->speech_detection.store(mode, std::memory_order_relaxed);
+      const bool gate =
+          control.speech_detection == 1 ||
+          control.speech_detection ==
+              static_cast<uint32_t>(RootSpeechDetection::kGate);
+      const RootSpeechDetection mode =
+          gate ? RootSpeechDetection::kGate : RootSpeechDetection::kOff;
+      capture_->speech_detection.store(static_cast<uint32_t>(mode),
+                                       std::memory_order_relaxed);
     }
     if (control.has_auto_sensitivity_minimum_db) {
       capture_->auto_sensitivity_minimum_db.store(
@@ -736,7 +738,8 @@ void AudioDeviceController::reset_root_audio(bool close_gate) const {
   if (apm_) {
     apm_->ResetPolicy();
     if (RootEchoModelController* echo_model = apm_->echo_model()) {
-      echo_model->ResetSession();
+      echo_model->ResetSession(close_gate ? RootEchoModelMode::kOff
+                                          : RootEchoModelMode::kAuto);
     }
   }
   if (denoiser_ && close_gate) {

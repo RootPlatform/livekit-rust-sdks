@@ -123,19 +123,17 @@ impl PushToTalk {
 pub enum SpeechDetection {
     /// The noise gate alone decides (the managed engine's behaviour).
     Off,
-    /// The ring and the speaking flag need confirmed speech; the audio follows
-    /// the noise gate.
-    Ring,
-    /// As `Ring`, and the noise gate also closes on what the detector rejects.
+    /// The ring and the speaking flag need confirmed speech, and the noise gate
+    /// also closes on what the detector rejects.
     Gate,
 }
 
 impl SpeechDetection {
-    /// The wire value (0, 1, 2). Unknown values are off.
+    /// The wire value (0, 2). 1, the removed ring mode, is gate; unknown values
+    /// are off.
     pub fn from_wire(value: u32) -> Self {
         match value {
-            1 => Self::Ring,
-            2 => Self::Gate,
+            1 | 2 => Self::Gate,
             _ => Self::Off,
         }
     }
@@ -143,7 +141,6 @@ impl SpeechDetection {
     pub fn to_wire(self) -> u32 {
         match self {
             Self::Off => 0,
-            Self::Ring => 1,
             Self::Gate => 2,
         }
     }
@@ -459,16 +456,18 @@ pub struct EchoModelStats {
 /// `auto_sensitivity`, the `gain_reset_db` command and `denoiser_wanted` (the
 /// host's noise suppression mode is the Effects SDK: the startup hold waits
 /// for the denoiser and native WebRTC NS covers a denoiser that stops or does
-/// not arrive), `speech_detection` (off until set, and after every session
-/// start), `auto_sensitivity_minimum_db` (the chain's -54 dBFS until set,
+/// not arrive), `speech_detection` (gate from every session start until
+/// set), `auto_sensitivity_minimum_db` (the chain's -54 dBFS until set,
 /// and after every session start), the voice gain's tunables (`voice_gain_*`,
 /// the chain's defaults until set and after every session start), the
-/// `gain_engine` (the chain's until set and after every session start),
-/// AGC2's settings (`agc2_*`, the defaults until set and after every session
-/// start) and `speech_lookahead_ms` (the chain's 40 ms until set and after
-/// every session start). Builds without the chain only store them.
-/// `echo_model` is off until set and after every session start; without
-/// [`ECHO_MODEL_AVAILABLE`] it is not supported.
+/// `gain_engine` (AGC2 from every session start until set), AGC2's settings
+/// (`agc2_*`, the defaults until set and after every session start) and
+/// `speech_lookahead_ms` (the chain's 40 ms until set and after every session
+/// start). Builds without the chain only store them. `echo_model` is auto from
+/// every session start until set; without [`ECHO_MODEL_AVAILABLE`] it is not
+/// supported. Outside a session (before the first handle and after the last
+/// one) native holds the chain's gain, no detection and no echo model, so
+/// nothing runs for them.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct RootAudioControl {
     pub mic_muted: Option<bool>,
@@ -1655,17 +1654,18 @@ mod tests {
     }
 
     #[test]
-    fn speech_detection_maps_unknown_wire_values_to_off() {
-        for mode in [SpeechDetection::Off, SpeechDetection::Ring, SpeechDetection::Gate] {
+    fn speech_detection_maps_the_ring_wire_value_to_gate_and_unknown_ones_to_off() {
+        for mode in [SpeechDetection::Off, SpeechDetection::Gate] {
             assert_eq!(SpeechDetection::from_wire(mode.to_wire()), mode);
         }
+        assert_eq!(SpeechDetection::from_wire(1), SpeechDetection::Gate);
         assert_eq!(SpeechDetection::from_wire(3), SpeechDetection::Off);
         let native = RootAudioControl {
-            speech_detection: Some(SpeechDetection::Ring),
+            speech_detection: Some(SpeechDetection::Gate),
             ..Default::default()
         }
         .to_native();
-        assert!(native.has_speech_detection && native.speech_detection == 1);
+        assert!(native.has_speech_detection && native.speech_detection == 2);
         assert!(!RootAudioControl::default().to_native().has_speech_detection);
     }
 

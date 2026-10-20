@@ -288,8 +288,8 @@ class RootEchoModelPolicy {
   void SetDevice(RootOutputDevice device);
   void SetKillSwitch() { kill_switch_ = true; }
   void SetUnavailable(bool unavailable) { unavailable_ = unavailable; }
-  // Mode off, latches, measurement and kill switch cleared; the device kept.
-  void ResetSession();
+  // `mode`, latches, measurement and kill switch cleared; the device kept.
+  void ResetSession(RootEchoModelMode mode);
   // Back to no device.
   void ForgetDevice();
   // The measurement starts over (a swap).
@@ -369,9 +369,10 @@ class RootEchoModelController {
   void OnOutputDevice(RootOutputDevice device);
   // The platform playout device closed.
   void OnPlayoutClosed();
-  // The device is kept only while a platform playout is open (a call's open
-  // classifies again).
-  void ResetSession();
+  // A session starts (AUTO, the desktop's choice) or ends (OFF: nothing
+  // polls while idle). The device is kept only while a platform playout is
+  // open (a call's open classifies again).
+  void ResetSession(RootEchoModelMode mode);
   // Any thread but the audio threads; takes the since-last-read values.
   RootEchoModelStatsSnapshot ReadStats();
 

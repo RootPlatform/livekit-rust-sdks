@@ -113,12 +113,28 @@ fn wait_until(what: &str, done: impl Fn() -> bool) {
 /// A session has started and the app records.
 fn started() -> UniquePtr<RootVoiceHarness> {
     let h = new_root_voice_harness();
+    level_gate_and_chain_gain(&h);
     h.recording(true);
     h
 }
 
 fn control(h: &RootVoiceHarness, update: RootAudioControlUpdate) {
     assert!(h.controller().set_root_audio_control(&update), "{update:?}");
+}
+
+/// The level gate alone and the chain's own voice gain, which these tests'
+/// synthetic voices are written for (a session starts with GATE and AGC2).
+fn level_gate_and_chain_gain(h: &RootVoiceHarness) {
+    control(
+        h,
+        RootAudioControlUpdate {
+            has_speech_detection: true,
+            speech_detection: 0,
+            has_gain_engine: true,
+            gain_engine: 0,
+            ..Default::default()
+        },
+    );
 }
 
 fn denoiser_wanted(h: &RootVoiceHarness, wanted: bool) {
@@ -965,6 +981,7 @@ fn without_remote(played: &[i16]) -> Vec<i16> {
 #[test]
 fn root_voice_monitor_plays_what_a_call_would_send_outside_the_aec_reference() {
     let h = new_root_voice_harness();
+    level_gate_and_chain_gain(&h);
     let c = h.controller();
     assert!(!h.platform_playing() && !h.platform_recording());
     assert_eq!(h.monitor(true), MONITOR_APPLIED);

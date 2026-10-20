@@ -51,16 +51,14 @@ struct D3D11DeviceBundle {
 
 using SharedD3D11Device = std::shared_ptr<const D3D11DeviceBundle>;
 
-enum class D3D11DeviceUser { kEncoder, kDecoder };
-
 // A multithread-protected, video-capable D3D11 device and its DXGI device
 // manager on the adapter identified by `luid` (the default adapter when
-// null), shared by every MF encoder and decoder on that adapter: each device
-// costs the NVIDIA driver 37 worker threads. The device is released when the
-// last holder drops it, and a removed device is replaced on the next call.
-HRESULT AcquireD3D11Device(const LUID* luid,
-                           D3D11DeviceUser user,
-                           SharedD3D11Device* out);
+// null), shared by every MF encoder and decoder on that adapter and the host:
+// each device costs the NVIDIA driver 37 worker threads. The device is
+// created without the driver's internal threading optimizations. It is
+// released when the last holder drops it, and a removed device is replaced
+// on the next call.
+HRESULT AcquireD3D11Device(const LUID* luid, SharedD3D11Device* out);
 
 // Hardware MFTs on multi-adapter systems are bound to one adapter, recorded
 // on the activate as MFT_ENUM_ADAPTER_LUID; the device manager handed to the

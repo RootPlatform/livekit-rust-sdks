@@ -657,9 +657,7 @@ impl DspChain {
         }
         let probability = match detection {
             SpeechDetection::Off => None,
-            SpeechDetection::Ring | SpeechDetection::Gate => {
-                speech_gate::probability(settings.speech_probability)
-            }
+            SpeechDetection::Gate => speech_gate::probability(settings.speech_probability),
         };
         // Push-to-talk leaves the audio to the key; the verdict keeps running, so speech that
         // continues when the key mode ends is already confirmed.

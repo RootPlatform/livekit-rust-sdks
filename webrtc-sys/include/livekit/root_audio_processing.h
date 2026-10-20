@@ -129,13 +129,12 @@ class RootFakeFxPipeline;
 class RootSpeechDetector;
 
 // RootCaptureState::speech_detection: what the speech detector's verdict
-// qualifies (rootapp_voice_dsp::SpeechDetection); other values are kOff.
+// qualifies (rootapp_voice_dsp::SpeechDetection). The host's 1 (the removed
+// ring mode) is stored as kGate, other values as kOff.
 enum class RootSpeechDetection : uint32_t {
   kOff = 0,
-  // The ring and the speaking flag need confirmed speech; the audio follows
-  // the level gate.
-  kRing = 1,
-  // As kRing, and the audio gate also closes on what the detector rejects.
+  // The ring and the speaking flag need confirmed speech, and the audio gate
+  // also closes on what the detector rejects.
   kGate = 2,
 };
 
@@ -248,7 +247,8 @@ struct RootCaptureState {
   std::atomic<float> gate_threshold{0.025f};
   std::atomic<bool> auto_sensitivity{true};
   std::atomic<bool> denoiser_wanted{false};
-  // RootSpeechDetection; off until the host asks (the managed engine's gate).
+  // RootSpeechDetection; off outside a session, gate from a session start
+  // until the host asks (ResetControls).
   std::atomic<uint32_t> speech_detection{0};
   // Auto sensitivity's open minimum as the host set it, dBFS before the
   // voice gain; the chain clamps it, and NaN (none) is its default.
@@ -267,7 +267,8 @@ struct RootCaptureState {
       std::numeric_limits<float>::quiet_NaN()};
   std::atomic<float> voice_gain_min_speech_probability{
       std::numeric_limits<float>::quiet_NaN()};
-  // RootGainEngine; the chain's until the host asks.
+  // RootGainEngine; the chain's outside a session, AGC2 from a session start
+  // until the host asks (ResetControls).
   std::atomic<uint32_t> gain_engine{0};
   // AGC2's settings as the host set them (RootAgc2Tuning; NaN: the default).
   std::atomic<float> agc2_headroom_db{std::numeric_limits<float>::quiet_NaN()};
@@ -408,7 +409,9 @@ struct RootCaptureState {
   // Back to the defaults (unity input volume), with the gate open or closed
   // (muted, push-to-talk key up) in the same store, and the DSP chain reset;
   // outputs are kept, except that speaking clears and a pending gate-open
-  // stamp is dropped.
+  // stamp is dropped. A session start (gate open) takes the desktop's gain
+  // engine and detection (AGC2, GATE); a session end (gate closed) the
+  // chain's voice gain and no detection, so neither runs while idle.
   void ResetControls(bool close_gate);
   // Not speaking, unless the audio thread says otherwise on a later frame:
   // for when frames stop (a session ends, recording stops).

@@ -242,7 +242,7 @@ pub mod ffi {
         pub monitor_dropped_frames: u64,
 
         /// The speech detector exists (with the DSP chain). The setting (0 off,
-        /// 1 ring, 2 gate), the highest probability since the previous read
+        /// 2 gate), the highest probability since the previous read
         /// (-1: none), whether the speech gate judged the last frame and found
         /// it speech, and frames with confirmed speech, frames it held the
         /// noise gate shut or forced it closed, and frames with detection on
@@ -313,7 +313,8 @@ pub mod ffi {
         pub gain_reset_db: f32,
         pub has_denoiser_wanted: bool,
         pub denoiser_wanted: bool,
-        /// 0 off, 1 ring, 2 gate; other values are off.
+        /// 0 off, 2 gate (1, the removed ring mode, is gate); other values
+        /// are off.
         pub has_speech_detection: bool,
         pub speech_detection: u32,
         /// 0 off, 1 on, 2 auto; other values are off.

@@ -134,13 +134,11 @@ fn lost_delayed(off: &Run, gate: &Run, range: std::ops::Range<usize>) -> Vec<usi
 fn off_and_no_probability_match_the_level_gate_exactly() {
     let script = speech_then_noise();
     let off = run(SpeechDetection::Off, &script, |_, s| s.speech_probability = -1.0);
-    for detection in [SpeechDetection::Ring, SpeechDetection::Gate] {
-        let none = run(detection, &script, |_, s| s.speech_probability = -1.0);
-        assert_eq!(off.sent, none.sent);
-        assert_eq!(off.speaking, none.speaking);
-        let nan = run(detection, &script, |_, s| s.speech_probability = f32::NAN);
-        assert_eq!(off.sent, nan.sent);
-    }
+    let none = run(SpeechDetection::Gate, &script, |_, s| s.speech_probability = -1.0);
+    assert_eq!(off.sent, none.sent);
+    assert_eq!(off.speaking, none.speaking);
+    let nan = run(SpeechDetection::Gate, &script, |_, s| s.speech_probability = f32::NAN);
+    assert_eq!(off.sent, nan.sent);
 }
 
 #[test]
@@ -164,22 +162,13 @@ fn level_gate_holds_open_on_noise_the_detector_rejects() {
 }
 
 #[test]
-fn ring_mode_matches_the_level_gate() {
-    let script = speech_then_noise();
-    let off = run(SpeechDetection::Off, &script, |_, _| {});
-    let ring = run(SpeechDetection::Ring, &script, |_, _| {});
-    assert_eq!(off.sent, ring.sent);
-    assert_eq!(off.speaking, ring.speaking);
-}
-
-#[test]
 fn every_frame_that_sends_audio_rings_in_every_mode() {
     let mut script = speech_then_noise();
     script.extend(std::iter::repeat_n((true, 0.4), 200));
     script.extend(std::iter::repeat_n((true, 0.1), 200));
     script.extend(std::iter::repeat_n((false, NOISE), 100));
     script.extend(std::iter::repeat_n((true, SPEECH), 100));
-    for detection in [SpeechDetection::Off, SpeechDetection::Ring, SpeechDetection::Gate] {
+    for detection in [SpeechDetection::Off, SpeechDetection::Gate] {
         let r = run(detection, &script, |f, s| {
             s.gate_threshold = if f % 700 < 350 { 0.01 } else { 0.03 };
         });
@@ -372,7 +361,7 @@ fn speech_gate_reads_only_finite_non_negative_probabilities() {
     assert_eq!(probability(1.5), Some(1.0));
     assert_eq!(probability(0.4), Some(0.4));
     assert_eq!(SpeechDetection::from_wire(0), SpeechDetection::Off);
-    assert_eq!(SpeechDetection::from_wire(1), SpeechDetection::Ring);
+    assert_eq!(SpeechDetection::from_wire(1), SpeechDetection::Gate, "the removed ring mode");
     assert_eq!(SpeechDetection::from_wire(2), SpeechDetection::Gate);
     assert_eq!(SpeechDetection::from_wire(3), SpeechDetection::Off);
 }
@@ -686,7 +675,6 @@ fn the_look_ahead_runs_only_where_the_speech_gate_decides_the_audio() {
     for (step, gated) in [
         (Step::default(), true),
         (Step { detection: SpeechDetection::Off, ..Step::default() }, false),
-        (Step { detection: SpeechDetection::Ring, ..Step::default() }, false),
         (Step { p: -1.0, ..Step::default() }, false),
         (Step { p: f32::NAN, ..Step::default() }, false),
         (Step { push_to_talk: PushToTalk::Held, ..Step::default() }, false),

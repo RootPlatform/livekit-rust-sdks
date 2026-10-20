@@ -941,7 +941,7 @@ fn adm_proxy_controller_stores_denoiser_wanted_until_a_reset() {
 #[test]
 fn adm_proxy_controller_stores_speech_detection_until_a_reset_and_turns_unknown_modes_off() {
     let h = harness(&["{spk}"], &["{mic}"]);
-    assert_eq!(h.control_state().speech_detection, 0, "off until the host asks");
+    assert_eq!(h.control_state().speech_detection, 0, "off outside a session");
     let mode = |value: u32| {
         assert!(h.apply_control(&RootAudioControlUpdate {
             has_speech_detection: true,
@@ -951,7 +951,8 @@ fn adm_proxy_controller_stores_speech_detection_until_a_reset_and_turns_unknown_
         h.control_state().speech_detection
     };
     assert_eq!(mode(2), 2);
-    assert_eq!(mode(1), 1);
+    assert_eq!(mode(0), 0);
+    assert_eq!(mode(1), 2, "the removed ring mode is gate");
     assert_eq!(mode(7), 0);
     assert_eq!(mode(2), 2);
     h.apply_control(&RootAudioControlUpdate {
@@ -960,11 +961,14 @@ fn adm_proxy_controller_stores_speech_detection_until_a_reset_and_turns_unknown_
         ..Default::default()
     });
     assert_eq!(h.control_state().speech_detection, 2, "an unset field keeps its value");
+    mode(0);
     h.reset_root_audio(false);
-    assert_eq!(h.control_state().speech_detection, 0);
+    assert_eq!(h.control_state().speech_detection, 2, "a session starts with gate");
     let stats = h.stats();
     assert!(stats.speech_available);
-    assert_eq!((stats.speech_detection, stats.speech_probability), (0, -1.0));
+    assert_eq!((stats.speech_detection, stats.speech_probability), (2, -1.0));
+    h.reset_root_audio(true);
+    assert_eq!(h.control_state().speech_detection, 0, "off once the session ends");
 }
 
 #[test]
@@ -1071,7 +1075,7 @@ fn adm_proxy_controller_stores_the_voice_gain_tunables_until_a_reset_and_reports
 fn adm_proxy_controller_stores_the_gain_engine_and_agc2_settings_until_a_reset() {
     let h = harness(&["{spk}"], &["{mic}"]);
     let state = h.control_state();
-    assert_eq!(state.gain_engine, 0, "the chain's voice gain until the host asks");
+    assert_eq!(state.gain_engine, 0, "the chain's voice gain outside a session");
     assert!(state.agc2_headroom_db.is_nan() && state.agc2_max_output_noise_dbfs.is_nan());
     let applied = |h: &AdmProxyHarness| {
         let s = h.stats();
@@ -1105,16 +1109,13 @@ fn adm_proxy_controller_stores_the_gain_engine_and_agc2_settings_until_a_reset()
         ..Default::default()
     });
     assert_eq!(h.control_state().gain_engine, 0, "an unknown engine is the chain's");
-    h.apply_control(&RootAudioControlUpdate {
-        has_gain_engine: true,
-        gain_engine: 1,
-        ..Default::default()
-    });
     h.reset_root_audio(false);
     let state = h.control_state();
-    assert_eq!(state.gain_engine, 0);
+    assert_eq!(state.gain_engine, 1, "a session starts with AGC2");
     assert!(state.agc2_headroom_db.is_nan() && state.agc2_max_gain_db.is_nan());
     assert_eq!(applied(&h), [5.0, 30.0, 6.0, -50.0]);
+    h.reset_root_audio(true);
+    assert_eq!(h.control_state().gain_engine, 0, "the chain's once the session ends");
 }
 
 fn denoiser_completions(h: &AdmProxyHarness, count: usize) -> Vec<RootDenoiserCompletionItem> {

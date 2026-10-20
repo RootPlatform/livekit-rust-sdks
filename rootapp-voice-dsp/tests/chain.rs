@@ -515,7 +515,7 @@ fn talk_with(h: &mut Harness, level_db: f64, seconds: f64, probability: f32) -> 
 /// sets the level, and without a probability the level alone decides.
 #[test]
 fn the_voice_gain_learns_speech_only_from_frames_the_detector_accepts() {
-    for detection in [SpeechDetection::Off, SpeechDetection::Ring, SpeechDetection::Gate] {
+    for detection in [SpeechDetection::Off, SpeechDetection::Gate] {
         for (probability, boosted) in [
             (0.1f32, false),
             (0.49, false),
