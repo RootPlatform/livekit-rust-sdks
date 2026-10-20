@@ -2209,6 +2209,110 @@ floor, `mf_device` with fault injection), `cargo test -p rootapp-voice-dsp --rel
 unchanged), `cargo test -p livekit-ffi --lib --release`, `cargo test -p libwebrtc --lib --release
 video_stream`, `cargo test -p livekit --lib --release platform_audio`.
 
+## macOS: the ADM's CoreAudio listeners on the device thread (`rootapp/mac-adm-listener-thread`)
+
+Two Mac staging aborts on the `audio-device` thread were the same race: 10/16 (0.10.138, hw.14,
+an AirPods swap) and 10/20 (0.10.145, hw.17, dylib UUID `C733994A-6CA0-3981-9AF3-DD0F6CE58DFF`).
+Both were `platform_thread.cc:181` `RTC_CHECK(0 == pthread_join(*handle_, nullptr))`. They were
+symbolicated by hand against the stripped release dylibs: the UUID matched, then the file, line and
+check strings beside each call site were read with rustup's `llvm-objdump` (not `--macho`, which
+ignores the address range). In these dylibs `__TEXT`'s vmaddr is 0, so a string's address is its
+file offset.
+
+- 10/20: CoreAudio's listener queue (`HALC_ProxyNotification Call Listener Queue`, under
+  `HALSystem::ObjectsPublishedAndDied`) was in `AudioDeviceMac::HandleDeviceChange`. The open output
+  device was not alive, so it ran `StopPlayout`, blocked in `render_worker_thread_.Finalize()`'s
+  `pthread_join`. The device thread was in `RequestReconcile`'s task: `ReconcilePlayoutLocked` (the
+  stale/unwanted stop), `StopDeviceLocked`, `AudioDeviceModuleImpl::StopPlayout`,
+  `AudioDeviceMac::StopPlayout`, and a second `pthread_join` of the same thread failed.
+- 10/16: the listener queue's "Default audio output device has changed" restart had just joined the
+  render worker inside `StopPlayout`. The device thread's `StartPlayout` then move-assigned
+  `render_worker_thread_` and joined the already-joined thread. The hw.16 change (a failed start is
+  stopped at once, f1a54064) is harmless but was not the cause: a join on a live thread waits, it
+  does not fail.
+
+webrtc-sdk m150's `AudioDeviceMac` (the pinned prebuilt, not upstream libwebrtc) restarts devices from
+its CoreAudio listener:
+- `kAudioHardwarePropertyDevices` (`HandleDeviceChange`): for an open direction whose device is not
+  alive it stops, and if it was running it runs `SetPlayoutDevice(0)` / `SetRecordingDevice(0)` and
+  then Init and Start.
+- The default output/input changed: while it plays (records) index 0, it runs Stop, Init and Start.
+
+Its `StopPlayout`/`StopRecording` release `mutex_` around the 2 s stop-event wait and around the
+worker join, and `PlatformThread` is not thread-safe. So any two threads in Stop or Start of one
+direction can join one worker twice. `AdmProxy` does Stop/Init/Start on its device thread for the
+reconcile, the format watch's reopen, `RestartDevices` and `SelectDevices`, often triggered by the
+same device change.
+
+The prebuilt cannot be patched, so `AdmListenerRouter` (`webrtc-sys/src/adm_listener_router.cpp`,
+`include/livekit/adm_listener_router.h`) moves the ADM's listener onto the device thread:
+- On macOS the library defines `AudioObjectAddPropertyListener` and
+  `AudioObjectRemovePropertyListener`. The statically linked libwebrtc's calls bind to these. CoreAudio's
+  own are reached through `dlopen`/`dlsym` of `CoreAudio.framework`.
+- A listener is routed when it is added on a thread with a router or with the proc and client of a
+  listener routed earlier. Threads with a router are the device thread (all of it) and the platform
+  ADM's `Init` in the `AdmProxy` constructor (an `AdmListenerScope`; the device thread is now created
+  before that `Init`). A routed listener is registered with CoreAudio as a trampoline whose client
+  data is an id. Every other listener goes to CoreAudio unchanged.
+- The trampoline copies the addresses and posts the notification to that `AdmProxy`'s device thread.
+  It takes only the registry and router locks, briefly, and never waits for the device thread.
+- On the device thread, `RunListenerNotification` runs the ADM's own listener under `mutex_`, in turn
+  with every other device operation, then requests a reconcile. The ADM may have stopped, reopened
+  or switched a direction there: a direction its handler closed and could not reopen is reopened on
+  the desired selection, and the published state is current.
+- Remove: a routed registration is erased and marked removed before CoreAudio removes its
+  trampoline. A notification already posted for it is dropped when it runs. The registry lock is
+  never held across a CoreAudio call, so a remove that waits for a running trampoline cannot
+  deadlock. CoreAudio's thread no longer enters `AudioDeviceMac`, so the 10/16 report's listener
+  waiting on the ADM's mutex is gone too.
+- A second add of the same listener (object, address, proc, client) is kept once. A leftover with
+  that key from a detached router is replaced.
+- After `AdmProxy`'s shutdown no listener runs (`terminated_`). The destructor detaches the router
+  before stopping the thread, so nothing is posted after.
+
+What the ADM does on a device change (switch to the default when its device goes away, follow the
+default) is unchanged; only the thread is new. No FFI request, proto field, stat or caps bit changed.
+
+Detection:
+- On macOS `AdmProxy` logs a warning when the platform ADM's `Init` registered no routed listener (the
+  override did not bind).
+- `build-rootapp-macos.sh` fails a dylib that still imports `_AudioObjectAddPropertyListener` or
+  `_AudioObjectRemovePropertyListener` (`nm -u`).
+
+Tests (`cargo test -p webrtc-sys --lib --release -- adm_`). The harness's fake platform ADM registers
+its listeners like `AudioDeviceMac` (a devices listener in `Init`, a format listener in
+`InitPlayout`), through a `FakeCoreAudio` that goes through the router as the macOS definitions do.
+On a devices notification it stops and reopens playout on device 0, and it counts overlapping device
+calls. The tests:
+- `adm_proxy_runs_the_platform_adms_listeners_on_the_device_thread`
+- `adm_proxy_holds_a_listener_notification_until_the_device_operation_in_progress_ends` (the race: a
+  notification while the device thread is inside `StartPlayout`)
+- `adm_proxy_reopens_what_the_platform_adms_listener_closed`
+- `adm_proxy_drops_a_notification_whose_listener_was_removed_before_it_ran`
+- `adm_proxy_runs_no_listener_after_shutdown`
+- `adm_listener_router_routes_only_the_platform_adms_listeners`
+
+With routing switched off all six fail; in the race test the listener ran on the notification thread
+while `StartPlayout` was in progress.
+
+Not verified:
+- The macOS link: whether Apple's linker binds libwebrtc's references to these definitions. The build
+  script's check answers it.
+- A run on a Mac.
+
+The macOS branch of `adm_listener_router.cpp` passed a clang 19 `-fsyntax-only -Wall -Wextra` check
+with `WEBRTC_MAC` against stub `CoreAudio/CoreAudio.h` and `pthread_spis.h` headers that mirror
+Apple's declarations.
+
+To verify on a Mac, platform engine, `ROOTAPP_CALL_DIAG=1`, in a call:
+- AirPods disconnected and reconnected.
+- The default output changed in Sound settings.
+- Wired headphones unplugged and plugged back in.
+- A USB mic unplugged.
+
+Each should end with audio on the expected device and no abort. The log should show no "listeners
+are not routed" warning.
+
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
 | Commit | Change |
