@@ -154,13 +154,22 @@ LogSink::LogSink(
     rust::Fn<void(rust::String message, LoggingSeverity severity)> fnc,
     LoggingSeverity min_severity)
     : fnc_(fnc) {
-  // m150 replaced the old "release builds don't log" default with LoggingConfig,
-  // which defaults to log_to_stderr=true / debug_severity=LS_INFO and installs
-  // itself on the first log call. That writes straight to stderr, bypassing this
-  // sink and therefore the Rust log facade, so nothing downstream can filter it.
-  // Route everything through the sink only.
-  webrtc::LogMessage::SetLogToStderr(false);
-  webrtc::LogMessage::LogToDebug(webrtc::LoggingSeverity::LS_NONE);
+  // m150's LoggingConfig is created once, by the first call that reads it
+  // (adding a sink is one), and its defaults are min_severity, debug_severity
+  // LS_INFO and log_to_stderr. min_severity is a floor of the global minimum
+  // that LogToDebug cannot raise, and debug_severity sends every line to
+  // OutputToDebug: every LS_INFO line would be formatted and logged under the
+  // global logging lock whatever this sink's minimum. Install a config that
+  // logs nowhere but the sinks before anything reads one, so the sinks'
+  // minimum alone decides what is formatted.
+  webrtc::LoggingConfig config;
+  config.set_min_severity(webrtc::LoggingSeverity::LS_NONE);
+  config.set_debug_severity(webrtc::LoggingSeverity::LS_NONE);
+  config.set_log_to_stderr(false);
+  if (!webrtc::InitializeLogging(std::move(config))) {
+    webrtc::LogMessage::SetLogToStderr(false);
+    webrtc::LogMessage::LogToDebug(webrtc::LoggingSeverity::LS_NONE);
+  }
 
   set_min_severity(min_severity);
 }
@@ -192,6 +201,23 @@ std::unique_ptr<LogSink> new_log_sink(
     LoggingSeverity min_severity) {
   return std::make_unique<LogSink>(fnc, min_severity);
 }
+
+#if defined(ROOTAPP_HARNESS)
+LoggingSeverity log_min_severity_for_test() {
+  return static_cast<LoggingSeverity>(webrtc::LogMessage::GetMinLogSeverity());
+}
+
+bool log_for_test(LoggingSeverity severity, rust::Str message) {
+  bool formatted = false;
+  auto mark = [&formatted] {
+    formatted = true;
+    return "";
+  };
+  RTC_LOG_V(static_cast<webrtc::LoggingSeverity>(severity))
+      << std::string(message) << mark();
+  return formatted;
+}
+#endif
 
 rust::String create_random_uuid() {
   return webrtc::CreateRandomUuid();

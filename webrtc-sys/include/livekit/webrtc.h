@@ -117,6 +117,11 @@ std::unique_ptr<LogSink> new_log_sink(
     rust::Fn<void(rust::String, LoggingSeverity)> fnc,
     LoggingSeverity min_severity);
 
+#if defined(ROOTAPP_HARNESS)
+LoggingSeverity log_min_severity_for_test();
+bool log_for_test(LoggingSeverity severity, rust::Str message);
+#endif
+
 rust::String create_random_uuid();
 
 rust::Vec<VideoEncoderBackend> video_encoder_backend_list();
