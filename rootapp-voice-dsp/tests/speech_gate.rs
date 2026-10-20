@@ -43,10 +43,6 @@ enum Sound {
     Noise,
     /// A 0.07 tone, 12 dB above the noise.
     Voice,
-    /// A 0.014 tone, just above the threshold.
-    Soft,
-    /// 0.0001, under QUIET_RMS.
-    Hush,
 }
 
 fn frame_of(sound: Sound, f: usize, rng: &mut Rng) -> Vec<f32> {
@@ -56,8 +52,6 @@ fn frame_of(sound: Sound, f: usize, rng: &mut Rng) -> Vec<f32> {
                 Sound::Quiet => 0.001 * rng.symmetric(),
                 Sound::Noise => 0.03 * rng.symmetric(),
                 Sound::Voice => sine(0.1, 220.0, f * N + i, 48_000),
-                Sound::Soft => sine(0.02, 220.0, f * N + i, 48_000),
-                Sound::Hush => 0.000_17 * rng.symmetric(),
             };
             v * 32_768.0
         })
