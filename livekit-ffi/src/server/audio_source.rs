@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{borrow::Cow, slice};
+use std::{borrow::Cow, slice, time::Duration};
 
 use livekit::webrtc::prelude::*;
 use tokio::sync::mpsc;
 
-use super::FfiHandle;
+use super::{utils::LogLimiter, FfiHandle};
 use crate::{proto, server, FfiError, FfiHandleId, FfiResult};
 
 pub struct FfiAudioSource {
@@ -181,8 +181,11 @@ impl FfiAudioSource {
 }
 
 fn send_capture_callback(server: &'static server::FfiServer, async_id: u64, error: Option<String>) {
+    static FAILED_CALLBACKS: LogLimiter = LogLimiter::new(Duration::from_secs(10));
     if let Err(e) = server.send_event(proto::CaptureAudioFrameCallback { async_id, error }.into()) {
-        log::error!("[AUDIO_CAPTURE] Failed to send callback async_id={}: {}", async_id, e);
+        if let Some(note) = FAILED_CALLBACKS.check() {
+            log::error!("[AUDIO_CAPTURE] Failed to send callback async_id={async_id}: {e}{note}");
+        }
     }
 }
 

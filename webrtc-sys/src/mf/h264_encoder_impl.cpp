@@ -1409,8 +1409,13 @@ HRESULT MFH264EncoderImpl::MapStagingSlot(size_t* slot_out,
     const bool timed_out = std::chrono::steady_clock::now() >= deadline;
     HRESULT hr = DXGI_ERROR_WAS_STILL_DRAWING;
     if (timed_out) {
-      RTC_LOG(LS_WARNING) << "MF encoder upload copy still pending after "
-                          << kStagingWait.count() << " ms; mapping it blocking.";
+      uint64_t held_back = 0;
+      if (staging_wait_log_.Allow(&held_back)) {
+        RTC_LOG(LS_WARNING) << "MF encoder upload copy still pending after "
+                            << kStagingWait.count()
+                            << " ms; mapping it blocking."
+                            << livekit_ffi::LogRepeatNote(held_back);
+      }
       hr = d3d_->context->Map(slot.texture.Get(), 0, D3D11_MAP_WRITE, 0,
                               mapped);
     } else if (upload_fence_.Completed(slot.copy_fence_value)) {
@@ -1910,8 +1915,12 @@ MFH264EncoderImpl::PendingFrameInfo MFH264EncoderImpl::TakePendingInfo(
   // check only guards against a driver dropping frames internally.
   while (!pending_frames_.empty() &&
          pending_frames_.front().sample_time_100ns < sample_time_100ns) {
-    RTC_LOG(LS_WARNING) << "Encoder MFT dropped frame with sample time "
-                        << pending_frames_.front().sample_time_100ns;
+    uint64_t held_back = 0;
+    if (dropped_frame_log_.Allow(&held_back)) {
+      RTC_LOG(LS_WARNING) << "Encoder MFT dropped frame with sample time "
+                          << pending_frames_.front().sample_time_100ns
+                          << livekit_ffi::LogRepeatNote(held_back);
+    }
     pending_frames_.pop_front();
   }
   PendingFrameInfo info;
@@ -1919,7 +1928,11 @@ MFH264EncoderImpl::PendingFrameInfo MFH264EncoderImpl::TakePendingInfo(
     info = pending_frames_.front();
     pending_frames_.pop_front();
   } else {
-    RTC_LOG(LS_WARNING) << "Encoded output without pending frame metadata.";
+    uint64_t held_back = 0;
+    if (missing_info_log_.Allow(&held_back)) {
+      RTC_LOG(LS_WARNING) << "Encoded output without pending frame metadata."
+                          << livekit_ffi::LogRepeatNote(held_back);
+    }
     info.sample_time_100ns = sample_time_100ns;
   }
   return info;
@@ -2049,12 +2062,20 @@ void MFH264EncoderImpl::ApplyBitrate(uint32_t bitrate_bps) {
 
 void MFH264EncoderImpl::SetRates(const RateControlParameters& parameters) {
   if (!transform_ && !reopen_deadline_ms_) {
-    RTC_LOG(LS_WARNING) << "SetRates() while uninitialized.";
+    uint64_t held_back = 0;
+    if (uninitialized_rates_log_.Allow(&held_back)) {
+      RTC_LOG(LS_WARNING) << "SetRates() while uninitialized."
+                          << livekit_ffi::LogRepeatNote(held_back);
+    }
     return;
   }
 
   if (parameters.framerate_fps < 1.0) {
-    RTC_LOG(LS_WARNING) << "Invalid frame rate: " << parameters.framerate_fps;
+    uint64_t held_back = 0;
+    if (invalid_rate_log_.Allow(&held_back)) {
+      RTC_LOG(LS_WARNING) << "Invalid frame rate: " << parameters.framerate_fps
+                          << livekit_ffi::LogRepeatNote(held_back);
+    }
     return;
   }
 

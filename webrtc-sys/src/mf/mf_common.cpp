@@ -27,6 +27,7 @@
 
 #include <codecapi.h>
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -111,6 +112,30 @@ std::string HResultToString(HRESULT hr) {
   char buf[16];
   std::snprintf(buf, sizeof(buf), "0x%08lX", static_cast<unsigned long>(hr));
   return buf;
+}
+
+bool LogRepeatLimiter::Allow(uint64_t* held_back) {
+  constexpr int64_t kIntervalMs = 10'000;
+  const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch())
+                          .count();
+  int64_t last = last_ms_.load(std::memory_order_relaxed);
+  if ((last != std::numeric_limits<int64_t>::min() &&
+       now - last < kIntervalMs) ||
+      !last_ms_.compare_exchange_strong(last, now,
+                                        std::memory_order_relaxed)) {
+    held_back_.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  *held_back = held_back_.exchange(0, std::memory_order_relaxed);
+  return true;
+}
+
+std::string LogRepeatNote(uint64_t held_back) {
+  if (held_back == 0) {
+    return std::string();
+  }
+  return " (" + std::to_string(held_back) + " more since the last report)";
 }
 
 DeferredReleaseQueue& MFDeferredReleases() {

@@ -20,6 +20,7 @@ use std::{
         Arc,
     },
     task::{Context, Poll, Waker},
+    time::{Duration, Instant},
 };
 
 use cxx::{SharedPtr, UniquePtr};
@@ -49,6 +50,7 @@ impl NativeVideoStream {
         let observer = Arc::new(VideoTrackObserver {
             frame_queue: frame_queue.clone(),
             packet_trailer_handler: Mutex::new(video_track.handle.packet_trailer_handler()),
+            unconvertible_frames: LogLimiter::new(LOG_INTERVAL),
         });
         let native_sink = sys_vt::ffi::new_native_video_sink(Box::new(
             sys_vt::VideoSinkWrapper::new(observer.clone()),
@@ -99,9 +101,47 @@ impl Stream for NativeVideoStream {
     }
 }
 
+const LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Lets the first of a run of repeated log lines through, then at most one per
+/// interval, with how many were left out since the last one.
+struct LogLimiter {
+    interval: Duration,
+    state: Mutex<(Option<Instant>, u64)>,
+}
+
+impl LogLimiter {
+    fn new(interval: Duration) -> Self {
+        Self { interval, state: Mutex::new((None, 0)) }
+    }
+
+    /// `Some(note)` when this occurrence is logged: what to append to the line.
+    fn check(&self) -> Option<String> {
+        self.check_at(Instant::now())
+    }
+
+    fn check_at(&self, now: Instant) -> Option<String> {
+        let mut state = self.state.lock();
+        match state.0 {
+            Some(last) if now.saturating_duration_since(last) < self.interval => {
+                state.1 += 1;
+                None
+            }
+            _ => {
+                state.0 = Some(now);
+                Some(match std::mem::take(&mut state.1) {
+                    0 => String::new(),
+                    n => format!(" ({n} more since the last report)"),
+                })
+            }
+        }
+    }
+}
+
 struct VideoTrackObserver {
     frame_queue: Arc<VideoFrameQueue>,
     packet_trailer_handler: Mutex<Option<PacketTrailerHandler>>,
+    unconvertible_frames: LogLimiter,
 }
 
 impl VideoTrackObserver {
@@ -128,7 +168,9 @@ impl VideoTrackObserver {
 impl sys_vt::VideoSink for VideoTrackObserver {
     fn on_frame(&self, frame: UniquePtr<webrtc_sys::video_frame::ffi::VideoFrame>) {
         let Some(buffer) = new_video_frame_buffer(unsafe { frame.video_frame_buffer() }) else {
-            log::warn!("dropping a video frame whose buffer cannot be converted to I420");
+            if let Some(note) = self.unconvertible_frames.check() {
+                log::warn!("dropping a video frame whose buffer cannot be converted to I420{note}");
+            }
             return;
         };
         let packet_trailer_handler = self.packet_trailer_handler.lock().clone();
@@ -306,9 +348,12 @@ impl VideoFrameQueue {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::Ordering;
+    use std::{
+        sync::atomic::Ordering,
+        time::{Duration, Instant},
+    };
 
-    use super::VideoFrameQueue;
+    use super::{LogLimiter, VideoFrameQueue};
     use crate::video_frame::{BoxVideoFrame, I420Buffer, VideoFrame, VideoRotation};
 
     fn test_frame(timestamp_us: i64) -> BoxVideoFrame {
@@ -389,5 +434,20 @@ mod tests {
         queue.push(test_frame(2));
 
         assert_eq!(pop_timestamp(&queue), None);
+    }
+
+    #[test]
+    fn log_limiter_logs_the_first_then_one_per_interval_with_the_count() {
+        let limiter = LogLimiter::new(Duration::from_secs(10));
+        let start = Instant::now();
+        let at = |s: u64| start + Duration::from_secs(s);
+
+        assert_eq!(limiter.check_at(at(0)), Some(String::new()));
+        assert_eq!(limiter.check_at(at(1)), None);
+        assert_eq!(limiter.check_at(at(9)), None);
+        assert_eq!(limiter.check_at(at(10)), Some(" (2 more since the last report)".into()));
+        assert_eq!(limiter.check_at(at(11)), None);
+        assert_eq!(limiter.check_at(at(30)), Some(" (1 more since the last report)".into()));
+        assert_eq!(limiter.check_at(at(45)), Some(String::new()));
     }
 }

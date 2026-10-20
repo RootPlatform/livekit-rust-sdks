@@ -27,7 +27,9 @@
 #include <strmif.h>  // ICodecAPI
 #include <wrl/client.h>
 
+#include <atomic>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -136,6 +138,22 @@ bool EnsureMFStarted();
 
 // Formats an HRESULT as "0x8007000E" for log output.
 std::string HResultToString(HRESULT hr);
+
+// Lets the first of a run of repeated log lines through, then at most one
+// every 10 s, and counts the ones it holds back in between. Any thread.
+class LogRepeatLimiter {
+ public:
+  // True when this occurrence is to be logged; `*held_back` is then how many
+  // were held back since the last one.
+  bool Allow(uint64_t* held_back);
+
+ private:
+  std::atomic<int64_t> last_ms_{std::numeric_limits<int64_t>::min()};
+  std::atomic<uint64_t> held_back_{0};
+};
+
+// " (N more since the last report)", or nothing for 0.
+std::string LogRepeatNote(uint64_t held_back);
 
 // The one thread MF encoder and decoder teardown runs on, in Release() order.
 // On unpublish or unsubscribe WebRTC's worker thread, which also delivers

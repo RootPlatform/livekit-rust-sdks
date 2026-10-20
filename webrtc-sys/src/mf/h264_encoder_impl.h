@@ -231,6 +231,13 @@ class MFH264EncoderImpl : public VideoEncoder {
   std::optional<uint32_t> fault_mean_bps_;
   std::optional<uint32_t> fault_max_bps_;
   std::optional<uint32_t> fault_buffer_bits_;
+  // Lines that repeat for as long as their cause lasts (every frame or every
+  // SetRates).
+  livekit_ffi::LogRepeatLimiter staging_wait_log_;
+  livekit_ffi::LogRepeatLimiter dropped_frame_log_;
+  livekit_ffi::LogRepeatLimiter missing_info_log_;
+  livekit_ffi::LogRepeatLimiter uninitialized_rates_log_;
+  livekit_ffi::LogRepeatLimiter invalid_rate_log_;
 
   EncodedImageCallback* encoded_image_callback_ = nullptr;
   LayerConfig configuration_;
