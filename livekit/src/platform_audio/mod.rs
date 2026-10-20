@@ -120,7 +120,7 @@ pub use rootapp::{
     DenoiserState, DeviceFormatStats, EchoModel, EchoModelReason, EchoModelState, EchoModelStats,
     EffectPlay, GainEngine, GainLimit, LocalSpeaking, MixSourceLevel, MonitorError, OutputDeviceKind,
     PushToTalk, ReturnedPipeline, ReturnedPipelines, RootAudioControl, RootAudioStats,
-    SpeechDetection, ECHO_MODEL_AVAILABLE, MAX_VOICE_GAIN_DB, MAX_VOLUME,
+    SpeechDetection, ThresholdTerm, ECHO_MODEL_AVAILABLE, MAX_VOICE_GAIN_DB, MAX_VOLUME,
 };
 
 // Re-export RtcAudioSource for convenience

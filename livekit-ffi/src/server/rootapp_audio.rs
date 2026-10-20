@@ -910,6 +910,7 @@ pub fn root_audio_control(control: &proto::RootAudioControl) -> RootAudioControl
         agc2_max_gain_db: control.agc2_max_gain_db,
         agc2_max_gain_change_db_per_second: control.agc2_max_gain_change_db_per_second,
         agc2_max_output_noise_dbfs: control.agc2_max_output_noise_dbfs,
+        speech_lookahead_ms: control.speech_lookahead_ms,
     }
     .sanitized()
 }
@@ -1339,6 +1340,12 @@ impl From<RootAudioStats> for proto::RootAudioStats {
             voice_gain_speech_level_db: stats.voice_gain_speech_level_db,
             voice_gain_floor_db: stats.voice_gain_floor_db,
             voice_gain_limit: stats.voice_gain_limit.map(|limit| limit.to_wire() as i32),
+            speech_denoiser_erased_frames: stats.speech_denoiser_erased_frames,
+            speech_gate_cut_frames: stats.speech_gate_cut_frames,
+            auto_sensitivity_floor_db: stats.auto_sensitivity_floor_db,
+            open_threshold_db: stats.open_threshold_db,
+            threshold_term: stats.threshold_term.map(|term| term.to_wire() as i32),
+            speech_lookahead_ms: stats.speech_lookahead_ms,
             denoiser_rate: stats.denoiser_rate,
             denoiser_installs: stats.denoiser_installs,
             denoiser_bypassed_frames: stats.denoiser_bypassed_frames,
@@ -1651,8 +1658,10 @@ mod tests {
             agc2_max_gain_db: Some(30.0),
             agc2_max_gain_change_db_per_second: Some(6.0),
             agc2_max_output_noise_dbfs: Some(-50.0),
+            speech_lookahead_ms: Some(40.0),
         });
         assert_eq!(control.auto_sensitivity_minimum_db, Some(-54.0));
+        assert_eq!(control.speech_lookahead_ms, Some(40.0));
         assert_eq!(
             (control.gain_engine, control.agc2_max_gain_db),
             (Some(GainEngine::Agc2), Some(30.0))
@@ -1877,6 +1886,44 @@ mod tests {
         let absent: proto::RootAudioStats = RootAudioStats::default().into();
         assert_eq!(
             (absent.gain_engine, absent.agc2_builds, absent.voice_gain_limit),
+            (None, None, None)
+        );
+    }
+
+    #[test]
+    fn rootapp_audio_speech_lookahead_and_tuning_stats_convert() {
+        use livekit::ThresholdTerm;
+        let control = root_audio_control(&proto::RootAudioControl {
+            speech_lookahead_ms: Some(70.0),
+            ..Default::default()
+        });
+        assert_eq!(control.speech_lookahead_ms, Some(70.0), "clamped by native, not here");
+        assert_eq!(
+            root_audio_control(&proto::RootAudioControl::default()).speech_lookahead_ms,
+            None
+        );
+
+        let p: proto::RootAudioStats = RootAudioStats {
+            speech_denoiser_erased_frames: Some(31),
+            speech_gate_cut_frames: Some(4),
+            auto_sensitivity_floor_db: Some(f32::NAN),
+            open_threshold_db: Some(-46.0),
+            threshold_term: Some(ThresholdTerm::Manual),
+            speech_lookahead_ms: Some(40),
+            ..Default::default()
+        }
+        .into();
+        assert_eq!(
+            (p.speech_denoiser_erased_frames, p.speech_gate_cut_frames),
+            (Some(31), Some(4))
+        );
+        assert!(p.auto_sensitivity_floor_db.is_some_and(f32::is_nan));
+        assert_eq!(p.open_threshold_db, Some(-46.0));
+        assert_eq!(p.threshold_term, Some(proto::RootAudioThresholdTerm::Manual as i32));
+        assert_eq!(p.speech_lookahead_ms, Some(40));
+        let absent: proto::RootAudioStats = RootAudioStats::default().into();
+        assert_eq!(
+            (absent.speech_gate_cut_frames, absent.threshold_term, absent.speech_lookahead_ms),
             (None, None, None)
         );
     }

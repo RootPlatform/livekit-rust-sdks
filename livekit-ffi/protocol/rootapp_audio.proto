@@ -65,14 +65,14 @@ enum RootAudioSpeechDetection {
   // The speaking state (RootAudioEvent.speaking) needs confirmed speech; the audio follows the noise
   // gate.
   ROOT_AUDIO_SPEECH_DETECTION_RING = 1;
-  // As RING, and the noise gate also closes on what the detector rejects. An open it has not
-  // confirmed within 200 ms of frames under 0.3, or confirmed speech whose 300 ms ran out while the
-  // input still holds the gate, is released over 50 ms (40 ms at full gain, then a 10 ms ramp; about
-  // 260 ms of a rejected open is sent) and held shut until a frame at 0.3 or more, an input 6 dB
-  // louder than what was rejected, an onset that stays above the threshold for 30 ms, or 100 ms under
-  // the threshold. When the 300 ms run out in a pause, only the gate's release is shortened to 50 ms.
-  // The threshold is OFF's (automatic sensitivity follows the noise gate alone), so GATE never sends
-  // more than OFF.
+  // As RING, and only confirmed speech goes out (hw.17): the noise gate may open only while speech
+  // is confirmed (3 frames at 0.5 or more; it continues while frames stay at 0.3 or more and ends
+  // 300 ms after the last). When confirmed speech ends with the gate open it is released over 50 ms
+  // and opens again only on newly confirmed speech. The gate decides on each frame and applies the
+  // decision to the audio RootAudioControl.speech_lookahead_ms older (hw.18; 40 ms by default), so
+  // the start of a word the detector confirms within that time goes out with it; that much latency
+  // is added. The threshold is OFF's (automatic sensitivity follows the noise gate alone), so GATE
+  // never applies more gain than OFF would at the same moment.
   ROOT_AUDIO_SPEECH_DETECTION_GATE = 2;
 }
 
@@ -123,6 +123,19 @@ enum RootAudioGainLimit {
   ROOT_AUDIO_GAIN_LIMIT_NOISE = 3;
   // The room before the denoiser stays under -50 dBFS (the chain's voice gain only).
   ROOT_AUDIO_GAIN_LIMIT_ROOM = 4;
+}
+
+// What set the noise gate's open threshold on the last frame (RootAudioStats.threshold_term).
+enum RootAudioThresholdTerm {
+  // No frame judged yet.
+  ROOT_AUDIO_THRESHOLD_TERM_NONE = 0;
+  // Automatic sensitivity: the noise floor plus its 8 dB margin.
+  ROOT_AUDIO_THRESHOLD_TERM_FLOOR = 1;
+  // Automatic sensitivity: its minimum (auto_sensitivity_minimum_db, lowered by the voice gain above
+  // 11 dB).
+  ROOT_AUDIO_THRESHOLD_TERM_MINIMUM = 2;
+  // The manual threshold (gate_threshold, compared after the voice gain).
+  ROOT_AUDIO_THRESHOLD_TERM_MANUAL = 3;
 }
 
 // What the APM runs (RootAudioStats.echo_model_state).
@@ -264,6 +277,12 @@ message RootAudioControl {
   optional float agc2_max_gain_change_db_per_second = 26;
   // The noise it may lift to, dBFS: -80..-30, default -50.
   optional float agc2_max_output_noise_dbfs = 27;
+  // The speech gate's look-ahead (speech_detection GATE, push-to-talk not in use), ms: clamped to
+  // 0..60 and rounded to 10 ms frames, a non-finite value is the default; 40 until set, and again when
+  // the first platform audio handle opens and when the last one closes. 0 is hw.17's gate. Libraries
+  // that predate it ignore the field and have none. RootAudioStats.speech_lookahead_ms is the value
+  // the last frame got.
+  optional float speech_lookahead_ms = 28;
 }
 message RootAudioSetControlRequest {
   required uint64 platform_audio_handle = 1;
@@ -658,6 +677,25 @@ message RootAudioStats {
   optional float voice_gain_speech_level_db = 146;
   optional float voice_gain_floor_db = 147;
   optional RootAudioGainLimit voice_gain_limit = 148;
+
+  // DSP chain, for tuning per microphone (absent without it and from libraries that predate them).
+  // Frames of steady confirmed speech (100 ms or more into a run of frames the detector rates 0.3 or
+  // more, with speech confirmed) while the transmit gate is open, outside the startup hold, that the
+  // Effects SDK erased (its aligned output 15 dB or more under every pre-denoise frame of the last
+  // 100 ms, which hold the frame it came from) and that the noise gate cut (it was shut for the whole
+  // frame on audio above -66 dBFS that the SDK had not erased; push-to-talk not in use). Cumulative
+  // for the engine's life. Both count only what they can tell for sure.
+  optional uint64 speech_denoiser_erased_frames = 149;
+  optional uint64 speech_gate_cut_frames = 150;
+  // The last frame's threshold, in dB of the denoised voice before the voice gain: automatic
+  // sensitivity's noise floor (NaN while it is off), the noise gate's open threshold (automatic
+  // sensitivity's, or the manual threshold less the gain; at least -140), and what set it.
+  optional float auto_sensitivity_floor_db = 151;
+  optional float open_threshold_db = 152;
+  optional RootAudioThresholdTerm threshold_term = 153;
+  // The speech gate's look-ahead the last frame got, ms (0 without one: detection not GATE, no
+  // probability, push-to-talk): the capture latency it adds.
+  optional uint32 speech_lookahead_ms = 154;
 }
 // One playout mixer source (a remote audio stream): its audio as it reached the mixer, decoded and
 // before its gain (tile volume, master volume, deafen; a muted frame counts as silence), as a sum of

@@ -215,6 +215,40 @@ impl GainLimit {
     }
 }
 
+/// What set the noise gate's open threshold on the last frame (DSP chain).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThresholdTerm {
+    /// No frame judged yet.
+    None,
+    /// Auto sensitivity: the noise floor plus its margin.
+    Floor,
+    /// Auto sensitivity: its minimum (lowered by the gain above its cap).
+    Minimum,
+    /// The manual threshold.
+    Manual,
+}
+
+impl ThresholdTerm {
+    /// The wire value (0..3). Unknown values are none.
+    pub fn from_wire(value: u32) -> Self {
+        match value {
+            1 => Self::Floor,
+            2 => Self::Minimum,
+            3 => Self::Manual,
+            _ => Self::None,
+        }
+    }
+
+    pub fn to_wire(self) -> u32 {
+        match self {
+            Self::None => 0,
+            Self::Floor => 1,
+            Self::Minimum => 2,
+            Self::Manual => 3,
+        }
+    }
+}
+
 /// Whether this build's native engine has the echo model (desktop, where the
 /// factory builds its APM). Without it a control that sets
 /// [`RootAudioControl::echo_model`] is answered as not supported and
@@ -429,9 +463,10 @@ pub struct EchoModelStats {
 /// start), `auto_sensitivity_minimum_db` (the chain's -54 dBFS until set,
 /// and after every session start), the voice gain's tunables (`voice_gain_*`,
 /// the chain's defaults until set and after every session start), the
-/// `gain_engine` (the chain's until set and after every session start) and
+/// `gain_engine` (the chain's until set and after every session start),
 /// AGC2's settings (`agc2_*`, the defaults until set and after every session
-/// start). Builds without the chain only store them.
+/// start) and `speech_lookahead_ms` (the chain's 40 ms until set and after
+/// every session start). Builds without the chain only store them.
 /// `echo_model` is off until set and after every session start; without
 /// [`ECHO_MODEL_AVAILABLE`] it is not supported.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -480,6 +515,10 @@ pub struct RootAudioControl {
     pub agc2_max_gain_db: Option<f32>,
     pub agc2_max_gain_change_db_per_second: Option<f32>,
     pub agc2_max_output_noise_dbfs: Option<f32>,
+    /// The speech gate's look-ahead (GATE detection), ms: the chain clamps it
+    /// to 0..60, rounds it to 10 ms frames and takes a non-finite one as its
+    /// default (40).
+    pub speech_lookahead_ms: Option<f32>,
 }
 
 impl RootAudioControl {
@@ -570,6 +609,8 @@ impl RootAudioControl {
                 .unwrap_or_default(),
             has_agc2_max_output_noise_dbfs: c.agc2_max_output_noise_dbfs.is_some(),
             agc2_max_output_noise_dbfs: c.agc2_max_output_noise_dbfs.unwrap_or_default(),
+            has_speech_lookahead_ms: c.speech_lookahead_ms.is_some(),
+            speech_lookahead_ms: c.speech_lookahead_ms.unwrap_or_default(),
         }
     }
 }
@@ -887,6 +928,20 @@ pub struct RootAudioStats {
     pub voice_gain_speech_level_db: Option<f32>,
     pub voice_gain_floor_db: Option<f32>,
     pub voice_gain_limit: Option<GainLimit>,
+    /// Frames of steady confirmed speech (100 ms into speech the detector
+    /// rates 0.3 or more) the denoiser erased (15 dB or more under every
+    /// pre-denoise frame of the last 100 ms) and the level gate cut (shut on
+    /// it, above -66 dBFS), with the transmit gate open.
+    pub speech_denoiser_erased_frames: Option<u64>,
+    pub speech_gate_cut_frames: Option<u64>,
+    /// The last frame's threshold before the gain: auto sensitivity's floor
+    /// (NaN while it is off), the open threshold, and what set it.
+    pub auto_sensitivity_floor_db: Option<f32>,
+    pub open_threshold_db: Option<f32>,
+    pub threshold_term: Option<ThresholdTerm>,
+    /// The speech gate's look-ahead the last frame got, ms (0: none; the
+    /// latency it adds).
+    pub speech_lookahead_ms: Option<u32>,
 
     // Denoiser details (Effects SDK slot); the histogram is empty without it.
     pub denoiser_rate: Option<u32>,
@@ -1030,6 +1085,12 @@ impl Default for RootAudioStats {
             voice_gain_speech_level_db: None,
             voice_gain_floor_db: None,
             voice_gain_limit: None,
+            speech_denoiser_erased_frames: None,
+            speech_gate_cut_frames: None,
+            auto_sensitivity_floor_db: None,
+            open_threshold_db: None,
+            threshold_term: None,
+            speech_lookahead_ms: None,
             denoiser_rate: None,
             denoiser_installs: None,
             denoiser_bypassed_frames: None,
@@ -1152,6 +1213,12 @@ impl RootAudioStats {
             voice_gain_speech_level_db: dsp.then_some(native.voice_gain_speech_level_db),
             voice_gain_floor_db: dsp.then_some(native.voice_gain_floor_db),
             voice_gain_limit: dsp.then_some(GainLimit::from_wire(native.voice_gain_limit)),
+            speech_denoiser_erased_frames: dsp.then_some(native.speech_denoiser_erased_frames),
+            speech_gate_cut_frames: dsp.then_some(native.speech_gate_cut_frames),
+            auto_sensitivity_floor_db: dsp.then_some(native.auto_sensitivity_floor_db),
+            open_threshold_db: dsp.then_some(native.open_threshold_db),
+            threshold_term: dsp.then_some(ThresholdTerm::from_wire(native.threshold_term)),
+            speech_lookahead_ms: dsp.then_some(native.speech_lookahead_ms),
             denoiser_rate: denoiser.then_some(native.denoiser_rate),
             denoiser_installs: denoiser.then_some(native.denoiser_installs),
             denoiser_bypassed_frames: denoiser.then_some(native.denoiser_bypassed_frames),
@@ -1676,6 +1743,56 @@ mod tests {
         let without = RootAudioStats::from_native(applied(false));
         assert_eq!(
             (without.gain_engine, without.agc2_builds, without.voice_gain_limit),
+            (None, None, None)
+        );
+    }
+
+    #[test]
+    fn the_speech_lookahead_reaches_native_and_the_tuning_stats_come_back_with_the_chain() {
+        let native =
+            RootAudioControl { speech_lookahead_ms: Some(30.0), ..Default::default() }.to_native();
+        assert!(native.has_speech_lookahead_ms && native.speech_lookahead_ms == 30.0);
+        let nan = RootAudioControl { speech_lookahead_ms: Some(f32::NAN), ..Default::default() };
+        assert!(
+            nan.to_native().has_speech_lookahead_ms && nan.to_native().speech_lookahead_ms.is_nan()
+        );
+        assert!(!RootAudioControl::default().to_native().has_speech_lookahead_ms);
+        for term in [
+            ThresholdTerm::None,
+            ThresholdTerm::Floor,
+            ThresholdTerm::Minimum,
+            ThresholdTerm::Manual,
+        ] {
+            assert_eq!(ThresholdTerm::from_wire(term.to_wire()), term);
+        }
+        assert_eq!(ThresholdTerm::from_wire(9), ThresholdTerm::None);
+
+        let applied = |dsp_available: bool| NativeAudioStats {
+            dsp_available,
+            speech_denoiser_erased_frames: 12,
+            speech_gate_cut_frames: 7,
+            auto_sensitivity_floor_db: -82.0,
+            open_threshold_db: -63.0,
+            threshold_term: 2,
+            speech_lookahead_ms: 40,
+            ..Default::default()
+        };
+        let stats = RootAudioStats::from_native(applied(true));
+        assert_eq!(
+            (stats.speech_denoiser_erased_frames, stats.speech_gate_cut_frames),
+            (Some(12), Some(7))
+        );
+        assert_eq!(
+            (stats.auto_sensitivity_floor_db, stats.open_threshold_db),
+            (Some(-82.0), Some(-63.0))
+        );
+        assert_eq!(
+            (stats.threshold_term, stats.speech_lookahead_ms),
+            (Some(ThresholdTerm::Minimum), Some(40))
+        );
+        let without = RootAudioStats::from_native(applied(false));
+        assert_eq!(
+            (without.speech_gate_cut_frames, without.threshold_term, without.speech_lookahead_ms),
             (None, None, None)
         );
     }

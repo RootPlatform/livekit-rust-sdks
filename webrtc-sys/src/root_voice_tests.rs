@@ -497,6 +497,55 @@ fn root_voice_a_stalled_denoiser_gets_webrtc_ns_at_once_through_the_worker() {
     assert_eq!(h.fake_counts(pipeline).process_calls, calls, "never called again");
 }
 
+/// A hardware mute (the device sends int16 zeros) for longer than the stall
+/// count and the fallback's grace: the decorator flags the raw frames, the
+/// pipeline never sees them, nothing stalls, bypasses or falls back to WebRTC
+/// NS, and speech after it is denoised from its first frame.
+#[test]
+fn root_voice_a_hardware_mute_never_reaches_the_denoiser_and_nothing_falls_back() {
+    if !root_denoiser_supported() {
+        return;
+    }
+    let h = started();
+    let c = h.controller();
+    control(
+        &h,
+        RootAudioControlUpdate {
+            has_auto_gain: true,
+            auto_gain: false,
+            has_denoiser_wanted: true,
+            denoiser_wanted: true,
+            ..Default::default()
+        },
+    );
+    let pipeline = install(&h, 48_000, 0.5);
+    let mut signal = Signal::new(48_000);
+    speak_until_speaking(&h, &mut signal);
+    quiet_until_released(&h, &mut signal);
+    let (fed, before) = (h.fake_counts(pipeline), c.root_audio_stats());
+    let zeros = vec![0i16; 480];
+    let muted = Instant::now();
+    let mut frames = 0;
+    while frames < 150 || muted.elapsed() < Duration::from_millis(1500) {
+        assert!(silent(&h.capture(48_000, 1, &zeros)));
+        frames += 1;
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let counts = h.fake_counts(pipeline);
+    assert_eq!(counts.process_calls, fed.process_calls, "the pipeline never saw the mute");
+    assert_eq!(counts.silent_calls, fed.silent_calls);
+    let stats = c.root_audio_stats();
+    assert!(stats.denoiser_installed && stats.denoiser_bypass_reason == 0, "{stats:?}");
+    assert!(!stats.webrtc_ns_fallback && !c.root_denoiser_state().webrtc_ns_fallback);
+    assert_eq!(stats.ns_gap_frames, before.ns_gap_frames, "silence needs no noise suppression");
+    assert_eq!(stats.denoiser_empty_outputs, before.denoiser_empty_outputs);
+
+    let rose = speak_until_speaking(&h, &mut signal);
+    assert!(rose < 5, "speech after the mute rings at once: frame {rose}");
+    assert_eq!(h.fake_counts(pipeline).process_calls, fed.process_calls + rose as u64 + 1);
+    assert_eq!(h.fake_counts(pipeline).silent_calls, fed.silent_calls);
+}
+
 #[test]
 fn root_voice_an_install_asked_while_speaking_lands_at_the_next_pause() {
     if !root_denoiser_supported() {

@@ -997,6 +997,27 @@ fn adm_proxy_controller_stores_the_auto_sensitivity_minimum_until_a_reset_and_re
 }
 
 #[test]
+fn adm_proxy_controller_stores_the_speech_lookahead_until_a_reset() {
+    let h = harness(&["{spk}"], &["{mic}"]);
+    assert!(h.control_state().speech_lookahead_ms.is_nan(), "none until the host sets one");
+    assert_eq!(h.stats().speech_lookahead_ms, 0, "no frame has run");
+    assert!(h.apply_control(&RootAudioControlUpdate {
+        has_speech_lookahead_ms: true,
+        speech_lookahead_ms: 30.0,
+        ..Default::default()
+    }));
+    assert_eq!(h.control_state().speech_lookahead_ms, 30.0, "stored as set; the chain clamps it");
+    h.apply_control(&RootAudioControlUpdate {
+        has_mic_muted: true,
+        mic_muted: true,
+        ..Default::default()
+    });
+    assert_eq!(h.control_state().speech_lookahead_ms, 30.0, "an unset field keeps it");
+    h.reset_root_audio(false);
+    assert!(h.control_state().speech_lookahead_ms.is_nan());
+}
+
+#[test]
 fn adm_proxy_controller_stores_the_voice_gain_tunables_until_a_reset_and_reports_them_clamped() {
     let h = harness(&["{spk}"], &["{mic}"]);
     let state = h.control_state();

@@ -1046,6 +1046,7 @@ RootControlState AdmProxyHarness::control_state() const {
       capture_->agc2_max_gain_change_db_per_second.load();
   state.agc2_max_output_noise_dbfs =
       capture_->agc2_max_output_noise_dbfs.load();
+  state.speech_lookahead_ms = capture_->speech_lookahead_ms.load();
   state.stream_epoch = capture_->stream_epoch.load();
   state.dsp_reset_seq = capture_->dsp_reset_seq.load();
   return state;
@@ -1364,6 +1365,7 @@ RootVoiceFakeCounts RootVoiceHarness::fake_counts(uint64_t pipeline) const {
   RootVoiceFakeCounts counts{};
   if (const RootFakeFxPipeline* fake = Fake(pipeline)) {
     counts.process_calls = fake->process_calls();
+    counts.silent_calls = fake->silent_calls();
     counts.flush_calls = fake->flush_calls();
     counts.power_sets = fake->power_sets();
     counts.last_power = fake->last_power();

@@ -197,6 +197,17 @@ pub mod ffi {
         pub voice_gain_speech_level_db: f32,
         pub voice_gain_floor_db: f32,
         pub voice_gain_limit: u32,
+        /// Steady confirmed speech the denoiser erased and the level gate cut
+        /// (frames); the last frame's threshold before the gain: auto
+        /// sensitivity's floor (NaN while off), the open threshold, and what
+        /// set it (0 none yet, 1 floor, 2 minimum, 3 manual); and the speech
+        /// gate's look-ahead it got (ms, 0 none).
+        pub speech_denoiser_erased_frames: u64,
+        pub speech_gate_cut_frames: u64,
+        pub auto_sensitivity_floor_db: f32,
+        pub open_threshold_db: f32,
+        pub threshold_term: u32,
+        pub speech_lookahead_ms: u32,
         pub denoiser_installed: bool,
         pub denoiser_frames: u64,
         pub denoiser_misses: u64,
@@ -337,6 +348,11 @@ pub mod ffi {
         pub agc2_max_gain_change_db_per_second: f32,
         pub has_agc2_max_output_noise_dbfs: bool,
         pub agc2_max_output_noise_dbfs: f32,
+        /// The speech gate's look-ahead, ms; the chain clamps it to 0..60,
+        /// rounds it to 10 ms frames and takes a non-finite value as its
+        /// default (40).
+        pub has_speech_lookahead_ms: bool,
+        pub speech_lookahead_ms: f32,
     }
 
     /// The stored controls (tests).
@@ -370,6 +386,8 @@ pub mod ffi {
         pub agc2_max_gain_db: f32,
         pub agc2_max_gain_change_db_per_second: f32,
         pub agc2_max_output_noise_dbfs: f32,
+        /// As stored (NaN: none, the chain's default).
+        pub speech_lookahead_ms: f32,
         pub stream_epoch: u64,
         pub dsp_reset_seq: u64,
     }
@@ -426,6 +444,8 @@ pub mod ffi {
     #[derive(Debug, Clone, Copy, Default, PartialEq)]
     pub struct RootVoiceFakeCounts {
         pub process_calls: u64,
+        /// Process calls whose input was all zeros.
+        pub silent_calls: u64,
         pub flush_calls: u64,
         pub power_sets: u64,
         pub last_power: f32,

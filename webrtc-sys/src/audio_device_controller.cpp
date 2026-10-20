@@ -439,6 +439,12 @@ RootAudioNativeStats AudioDeviceController::root_audio_stats() const {
     stats.voice_gain_speech_level_db = dsp.voice_gain_speech_level_db;
     stats.voice_gain_floor_db = dsp.voice_gain_floor_db;
     stats.voice_gain_limit = dsp.voice_gain_limit;
+    stats.speech_denoiser_erased_frames = dsp.speech_denoiser_erased_frames;
+    stats.speech_gate_cut_frames = dsp.speech_gate_cut_frames;
+    stats.auto_sensitivity_floor_db = dsp.auto_sensitivity_floor_db;
+    stats.open_threshold_db = dsp.open_threshold_db;
+    stats.threshold_term = dsp.threshold_term;
+    stats.speech_lookahead_ms = dsp.speech_lookahead_applied_ms;
   }
   if (denoiser_) {
     const RootDenoiserSlotStats slot = capture_->denoiser_slot->ReadStats(true);
@@ -517,7 +523,8 @@ bool AudioDeviceController::set_root_audio_control(
       control.has_gain_engine || control.has_agc2_headroom_db ||
       control.has_agc2_max_gain_db ||
       control.has_agc2_max_gain_change_db_per_second ||
-      control.has_agc2_max_output_noise_dbfs;
+      control.has_agc2_max_output_noise_dbfs ||
+      control.has_speech_lookahead_ms;
   const bool mixer_fields = control.has_master_volume || control.has_deafened;
   const bool apm_fields =
       control.has_echo_cancellation || control.has_noise_suppression;
@@ -597,6 +604,10 @@ bool AudioDeviceController::set_root_audio_control(
     if (control.has_auto_sensitivity_minimum_db) {
       capture_->auto_sensitivity_minimum_db.store(
           control.auto_sensitivity_minimum_db, std::memory_order_relaxed);
+    }
+    if (control.has_speech_lookahead_ms) {
+      capture_->speech_lookahead_ms.store(control.speech_lookahead_ms,
+                                          std::memory_order_relaxed);
     }
     if (control.has_voice_gain_max_db) {
       capture_->voice_gain_max_db.store(
