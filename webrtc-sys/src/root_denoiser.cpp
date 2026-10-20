@@ -920,6 +920,10 @@ uint64_t RootFakeFxPipeline::process_calls() const {
   return process_calls_.load(std::memory_order_relaxed);
 }
 
+uint64_t RootFakeFxPipeline::silent_calls() const {
+  return silent_calls_.load(std::memory_order_relaxed);
+}
+
 uint64_t RootFakeFxPipeline::flush_calls() const {
   return flush_calls_.load(std::memory_order_relaxed);
 }
@@ -1016,6 +1020,10 @@ uint32_t RootFakeFxPipeline::Process(void* object,
   self->process_calls_.fetch_add(1, std::memory_order_relaxed);
   self->Spin();
   const auto* input = static_cast<const float*>(in);
+  if (input != nullptr && std::all_of(input, input + in_frames,
+                                      [](float v) { return v == 0.0f; })) {
+    self->silent_calls_.fetch_add(1, std::memory_order_relaxed);
+  }
   for (uint32_t i = 0; i < in_frames && self->size_ < kCapacity; ++i) {
     const float sample = input ? input[i] : 0.0f;
     self->fifo_[(self->head_ + self->size_) % kCapacity] =

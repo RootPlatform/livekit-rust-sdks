@@ -86,7 +86,14 @@ struct RootFxNotificationHandler {
 // convention holds.
 constexpr bool kRootDenoiserSupported = sizeof(void*) == 8;
 
-enum class RootDenoiseKind : uint8_t { kNotInUse = 0, kMissed = 1, kRan = 2 };
+// kSkipped: the capture processor did not hand the frame to the slot (its raw
+// capture was digital silence); the slot never returns it.
+enum class RootDenoiseKind : uint8_t {
+  kNotInUse = 0,
+  kMissed = 1,
+  kRan = 2,
+  kSkipped = 3,
+};
 enum class RootDenoiserBypass : uint32_t {
   kNone = 0,
   kRateMismatch = 1,
@@ -469,6 +476,8 @@ class RootFakeFxPipeline {
   void Poison();
 
   uint64_t process_calls() const;
+  // Process calls whose input was all zeros.
+  uint64_t silent_calls() const;
   uint64_t flush_calls() const;
   uint64_t power_sets() const;
   float last_power() const;
@@ -512,6 +521,7 @@ class RootFakeFxPipeline {
   std::atomic<bool> empty_{false};
   std::atomic<bool> poisoned_{false};
   std::atomic<uint64_t> process_calls_{0};
+  std::atomic<uint64_t> silent_calls_{0};
   std::atomic<uint64_t> flush_calls_{0};
   std::atomic<uint64_t> power_sets_{0};
   std::atomic<float> power_{1.0f};

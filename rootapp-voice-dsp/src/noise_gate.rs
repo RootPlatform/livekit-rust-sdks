@@ -128,11 +128,36 @@ impl NoiseGate {
     /// `process_gated`.
     pub fn process_controlled(&mut self, samples: &mut [f32], apply: bool, control: GateControl) {
         for block in samples.chunks_mut(self.block_samples) {
-            self.process_block(block, apply, control);
+            let multiplier = self.advance(block, control);
+            if apply {
+                apply_multiplier(block, multiplier);
+            }
         }
     }
 
-    fn process_block(&mut self, block: &mut [f32], apply: bool, control: GateControl) {
+    /// `process_controlled` with the level measured on `measure` and the gain applied to the same
+    /// block of `apply` (a look-ahead: `apply` holds older audio). The state advances exactly as
+    /// `process_controlled(measure, ..)` would; blocks past the shorter slice are not processed.
+    pub fn process_split(
+        &mut self,
+        measure: &[f32],
+        apply: &mut [f32],
+        gain: bool,
+        control: GateControl,
+    ) {
+        let block_samples = self.block_samples;
+        for (measured, applied) in
+            measure.chunks(block_samples).zip(apply.chunks_mut(block_samples))
+        {
+            let multiplier = self.advance(measured, control);
+            if gain {
+                apply_multiplier(applied, multiplier);
+            }
+        }
+    }
+
+    /// One block of the state on `block`'s level; returns the gain for the block.
+    fn advance(&mut self, block: &[f32], control: GateControl) -> f32 {
         let block_seconds = block.len() as f64 / f64::from(self.sample_rate);
         let rms = match self.push_to_talk {
             None => compute_rms(block),
@@ -160,15 +185,6 @@ impl NoiseGate {
         }
 
         let multiplier = (self.envelope / FULL_ON_ENVELOPE).min(1.0);
-        if apply {
-            if multiplier <= 0.0 {
-                block.fill(0.0);
-            } else if multiplier < 1.0 {
-                for s in block.iter_mut() {
-                    *s *= multiplier;
-                }
-            }
-        }
 
         if self.envelope > 0.0 {
             self.is_speaking = true;
@@ -180,6 +196,17 @@ impl NoiseGate {
         }
 
         self.position = self.position.saturating_add(block.len() as i64);
+        multiplier
+    }
+}
+
+fn apply_multiplier(block: &mut [f32], multiplier: f32) {
+    if multiplier <= 0.0 {
+        block.fill(0.0);
+    } else if multiplier < 1.0 {
+        for s in block.iter_mut() {
+            *s *= multiplier;
+        }
     }
 }
 

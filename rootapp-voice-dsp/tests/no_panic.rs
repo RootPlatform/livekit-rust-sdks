@@ -151,6 +151,7 @@ fn any_shape_settings_input_and_denoiser_output_leaves_finite_full_scale_audio()
                             voice_gain: tuning(step),
                             gain_engine: GainEngine::from_wire((step % 3) as u32),
                             agc2: agc2(step),
+                            speech_lookahead_ms: FLOATS[(step / 2) % FLOATS.len()] * 40.0,
                         };
                         let commands = DspCommands {
                             reset: step % 29 == 0,
@@ -167,9 +168,10 @@ fn any_shape_settings_input_and_denoiser_output_leaves_finite_full_scale_audio()
                         } else {
                             fill(&mut denoised[..m], 7, &mut rng);
                         }
-                        let output = match step % 4 {
+                        let output = match step % 5 {
                             0 => DenoiserOutput::NotInUse,
                             1 => DenoiserOutput::Missed,
+                            2 => DenoiserOutput::Skipped,
                             _ => DenoiserOutput::Ran {
                                 samples: &denoised[..m],
                                 restart: step % 9 == 0,
@@ -230,6 +232,7 @@ fn abrupt_changes_and_commands_in_every_state_never_panic() {
             voice_gain: tuning((v >> 48) as usize),
             gain_engine: GainEngine::from_wire(((v >> 18) % 2) as u32),
             agc2: agc2((v >> 12) as usize),
+            speech_lookahead_ms: [f32::NAN, 40.0, 0.0, 1e30, -5.0, 60.0][((v >> 54) % 6) as usize],
         };
         let commands = DspCommands {
             reset: (v >> 38) % 40 == 0,
@@ -242,9 +245,10 @@ fn abrupt_changes_and_commands_in_every_state_never_panic() {
             *s = if step % 500 < 250 { 32767.0 * rng.symmetric() } else { 3.0e5 * rng.symmetric() };
         }
         let m = ((v >> 40) % (8 * 480 + 501)) as usize;
-        let output = match (v >> 42) % 3 {
+        let output = match (v >> 42) % 4 {
             0 => DenoiserOutput::NotInUse,
             1 => DenoiserOutput::Missed,
+            2 => DenoiserOutput::Skipped,
             _ => DenoiserOutput::Ran { samples: &denoised[..m], restart: (v >> 46) % 7 == 0 },
         };
         let context = format!("step {step} rate {rate} len {len}");

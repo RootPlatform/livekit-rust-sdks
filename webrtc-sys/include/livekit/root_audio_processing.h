@@ -201,6 +201,21 @@ struct RootDspStatsSnapshot {
   RootAgc2Tuning agc2_applied = RootAgc2TuningUnset();
   uint32_t agc2_rate = 0;
   uint64_t agc2_builds = 0;
+  // The stored look-ahead setting (NaN: none, the chain's default) and the
+  // one the last frame got (0: none).
+  float speech_lookahead_ms = std::numeric_limits<float>::quiet_NaN();
+  uint32_t speech_lookahead_applied_ms = 0;
+  // Steady confirmed speech the denoiser erased and the level gate cut
+  // (RootDspOutputs), and the last frame's threshold before the gain:
+  // auto sensitivity's floor (NaN while off), the open threshold, and what
+  // set it (rootapp_voice_dsp::ThresholdTerm).
+  uint64_t speech_denoiser_erased_frames = 0;
+  uint64_t speech_gate_cut_frames = 0;
+  float auto_sensitivity_floor_db = std::numeric_limits<float>::quiet_NaN();
+  float open_threshold_db = std::numeric_limits<float>::quiet_NaN();
+  uint32_t threshold_term = 0;
+  // Frames the processor did not hand to the denoiser (digital silence).
+  uint64_t denoiser_skipped_frames = 0;
 };
 
 struct RootSpeakingSnapshot {
@@ -258,6 +273,10 @@ struct RootCaptureState {
   std::atomic<float> agc2_max_gain_change_db_per_second{
       std::numeric_limits<float>::quiet_NaN()};
   std::atomic<float> agc2_max_output_noise_dbfs{
+      std::numeric_limits<float>::quiet_NaN()};
+  // The speech gate's look-ahead as the host set it, ms; the chain clamps and
+  // rounds it, and NaN (none) is its default.
+  std::atomic<float> speech_lookahead_ms{
       std::numeric_limits<float>::quiet_NaN()};
   // Stored by the APM decorator before each capture frame it forwards: that
   // frame's raw input was digital silence (kRootCaptureSilencePeak). The
@@ -356,6 +375,18 @@ struct RootCaptureState {
       std::numeric_limits<float>::quiet_NaN()};
   std::atomic<bool> speech_detector_running{false};
   std::atomic<bool> speech{false};
+  // The speech gate's look-ahead on the last frame, ms (0: none); steady
+  // confirmed speech the denoiser erased or the level gate cut; the last
+  // frame's threshold before the gain (auto sensitivity's floor, NaN while
+  // off; the open threshold; ThresholdTerm); frames the denoiser was not fed.
+  std::atomic<uint32_t> speech_lookahead_applied_ms{0};
+  std::atomic<uint64_t> speech_denoiser_erased_frames{0};
+  std::atomic<uint64_t> speech_gate_cut_frames{0};
+  std::atomic<float> auto_sensitivity_floor_db{
+      std::numeric_limits<float>::quiet_NaN()};
+  std::atomic<float> open_threshold_db{std::numeric_limits<float>::quiet_NaN()};
+  std::atomic<uint32_t> threshold_term{0};
+  std::atomic<uint64_t> denoiser_skipped_frames{0};
   // SetGate stamps (steady clock, µs) the gate going from closed to open; the
   // first frame processed open turns it into gate_open_delay_us.
   std::atomic<int64_t> gate_open_stamp_us{0};
@@ -421,13 +452,15 @@ RootCaptureFormatSnapshot ReadCaptureFormat(const RootCaptureState& state);
 // count. It runs the voice chain (rootapp-voice-dsp) on channel 0 around the
 // denoiser slot and copies the result to the other channels:
 //   sanitise, voice gain level -> speech detector (while speech_detection is
-//   set; 16, 32 and 48 kHz) -> denoiser slot (Effects SDK) -> aligner ->
-//   voice gain: AGC2 (gain_engine kAgc2, RootAgc2) or the chain's (its level
-//   from the frames the detector rates as speech, with the host's tunables;
-//   also the frames AGC2 has no instance at their rate for yet) -> auto
-//   sensitivity (learning nothing from a frame whose raw input the decorator
-//   found digitally silent) -> startup hold -> noise gate (with the speech
-//   gate) -> input volume (20 ms ramp) -> mute/PTT gate (5 ms fade each way).
+//   set; 16, 32 and 48 kHz) -> denoiser slot (Effects SDK; a frame whose raw
+//   input the decorator found digitally silent is not handed to it and is
+//   silence) -> aligner -> voice gain: AGC2 (gain_engine kAgc2, RootAgc2) or
+//   the chain's (its level from the frames the detector rates as speech, with
+//   the host's tunables; also the frames AGC2 has no instance at their rate
+//   for yet) -> auto sensitivity (learning nothing from a digitally silent
+//   frame) -> startup hold -> noise gate (with the speech gate; in GATE mode
+//   it decides on each frame and gates the frame speech_lookahead_ms older)
+//   -> input volume (20 ms ramp) -> mute/PTT gate (5 ms fade each way).
 // Real-time code: no locks, allocation, logging or APM calls (AGC2's own APM,
 // built and initialized off the audio thread, is the one this thread uses
 // alone). Initialize runs under both APM locks on up to four threads and only
@@ -972,6 +1005,7 @@ class RootProcessorHarness {
   void set_voice_gain_tuning(RootVoiceGainTuning tuning) const;
   // As the APM decorator does before the next frame.
   void set_capture_silent(bool silent) const;
+  void set_speech_lookahead_ms(float ms) const;
   void set_webrtc_ns_applied(bool applied) const;
   void set_ns_fallback_decided(bool on) const;
   void bump_stream_epoch() const;

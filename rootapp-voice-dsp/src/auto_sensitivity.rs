@@ -103,6 +103,13 @@ impl AutoSensitivity {
         (self.floor_db + o.open_margin_db).max(o.open_minimum_db - excess)
     }
 
+    /// The floor plus its margin, not the minimum, sets open_db_at(gain_db).
+    pub fn floor_sets_open_at(&self, gain_db: f64) -> bool {
+        let o = &self.options;
+        let excess = (gain_db - o.voice_gain_cap_db).max(0.0);
+        self.floor_db + o.open_margin_db >= o.open_minimum_db - excess
+    }
+
     pub fn close_db_at(&self, gain_db: f64) -> f64 {
         self.open_db_at(gain_db) - self.options.hysteresis_db
     }

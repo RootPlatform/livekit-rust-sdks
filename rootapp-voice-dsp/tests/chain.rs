@@ -11,7 +11,7 @@ mod support;
 use rootapp_voice_dsp::auto_sensitivity::AutoSensitivityOptions;
 use rootapp_voice_dsp::{
     Agc2Tuning, DenoiserOutput, DspChain, DspCommands, DspOutputs, DspSettings, GainEngine,
-    GainLimit, PreDenoise, PushToTalk, SpeechDetection, AUTO_MIN_OPEN_BLOCKS,
+    GainLimit, PreDenoise, PushToTalk, SpeechDetection, ThresholdTerm, AUTO_MIN_OPEN_BLOCKS,
     DENOISER_STALL_FRAMES, MAX_DENOISER_WAIT_FRAMES, STARTUP_HOLD_FRAMES,
 };
 use support::{in_range, near, silent, sine, Rng};
@@ -1164,4 +1164,204 @@ fn post_denoise_is_align_then_the_chain_gain() {
     let mut frame = vec![100.0f32; 480];
     split.chain.post_gain(&mut frame, 0.5, 12.0, &split.settings, &mut split.out);
     assert!(split.out.unsupported, "post_gain without post_denoise_align");
+}
+
+/// A frame of `value` everywhere.
+fn flat(value: f32) -> Vec<f32> {
+    vec![value; 480]
+}
+
+/// A hardware mute with the denoiser in use: the frames the host does not hand to the pipeline are
+/// silence, the aligner keeps what it held and pops nothing, so the denoiser's stream carries on
+/// where it stopped; no frame counts as an empty output, however long the mute.
+#[test]
+fn a_frame_the_denoiser_skipped_is_silence_and_its_stream_carries_on_where_it_stopped() {
+    let mut h = Harness::pass_through(48000);
+    h.settings.denoiser_wanted = true;
+    let input = flat(1000.0);
+    let first: Vec<f32> = [flat(1.0), flat(2.0)].concat()[..720].to_vec();
+    h.run_with(&input, DenoiserOutput::Ran { samples: &first, restart: true });
+    for call in 2..=40 {
+        h.run_with(
+            &input,
+            DenoiserOutput::Ran { samples: &flat(call as f32 * 10.0), restart: false },
+        );
+    }
+    let before = h.out.aligner;
+    assert_eq!(before.buffered_samples, 240, "half of the last output waits in the aligner");
+    for i in 0..DENOISER_STALL_FRAMES as usize + 50 {
+        let mut frame = input.clone();
+        h.pre(&mut frame);
+        let aligned = h.chain.post_denoise_align(
+            &mut frame,
+            DenoiserOutput::Skipped,
+            &h.settings,
+            &mut h.out,
+        );
+        assert_eq!((aligned.supported, aligned.pre_gain_rms), (true, 0.0), "{i}");
+        assert!(silent(&frame), "{i}: the frame before the gain is silence");
+        h.chain.post_gain(&mut frame, aligned.pre_gain_rms, f32::NAN, &h.settings, &mut h.out);
+        assert!(silent(&frame), "{i}");
+        assert!(h.out.denoiser_skipped && !h.out.denoiser_ran && !h.out.denoiser_stalled, "{i}");
+        assert_eq!(h.out.denoised_sumsq, 0.0);
+        assert_eq!(h.out.aligner, before, "{i}: the aligner is untouched");
+    }
+    let mut resumed = input.clone();
+    h.pre(&mut resumed);
+    let next = flat(410.0);
+    let denoised = DenoiserOutput::Ran { samples: &next, restart: false };
+    h.chain.post_denoise_align(&mut resumed, denoised, &h.settings, &mut h.out);
+    assert_eq!(&resumed[..240], &flat(400.0)[..240], "what the aligner held first");
+    assert_eq!(&resumed[240..], &flat(410.0)[..240], "then the pipeline's next output");
+    assert!(!h.out.denoiser_skipped && h.out.denoiser_ran && !h.out.denoiser_stalled);
+    assert_eq!(h.out.aligner.underruns, before.underruns);
+}
+
+#[test]
+fn skipped_frames_are_no_denoiser_for_the_startup_hold() {
+    let mut h = Harness::pass_through(48000);
+    h.settings.denoiser_wanted = true;
+    let input = flat(1000.0);
+    for i in 0..60 {
+        let sent = h.run_with(&input, DenoiserOutput::Skipped);
+        assert!(silent(&sent) && h.out.held, "{i}: the hold still waits for the denoiser");
+    }
+    h.run_with(&input, DenoiserOutput::Ran { samples: &input, restart: true });
+    assert!(!h.out.held, "a pipeline ran");
+}
+
+/// Gate mode, manual threshold 0.01 (-40 dBFS), no voice gain, a denoiser that returns this frame
+/// scaled by `kept` (no latency). Returns the frames counted erased and cut.
+fn speech_loss(script: &[(f32, f32, f32, bool)]) -> (Vec<usize>, Vec<usize>) {
+    let mut h = Harness::new(48000);
+    h.settings.auto_gain = false;
+    h.settings.auto_sensitivity = false;
+    h.settings.gate_threshold = 0.01;
+    h.settings.denoiser_wanted = true;
+    h.settings.speech_detection = SpeechDetection::Gate;
+    let (mut erased, mut cut) = (vec![], vec![]);
+    for (f, &(level_db, kept, p, muted)) in script.iter().enumerate() {
+        let amplitude = 10f32.powf(level_db / 20.0) * std::f32::consts::SQRT_2 * 32768.0;
+        let input = h.tone(amplitude, 220.0);
+        let denoised: Vec<f32> = input.iter().map(|v| v * kept).collect();
+        h.settings.speech_probability = p;
+        h.settings.mic_muted = muted;
+        h.run_with(&input, DenoiserOutput::Ran { samples: &denoised, restart: f == 0 });
+        if h.out.speech_denoiser_erased {
+            erased.push(f);
+        }
+        if h.out.speech_gate_cut {
+            cut.push(f);
+        }
+    }
+    (erased, cut)
+}
+
+/// Frames a..b.
+fn frames(a: usize, b: usize) -> Vec<usize> {
+    (a..b).collect()
+}
+
+#[test]
+fn steady_confirmed_speech_the_denoiser_erases_or_the_level_gate_cuts_is_counted() {
+    const QUIET: (f32, f32, f32, bool) = (-80.0, 1.0, 0.0, false);
+    const LOOKAHEAD: usize = 4;
+    let steady = |start: usize| start + 9;
+    let script = |speech: (f32, f32, f32, bool)| {
+        let mut s = vec![QUIET; 40];
+        s.extend(std::iter::repeat_n(speech, 50));
+        s.extend(std::iter::repeat_n(QUIET, 60));
+        s
+    };
+
+    let (erased, cut) = speech_loss(&script((-20.0, 0.01, 0.9, false)));
+    assert_eq!(erased, frames(steady(40), 90), "40 dB under its input");
+    assert!(cut.is_empty(), "what the denoiser erased is not the level gate's");
+
+    let (erased, cut) = speech_loss(&script((-46.0, 0.5, 0.9, false)));
+    assert!(erased.is_empty(), "6 dB under its input is kept");
+    assert_eq!(cut, frames(steady(40) + LOOKAHEAD, 90 + LOOKAHEAD), "-52 dBFS under -40");
+
+    let (erased, cut) = speech_loss(&script((-20.0, 0.5, 0.9, false)));
+    assert!(erased.is_empty() && cut.is_empty(), "sent");
+
+    let (erased, cut) = speech_loss(&script((-46.0, 0.01, 0.4, false)));
+    assert!(erased.is_empty() && cut.is_empty(), "never confirmed");
+
+    let (erased, cut) = speech_loss(&script((-46.0, 0.01, 0.9, true)));
+    assert!(erased.is_empty() && cut.is_empty(), "muted");
+
+    let mut s = script((-20.0, 1.0, 0.9, false));
+    for frame in s.iter_mut().skip(90).take(30) {
+        *frame = (-50.0, 0.01, 0.0, false);
+    }
+    let (erased, cut) = speech_loss(&s);
+    assert!(
+        erased.is_empty() && cut.is_empty(),
+        "noise the denoiser removes in the hang is no speech"
+    );
+
+    let mut s = script((-20.0, 0.01, 0.9, false));
+    s[60] = (-20.0, 0.01, 0.2, false);
+    let (erased, _) = speech_loss(&s);
+    assert_eq!(
+        erased,
+        [frames(steady(40), 60), frames(steady(61), 90)].concat(),
+        "a frame under 0.3 starts the run over"
+    );
+}
+
+#[test]
+fn the_threshold_stats_say_what_set_the_open_threshold() {
+    let mut h = Harness::new(48000);
+    h.settings.gain_engine = GainEngine::External;
+    h.settings.auto_sensitivity = false;
+    h.settings.gate_threshold = 0.01;
+    let input = flat(0.0);
+    run_external(&mut h, &input, 6.0);
+    assert_eq!(h.out.threshold_term, ThresholdTerm::Manual);
+    assert!(near(f64::from(h.out.open_threshold_db), -46.0, 1e-4), "{}", h.out.open_threshold_db);
+    assert!(h.out.auto_sensitivity_floor_db.is_nan());
+    h.settings.gate_threshold = 0.0;
+    run_external(&mut h, &input, 6.0);
+    assert_eq!(h.out.open_threshold_db, -140.0, "an open mic");
+
+    h.settings.auto_sensitivity = true;
+    let mut rng = Rng::new(8);
+    let mut room = |h: &mut Harness, db: f64, gain: f32, frames: usize| {
+        let level = (10f64.powf(db / 20.0) * 3f64.sqrt()) as f32 * 32768.0;
+        for _ in 0..frames {
+            let input: Vec<f32> = (0..480).map(|_| level * rng.symmetric()).collect();
+            run_external(h, &input, gain);
+        }
+    };
+    room(&mut h, -70.0, 0.0, 600);
+    assert!(
+        near(f64::from(h.out.auto_sensitivity_floor_db), -70.0, 1.5),
+        "{}",
+        h.out.auto_sensitivity_floor_db
+    );
+    assert_eq!(h.out.threshold_term, ThresholdTerm::Minimum, "-62 under -54");
+    assert_eq!(h.out.open_threshold_db, -54.0);
+    room(&mut h, -70.0, 20.0, 50);
+    assert_eq!(
+        h.out.threshold_term,
+        ThresholdTerm::Floor,
+        "the minimum gives way by 9 dB of the gain"
+    );
+    assert!(near(f64::from(h.out.open_threshold_db), -62.0, 1.5), "{}", h.out.open_threshold_db);
+    room(&mut h, -45.0, 0.0, 6000);
+    assert_eq!(h.out.threshold_term, ThresholdTerm::Floor);
+    assert!(near(f64::from(h.out.open_threshold_db), -37.0, 1.5), "{}", h.out.open_threshold_db);
+
+    let mut unsupported = vec![0.0f32; 479];
+    h.pre(&mut unsupported);
+    let kept = (h.out.open_threshold_db, h.out.threshold_term);
+    h.chain.post_denoise(&mut unsupported, DenoiserOutput::NotInUse, &h.settings, &mut h.out);
+    assert_eq!((h.out.open_threshold_db, h.out.threshold_term), kept, "the last state");
+    h.commands.reset = true;
+    let mut unsupported = vec![0.0f32; 479];
+    h.pre(&mut unsupported);
+    h.chain.post_denoise(&mut unsupported, DenoiserOutput::NotInUse, &h.settings, &mut h.out);
+    assert_eq!(h.out.threshold_term, ThresholdTerm::Floor, "commands wait for a supported frame");
 }

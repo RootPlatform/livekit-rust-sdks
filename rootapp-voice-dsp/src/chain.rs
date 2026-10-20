@@ -1,16 +1,19 @@
 use crate::aligner::{ring_samples, DenoiseFrameAligner};
-use crate::auto_sensitivity::{AutoSensitivity, AutoSensitivityOptions};
+use crate::auto_sensitivity::{self, AutoSensitivity, AutoSensitivityOptions};
+use crate::frame_delay::{FrameDelay, FrameTag};
 use crate::gain_ramp::GainRamp;
 use crate::noise_gate::{block_samples_for, NoiseGate};
 use crate::sanitize::{self, FULL_SCALE};
-use crate::speech_gate::{self, GateControl, SpeechDetection, SpeechGate};
+use crate::speech_gate::{
+    self, GateControl, SpeechDetection, SpeechGate, QUIET_RMS, SPEECH_OFF, STEADY_SPEECH_FRAMES,
+};
 use crate::transmit_gate::TransmitGate;
 use crate::voice_gain::{GainLimit, VoiceGain, VoiceGainOptions};
 use crate::{
     clamp_f64, Agc2Tuning, Aligned, AlignerStats, DenoiserOutput, DspCommands, DspOutputs,
-    DspSettings, GainEngine, PreDenoise, PushToTalk, DENOISER_OUTPUT_FRAMES, DENOISER_STALL_FRAMES,
-    MAX_DENOISER_WAIT_FRAMES, MAX_FRAME, MAX_RATE, MAX_VOICE_GAIN_DB, MIN_RATE,
-    STARTUP_HOLD_FRAMES, TRANSMIT_FADE_MS,
+    DspSettings, GainEngine, PreDenoise, PushToTalk, ThresholdTerm, DENOISER_OUTPUT_FRAMES,
+    DENOISER_STALL_FRAMES, MAX_DENOISER_WAIT_FRAMES, MAX_FRAME, MAX_LOOKAHEAD_FRAMES, MAX_RATE,
+    MAX_VOICE_GAIN_DB, MIN_RATE, STARTUP_HOLD_FRAMES, TRANSMIT_FADE_MS,
 };
 
 /// 2^-15: FloatS16 to a ±1 signal (exact).
@@ -19,6 +22,11 @@ const TO_UNIT: f32 = 1.0 / 32_768.0;
 const SUMSQ_TO_S16: f64 = 1_073_741_824.0;
 /// Managed `NativeMicrophoneCapture.AutoMinOpenBlocks`.
 pub const AUTO_MIN_OPEN_BLOCKS: u32 = 5;
+/// -15 dB in power: the denoiser erased a frame this far under its input.
+const DENOISER_ERASED_RATIO: f64 = 0.031_622_776_601_683_79;
+/// The lowest open threshold reported, dB.
+const LOWEST_THRESHOLD_DB: f64 = -140.0;
+const PRE_LEVELS: usize = STEADY_SPEECH_FRAMES as usize;
 
 fn frame_samples_for(rate: u32) -> usize {
     (rate / 100) as usize
@@ -111,6 +119,44 @@ impl GainView {
     }
 }
 
+/// The open threshold before the gain and what set it, for the stats.
+#[derive(Clone, Copy, Debug)]
+struct ThresholdView {
+    floor_db: f32,
+    open_db: f32,
+    term: ThresholdTerm,
+}
+
+impl ThresholdView {
+    const NONE: Self = Self { floor_db: f32::NAN, open_db: f32::NAN, term: ThresholdTerm::None };
+
+    fn auto(auto: &AutoSensitivity, gain_db: f64) -> Self {
+        Self {
+            floor_db: auto.floor_db() as f32,
+            open_db: auto.open_db_at(gain_db).max(LOWEST_THRESHOLD_DB) as f32,
+            term: if auto.floor_sets_open_at(gain_db) {
+                ThresholdTerm::Floor
+            } else {
+                ThresholdTerm::Minimum
+            },
+        }
+    }
+
+    fn manual(threshold: f32, gain_db: f64) -> Self {
+        Self {
+            floor_db: f32::NAN,
+            open_db: (auto_sensitivity::to_db(threshold) - gain_db).max(LOWEST_THRESHOLD_DB) as f32,
+            term: ThresholdTerm::Manual,
+        }
+    }
+
+    fn write(&self, out: &mut DspOutputs) {
+        out.auto_sensitivity_floor_db = self.floor_db;
+        out.open_threshold_db = self.open_db;
+        out.threshold_term = self.term;
+    }
+}
+
 /// What holds the host's gain (External): its maximum, or its noise cap over the floor the chain's
 /// voice gain measures, within 1 dB; the talker's level otherwise, once the voice gain heard enough
 /// speech to have one.
@@ -183,6 +229,17 @@ pub struct DspChain {
     speech: SpeechGate,
     /// The detection mode the speech gate last ran in: a change starts its verdict over.
     speech_mode: SpeechDetection,
+    /// The speech gate's look-ahead: the frames the gate's decisions run ahead of what it gates.
+    delay: FrameDelay,
+    /// Frames in a row the detector rated SPEECH_OFF or more.
+    steady_frames: u32,
+    /// Mean squares (FloatS16) of the last PRE_LEVELS pre-denoise frames.
+    pre_levels: [f64; PRE_LEVELS],
+    pre_level_next: usize,
+    /// post_denoise_align ran the denoiser this frame, and its aligned output's mean square.
+    aligned_ran: bool,
+    aligned_level: f64,
+    threshold_view: ThresholdView,
 }
 
 impl DspChain {
@@ -223,6 +280,13 @@ impl DspChain {
             denoiser_seen: false,
             speech: SpeechGate::default(),
             speech_mode: SpeechDetection::Off,
+            delay: FrameDelay::new(MAX_LOOKAHEAD_FRAMES, max_frame),
+            steady_frames: 0,
+            pre_levels: [0.0; PRE_LEVELS],
+            pre_level_next: 0,
+            aligned_ran: false,
+            aligned_level: 0.0,
+            threshold_view: ThresholdView::NONE,
         }
     }
 
@@ -237,13 +301,16 @@ impl DspChain {
             && len == frame_samples_for(rate)
     }
 
-    /// Stream (re)start: the aligner, the stall count and the startup hold start over.
+    /// Stream (re)start: the aligner, the stall count, the startup hold, the speech verdict and the
+    /// look-ahead start over (what the look-ahead held is dropped).
     fn flush_stream(&mut self) {
         self.aligner.reset();
         self.aligner_in_use = false;
         self.empty_outputs = 0;
         self.frames_since_open = 0;
         self.speech.reset();
+        self.steady_frames = 0;
+        self.delay.clear();
     }
 
     /// A new rate (or a reset): flush, a fresh noise gate, ramps and fade at their targets. The
@@ -274,6 +341,7 @@ impl DspChain {
         self.voice_gain_settled = false;
         self.gain_view = GainView::NONE;
         self.auto_sensitivity_active = false;
+        self.threshold_view = ThresholdView::NONE;
     }
 
     fn reset_gain(&mut self, db: f32) {
@@ -342,6 +410,11 @@ impl DspChain {
             return PreDenoise { flush_denoiser: false, supported: false };
         }
         out.unsupported = false;
+        if let Some(level) = self.pre_levels.get_mut(self.pre_level_next) {
+            *level = out.apm_out_sumsq / frame.len() as f64;
+        }
+        self.pre_level_next =
+            self.pre_level_next.saturating_add(1).checked_rem(PRE_LEVELS).unwrap_or(0);
         // Before the commands, so a gain reset in this frame is clamped to this frame's maximum.
         self.voice_gain.set_tuning(&settings.voice_gain);
 
@@ -408,6 +481,7 @@ impl DspChain {
         out: &mut DspOutputs,
     ) -> Aligned {
         self.aligned = None;
+        self.aligned_ran = false;
         let prepared = match self.prepared.take() {
             Some(len) if len == frame.len() && settings.sample_rate == self.rate => Some(len),
             _ => None,
@@ -429,7 +503,12 @@ impl DspChain {
         };
 
         let mut ran = false;
+        let mut skipped = false;
         match denoised {
+            DenoiserOutput::Skipped => {
+                skipped = true;
+                w.fill(0.0);
+            }
             DenoiserOutput::NotInUse => {
                 if *aligner_in_use {
                     aligner.reset();
@@ -472,12 +551,15 @@ impl DspChain {
         }
         out.denoised_sumsq = sanitize::sum_squares(w) * SUMSQ_TO_S16;
         out.denoiser_ran = ran;
+        out.denoiser_skipped = skipped;
         out.denoiser_stalled = *empty_outputs >= DENOISER_STALL_FRAMES;
         let pre_gain_rms = rms(w);
         for (x, &v) in frame.iter_mut().zip(w.iter()) {
             *x = v * FULL_SCALE;
         }
         self.aligned = Some(len);
+        self.aligned_ran = ran;
+        self.aligned_level = out.denoised_sumsq / len as f64;
         Aligned { supported: true, pre_gain_rms }
     }
 
@@ -522,6 +604,12 @@ impl DspChain {
             denoiser_seen,
             speech,
             speech_mode,
+            delay,
+            steady_frames,
+            pre_levels,
+            aligned_ran,
+            aligned_level,
+            threshold_view,
             ..
         } = self;
         let Some(w) = work.get_mut(..len) else {
@@ -583,6 +671,10 @@ impl DspChain {
             Some(p) => speech.observe(p),
             None => speech.reset(),
         }
+        *steady_frames = match probability {
+            Some(p) if p >= SPEECH_OFF => steady_frames.saturating_add(1),
+            _ => 0,
+        };
         if settings.auto_sensitivity {
             if !*auto_sensitivity_active {
                 auto_sensitivity.reset();
@@ -600,8 +692,10 @@ impl DspChain {
                 settings.capture_silent,
             ));
             gate.set_min_open_blocks(AUTO_MIN_OPEN_BLOCKS);
+            *threshold_view = ThresholdView::auto(auto_sensitivity, applied_db);
         } else {
             *auto_sensitivity_active = false;
+            *threshold_view = ThresholdView::manual(gate.threshold(), applied_db);
         }
 
         *frames_since_open = frames_since_open.saturating_add(1);
@@ -612,8 +706,41 @@ impl DspChain {
         if held {
             w.fill(0.0);
         }
-        out.gate_in_block_peak_db = block_peak_db(w, gate.block_samples());
-        out.gate_in_sumsq = sanitize::sum_squares(w) * SUMSQ_TO_S16;
+
+        let speech_confirmed = probability.is_some() && speech.confirmed();
+        let push_to_talk = gate.push_to_talk().is_some();
+        let steady = speech_confirmed && *steady_frames >= STEADY_SPEECH_FRAMES && !held;
+        let erased = steady && open && *aligned_ran && {
+            let quietest = pre_levels.iter().fold(f64::INFINITY, |m, &v| m.min(v));
+            *aligned_level <= quietest * DENOISER_ERASED_RATIO
+        };
+        let tag = FrameTag {
+            held,
+            open,
+            speech: steady && !erased && !push_to_talk && input_rms > QUIET_RMS,
+        };
+
+        // The look-ahead: the gate decides on this frame and applies the decision to the frame
+        // `lookahead` frames older. Starting it (or changing it) sends that many frames of silence
+        // first; ending it drops what it held.
+        let lookahead = if gate_audio {
+            sanitize::speech_lookahead_frames(settings.speech_lookahead_ms)
+        } else {
+            0
+        };
+        if lookahead != delay.frames() || (lookahead > 0 && delay.frame_len() != len) {
+            delay.restart(lookahead, len, FrameTag { speech: false, ..tag });
+        }
+        let mut sent_tag = tag;
+        let (measure, sent): (Option<&[f32]>, &mut [f32]) = match scratch.get_mut(..len) {
+            Some(apply) if delay.frames() > 0 => {
+                sent_tag = delay.exchange(w, apply, tag);
+                (Some(&*w), apply)
+            }
+            _ => (None, w),
+        };
+        out.gate_in_block_peak_db = block_peak_db(sent, gate.block_samples());
+        out.gate_in_sumsq = sanitize::sum_squares(sent) * SUMSQ_TO_S16;
 
         let released = gate.push_to_talk() == Some(false);
         let above = input_rms > gate.threshold();
@@ -621,56 +748,67 @@ impl DspChain {
             Some(_) if gate_audio => speech.control(input_rms, level_open),
             _ => GateControl::LEVEL,
         };
-        gate.process_controlled(w, !released, control);
+        let shut_before = gate.envelope() <= 0.0;
+        match measure {
+            Some(measure) => gate.process_split(measure, sent, !released, control),
+            None => gate.process_controlled(sent, !released, control),
+        }
         if gate_audio {
             speech.after_gate(gate.envelope());
         }
 
+        let sent_open = open && sent_tag.open;
         ramp.set_target(sanitize::input_volume(settings.input_volume));
-        ramp.apply(w);
-        for s in w.iter_mut() {
+        ramp.apply(sent);
+        for s in sent.iter_mut() {
             *s = s.clamp(-1.0, 1.0);
         }
-        let transmitting = transmit.apply(w, open);
-        for (x, &v) in frame.iter_mut().zip(w.iter()) {
+        let transmitting = transmit.apply(sent, sent_open);
+        for (x, &v) in frame.iter_mut().zip(sent.iter()) {
             *x = v * FULL_SCALE;
         }
 
         let threshold = gate.threshold();
         let envelope = gate.envelope();
         let gate_speaking = gate.is_speaking();
-        let speech_confirmed = probability.is_some() && speech.confirmed();
         out.sent_sumsq = sanitize::sum_squares(frame);
         out.gate_in_rms = input_rms;
         out.threshold = threshold;
         out.envelope = envelope;
         out.gate_speaking = gate_speaking;
-        out.speaking = open && !held && (gate_speaking || out.sent_sumsq > 0.0);
+        out.speaking = sent_open && !sent_tag.held && (gate_speaking || out.sent_sumsq > 0.0);
         out.speech_probability = probability.unwrap_or(-1.0);
         out.speech = speech_confirmed;
         out.speech_closed = control.fast_close || (!control.allow_open && above);
         out.gate_open = envelope > 0.0;
         out.gate_input_above = input_rms > threshold;
-        out.held = held;
-        out.transmit_open = open;
+        out.held = sent_tag.held;
+        out.transmit_open = sent_open;
         out.transmitting = transmitting;
         out.voice_gain_db = *voice_gain_db;
         out.voice_gain_settled = *voice_gain_settled;
         out.gain_engine = *gain_engine;
         gain_view.write(out);
+        out.speech_lookahead_ms = u32::try_from(delay.frames().saturating_mul(10)).unwrap_or(0);
+        out.speech_denoiser_erased = erased;
+        out.speech_gate_cut =
+            sent_tag.speech && sent_open && !push_to_talk && shut_before && envelope <= 0.0;
+        threshold_view.write(out);
         out.unsupported = false;
         out.aligner = self.aligner_stats();
     }
 
     /// The input volume and the transmit gate (without a fade) only. The noise gate hears a frame
-    /// of silence at the configured rate, so its speaking state runs out instead of freezing;
-    /// everything else reports its last state.
+    /// of silence at the configured rate, so its speaking state runs out instead of freezing; the
+    /// look-ahead drops what it held; everything else reports its last state.
     fn post_unsupported(
         &mut self,
         frame: &mut [f32],
         settings: &DspSettings,
         out: &mut DspOutputs,
     ) {
+        self.delay.clear();
+        self.steady_frames = 0;
         let open = transmit_open(settings);
         let passed = sanitize::sum_squares(frame);
         self.ramp.set_target(sanitize::input_volume(settings.input_volume));
@@ -706,7 +844,12 @@ impl DspChain {
         out.gain_engine = self.gain_engine;
         self.gain_view.write(out);
         out.denoiser_ran = false;
+        out.denoiser_skipped = false;
         out.denoiser_stalled = false;
+        out.speech_lookahead_ms = 0;
+        out.speech_denoiser_erased = false;
+        out.speech_gate_cut = false;
+        self.threshold_view.write(out);
         out.aligner = self.aligner_stats();
         out.unsupported = true;
     }

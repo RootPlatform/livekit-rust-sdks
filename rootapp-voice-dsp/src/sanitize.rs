@@ -62,6 +62,19 @@ pub fn auto_sensitivity_minimum_db(db: f32) -> f32 {
     }
 }
 
+/// Non-finite → SPEECH_LOOKAHEAD_MS, clamped to SPEECH_LOOKAHEAD_RANGE_MS, in whole 10 ms frames
+/// (halves round up): 0..=MAX_LOOKAHEAD_FRAMES.
+pub fn speech_lookahead_frames(ms: f32) -> usize {
+    let (lowest, highest) = crate::SPEECH_LOOKAHEAD_RANGE_MS;
+    let ms = if ms.is_finite() { ms.clamp(lowest, highest) } else { crate::SPEECH_LOOKAHEAD_MS };
+    let frames = (f64::from(ms) / 10.0).round();
+    if frames >= 1.0 {
+        (frames as usize).min(crate::MAX_LOOKAHEAD_FRAMES)
+    } else {
+        0
+    }
+}
+
 pub fn sum_squares(samples: &[f32]) -> f64 {
     let mut sum = 0.0f64;
     for &sample in samples {

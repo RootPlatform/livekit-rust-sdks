@@ -592,8 +592,10 @@ fn golden_vectors_align_and_post_gain_equal_post_denoise() {
 /// The speech detector's paths leave the audio as it is when they change nothing: Ring mode (it
 /// qualifies the ring only) sends what the managed reference sent with each vector's own
 /// probabilities, and bit for bit what Off sends with any probability; Gate mode with a
-/// probability that never stops being speech (it never closes) sends what Off sends. The voice
-/// gain takes the probability in every mode, so each pair compares the same probabilities.
+/// probability that never stops being speech (it never closes) and no look-ahead sends what Off
+/// sends. The voice gain takes the probability in every mode, so each pair compares the same
+/// probabilities. Gate mode's look-ahead is checked by golden_vectors_gate_with_constant_speech_
+/// is_off_delayed_by_the_look_ahead.
 #[test]
 fn golden_vectors_hold_where_speech_detection_changes_no_audio() {
     let tolerance =
@@ -624,10 +626,11 @@ fn golden_vectors_hold_where_speech_detection_changes_no_audio() {
                 Box::new(move |f, s| s.speech_probability = any(f)),
             ),
             (
-                "gate vs off, constant speech",
+                "gate vs off, constant speech, no look-ahead",
                 Box::new(|_, s| {
                     s.speech_detection = SpeechDetection::Gate;
                     s.speech_probability = 1.0;
+                    s.speech_lookahead_ms = 0.0;
                 }),
                 Box::new(|_, s| s.speech_probability = 1.0),
             ),
@@ -640,5 +643,80 @@ fn golden_vectors_hold_where_speech_detection_changes_no_audio() {
             }
         }
     }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// Gate mode with constant speech and the default look-ahead (4 frames) decides exactly as Off on
+/// every frame: the gate measures the frame it is handed, so the threshold, the envelope, the
+/// voice gain, the levels before the gate and the gate's flags are Off's, frame for frame. What it
+/// sends is the audio 4 frames older under that decision. Wherever Off's gain was the same over
+/// both frames (full on, or shut) and nothing in between changed the stream or the transmit and
+/// volume settings, frame f sends exactly what Off sent at frame f - 4, as does its gate input
+/// and its startup hold flag: the look-ahead is a pure delay of the audio.
+#[test]
+fn golden_vectors_gate_with_constant_speech_is_off_delayed_by_the_look_ahead() {
+    const DELAY: usize = 4;
+    const FULL: f32 = 0.2 + 0.025;
+    let mut failed = Vec::new();
+    let mut compared = 0usize;
+    for path in vector_files() {
+        let name = path.file_stem().unwrap().to_string_lossy().to_string();
+        let (_, records) = parse(&std::fs::read(&path).unwrap()).unwrap();
+        let gate = run_chain(&records, |_, s| {
+            s.speech_detection = SpeechDetection::Gate;
+            s.speech_probability = 1.0;
+        });
+        let off = run_chain(&records, |_, s| s.speech_probability = 1.0);
+        let decided = |v: &[f32; 7]| [v[1], v[2], v[4], v[5], v[6]];
+        let decision_flags = 0x02 | 0x04 | 0x08 | 0x20 | 0x40;
+        for f in 0..records.len() {
+            let ((_, gv, gflags), (_, ov, oflags)) = (&gate[f], &off[f]);
+            if decided(gv) != decided(ov) || gflags & decision_flags != oflags & decision_flags {
+                failed.push(format!("{name}: frame {f} decides differently"));
+                break;
+            }
+        }
+        let supported = |r: &Record| {
+            r.input.len() == (r.settings.sample_rate / 100) as usize && !r.input.is_empty()
+        };
+        let steady = |f: usize| {
+            f >= DELAY + 3
+                && (f - DELAY - 3..=f).all(|k| {
+                    let (a, b) = (&records[k], &records[f]);
+                    supported(a)
+                        && a.settings.sample_rate == b.settings.sample_rate
+                        && a.settings.push_to_talk == PushToTalk::VoiceActivity
+                        && a.settings.mic_muted == b.settings.mic_muted
+                        && a.settings.input_volume == b.settings.input_volume
+                        && !a.commands.reset
+                        && !a.commands.flush
+                        && a.flags & 0x80 == 0
+                })
+        };
+        let envelope = |f: usize| off[f].1[5];
+        for f in DELAY + 3..records.len() {
+            if !steady(f) {
+                continue;
+            }
+            let span = [f - DELAY - 1, f - DELAY, f - 1, f];
+            let full = span.iter().all(|&k| envelope(k) >= FULL);
+            let shut = span.iter().all(|&k| envelope(k) == 0.0);
+            if !full && !shut {
+                continue;
+            }
+            compared += 1;
+            let (g, o) = (&gate[f], &off[f - DELAY]);
+            let same_audio = g.0.iter().map(|x| x.to_bits()).eq(o.0.iter().map(|x| x.to_bits()));
+            if !same_audio || g.1[3].to_bits() != o.1[3].to_bits() || g.2 & 0x10 != o.2 & 0x10 {
+                failed.push(format!(
+                    "{name}: frame {f} is not Off's frame {} ({})",
+                    f - DELAY,
+                    if full { "full" } else { "shut" }
+                ));
+                break;
+            }
+        }
+    }
+    assert!(compared > 10_000, "only {compared} frames were steady enough to compare");
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }

@@ -79,9 +79,10 @@ fn the_counter_sees_allocations() {
 
 const RATES: [u32; 8] = [8000, 11025, 16000, 22050, 24000, 32000, 44100, 48000];
 
-/// 10 000 frames: every rate, rate changes, every command, the three denoiser kinds (empty,
-/// short, burst and oversized outputs, restarts), unsupported shapes, changing settings, and
-/// both gain engines through post_denoise_align and post_gain (a host's gain in between).
+/// 10 000 frames: every rate, rate changes, every command, the four denoiser kinds (empty,
+/// short, burst and oversized outputs, restarts), unsupported shapes, changing settings (the
+/// look-ahead starting, changing and ending), and both gain engines through post_denoise_align and
+/// post_gain (a host's gain in between).
 #[test]
 fn the_chain_never_allocates_or_frees_after_new() {
     let mut chain = DspChain::new(48_000);
@@ -130,6 +131,7 @@ fn the_chain_never_allocates_or_frees_after_new() {
                 ][(f / 170) % 5],
                 gain_engine: GainEngine::from_wire(((f / 230) % 2) as u32),
                 agc2: [Agc2Tuning::UNSET, Agc2Tuning::DEFAULT, Agc2Tuning::MAX][(f / 310) % 3],
+                speech_lookahead_ms: [f32::NAN, 0.0, 60.0, 20.0, 35.0][(f / 190) % 5],
             };
             let commands = DspCommands {
                 reset: f % 997 == 3,
@@ -148,7 +150,8 @@ fn the_chain_never_allocates_or_frees_after_new() {
                 *s *= level;
             }
             let output = match f % 11 {
-                0 | 1 => DenoiserOutput::NotInUse,
+                0 => DenoiserOutput::NotInUse,
+                1 => DenoiserOutput::Skipped,
                 2 => DenoiserOutput::Missed,
                 3 => DenoiserOutput::Ran { samples: &denoised[..0], restart: false },
                 4 => DenoiserOutput::Ran { samples: &denoised[..2 * n], restart: f % 5 == 0 },

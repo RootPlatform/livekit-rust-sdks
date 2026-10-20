@@ -10,6 +10,7 @@ mod support;
 use rootapp_voice_dsp::noise_gate::{
     block_samples_for, NoiseGate, ATTACK_SECONDS, BLOCK_SAMPLES, FULL_ON_ENVELOPE,
 };
+use rootapp_voice_dsp::speech_gate::GateControl;
 use support::{near, silent};
 
 const RATE: u32 = 48000;
@@ -252,4 +253,52 @@ fn rate_scaled_blocks_keep_the_timing() {
         assert!(frames < 100);
     }
     assert!((69..=71).contains(&frames), "{frames}");
+}
+
+/// The look-ahead's split: the state moves exactly as process_controlled on the measured audio,
+/// and each block's gain lands on the same block of the other buffer.
+#[test]
+fn a_split_gate_measures_one_buffer_and_gains_the_other() {
+    let mut whole = new_gate();
+    let mut split = new_gate();
+    for gate in [&mut whole, &mut split] {
+        gate.set_threshold(0.05);
+        gate.set_min_open_blocks(2);
+    }
+    let control = GateControl { allow_open: true, fast_close: false, eager_open: false };
+    for f in 0..60 {
+        let amplitude = if (10..30).contains(&f) || f >= 45 { 0.3 } else { 0.01 };
+        let measured = tone(amplitude, FRAME);
+        let mut gained = measured.clone();
+        whole.process_controlled(&mut gained, true, control);
+        let mut applied: Vec<f32> =
+            (0..FRAME).map(|i| if i % 2 == 0 { 0.5 } else { -0.25 }).collect();
+        let original = applied.clone();
+        split.process_split(&measured, &mut applied, true, control);
+        assert_eq!(
+            (whole.envelope(), whole.level_envelope(), whole.is_speaking()),
+            (split.envelope(), split.level_envelope(), split.is_speaking()),
+            "frame {f}"
+        );
+        for (b, (g, m)) in
+            gained.chunks(BLOCK_SAMPLES).zip(measured.chunks(BLOCK_SAMPLES)).enumerate()
+        {
+            let gain = if m.iter().all(|&v| v == 0.0) {
+                None
+            } else {
+                m.iter().zip(g).find(|(m, _)| **m != 0.0).map(|(m, g)| g / m)
+            };
+            let Some(gain) = gain else { continue };
+            for i in b * BLOCK_SAMPLES..(b * BLOCK_SAMPLES + BLOCK_SAMPLES).min(FRAME) {
+                assert!(
+                    near(f64::from(applied[i]), f64::from(original[i] * gain), 1e-6),
+                    "frame {f} block {b} sample {i}"
+                );
+            }
+        }
+        let mut untouched = original.clone();
+        split.process_split(&measured, &mut untouched, false, control);
+        assert_eq!(untouched, original, "gain false leaves it alone");
+        whole.process_controlled(&mut measured.clone(), false, control);
+    }
 }

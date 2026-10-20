@@ -259,6 +259,8 @@ void RootCaptureState::ResetControls(bool close_gate) {
   speech_detection.store(0, std::memory_order_relaxed);
   auto_sensitivity_minimum_db.store(std::numeric_limits<float>::quiet_NaN(),
                                     std::memory_order_relaxed);
+  speech_lookahead_ms.store(std::numeric_limits<float>::quiet_NaN(),
+                            std::memory_order_relaxed);
   for (std::atomic<float>* tunable :
        {&voice_gain_max_db, &voice_gain_target_db,
         &voice_gain_rise_db_per_second, &voice_gain_fall_db_per_second,
@@ -374,6 +376,15 @@ RootDspStatsSnapshot RootCaptureState::ReadDspStats(bool take_maxima) {
   s.aligner_trimmed_samples = aligner_trimmed_samples.load(kRelaxed);
   s.aligner_drained_samples = aligner_drained_samples.load(kRelaxed);
   s.aligner_latency_ms = aligner_latency_ms.load(kRelaxed);
+  s.speech_lookahead_ms = speech_lookahead_ms.load(kRelaxed);
+  s.speech_lookahead_applied_ms = speech_lookahead_applied_ms.load(kRelaxed);
+  s.speech_denoiser_erased_frames =
+      speech_denoiser_erased_frames.load(kRelaxed);
+  s.speech_gate_cut_frames = speech_gate_cut_frames.load(kRelaxed);
+  s.auto_sensitivity_floor_db = auto_sensitivity_floor_db.load(kRelaxed);
+  s.open_threshold_db = open_threshold_db.load(kRelaxed);
+  s.threshold_term = threshold_term.load(kRelaxed);
+  s.denoiser_skipped_frames = denoiser_skipped_frames.load(kRelaxed);
   return s;
 }
 
@@ -514,6 +525,7 @@ void RootCaptureProcessor::Process(webrtc::AudioBuffer* audio) {
   settings.voice_gain = state.ReadVoiceGainTuning();
   settings.gain_engine = state.gain_engine.load(kRelaxed);
   settings.agc2 = RootAgc2TuningUnset();
+  settings.speech_lookahead_ms = state.speech_lookahead_ms.load(kRelaxed);
   const float power = state.denoise_power.load(kRelaxed);
 
   // The gain reset first: a session reset stored before it is then seen in
@@ -553,8 +565,16 @@ void RootCaptureProcessor::Process(webrtc::AudioBuffer* audio) {
   }
   speech_running_ = detect;
 
+  // Digital silence (a hardware mute, a device gating its own mic) is not
+  // handed to the pipeline: its noise model would learn the silence and
+  // erase speech for tens of seconds after it. The pipeline's stream carries
+  // on where it stopped (the chain's aligner is left alone), so its latency
+  // is unchanged when frames come back.
   RootDenoiseResult denoised;
-  if (pre.supported && settings.denoiser_wanted) {
+  if (pre.supported && settings.denoiser_wanted && settings.capture_silent) {
+    denoised.kind = RootDenoiseKind::kSkipped;
+    denoiser_flush_owed_ = denoiser_flush_owed_ || pre.flush_denoiser;
+  } else if (pre.supported && settings.denoiser_wanted) {
     denoised = slot->ProcessAudio(
         samples, frames, rate, pre.flush_denoiser || denoiser_flush_owed_,
         power, denoise_out_.data(),
@@ -628,6 +648,7 @@ void RootCaptureProcessor::Publish(const RootDspOutputs& outputs,
 
   const bool held = supported && outputs.held;
   const bool ran = supported && outputs.denoiser_ran;
+  const bool skipped = supported && outputs.denoiser_skipped;
   CountIf(state.gate_open_frames, supported && outputs.gate_open);
   CountIf(state.gate_input_above_frames,
           supported && outputs.gate_input_above);
@@ -640,7 +661,8 @@ void RootCaptureProcessor::Publish(const RootDspOutputs& outputs,
   const bool ns_applied = state.webrtc_ns_applied.load(kRelaxed);
   CountIf(state.ns_gap_frames,
           outputs.transmit_open && denoiser_wanted && !held && !ran &&
-              !ns_applied);
+              !skipped && !ns_applied);
+  CountIf(state.denoiser_skipped_frames, skipped);
   CountIf(state.ns_fallback_pending_frames,
           !ns_applied && state.ns_fallback_decided.load(kRelaxed));
   if (outputs.non_finite_samples > 0) {
@@ -657,6 +679,15 @@ void RootCaptureProcessor::Publish(const RootDspOutputs& outputs,
   state.speech_detector_running.store(
       supported && outputs.speech_probability >= 0, kRelaxed);
   state.speech.store(speech, kRelaxed);
+  CountIf(state.speech_denoiser_erased_frames,
+          supported && outputs.speech_denoiser_erased);
+  CountIf(state.speech_gate_cut_frames, supported && outputs.speech_gate_cut);
+  state.speech_lookahead_applied_ms.store(outputs.speech_lookahead_ms,
+                                          kRelaxed);
+  state.auto_sensitivity_floor_db.store(outputs.auto_sensitivity_floor_db,
+                                        kRelaxed);
+  state.open_threshold_db.store(outputs.open_threshold_db, kRelaxed);
+  state.threshold_term.store(outputs.threshold_term, kRelaxed);
 
   state.threshold.store(outputs.threshold, kRelaxed);
   state.voice_gain_db.store(outputs.voice_gain_db, kRelaxed);
@@ -1917,6 +1948,10 @@ void RootProcessorHarness::set_capture_silent(bool silent) const {
   state_->capture_silent.store(silent);
 }
 
+void RootProcessorHarness::set_speech_lookahead_ms(float ms) const {
+  state_->speech_lookahead_ms.store(ms);
+}
+
 void RootProcessorHarness::set_denoiser_wanted(bool wanted) const {
   state_->denoiser_wanted.store(wanted);
 }
@@ -2064,6 +2099,14 @@ RootProcessorDsp DspProbe(RootCaptureState& state, bool take_maxima) {
   dsp.agc2_applied = s.agc2_applied;
   dsp.agc2_rate = s.agc2_rate;
   dsp.agc2_builds = s.agc2_builds;
+  dsp.speech_lookahead_ms = s.speech_lookahead_ms;
+  dsp.speech_lookahead_applied_ms = s.speech_lookahead_applied_ms;
+  dsp.speech_denoiser_erased_frames = s.speech_denoiser_erased_frames;
+  dsp.speech_gate_cut_frames = s.speech_gate_cut_frames;
+  dsp.auto_sensitivity_floor_db = s.auto_sensitivity_floor_db;
+  dsp.open_threshold_db = s.open_threshold_db;
+  dsp.threshold_term = s.threshold_term;
+  dsp.denoiser_skipped_frames = s.denoiser_skipped_frames;
   return dsp;
 }
 
@@ -2101,6 +2144,7 @@ RootFakeDenoiserProbe RootProcessorHarness::fake_denoiser() const {
   if (!fakes_.empty()) {
     const RootFakeFxPipeline& fake = *fakes_.back();
     probe.process_calls = fake.process_calls();
+    probe.silent_calls = fake.silent_calls();
     probe.flush_calls = fake.flush_calls();
     probe.power_sets = fake.power_sets();
     probe.last_power = fake.last_power();

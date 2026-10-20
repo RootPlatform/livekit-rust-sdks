@@ -4,6 +4,7 @@ pub mod agc2;
 pub mod aligner;
 pub mod auto_sensitivity;
 mod chain;
+pub mod frame_delay;
 pub mod gain_ramp;
 pub mod noise_gate;
 pub mod sanitize;
@@ -51,6 +52,12 @@ pub const MAX_VOICE_GAIN_DB: f32 = 24.0;
 pub const AUTO_SENSITIVITY_MINIMUM_DB: f32 = -54.0;
 /// The range a host's minimum is clamped to.
 pub const AUTO_SENSITIVITY_MINIMUM_RANGE_DB: (f32, f32) = (-80.0, -30.0);
+/// The speech gate's look-ahead while the host sets none, ms.
+pub const SPEECH_LOOKAHEAD_MS: f32 = 40.0;
+/// The range a host's look-ahead is clamped to, ms (then rounded to whole 10 ms frames).
+pub const SPEECH_LOOKAHEAD_RANGE_MS: (f32, f32) = (0.0, 60.0);
+/// Frames the look-ahead's delay line holds at most (SPEECH_LOOKAHEAD_RANGE_MS's top).
+pub const MAX_LOOKAHEAD_FRAMES: usize = 6;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PushToTalk {
@@ -100,6 +107,31 @@ impl GainEngine {
     }
 }
 
+/// What sets the noise gate's open threshold (DspOutputs::threshold_term).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ThresholdTerm {
+    /// No frame judged yet.
+    #[default]
+    None,
+    /// Auto sensitivity: the noise floor plus its margin.
+    Floor,
+    /// Auto sensitivity: its minimum (lowered by the gain above its cap).
+    Minimum,
+    /// The manual threshold.
+    Manual,
+}
+
+impl ThresholdTerm {
+    pub fn to_wire(self) -> u32 {
+        match self {
+            Self::None => 0,
+            Self::Floor => 1,
+            Self::Minimum => 2,
+            Self::Manual => 3,
+        }
+    }
+}
+
 /// Read once per frame. Values need not be sanitised (the chain does: NaN volume/threshold → 0,
 /// volume clamped 0..2, threshold 0..1).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -136,6 +168,11 @@ pub struct DspSettings {
     pub gain_engine: GainEngine,
     /// The AGC2 the host ran on this frame (External): which limit holds its gain.
     pub agc2: Agc2Tuning,
+    /// The speech gate's look-ahead (Gate mode with a probability, no push-to-talk), ms:
+    /// non-finite is SPEECH_LOOKAHEAD_MS, the rest clamped to SPEECH_LOOKAHEAD_RANGE_MS and
+    /// rounded to whole frames. The gate decides on each frame and applies that to the audio this
+    /// many frames older, so the start of a word the detector confirms within it goes out.
+    pub speech_lookahead_ms: f32,
 }
 
 impl Default for DspSettings {
@@ -156,6 +193,7 @@ impl Default for DspSettings {
             voice_gain: VoiceGainTuning::UNSET,
             gain_engine: GainEngine::Legacy,
             agc2: Agc2Tuning::UNSET,
+            speech_lookahead_ms: f32::NAN,
         }
     }
 }
@@ -200,6 +238,10 @@ pub enum DenoiserOutput<'a> {
     /// restart: first frame of a newly installed pipeline, or the pipeline was flushed before this
     /// call (the aligner is reset before the push).
     Ran { samples: &'a [f32], restart: bool },
+    /// The host did not hand the frame to the pipeline (its raw capture was digital silence): the
+    /// frame becomes silence; the aligner, the stall count and the startup hold's wait for the
+    /// denoiser are untouched, so the denoiser's stream carries on where it stopped.
+    Skipped,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -227,14 +269,15 @@ pub struct DspOutputs {
     pub apm_out_sumsq: f64,
     /// After the denoise stage (aligner output, or the input when not in use).
     pub denoised_sumsq: f64,
-    /// After voice gain and startup hold (managed VoiceMicGateInput).
+    /// After voice gain and startup hold (managed VoiceMicGateInput): the audio the gate's gain
+    /// applies to, which the look-ahead delays like the frame sent.
     pub gate_in_sumsq: f64,
     /// What leaves (after the transmit gate).
     pub sent_sumsq: f64,
-    /// RMS (±1 units) after voice gain, before the hold: what auto sensitivity and the input duty
-    /// see.
+    /// RMS (±1 units) after voice gain, before the hold, of this frame (never delayed): what auto
+    /// sensitivity, the gate's level and the input duty see.
     pub gate_in_rms: f32,
-    /// Loudest gate block (after the hold), dBFS of ±1; -inf when every block is silent.
+    /// Loudest block of gate_in (after the hold), dBFS of ±1; -inf when every block is silent.
     pub gate_in_block_peak_db: f32,
     /// The gate's threshold after this frame.
     pub threshold: f32,
@@ -242,17 +285,20 @@ pub struct DspOutputs {
     pub envelope: f32,
     /// NoiseGate.IsSpeaking after this frame.
     pub gate_speaking: bool,
-    /// Audio goes out: gate_speaking (the gate passes audio, or its hold after it did) while the
-    /// transmit gate is open, outside the startup hold (unsupported frames: whatever is sent). The
-    /// ring and the speaking byte follow it, so what is sent rings (but the fade of a mute).
+    /// Audio goes out: gate_speaking (the gate passes audio, or its hold after it did) or the frame
+    /// sent carries audio, while the transmit gate is open, outside the startup hold (unsupported
+    /// frames: whatever is sent). The ring and the speaking byte follow it, so what is sent rings
+    /// (but the fade of a mute).
     pub speaking: bool,
     /// envelope > 0.
     pub gate_open: bool,
     /// gate_in_rms > threshold.
     pub gate_input_above: bool,
-    /// The startup hold zeroed this frame.
+    /// The startup hold zeroed the frame sent (with the look-ahead: when it went in; the delay
+    /// line's first frames after a stream start count as held).
     pub held: bool,
-    /// Transmit gate target (not muted, PTT not Released).
+    /// Transmit gate target (not muted, PTT not Released) for the frame sent: with the look-ahead
+    /// it was open both now and when the frame went in, so nothing captured while muted leaves.
     pub transmit_open: bool,
     /// The transmit gate was above 0 for any sample of this frame.
     pub transmitting: bool,
@@ -270,6 +316,8 @@ pub struct DspOutputs {
     pub voice_gain_limit: GainLimit,
     /// DenoiserOutput::Ran this frame.
     pub denoiser_ran: bool,
+    /// DenoiserOutput::Skipped this frame.
+    pub denoiser_skipped: bool,
     /// ≥ DENOISER_STALL_FRAMES empty outputs in a row.
     pub denoiser_stalled: bool,
     pub aligner: AlignerStats,
@@ -286,4 +334,21 @@ pub struct DspOutputs {
     pub speech: bool,
     /// The speech gate kept the gate from opening or forced its release this frame.
     pub speech_closed: bool,
+    /// The look-ahead applied to this frame, ms (0: none; the latency it adds).
+    pub speech_lookahead_ms: u32,
+    /// Steady confirmed speech (speech_gate::STEADY_SPEECH_FRAMES) the denoiser erased: its aligned
+    /// output is 15 dB or more under every pre-denoise frame of the last STEADY_SPEECH_FRAMES
+    /// (which hold the frame it came from), transmit open, outside the startup hold.
+    pub speech_denoiser_erased: bool,
+    /// The frame sent was steady confirmed speech above QUIET_RMS when it went in, not erased by
+    /// the denoiser, and the level gate was shut for all of it (under the threshold), transmit
+    /// open, push-to-talk not in use.
+    pub speech_gate_cut: bool,
+    /// Auto sensitivity's noise floor, dB before the gain (NaN while it is off).
+    pub auto_sensitivity_floor_db: f32,
+    /// The gate's open threshold in dB before the gain this frame (auto sensitivity's, or the
+    /// manual threshold less the gain; at least -140).
+    pub open_threshold_db: f32,
+    /// What set it.
+    pub threshold_term: ThresholdTerm,
 }

@@ -11,6 +11,9 @@ pub const HANG_FRAMES: u32 = 30;
 pub const QUIET_RMS: f32 = 0.0005;
 /// Release of a close the detector forced.
 pub const FAST_RELEASE_SECONDS: f64 = 0.05;
+/// Frames in a row at SPEECH_OFF or more before the speech-loss counters judge a frame (100 ms,
+/// longer than the denoiser's latency at any rate).
+pub const STEADY_SPEECH_FRAMES: u32 = 10;
 
 /// What the detector's verdict qualifies.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -68,7 +71,9 @@ impl GateControl {
 /// of a word before the confirmation) never goes out. When confirmed speech ends with the gate
 /// still open, it closes over FAST_RELEASE_SECONDS; it opens again only on newly confirmed speech.
 /// A verdict that starts over (a flush, a mode change) closes nothing: an open gate keeps its
-/// level gate's release.
+/// level gate's release. The chain applies each frame's decision to the audio
+/// DspSettings::speech_lookahead_ms older, so the frames of a word before its confirmation go out
+/// with it when the confirmation comes within that time.
 #[derive(Clone, Debug, Default)]
 pub struct SpeechGate {
     speech_run: u32,

@@ -28,10 +28,10 @@ pub mod ffi {
     /// anything else released; speech_detection 0 off, 1 ring, 2 gate, anything
     /// else off; speech_probability the detector's for this frame (negative:
     /// it did not run); capture_silent the decorator found this frame's raw
-    /// input digitally silent; auto_sensitivity_minimum_db and voice_gain as
-    /// the host set them (NaN: the chain's default); gain_engine 0 the chain's
-    /// voice gain, 1 AGC2 between post_denoise_align and post_gain (anything
-    /// else 0), with the AGC2 that ran in agc2.
+    /// input digitally silent; auto_sensitivity_minimum_db, voice_gain and
+    /// speech_lookahead_ms as the host set them (NaN: the chain's default);
+    /// gain_engine 0 the chain's voice gain, 1 AGC2 between post_denoise_align
+    /// and post_gain (anything else 0), with the AGC2 that ran in agc2.
     #[derive(Debug, Clone, Copy, Default)]
     pub struct RootDspSettings {
         pub sample_rate: u32,
@@ -49,6 +49,7 @@ pub mod ffi {
         pub voice_gain: RootVoiceGainTuning,
         pub gain_engine: u32,
         pub agc2: RootAgc2Tuning,
+        pub speech_lookahead_ms: f32,
     }
 
     /// `rootapp_voice_dsp::Agc2Tuning`: AGC2's adaptive digital settings (dB,
@@ -140,6 +141,18 @@ pub mod ffi {
         pub voice_gain_speech_level_db: f32,
         pub voice_gain_floor_db: f32,
         pub voice_gain_limit: u32,
+        /// The frame was not handed to the denoiser (kind 3); the look-ahead
+        /// applied to it (ms, 0 none); steady confirmed speech the denoiser
+        /// erased, and the level gate cut; the threshold before the gain:
+        /// auto sensitivity's floor (NaN while off), the open threshold, and
+        /// what set it (0 none yet, 1 floor, 2 minimum, 3 manual).
+        pub denoiser_skipped: bool,
+        pub speech_lookahead_ms: u32,
+        pub speech_denoiser_erased: bool,
+        pub speech_gate_cut: bool,
+        pub auto_sensitivity_floor_db: f32,
+        pub open_threshold_db: f32,
+        pub threshold_term: u32,
     }
 
     extern "Rust" {
@@ -164,7 +177,8 @@ pub mod ffi {
             outputs: &mut RootDspOutputs,
         ) -> RootDspPre;
         /// kind: 0 not in use, 1 missed, 2 ran (denoised and restart are used
-        /// only for 2). Leaves the aligned voice before any gain in `frame`.
+        /// only for 2), 3 skipped (not handed to the denoiser: silence). Leaves
+        /// the aligned voice before any gain in `frame`.
         fn post_denoise_align(
             self: &mut RootDspChain,
             frame: &mut [f32],
@@ -290,6 +304,15 @@ pub mod ffi {
         pub agc2_applied: RootAgc2Tuning,
         pub agc2_rate: u32,
         pub agc2_builds: u64,
+        /// The stored look-ahead (NaN: none) and the one the last frame got.
+        pub speech_lookahead_ms: f32,
+        pub speech_lookahead_applied_ms: u32,
+        pub speech_denoiser_erased_frames: u64,
+        pub speech_gate_cut_frames: u64,
+        pub auto_sensitivity_floor_db: f32,
+        pub open_threshold_db: f32,
+        pub threshold_term: u32,
+        pub denoiser_skipped_frames: u64,
     }
 
     /// RootSpeechDetector over a synthetic signal (`root_speech_detector_probe`).
@@ -315,6 +338,8 @@ pub mod ffi {
     #[derive(Debug, Clone, Copy, Default)]
     pub struct RootFakeDenoiserProbe {
         pub process_calls: u64,
+        /// Process calls whose input was all zeros.
+        pub silent_calls: u64,
         pub flush_calls: u64,
         pub power_sets: u64,
         pub last_power: f32,
@@ -370,6 +395,8 @@ pub mod ffi {
         fn set_voice_gain_tuning(self: &RootProcessorHarness, tuning: RootVoiceGainTuning);
         /// As the APM decorator does before the next frame.
         fn set_capture_silent(self: &RootProcessorHarness, silent: bool);
+        /// As the controller stores it (NaN: none).
+        fn set_speech_lookahead_ms(self: &RootProcessorHarness, ms: f32);
         fn set_webrtc_ns_applied(self: &RootProcessorHarness, applied: bool);
         /// As the denoiser control does when it decides the NS fallback.
         fn set_ns_fallback_decided(self: &RootProcessorHarness, on: bool);
@@ -565,6 +592,7 @@ fn dsp_settings(settings: &ffi::RootDspSettings) -> DspSettings {
         voice_gain: voice_gain_tuning(&settings.voice_gain),
         gain_engine: GainEngine::from_wire(settings.gain_engine),
         agc2: agc2_tuning(&settings.agc2),
+        speech_lookahead_ms: settings.speech_lookahead_ms,
     }
 }
 
@@ -609,6 +637,13 @@ fn copy_outputs(from: &DspOutputs, to: &mut ffi::RootDspOutputs) {
         voice_gain_speech_level_db: from.voice_gain_speech_level_db,
         voice_gain_floor_db: from.voice_gain_floor_db,
         voice_gain_limit: from.voice_gain_limit.to_wire(),
+        denoiser_skipped: from.denoiser_skipped,
+        speech_lookahead_ms: from.speech_lookahead_ms,
+        speech_denoiser_erased: from.speech_denoiser_erased,
+        speech_gate_cut: from.speech_gate_cut,
+        auto_sensitivity_floor_db: from.auto_sensitivity_floor_db,
+        open_threshold_db: from.open_threshold_db,
+        threshold_term: from.threshold_term.to_wire(),
     };
 }
 
@@ -643,6 +678,7 @@ impl RootDspChain {
         let denoised = match kind {
             1 => DenoiserOutput::Missed,
             2 => DenoiserOutput::Ran { samples: denoised, restart },
+            3 => DenoiserOutput::Skipped,
             _ => DenoiserOutput::NotInUse,
         };
         let aligned =
@@ -1318,6 +1354,82 @@ mod processor_tests {
         assert_eq!(run(&h, 48000, 1, 1000.0), vec![500.0; 480]);
     }
 
+    /// A hardware mute: the pipeline is not fed the digital silence, the
+    /// frames are silent, nothing stalls, bypasses or counts as a gap, and
+    /// after it the pipeline's stream carries on where it stopped (what it
+    /// held comes first, then the new audio at the same latency).
+    #[test]
+    fn root_capture_processor_never_feeds_the_denoiser_digital_silence() {
+        let h = pass_through(48000, 1);
+        h.set_denoiser_wanted(true);
+        assert!(h.install_fake_denoiser(48000, 0.5, 240, 0, 0, 0));
+        for _ in 0..WARM_FRAMES + 2 {
+            run(&h, 48000, 1, 1000.0);
+        }
+        assert_eq!(run(&h, 48000, 1, 1000.0), vec![500.0; 480]);
+        let (fake, dsp) = (h.fake_denoiser(), h.dsp(false));
+        for i in 0..400 {
+            h.set_capture_silent(true);
+            assert!(silent(&run(&h, 48000, 1, 0.0)), "{i}");
+        }
+        let muted = h.fake_denoiser();
+        assert_eq!(muted.process_calls, fake.process_calls, "the pipeline never saw the silence");
+        assert_eq!((muted.silent_calls, muted.bypass, muted.flush_calls), (0, 0, 0));
+        let after = h.dsp(false);
+        assert_eq!(after.denoiser_skipped_frames - dsp.denoiser_skipped_frames, 400);
+        assert_eq!(after.ns_gap_frames, dsp.ns_gap_frames, "silence needs no noise suppression");
+        assert_eq!(after.aligner_underruns, dsp.aligner_underruns);
+        assert_eq!(after.startup_hold_frames, dsp.startup_hold_frames);
+
+        let resumed = run(&h, 48000, 1, 2000.0);
+        assert_eq!(&resumed[128..240], &[500.0; 112], "what the pipeline held");
+        assert_eq!(
+            &resumed[240..],
+            &[1000.0; 240],
+            "then the new audio, 240 samples late as before"
+        );
+        assert_eq!(run(&h, 48000, 1, 2000.0), vec![1000.0; 480]);
+        let resumed = h.fake_denoiser();
+        assert_eq!((resumed.process_calls, resumed.silent_calls), (fake.process_calls + 2, 0));
+        assert_eq!(resumed.bypass, 0);
+
+        h.set_capture_silent(true);
+        h.bump_stream_epoch();
+        assert!(silent(&run(&h, 48000, 1, 0.0)));
+        run(&h, 48000, 1, 2000.0);
+        assert_eq!(h.fake_denoiser().flush_calls, 1, "a flush that came during the silence waits");
+    }
+
+    #[test]
+    fn root_capture_processor_applies_the_speech_lookahead_it_is_given() {
+        let h = started(48000, 1);
+        h.set_dsp(false, false, 0.01);
+        h.set_speech_detection(2);
+        for (setting, applied) in
+            [(f32::NAN, 40), (60.0, 60), (0.0, 0), (25.0, 30), (-5.0, 0), (1e9, 60), (40.0, 40)]
+        {
+            h.set_speech_lookahead_ms(setting);
+            run(&h, 48000, 1, 0.0);
+            let dsp = h.dsp(false);
+            assert_eq!(dsp.speech_lookahead_applied_ms, applied, "{setting}");
+            assert!(dsp.speech_lookahead_ms.to_bits() == setting.to_bits(), "stored as set");
+        }
+        assert_eq!(h.dsp(false).threshold_term, 3, "manual");
+        assert!((h.dsp(false).open_threshold_db + 40.0).abs() < 1e-3);
+        h.set_speech_detection(0);
+        run(&h, 48000, 1, 0.0);
+        assert_eq!(h.dsp(false).speech_lookahead_applied_ms, 0, "Off: no look-ahead");
+        h.reset_controls();
+        assert!(h.dsp(false).speech_lookahead_ms.is_nan(), "a reset forgets it");
+        h.set_dsp(false, true, 0.025);
+        for _ in 0..300 {
+            run(&h, 48000, 1, 0.0);
+        }
+        let dsp = h.dsp(false);
+        assert_eq!((dsp.threshold_term, dsp.open_threshold_db), (2, -54.0), "the minimum");
+        assert_eq!(dsp.auto_sensitivity_floor_db, -90.0, "silence: the floor's bottom");
+    }
+
     #[test]
     fn root_capture_processor_runs_the_denoiser_only_while_wanted() {
         let h = pass_through(48000, 1);
@@ -1941,6 +2053,9 @@ mod speech_tests {
     const CONFIRM_FRAMES: u32 = 3;
     const HANG_FRAMES: usize = 30;
     const HOLD_FRAMES: usize = 20;
+    /// rootapp_voice_dsp::SPEECH_LOOKAHEAD_MS in frames: GATE sends each frame
+    /// this many frames after it came.
+    const LOOKAHEAD: usize = 4;
 
     fn frames(rate: i32) -> usize {
         (rate / 100) as usize
@@ -2103,8 +2218,14 @@ mod speech_tests {
                 (onset as i64 - quiet as i64) * 10
             );
             assert!(
-                (0..onset).all(|f| !gate[f].1) && gate[onset].1,
-                "{rate}: nothing goes out before the detector confirms, and the confirmation opens it"
+                (0..onset).all(|f| !gate[f].1),
+                "{rate}: nothing goes out before the detector confirms"
+            );
+            assert_eq!(
+                (0..gate.len()).find(|&f| gate[f].1),
+                Some(quiet + LOOKAHEAD),
+                "{rate}: the confirmation came within the look-ahead, so the voice goes out from its \
+                 first frame, LOOKAHEAD frames after it came"
             );
 
             let end = quiet + voice;
@@ -2185,9 +2306,16 @@ mod speech_tests {
         assert!(muted.iter().all(|&(ring, sent)| !ring && !sent));
         assert!(h.dsp(false).speech, "the detector keeps judging while muted");
         h.set_mic_muted(false);
-        let vowel = root_speech_test_signal(VOWEL, 48000, 61);
-        run(&h, 48000, &vowel[vowel.len() - 480..]);
-        assert!(h.dsp(false).published_speaking, "unmuting mid-word rings at once");
+        let vowel = root_speech_test_signal(VOWEL, 48000, 60 + LOOKAHEAD as u32 + 1);
+        let unmuted = run(&h, 48000, &vowel[60 * 480..]);
+        assert!(
+            unmuted[..LOOKAHEAD].iter().all(|&(ring, sent)| !ring && !sent),
+            "what the look-ahead held was captured while muted"
+        );
+        assert!(
+            unmuted[LOOKAHEAD].0 && unmuted[LOOKAHEAD].1,
+            "unmuting mid-word rings with the first frame after it"
+        );
     }
 
     #[test]
