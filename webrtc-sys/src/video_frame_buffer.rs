@@ -45,6 +45,7 @@ pub mod ffi {
         type I444Buffer;
         type I010Buffer;
         type NV12Buffer;
+        type I420BufferPool;
         type PlatformImageBuffer;
 
         fn buffer_type(self: &VideoFrameBuffer) -> VideoFrameBufferType;
@@ -104,6 +105,9 @@ pub mod ffi {
             -> UniquePtr<I010Buffer>;
         fn scale(self: &NV12Buffer, scaled_width: i32, scaled_height: i32)
             -> UniquePtr<NV12Buffer>;
+
+        fn new_i420_buffer_pool(max_buffers: usize) -> UniquePtr<I420BufferPool>;
+        fn create(self: &I420BufferPool, width: i32, height: i32) -> UniquePtr<I420Buffer>;
 
         fn copy_i420_buffer(i420: &UniquePtr<I420Buffer>) -> UniquePtr<I420Buffer>;
         fn new_i420_buffer(
@@ -190,6 +194,7 @@ impl_thread_safety!(ffi::I422Buffer, Send + Sync);
 impl_thread_safety!(ffi::I444Buffer, Send + Sync);
 impl_thread_safety!(ffi::I010Buffer, Send + Sync);
 impl_thread_safety!(ffi::NV12Buffer, Send + Sync);
+impl_thread_safety!(ffi::I420BufferPool, Send + Sync);
 
 #[cfg(test)]
 mod tests {

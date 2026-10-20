@@ -312,6 +312,26 @@ std::unique_ptr<NV12Buffer> NV12Buffer::scale(int scaled_width,
           const_cast<webrtc::NV12BufferInterface*>(result->GetNV12())));
 }
 
+I420BufferPool::I420BufferPool(size_t max_buffers)
+    : pool_(/*zero_initialize=*/false, max_buffers) {}
+
+std::unique_ptr<I420Buffer> I420BufferPool::create(int width,
+                                                   int height) const {
+  webrtc::scoped_refptr<webrtc::I420Buffer> buffer;
+  {
+    webrtc::MutexLock lock(&mutex_);
+    buffer = pool_.CreateI420Buffer(width, height);
+  }
+  if (!buffer) {
+    buffer = webrtc::I420Buffer::Create(width, height);
+  }
+  return std::make_unique<I420Buffer>(std::move(buffer));
+}
+
+std::unique_ptr<I420BufferPool> new_i420_buffer_pool(size_t max_buffers) {
+  return std::make_unique<I420BufferPool>(max_buffers);
+}
+
 std::unique_ptr<I420Buffer> copy_i420_buffer(
     const std::unique_ptr<I420Buffer>& i420) {
   return std::make_unique<I420Buffer>(webrtc::I420Buffer::Copy(*i420->get()));

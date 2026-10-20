@@ -571,6 +571,22 @@ pub mod native {
 
     new_buffer_type!(NativeBuffer, Native, as_native);
 
+    /// Packed I420 buffers with uninitialized contents, reused once nothing else references them.
+    /// When `max_buffers` are in use, `create` allocates a buffer outside the pool.
+    pub struct I420BufferPool {
+        handle: vf_imp::I420BufferPool,
+    }
+
+    impl I420BufferPool {
+        pub fn new(max_buffers: usize) -> Self {
+            Self { handle: vf_imp::I420BufferPool::new(max_buffers) }
+        }
+
+        pub fn create(&self, width: u32, height: u32) -> I420Buffer {
+            self.handle.create(width, height)
+        }
+    }
+
     impl NativeBuffer {
         /// Creates a `NativeBuffer` from a `CVPixelBufferRef` pointer.
         ///
@@ -634,7 +650,21 @@ pub mod web {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
-    use super::I420Buffer;
+    use std::{future::poll_fn, pin::Pin, time::Duration};
+
+    use livekit_runtime::Stream;
+    use webrtc_sys::video_frame as vf_sys;
+
+    use super::{
+        internal::BufferSealed, native::I420BufferPool, I420Buffer, VideoBuffer, VideoFrame,
+        VideoRotation,
+    };
+    use crate::{
+        imp::video_frame::new_video_frame_buffer,
+        peer_connection_factory::{native::PeerConnectionFactoryExt, PeerConnectionFactory},
+        video_source::{native::NativeVideoSource, VideoResolution},
+        video_stream::native::{NativeVideoStream, NativeVideoStreamOptions},
+    };
 
     #[test]
     fn new_black_initializes_every_plane() {
@@ -643,5 +673,136 @@ mod tests {
         assert!(data_y.iter().all(|&px| px == 0));
         assert!(data_u.iter().all(|&px| px == 128));
         assert!(data_v.iter().all(|&px| px == 128));
+    }
+
+    fn data_ptr(buffer: &I420Buffer) -> *const u8 {
+        buffer.data().0.as_ptr()
+    }
+
+    fn hold_in_frame(buffer: &I420Buffer) -> cxx::UniquePtr<vf_sys::ffi::VideoFrame> {
+        let mut builder = vf_sys::ffi::new_video_frame_builder();
+        builder.pin_mut().set_video_frame_buffer(buffer.sys_handle());
+        builder.pin_mut().build()
+    }
+
+    #[test]
+    fn pool_reuses_a_buffer_nothing_holds() {
+        let pool = I420BufferPool::new(4);
+        let first = data_ptr(&pool.create(64, 32));
+        for _ in 0..8 {
+            assert_eq!(data_ptr(&pool.create(64, 32)), first);
+        }
+    }
+
+    #[test]
+    fn pool_never_hands_out_a_buffer_a_frame_still_holds() {
+        let pool = I420BufferPool::new(4);
+        let mut held = pool.create(64, 32);
+        held.data_mut().0.fill(7);
+        let held_ptr = data_ptr(&held);
+        let frame = hold_in_frame(&held);
+        let clone = new_video_frame_buffer(unsafe { frame.video_frame_buffer() }).unwrap();
+        drop(held);
+
+        for _ in 0..8 {
+            let mut other = pool.create(64, 32);
+            assert_ne!(data_ptr(&other), held_ptr);
+            other.data_mut().0.fill(9);
+        }
+        drop(frame);
+        assert_ne!(data_ptr(&pool.create(64, 32)), held_ptr);
+
+        let clone = clone.as_i420().unwrap();
+        assert_eq!(data_ptr(clone), held_ptr);
+        assert!(clone.data().0.iter().all(|&px| px == 7));
+    }
+
+    #[test]
+    fn pool_buffer_is_reused_once_the_last_holder_lets_go() {
+        let pool = I420BufferPool::new(4);
+        let held = pool.create(64, 32);
+        let held_ptr = data_ptr(&held);
+        let frame = hold_in_frame(&held);
+        drop(held);
+        assert_ne!(data_ptr(&pool.create(64, 32)), held_ptr);
+        drop(frame);
+        assert_eq!(data_ptr(&pool.create(64, 32)), held_ptr);
+    }
+
+    #[test]
+    fn pool_allocates_past_its_cap_instead_of_waiting() {
+        let pool = I420BufferPool::new(2);
+        let first = pool.create(64, 32);
+        let second = pool.create(64, 32);
+        let extra = pool.create(64, 32);
+        let pooled = [data_ptr(&first), data_ptr(&second)];
+        assert!(!pooled.contains(&data_ptr(&extra)));
+        assert_eq!((extra.width(), extra.height(), extra.strides()), (64, 32, (64, 32, 32)));
+        drop(extra);
+        drop(first);
+        assert_eq!(data_ptr(&pool.create(64, 32)), pooled[0]);
+    }
+
+    #[test]
+    fn pool_follows_a_size_change() {
+        let pool = I420BufferPool::new(4);
+        let mut old = pool.create(64, 32);
+        old.data_mut().0.fill(5);
+
+        let resized = pool.create(33, 17);
+        assert_eq!((resized.width(), resized.height(), resized.strides()), (33, 17, (33, 17, 17)));
+        let (y, u, v) = resized.data();
+        assert_eq!((y.len(), u.len(), v.len()), (33 * 17, 17 * 9, 17 * 9));
+        let resized_ptr = data_ptr(&resized);
+        drop(resized);
+        assert_eq!(data_ptr(&pool.create(33, 17)), resized_ptr);
+
+        assert!(old.data().0.iter().all(|&px| px == 5));
+        drop(old);
+        let back = pool.create(64, 32);
+        assert_eq!((back.width(), back.height(), back.strides()), (64, 32, (64, 32, 32)));
+    }
+
+    #[tokio::test]
+    async fn pool_never_hands_out_a_buffer_a_sink_still_holds() {
+        let factory = PeerConnectionFactory::default();
+        let source = NativeVideoSource::new(VideoResolution { width: 64, height: 32 }, false);
+        let track = factory.create_video_track("pool", source.clone());
+        let mut stream = NativeVideoStream::with_options(
+            track,
+            NativeVideoStreamOptions { queue_size_frames: Some(0) },
+        );
+        let pool = I420BufferPool::new(4);
+
+        let mut buffer = pool.create(64, 32);
+        buffer.data_mut().0.fill(3);
+        let sent = data_ptr(&buffer);
+        source.capture_frame(&VideoFrame {
+            rotation: VideoRotation::VideoRotation0,
+            timestamp_us: 0,
+            frame_metadata: None,
+            buffer,
+        });
+
+        let received = livekit_runtime::timeout(Duration::from_secs(5), async {
+            loop {
+                let frame = poll_fn(|cx| Pin::new(&mut stream).poll_next(cx)).await.unwrap();
+                if frame.buffer.as_i420().is_some_and(|i420| data_ptr(i420) == sent) {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("the captured frame reaches the sink");
+
+        for _ in 0..8 {
+            let mut other = pool.create(64, 32);
+            assert_ne!(data_ptr(&other), sent);
+            other.data_mut().0.fill(9);
+        }
+        assert!(received.buffer.as_i420().unwrap().data().0.iter().all(|&px| px == 3));
+        drop(received);
+        assert_eq!(data_ptr(&pool.create(64, 32)), sent);
+        stream.close();
     }
 }

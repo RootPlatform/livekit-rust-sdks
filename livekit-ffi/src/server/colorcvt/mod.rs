@@ -13,22 +13,28 @@
 // limitations under the License.
 
 use crate::{proto, FfiResult};
-use livekit::webrtc::{prelude::*, video_frame::BoxVideoBuffer};
+use livekit::webrtc::{
+    prelude::*,
+    video_frame::{native::I420BufferPool, BoxVideoBuffer},
+};
 use std::slice;
 
 pub mod cvtimpl;
 
-pub unsafe fn to_libwebrtc_buffer(info: proto::VideoBufferInfo) -> BoxVideoBuffer {
+pub unsafe fn to_libwebrtc_buffer(
+    info: proto::VideoBufferInfo,
+    pool: &I420BufferPool,
+) -> BoxVideoBuffer {
     let r#type = info.r#type();
     let proto::VideoBufferInfo { width, height, components, .. } = info.clone();
 
     match r#type {
         // For RGBA-family / RGB24 buffers, fused conversion directly into I420Buffer
-        proto::VideoBufferType::Rgba => cvtimpl::cvt_rgba_to_i420_buffer(info, false),
-        proto::VideoBufferType::Abgr => cvtimpl::cvt_abgr_to_i420_buffer(info, false),
-        proto::VideoBufferType::Argb => cvtimpl::cvt_argb_to_i420_buffer(info, false),
-        proto::VideoBufferType::Bgra => cvtimpl::cvt_bgra_to_i420_buffer(info, false),
-        proto::VideoBufferType::Rgb24 => cvtimpl::cvt_rgb24_to_i420_buffer(info, false),
+        proto::VideoBufferType::Rgba => cvtimpl::cvt_rgba_to_i420_buffer(info, false, pool),
+        proto::VideoBufferType::Abgr => cvtimpl::cvt_abgr_to_i420_buffer(info, false, pool),
+        proto::VideoBufferType::Argb => cvtimpl::cvt_argb_to_i420_buffer(info, false, pool),
+        proto::VideoBufferType::Bgra => cvtimpl::cvt_bgra_to_i420_buffer(info, false, pool),
+        proto::VideoBufferType::Rgb24 => cvtimpl::cvt_rgb24_to_i420_buffer(info, false, pool),
         proto::VideoBufferType::I420 | proto::VideoBufferType::I420a => {
             let (c0, c1, c2) = (&components[0], &components[1], &components[2]);
 
@@ -39,7 +45,12 @@ pub unsafe fn to_libwebrtc_buffer(info: proto::VideoBufferInfo) -> BoxVideoBuffe
                     slice::from_raw_parts(c2.data_ptr as *const u8, c2.size as usize),
                 )
             };
-            let mut i420 = I420Buffer::with_strides(width, height, c0.stride, c1.stride, c2.stride);
+            let chroma_w = (width + 1) / 2;
+            let mut i420 = if (c0.stride, c1.stride, c2.stride) == (width, chroma_w, chroma_w) {
+                pool.create(width, height)
+            } else {
+                I420Buffer::with_strides(width, height, c0.stride, c1.stride, c2.stride)
+            };
 
             let (dy, du, dv) = i420.data_mut();
             dy.copy_from_slice(data_y);
@@ -636,6 +647,131 @@ mod tests {
         let packed = I420Buffer::new(640, 360);
         assert!(shared_i420_info(&packed, Some(proto::VideoBufferType::Rgba)).is_none());
         assert!(shared_i420_info(&packed, Some(proto::VideoBufferType::Nv12)).is_none());
+    }
+
+    fn noise(len: usize, seed: u32) -> Vec<u8> {
+        let mut state = seed.wrapping_mul(2654435761) | 1;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                (state >> 8) as u8
+            })
+            .collect()
+    }
+
+    fn planes(buffer: &I420Buffer) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let (y, u, v) = buffer.data();
+        (y.to_vec(), u.to_vec(), v.to_vec())
+    }
+
+    fn unpooled_i420(
+        r#type: proto::VideoBufferType,
+        src: &[u8],
+        width: u32,
+        height: u32,
+    ) -> I420Buffer {
+        use imgproc::colorcvt;
+        let chroma_w = (width + 1) / 2;
+        let mut i420 = I420Buffer::with_strides(width, height, width, chroma_w, chroma_w);
+        let (y, u, v) = i420.data_mut();
+        y.fill(0x55);
+        u.fill(0x55);
+        v.fill(0x55);
+        let convert = match r#type {
+            proto::VideoBufferType::Rgba => colorcvt::abgr_to_i420,
+            proto::VideoBufferType::Abgr => colorcvt::rgba_to_i420,
+            proto::VideoBufferType::Argb => colorcvt::bgra_to_i420,
+            proto::VideoBufferType::Bgra => colorcvt::argb_to_i420,
+            proto::VideoBufferType::Rgb24 => colorcvt::raw_to_i420,
+            _ => unreachable!(),
+        };
+        let bpp = if r#type == proto::VideoBufferType::Rgb24 { 3 } else { 4 };
+        convert(src, width * bpp, y, width, u, chroma_w, v, chroma_w, width, height, false);
+        i420
+    }
+
+    fn dirty_pool_buffer(pool: &I420BufferPool, width: u32, height: u32) -> *const u8 {
+        let mut buffer = pool.create(width, height);
+        let (y, u, v) = buffer.data_mut();
+        y.fill(0xAA);
+        u.fill(0xAA);
+        v.fill(0xAA);
+        y.as_ptr()
+    }
+
+    #[test]
+    fn pooled_capture_conversions_match_the_unpooled_path() {
+        let types = [
+            proto::VideoBufferType::Rgba,
+            proto::VideoBufferType::Abgr,
+            proto::VideoBufferType::Argb,
+            proto::VideoBufferType::Bgra,
+            proto::VideoBufferType::Rgb24,
+        ];
+        let pool = I420BufferPool::new(2);
+        for (width, height) in [(641, 359), (1280, 720), (3, 3), (1, 1)] {
+            for (i, r#type) in types.into_iter().enumerate() {
+                let bpp = if r#type == proto::VideoBufferType::Rgb24 { 3 } else { 4 };
+                let src = noise((width * height * bpp) as usize, i as u32 + width);
+                let info = proto::VideoBufferInfo {
+                    r#type: r#type.into(),
+                    width,
+                    height,
+                    data_ptr: src.as_ptr() as u64,
+                    stride: Some(width * bpp),
+                    components: Vec::new(),
+                };
+
+                let reused = dirty_pool_buffer(&pool, width, height);
+                let pooled = unsafe { to_libwebrtc_buffer(info, &pool) };
+                let pooled = pooled.as_i420().unwrap();
+                assert_eq!(pooled.data().0.as_ptr(), reused, "{:?} {width}x{height}", r#type);
+
+                let unpooled = unpooled_i420(r#type, &src, width, height);
+                assert_eq!(pooled.strides(), unpooled.strides());
+                assert!(planes(pooled) == planes(&unpooled), "{:?} {width}x{height}", r#type);
+            }
+        }
+    }
+
+    #[test]
+    fn packed_i420_capture_uses_the_pool_and_padded_keeps_its_strides() {
+        let pool = I420BufferPool::new(2);
+        for (width, height) in [(641, 359), (640, 360)] {
+            let chroma_w = (width + 1) / 2;
+            let chroma_size = (chroma_w * ((height + 1) / 2)) as usize;
+            let y = noise((width * height) as usize, 1);
+            let u = noise(chroma_size, 2);
+            let v = noise(chroma_size, 3);
+            let info = i420_info(
+                y.as_ptr(),
+                y.as_ptr(),
+                u.as_ptr(),
+                v.as_ptr(),
+                width,
+                height,
+                width,
+                chroma_w,
+                chroma_w,
+            );
+
+            let reused = dirty_pool_buffer(&pool, width, height);
+            let pooled = unsafe { to_libwebrtc_buffer(info, &pool) };
+            let pooled = pooled.as_i420().unwrap();
+            assert_eq!(pooled.data().0.as_ptr(), reused);
+            assert!(planes(pooled) == (y, u, v));
+        }
+
+        let padded = filled(I420Buffer::with_strides(640, 360, 704, 352, 352));
+        let (y, u, v) = padded.data();
+        let info =
+            i420_info(y.as_ptr(), y.as_ptr(), u.as_ptr(), v.as_ptr(), 640, 360, 704, 352, 352);
+        let copied = unsafe { to_libwebrtc_buffer(info, &pool) };
+        let copied = copied.as_i420().unwrap();
+        assert_eq!(copied.strides(), (704, 352, 352));
+        assert!(planes(copied) == planes(&padded));
     }
 
     #[test]

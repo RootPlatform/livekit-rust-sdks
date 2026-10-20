@@ -16,13 +16,16 @@ use super::{colorcvt, FfiHandle};
 use crate::{proto, server, FfiError, FfiHandleId, FfiResult};
 use livekit::webrtc::{
     prelude::*,
-    video_frame::{FrameMetadata, VideoFrame},
+    video_frame::{native::I420BufferPool, FrameMetadata, VideoFrame},
 };
+
+const CAPTURE_POOL_BUFFERS: usize = 8;
 
 pub struct FfiVideoSource {
     pub handle_id: FfiHandleId,
     pub source_type: proto::VideoSourceType,
     pub source: RtcVideoSource,
+    i420_pool: I420BufferPool,
 }
 
 impl FfiHandle for FfiVideoSource {}
@@ -62,7 +65,12 @@ impl FfiVideoSource {
         };
 
         let handle_id = server.next_id();
-        let video_source = Self { handle_id, source_type, source: source_inner };
+        let video_source = Self {
+            handle_id,
+            source_type,
+            source: source_inner,
+            i420_pool: I420BufferPool::new(CAPTURE_POOL_BUFFERS),
+        };
         let source_info = proto::VideoSourceInfo::from(&video_source);
         server.store_handle(handle_id, video_source);
 
@@ -80,7 +88,7 @@ impl FfiVideoSource {
         match self.source {
             #[cfg(not(target_arch = "wasm32"))]
             RtcVideoSource::Native(ref source) => {
-                let buffer = colorcvt::to_libwebrtc_buffer(capture.buffer.clone());
+                let buffer = colorcvt::to_libwebrtc_buffer(capture.buffer.clone(), &self.i420_pool);
                 let frame = VideoFrame {
                     rotation: capture.rotation().into(),
                     timestamp_us: capture.timestamp_us,

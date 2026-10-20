@@ -127,6 +127,26 @@ pub struct NV12Buffer {
     sys_handle: UniquePtr<vfb_sys::ffi::NV12Buffer>,
 }
 
+pub struct I420BufferPool {
+    sys_handle: UniquePtr<vfb_sys::ffi::I420BufferPool>,
+}
+
+impl I420BufferPool {
+    pub fn new(max_buffers: usize) -> Self {
+        Self { sys_handle: vfb_sys::ffi::new_i420_buffer_pool(max_buffers) }
+    }
+
+    pub fn create(&self, width: u32, height: u32) -> vf::I420Buffer {
+        vf::I420Buffer {
+            handle: I420Buffer {
+                sys_handle: self
+                    .sys_handle
+                    .create(width.try_into().unwrap(), height.try_into().unwrap()),
+            },
+        }
+    }
+}
+
 macro_rules! impl_to_argb {
     (I420Buffer [$($variant:ident: $fnc:ident),+], $format:ident, $self:ident, $dst:ident, $dst_stride:ident, $dst_width:ident, $dst_height:ident) => {
         match $format {

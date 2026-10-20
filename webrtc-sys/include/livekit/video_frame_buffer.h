@@ -24,6 +24,8 @@
 #include "api/video/i010_buffer.h"
 #include "api/video/nv12_buffer.h"
 #include "api/video/video_frame_buffer.h"
+#include "common_video/include/video_frame_buffer_pool.h"
+#include "rtc_base/synchronization/mutex.h"
 
 namespace livekit_ffi {
 class VideoFrameBuffer;
@@ -38,6 +40,7 @@ class I422Buffer;
 class I444Buffer;
 class I010Buffer;
 class NV12Buffer;
+class I420BufferPool;
 }  // namespace livekit_ffi
 
 #ifdef __APPLE__
@@ -210,6 +213,19 @@ class NV12Buffer : public BiplanarYuv8Buffer {
  private:
   webrtc::NV12BufferInterface* buffer() const;
 };
+
+class I420BufferPool {
+ public:
+  explicit I420BufferPool(size_t max_buffers);
+
+  std::unique_ptr<I420Buffer> create(int width, int height) const;
+
+ private:
+  mutable webrtc::Mutex mutex_;
+  mutable webrtc::VideoFrameBufferPool pool_;
+};
+
+std::unique_ptr<I420BufferPool> new_i420_buffer_pool(size_t max_buffers);
 
 std::unique_ptr<I420Buffer> copy_i420_buffer(
     const std::unique_ptr<I420Buffer>& i420);
