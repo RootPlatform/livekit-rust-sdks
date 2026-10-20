@@ -38,19 +38,21 @@ class Thread;
 
 namespace livekit_ffi {
 class AudioDeviceController;
+#if defined(ROOTAPP_HARNESS)
 class AdmProxyHarness;
 class RootVoiceHarness;
 class RootEngineHarness;
 class RootMonitorHarness;
 struct RootMonitorStats;
 struct RootVoiceFakeCounts;
+struct AdmDeviceRender;
+struct RootControlState;
+#endif
 struct AudioDeviceSelection;
 struct AudioDeviceRequestOutcome;
-struct AdmDeviceRender;
 struct RootAudioNativeStats;
 struct RootAudioControlUpdate;
 struct RootAudioCaptureFormat;
-struct RootControlState;
 struct RootDenoiserCompletionItem;
 struct RootDenoiserReturnedItem;
 struct RootReturnPipelinesResult;
@@ -190,6 +192,7 @@ class AudioDeviceController {
   std::unique_ptr<RootDenoiserControl> denoiser_;
 };
 
+#if defined(ROOTAPP_HARNESS)
 int32_t resolve_audio_device_index_for_test(
     const AudioDeviceSelection& selection,
     rust::Slice<const rust::String> names,
@@ -508,5 +511,6 @@ class RootEngineHarness {
 };
 
 std::unique_ptr<RootEngineHarness> new_root_engine_harness();
+#endif
 
 }  // namespace livekit_ffi

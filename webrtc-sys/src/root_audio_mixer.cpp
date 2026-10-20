@@ -236,6 +236,7 @@ uint64_t RootAudioMixer::sources_added() const {
   return sources_added_.load(std::memory_order_acquire);
 }
 
+#if defined(ROOTAPP_HARNESS)
 void RootAudioMixer::SetTimeoutsForTest(int64_t unconfigured_hold_ms,
                                         int64_t max_effect_wait_ms) {
   unconfigured_hold_ns_.store(unconfigured_hold_ms * 1000000,
@@ -243,6 +244,7 @@ void RootAudioMixer::SetTimeoutsForTest(int64_t unconfigured_hold_ms,
   max_effect_wait_ns_.store(max_effect_wait_ms * 1000000,
                             std::memory_order_relaxed);
 }
+#endif
 
 bool RootAudioMixer::RegisterEffectClip(uint32_t id,
                                         const int16_t* samples,
@@ -620,6 +622,7 @@ std::vector<RootAudioMixerSourceLevel> RootAudioMixer::ReadSourceLevels()
   return levels;
 }
 
+#if defined(ROOTAPP_HARNESS)
 float root_audio_soft_clip(float sample) {
   return RootSoftClip(sample);
 }
@@ -955,5 +958,6 @@ RootMixStress root_audio_mixer_stress_for_test(uint32_t mixes) {
   }
   return result;
 }
+#endif
 
 }  // namespace livekit_ffi

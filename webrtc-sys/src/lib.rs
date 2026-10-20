@@ -34,6 +34,7 @@ pub mod packet_trailer;
 pub mod peer_connection;
 pub mod peer_connection_factory;
 pub mod prohibit_libsrtp_initialization;
+#[cfg(feature = "harness")]
 pub mod root_audio_mixer;
 pub mod root_audio_processing;
 pub mod root_denoiser;

@@ -81,7 +81,9 @@ int16_t ToInt16(float value, uint64_t* clipped) {
   return static_cast<int16_t>(value * 32767.0f);
 }
 
+#if defined(ROOTAPP_HARNESS)
 std::atomic<bool> g_fake_backend{false};
+#endif
 
 }  // namespace
 
@@ -984,8 +986,10 @@ static std::unique_ptr<ScreenAudioBackend> MakeScreenAudioBackend(
     const ScreenAudioCaptureOptions& options) {
   if (options.make_backend)
     return options.make_backend();
+#if defined(ROOTAPP_HARNESS)
   if (auto factory = ScreenAudioBackendFactoryOverride())
     return factory();
+#endif
   return CreateRootScreenAudioBackend();
 }
 
@@ -1351,6 +1355,7 @@ std::unique_ptr<RootScreenAudioCaptureHandle> new_root_screen_audio_capture(
   return std::make_unique<RootScreenAudioCaptureHandle>(std::move(capture));
 }
 
+#if defined(ROOTAPP_HARNESS)
 void root_screen_audio_use_fake_backend(bool enabled) {
   g_fake_backend.store(enabled);
 }
@@ -1363,5 +1368,6 @@ ScreenAudioBackendFactoryOverride() {
     return nullptr;
   return [] { return NewToneScreenAudioBackend(); };
 }
+#endif
 
 }  // namespace livekit_ffi

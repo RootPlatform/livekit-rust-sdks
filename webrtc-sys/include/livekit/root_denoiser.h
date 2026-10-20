@@ -35,6 +35,7 @@
 
 namespace livekit_ffi {
 struct RootDenoiserNotificationCounts;
+#if defined(ROOTAPP_HARNESS)
 struct RootFakeFxSpec;
 struct RootFakeFxCounts;
 struct RootDenoiseTestFrame;
@@ -43,6 +44,7 @@ struct RootDenoiserTestCompletion;
 struct RootDenoiserTestReturned;
 struct RootDenoiserTestReturnAll;
 class RootDenoiserHarness;
+#endif
 }  // namespace livekit_ffi
 #include "webrtc-sys/src/root_denoiser.rs.h"
 
@@ -184,11 +186,13 @@ class RootDenoiserSlot {
   // `take_max` resets process_max_us.
   RootDenoiserSlotStats ReadStats(bool take_max);
 
+#if defined(ROOTAPP_HARNESS)
   // Tests: install or remove at once (the replaced pipeline is dropped).
   bool InstallForTest(void* pipeline, uint32_t rate);
   void* RemoveForTest();
   // Tests: hold the slot as the audio thread would during process().
   bool HoldForTest(bool hold);
+#endif
 
  private:
   static constexpr uint32_t kFree = 0;
@@ -439,6 +443,8 @@ RootDenoiserNotificationCounts root_denoiser_notification_counts();
 // The handler's address as an integer, 0 where the denoiser is not built.
 size_t root_denoiser_notification_handler();
 bool root_denoiser_supported();
+
+#if defined(ROOTAPP_HARNESS)
 // Tests: one fake INotification per code through the handler's vtable, and a
 // null notification first with `include_null`.
 void root_denoiser_notify_for_test(rust::Slice<const int32_t> codes,
@@ -607,5 +613,6 @@ class RootDenoiserHarness {
 std::unique_ptr<RootDenoiserHarness> new_root_denoiser_harness(
     int64_t install_wait_ms,
     int64_t fallback_grace_ms);
+#endif
 
 }  // namespace livekit_ffi

@@ -31,6 +31,7 @@
 #include "rtc_base/synchronization/mutex.h"
 #include "rust/cxx.h"
 
+#if defined(ROOTAPP_HARNESS)
 namespace livekit_ffi {
 struct RootMixTestSource;
 struct RootMixTestResult;
@@ -40,6 +41,7 @@ struct RootMixStress;
 class RootMixerHarness;
 }  // namespace livekit_ffi
 #include "webrtc-sys/src/root_audio_mixer.rs.h"
+#endif
 
 namespace livekit_ffi {
 
@@ -178,9 +180,11 @@ class RootAudioMixer : public webrtc::AudioMixer {
   // Atomics only; a source removed or replaced while it is read is left out.
   std::vector<RootAudioMixerSourceLevel> ReadSourceLevels() const;
 
+#if defined(ROOTAPP_HARNESS)
   // Tests only: shorter hold and effect wait, so they run in real time.
   void SetTimeoutsForTest(int64_t unconfigured_hold_ms,
                           int64_t max_effect_wait_ms);
+#endif
 
  private:
   struct GainSetting {
@@ -288,6 +292,7 @@ class RootAudioMixer : public webrtc::AudioMixer {
 static_assert(std::atomic<double>::is_always_lock_free);
 static_assert(std::atomic<float>::is_always_lock_free);
 
+#if defined(ROOTAPP_HARNESS)
 float root_audio_soft_clip(float sample);
 float root_audio_volume_to_gain(float linear_volume);
 
@@ -334,5 +339,6 @@ std::unique_ptr<RootMixerHarness> new_root_mixer_harness();
 // Mixes `mixes` times while other threads change gains, master, deafen and the
 // platform reference, play and stop effects, and add and remove sources.
 RootMixStress root_audio_mixer_stress_for_test(uint32_t mixes);
+#endif
 
 }  // namespace livekit_ffi

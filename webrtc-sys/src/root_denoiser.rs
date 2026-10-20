@@ -30,6 +30,7 @@ pub mod ffi {
     /// [empty_from, empty_from + empty_count) return nothing (calls count from
     /// 1 after creation or a flush); process, flush and the power setter each
     /// busy-wait sleep_us.
+    #[cfg(feature = "harness")]
     #[derive(Debug, Clone, Copy, Default)]
     pub struct RootFakeFxSpec {
         pub scale: f32,
@@ -40,6 +41,7 @@ pub mod ffi {
         pub sleep_us: u32,
     }
 
+    #[cfg(feature = "harness")]
     #[derive(Debug, Clone, Copy, Default)]
     pub struct RootFakeFxCounts {
         pub process_calls: u64,
@@ -50,6 +52,7 @@ pub mod ffi {
         pub releases: u64,
     }
 
+    #[cfg(feature = "harness")]
     #[derive(Debug, Clone, Default)]
     pub struct RootDenoiseTestFrame {
         /// 0 not in use, 1 missed, 2 ran.
@@ -59,6 +62,7 @@ pub mod ffi {
         pub out: Vec<f32>,
     }
 
+    #[cfg(feature = "harness")]
     #[derive(Debug, Clone, Default)]
     pub struct RootDenoiserSlotInfo {
         pub installed: bool,
@@ -77,6 +81,7 @@ pub mod ffi {
         pub histogram: Vec<u64>,
     }
 
+    #[cfg(feature = "harness")]
     #[derive(Debug, Clone, Default, PartialEq, Eq)]
     pub struct RootDenoiserTestCompletion {
         pub owner: u64,
@@ -88,12 +93,14 @@ pub mod ffi {
         pub pipeline: u64,
     }
 
+    #[cfg(feature = "harness")]
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
     pub struct RootDenoiserTestReturned {
         pub owner: u64,
         pub pipeline: u64,
     }
 
+    #[cfg(feature = "harness")]
     #[derive(Debug, Clone, Default)]
     pub struct RootDenoiserTestReturnAll {
         pub pipelines: Vec<u64>,
@@ -103,12 +110,18 @@ pub mod ffi {
     unsafe extern "C++" {
         include!("livekit/root_denoiser.h");
 
-        type RootDenoiserHarness;
-
         fn root_denoiser_notification_counts() -> RootDenoiserNotificationCounts;
         /// The handler's address, 0 where the denoiser is not built.
         fn root_denoiser_notification_handler() -> usize;
         fn root_denoiser_supported() -> bool;
+    }
+
+    #[cfg(feature = "harness")]
+    unsafe extern "C++" {
+        include!("livekit/root_denoiser.h");
+
+        type RootDenoiserHarness;
+
         fn root_denoiser_notify_for_test(codes: &[i32], include_null: bool);
 
         /// A slot, fake pipelines and the control side over hooks the test

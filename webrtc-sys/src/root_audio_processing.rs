@@ -199,6 +199,7 @@ pub mod ffi {
         );
     }
 
+    #[cfg(feature = "harness")]
     #[derive(Debug, Clone, Default)]
     pub struct RootProcessorFrame {
         pub samples: Vec<f32>,
@@ -206,6 +207,7 @@ pub mod ffi {
         pub copies_match: bool,
     }
 
+    #[cfg(feature = "harness")]
     #[derive(Debug, Clone, Copy, Default)]
     pub struct RootProcessorStats {
         pub format_seq: u64,
@@ -217,6 +219,7 @@ pub mod ffi {
         pub stage_samples: u64,
     }
 
+    #[cfg(feature = "harness")]
     #[derive(Debug, Clone, Copy, Default)]
     pub struct RootDecoratorProbe {
         /// Inner ApplyConfig calls the decorator made.
@@ -242,6 +245,7 @@ pub mod ffi {
     }
 
     /// `RootCaptureState::ReadDspStats` and `ReadSpeaking`.
+    #[cfg(feature = "harness")]
     #[derive(Debug, Clone, Copy, Default)]
     pub struct RootProcessorDsp {
         pub processed_frames: u64,
@@ -318,6 +322,7 @@ pub mod ffi {
     /// RootSpeechDetector over a synthetic signal (`root_speech_detector_probe`).
     /// The statistics skip the first 200 ms (the detector's warm-up) and
     /// frames it could not analyze.
+    #[cfg(feature = "harness")]
     #[derive(Debug, Clone, Copy, Default)]
     pub struct RootSpeechDetectorProbe {
         pub frames: u32,
@@ -335,6 +340,7 @@ pub mod ffi {
         pub longest_run: u32,
     }
 
+    #[cfg(feature = "harness")]
     #[derive(Debug, Clone, Copy, Default)]
     pub struct RootFakeDenoiserProbe {
         pub process_calls: u64,
@@ -350,6 +356,7 @@ pub mod ffi {
         pub misses: u64,
     }
 
+    #[cfg(feature = "harness")]
     #[derive(Debug, Clone, Copy, Default)]
     pub struct RootPolicyProbe {
         pub applies: u64,
@@ -364,11 +371,16 @@ pub mod ffi {
     unsafe extern "C++" {
         include!("livekit/root_audio_processing.h");
 
-        type RootProcessorHarness;
-        type RootApmHarness;
-
         /// The factory builds the voice chain (desktop): the DSP capability.
         fn root_dsp_supported() -> bool;
+    }
+
+    #[cfg(feature = "harness")]
+    unsafe extern "C++" {
+        include!("livekit/root_audio_processing.h");
+
+        type RootProcessorHarness;
+        type RootApmHarness;
 
         fn new_root_processor_harness() -> UniquePtr<RootProcessorHarness>;
         /// Without a denoiser slot (32-bit and mobile builds).

@@ -909,6 +909,7 @@ RootEchoModelStatsSnapshot RootEchoModelController::ReadStats() {
 // Test hooks
 // =============================================================================
 
+#if defined(ROOTAPP_HARNESS)
 uint32_t root_output_kind_from_windows(uint32_t form_factor, bool bluetooth) {
   return static_cast<uint32_t>(RootOutputKindFromWindows(form_factor, bluetooth));
 }
@@ -1360,5 +1361,6 @@ bool root_echo_adjust_config_is_googles_tuning() {
          tuned.high_frequency_suppression.bands_in_limiting_gain == 3 &&
          config.suppressor.normal_tuning.mask_lf.enr_transparent == 0.3f;
 }
+#endif
 
 }  // namespace livekit_ffi

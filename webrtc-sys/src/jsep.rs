@@ -101,6 +101,7 @@ impl ffi::SdpParseError {
 mod tests {
     #[cxx::bridge(namespace = "livekit_ffi")]
     pub mod ffi_tests {
+        #[cfg(feature = "harness")]
         unsafe extern "C++" {
             include!("livekit/jsep.h");
 

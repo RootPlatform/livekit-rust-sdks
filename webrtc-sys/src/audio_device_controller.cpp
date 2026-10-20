@@ -963,6 +963,7 @@ bool AudioDeviceController::is_platform_adm_active() const {
   return adm_proxy_->is_platform_adm_active();
 }
 
+#if defined(ROOTAPP_HARNESS)
 int32_t resolve_audio_device_index_for_test(
     const AudioDeviceSelection& selection,
     rust::Slice<const rust::String> names,
@@ -976,5 +977,6 @@ int32_t resolve_audio_device_index_for_test(
         return true;
       });
 }
+#endif
 
 }  // namespace livekit_ffi

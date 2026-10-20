@@ -128,6 +128,7 @@ uint32_t RootSpeechDetector::ResamplerBit(int rate) {
 // Test hooks
 // =============================================================================
 
+#if defined(ROOTAPP_HARNESS)
 namespace {
 
 constexpr double kPi = 3.14159265358979;
@@ -412,5 +413,6 @@ RootSpeechDetectorProbe root_speech_detector_hiss(int32_t rate,
       probe.judged > 0 ? static_cast<float>(sum / probe.judged) : 0.0f;
   return probe;
 }
+#endif
 
 }  // namespace livekit_ffi

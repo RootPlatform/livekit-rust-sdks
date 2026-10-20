@@ -61,6 +61,7 @@ pub mod ffi {
     }
 
     /// One render callback of the harness's fake device (tests only).
+    #[cfg(feature = "harness")]
     #[derive(Debug, Clone, Default)]
     pub struct AdmDeviceRender {
         /// AudioDeviceBuffer::RequestPlayoutData's result: the frames
@@ -275,6 +276,7 @@ pub mod ffi {
     }
 
     /// A RootAudioMonitor's counters (tests).
+    #[cfg(feature = "harness")]
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
     pub struct RootMonitorStats {
         pub active: bool,
@@ -356,6 +358,7 @@ pub mod ffi {
     }
 
     /// The stored controls (tests).
+    #[cfg(feature = "harness")]
     #[derive(Debug, Clone, Copy, Default, PartialEq)]
     pub struct RootControlState {
         pub mic_muted: bool,
@@ -441,6 +444,7 @@ pub mod ffi {
     }
 
     /// What a fake Effects SDK pipeline was asked (tests).
+    #[cfg(feature = "harness")]
     #[derive(Debug, Clone, Copy, Default, PartialEq)]
     pub struct RootVoiceFakeCounts {
         pub process_calls: u64,
@@ -456,10 +460,6 @@ pub mod ffi {
         include!("livekit/peer_connection_factory.h");
 
         type AudioDeviceController;
-        type AdmProxyHarness;
-        type RootVoiceHarness;
-        type RootEngineHarness;
-        type RootMonitorHarness;
         type PeerConnectionFactory = crate::peer_connection_factory::ffi::PeerConnectionFactory;
 
         fn audio_device(self: &PeerConnectionFactory) -> SharedPtr<AudioDeviceController>;
@@ -573,6 +573,16 @@ pub mod ffi {
         fn release_platform_adm(self: &AudioDeviceController);
         fn platform_adm_ref_count(self: &AudioDeviceController) -> i32;
         fn is_platform_adm_active(self: &AudioDeviceController) -> bool;
+    }
+
+    #[cfg(feature = "harness")]
+    unsafe extern "C++" {
+        include!("livekit/audio_device_controller.h");
+
+        type AdmProxyHarness;
+        type RootVoiceHarness;
+        type RootEngineHarness;
+        type RootMonitorHarness;
 
         fn resolve_audio_device_index_for_test(
             selection: &AudioDeviceSelection,

@@ -37,12 +37,14 @@
 
 namespace livekit_ffi {
 struct RootEchoModelSession;
+#if defined(ROOTAPP_HARNESS)
 struct RootEchoPolicyProbe;
 struct RootEchoWindowProbe;
 struct RootEchoHarnessProbe;
 struct RootEchoStressProbe;
 struct RootEchoGraceProbe;
 class RootEchoHarness;
+#endif
 }  // namespace livekit_ffi
 #include "webrtc-sys/src/root_echo_model.rs.h"
 
@@ -422,6 +424,7 @@ class RootEchoModelController {
   uint64_t read_us_total_ = 0;
 };
 
+#if defined(ROOTAPP_HARNESS)
 // Test hooks (root_echo_model_tests.rs).
 uint32_t root_output_kind_from_windows(uint32_t form_factor, bool bluetooth);
 bool root_is_bluetooth_instance_id(rust::Str instance_id);
@@ -514,5 +517,6 @@ class RootEchoHarness {
 };
 
 std::unique_ptr<RootEchoHarness> new_root_echo_harness(bool today);
+#endif
 
 }  // namespace livekit_ffi

@@ -40,8 +40,10 @@ class PushResampler;
 
 namespace livekit_ffi {
 class RootScreenAudioCaptureHandle;
+#if defined(ROOTAPP_HARNESS)
 class RootScreenAudioPipeHarness;
 class RootScreenAudioCaptureHarness;
+#endif
 }  // namespace livekit_ffi
 #include "webrtc-sys/src/root_screen_audio.rs.h"
 
@@ -455,6 +457,7 @@ std::unique_ptr<RootScreenAudioCaptureHandle> new_root_screen_audio_capture(
 ScreenAudioTarget ScreenAudioTargetFromSpec(
     const RootScreenAudioTargetSpec& spec);
 
+#if defined(ROOTAPP_HARNESS)
 // Testing: every capture made after this (without its own make_backend) uses
 // the fake backend: a 48 kHz stereo 440 Hz tone at -12 dBFS in 10 ms packets
 // from its own thread.
@@ -552,5 +555,6 @@ rust::Vec<uint32_t> screen_audio_ancestors(uint32_t self_pid,
                                            rust::Slice<const uint32_t> pids,
                                            rust::Slice<const uint32_t> parents,
                                            rust::Slice<const uint64_t> created);
+#endif
 
 }  // namespace livekit_ffi

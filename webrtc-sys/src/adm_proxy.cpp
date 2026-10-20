@@ -1658,6 +1658,7 @@ void AdmProxy::SetCaptureState(
   tap_.set_monitor(monitor);
 }
 
+#if defined(ROOTAPP_HARNESS)
 void AdmProxy::FlushDeviceTasksForTest() {
   RunDeviceTaskAndWait([] {});
 }
@@ -1693,6 +1694,7 @@ void AdmProxy::PollDeviceFormatsForTest() {
     PollDeviceFormatsLocked();
   });
 }
+#endif
 
 AdmNativeStats AdmProxy::ReadNativeStats() {
   AdmNativeStats stats;
@@ -1850,11 +1852,13 @@ bool AdmProxy::LockForEnumeration() {
   return false;
 }
 
+#if defined(ROOTAPP_HARNESS)
 void AdmProxy::SetEnumerationLockForTest(bool serialize, int wait_ms) {
   serialize_enumeration_.store(serialize);
   enumeration_wait_ms_.store(wait_ms);
   enumeration_busy_until_ns_.store(0);
 }
+#endif
 
 // Enumeration goes straight to the Platform ADM, so (except on Linux, see
 // EnumerationGuard) a device list is never stuck behind a device being

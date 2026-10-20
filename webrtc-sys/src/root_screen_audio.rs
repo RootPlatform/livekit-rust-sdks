@@ -109,6 +109,11 @@ pub mod ffi {
         fn stop(self: &RootScreenAudioCaptureHandle, async_id: u64);
         fn stats(self: &RootScreenAudioCaptureHandle) -> RootScreenAudioStatsData;
         fn take_events(self: &RootScreenAudioCaptureHandle) -> Vec<RootScreenAudioEventData>;
+    }
+
+    #[cfg(feature = "harness")]
+    unsafe extern "C++" {
+        include!("livekit/root_screen_audio.h");
 
         /// Testing: captures made afterwards use a fake backend (a 48 kHz
         /// stereo 440 Hz tone in 10 ms packets from its own thread).

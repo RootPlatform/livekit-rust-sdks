@@ -24,6 +24,7 @@ fn main() {
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
     let is_desktop = target_os == "linux" || target_os == "windows" || target_os == "macos";
+    let harness = env::var_os("CARGO_FEATURE_HARNESS").is_some();
 
     println!("cargo:rerun-if-env-changed=LK_DEBUG_WEBRTC");
     println!("cargo:rerun-if-env-changed=LK_CUSTOM_WEBRTC");
@@ -55,7 +56,6 @@ fn main() {
         "src/prohibit_libsrtp_initialization.rs",
         "src/apm.rs",
         "src/audio_mixer.rs",
-        "src/root_audio_mixer.rs",
         "src/root_audio_processing.rs",
         "src/root_denoiser.rs",
         "src/root_screen_audio.rs",
@@ -66,6 +66,9 @@ fn main() {
 
     if is_desktop {
         rust_files.push("src/desktop_capturer.rs");
+    }
+    if harness {
+        rust_files.push("src/root_audio_mixer.rs");
     }
 
     let mut builder = cxx_build::bridges(rust_files);
@@ -96,7 +99,6 @@ fn main() {
         "src/video_decoder_factory.cpp",
         "src/synthetic_audio_device.cpp",
         "src/adm_proxy.cpp",
-        "src/adm_proxy_harness.cpp",
         "src/audio_thread.cpp",
         "src/root_audio_mixer.cpp",
         "src/root_audio_monitor.cpp",
@@ -104,7 +106,6 @@ fn main() {
         "src/root_audio_processing.cpp",
         "src/root_denoiser.cpp",
         "src/root_screen_audio.cpp",
-        "src/root_screen_audio_harness.cpp",
         "src/screen_audio/root_screen_audio_pipewire_graph.cpp",
         "src/root_echo_model.cpp",
         "src/root_speech_detector.cpp",
@@ -124,6 +125,13 @@ fn main() {
         builder.file("src/desktop_capturer.cpp");
     }
 
+    // Test harnesses and test hooks (the `harness` feature, which the crates'
+    // dev-dependencies turn on); release builds compile none of them.
+    if harness {
+        builder.files(&["src/adm_proxy_harness.cpp", "src/root_screen_audio_harness.cpp"]);
+        builder.define("ROOTAPP_HARNESS", None);
+        builder.define("LIVEKIT_TEST", None);
+    }
     if env::var_os("CARGO_FEATURE_MF_FAULT_INJECTION").is_some() {
         builder.define("LK_MF_FAULT_INJECTION", None);
     }
@@ -443,8 +451,6 @@ fn main() {
         }
     }
 
-    // TODO(theomonnom) Only add this define when building tests
-    builder.define("LIVEKIT_TEST", None);
     builder.warnings(false).compile("webrtcsys-cxx");
 
     for entry in glob::glob("./src/**/*.cpp").unwrap() {

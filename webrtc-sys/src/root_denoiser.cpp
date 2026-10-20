@@ -348,6 +348,7 @@ RootDenoiserSlotStats RootDenoiserSlot::ReadStats(bool take_max) {
   return stats;
 }
 
+#if defined(ROOTAPP_HARNESS)
 bool RootDenoiserSlot::InstallForTest(void* pipeline, uint32_t rate) {
   return Install(static_cast<RootFxPipeline*>(pipeline), rate,
                  kControlTimeoutMs, nullptr);
@@ -370,6 +371,7 @@ bool RootDenoiserSlot::HoldForTest(bool hold) {
   return owner_.compare_exchange_strong(
       expected, kAudio, std::memory_order_acquire, std::memory_order_relaxed);
 }
+#endif
 
 // =============================================================================
 // RootNsFallback
@@ -846,6 +848,7 @@ bool root_denoiser_supported() {
   return kRootDenoiserSupported;
 }
 
+#if defined(ROOTAPP_HARNESS)
 namespace {
 
 struct FakeNotification {
@@ -1404,5 +1407,6 @@ std::unique_ptr<RootDenoiserHarness> new_root_denoiser_harness(
   return std::make_unique<RootDenoiserHarness>(install_wait_ms,
                                                fallback_grace_ms);
 }
+#endif
 
 }  // namespace livekit_ffi

@@ -51,6 +51,7 @@ struct RootDspCommands;
 struct RootDspPre;
 struct RootDspOutputs;
 struct RootDspChain;
+#if defined(ROOTAPP_HARNESS)
 struct RootProcessorFrame;
 struct RootProcessorStats;
 struct RootProcessorDsp;
@@ -60,6 +61,7 @@ struct RootPolicyProbe;
 struct RootSpeechDetectorProbe;
 class RootProcessorHarness;
 class RootApmHarness;
+#endif
 }  // namespace livekit_ffi
 #include "webrtc-sys/src/root_audio_processing.rs.h"
 
@@ -655,8 +657,10 @@ class RootApmDecorator : public webrtc::AudioProcessing {
   bool running_model() const;
   std::optional<bool> staged_variant() const;
   uint64_t swaps() const;
+#if defined(ROOTAPP_HARNESS)
   // The APM in use (tests; the pointer may be retired at once).
   webrtc::AudioProcessing* active_for_test() const;
+#endif
 
   // Unset values leave that part of the policy as it is.
   void SetPolicy(std::optional<bool> echo_cancellation,
@@ -729,7 +733,9 @@ class RootApmDecorator : public webrtc::AudioProcessing {
   Config GetConfig() const override;
 
  private:
+#if defined(ROOTAPP_HARNESS)
   friend class RootEchoHarness;
+#endif
 
   // An APM the decorator owns: the flag its post-processor forwards under
   // (null for the first one, which always forwards), the time of the capture
@@ -976,6 +982,7 @@ webrtc::scoped_refptr<RootApmDecorator> CreateRootAudioProcessing(
 bool RootApmConfigsEqual(const webrtc::AudioProcessing::Config& a,
                          const webrtc::AudioProcessing::Config& b);
 
+#if defined(ROOTAPP_HARNESS)
 // Tests only: the decorator over a fake APM that reports fixed echo
 // statistics (ERL 12 dB, ERLE 20 dB, delay 40 ms, divergent fraction 0.25),
 // with policy changes applied inline.
@@ -1145,5 +1152,6 @@ RootSpeechDetectorProbe root_speech_detector_hiss(int32_t rate,
 // A 16 kHz vowel, a 48 kHz vowel, then a frame of 16 kHz silence: its
 // probability (0 once the rate change flushed the 16 kHz resampler).
 float root_speech_detector_rate_switch_for_test();
+#endif
 
 }  // namespace livekit_ffi

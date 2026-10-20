@@ -20,6 +20,7 @@
 #[cxx::bridge(namespace = "livekit_ffi")]
 pub mod ffi {
     /// A policy script's outcome.
+    #[cfg(feature = "harness")]
     #[derive(Debug, Clone, Copy, Default)]
     pub struct RootEchoPolicyProbe {
         pub on: bool,
@@ -32,6 +33,7 @@ pub mod ffi {
     }
 
     /// A kill-switch script's outcome.
+    #[cfg(feature = "harness")]
     #[derive(Debug, Clone, Copy, Default)]
     pub struct RootEchoWindowProbe {
         /// The inference that tripped it (-1: none).
@@ -41,6 +43,7 @@ pub mod ffi {
     }
 
     /// The echo harness's APM, controller and capture state.
+    #[cfg(feature = "harness")]
     #[derive(Debug, Clone, Copy, Default)]
     pub struct RootEchoHarnessProbe {
         pub running_model: bool,
@@ -79,6 +82,7 @@ pub mod ffi {
         pub far_end_delay_ms: i32,
     }
 
+    #[cfg(feature = "harness")]
     #[derive(Debug, Clone, Copy, Default)]
     pub struct RootEchoStressProbe {
         pub swaps: u64,
@@ -92,6 +96,7 @@ pub mod ffi {
 
     /// `grace_replay`: a reader that read the epoch before switch 1 and
     /// counted itself after it.
+    #[cfg(feature = "harness")]
     #[derive(Debug, Clone, Copy, Default)]
     pub struct RootEchoGraceProbe {
         pub first_switched: bool,
@@ -153,6 +158,12 @@ pub mod ffi {
         include!("livekit/root_echo_model.h");
 
         fn root_echo_model_supported() -> bool;
+    }
+
+    #[cfg(feature = "harness")]
+    unsafe extern "C++" {
+        include!("livekit/root_echo_model.h");
+
         fn root_output_kind_from_windows(form_factor: u32, bluetooth: bool) -> u32;
         fn root_is_bluetooth_instance_id(instance_id: &str) -> bool;
         fn root_output_kind_from_mac(

@@ -495,6 +495,7 @@ class AdmProxy : public webrtc::AudioDeviceModule {
   /// Atomics only; the max gaps are reset on read.
   AdmNativeStats ReadNativeStats();
 
+#if defined(ROOTAPP_HARNESS)
   /// Returns once every device task posted before the call has run.
   void FlushDeviceTasksForTest();
   /// The destructor's shutdown of both ADMs.
@@ -511,6 +512,7 @@ class AdmProxy : public webrtc::AudioDeviceModule {
   /// Whether enumeration serializes with device operations (Linux) and how
   /// long it waits for one in progress.
   void SetEnumerationLockForTest(bool serialize, int wait_ms);
+#endif
 
   // ===========================================================================
   // AudioDeviceModule Interface

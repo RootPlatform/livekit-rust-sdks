@@ -174,6 +174,7 @@ mod tests {
 
     #[cxx::bridge(namespace = "livekit_ffi")]
     pub mod ffi {
+        #[cfg(feature = "harness")]
         unsafe extern "C++" {
             include!("livekit/rtc_error.h");
 

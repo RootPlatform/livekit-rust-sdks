@@ -1515,9 +1515,11 @@ uint64_t RootApmDecorator::swaps() const {
   return swaps_.load(std::memory_order_relaxed);
 }
 
+#if defined(ROOTAPP_HARNESS)
 webrtc::AudioProcessing* RootApmDecorator::active_for_test() const {
   return active_.load(std::memory_order_seq_cst)->apm.get();
 }
+#endif
 
 // =============================================================================
 // AudioProcessing
@@ -1854,6 +1856,7 @@ webrtc::scoped_refptr<RootApmDecorator> CreateRootAudioProcessing(
 // Test hooks
 // =============================================================================
 
+#if defined(ROOTAPP_HARNESS)
 namespace {
 
 std::shared_ptr<RootCaptureState> NewCaptureState(bool with_slot) {
@@ -2607,5 +2610,6 @@ uint32_t RootApmHarness::processor_channels() const {
 std::unique_ptr<RootApmHarness> new_root_apm_harness(bool real_apm) {
   return std::make_unique<RootApmHarness>(real_apm);
 }
+#endif
 
 }  // namespace livekit_ffi
