@@ -1235,7 +1235,10 @@ and evaluation: the desktop's `docs/native-platform-audio.md` ("Speech detection
     over (a flush, a mode change) closes nothing: an open gate keeps its level release;
   - at or below -66 dBFS a frame opens nothing whatever the threshold;
   - auto sensitivity follows the level gate alone (`NoiseGate::level_envelope`), so the threshold is
-    Off's and Gate never sends a sample louder than Off.
+    Off's and Gate never applies more gain than Off at the same frame;
+  - since hw.18 the gate decides on each frame and applies the decision to the audio 40 ms older, so
+    a word the detector confirms within 40 ms goes out from its first frame (see "Speech gate
+    look-ahead").
   Push-to-talk, frames without a probability (off, other rates, NaN or negative) and unsupported
   frames leave the chain bit for bit as the level gate; the verdict keeps running under push-to-talk,
   so speech that continues when the key mode ends is already confirmed. Mute does not bypass the speech
@@ -1983,6 +1986,125 @@ ramp from the remembered gain; the platform and managed engines now differ.
 AGC2 as the platform engine's voice gain, and the chain's voice gain without the erased-speech room
 (controls 23-27, stats 139-148, caps 32767): see "Voice gain: AGC2". Carries the macOS playout fix
 released alone as hw.13.
+
+## Speech gate look-ahead, hardware mute and tuning stats (`rootapp/hw18`, hw.18)
+
+Background: the auto sensitivity bench of 2026-10-19 (15 synthetic microphone profiles of one 20-minute
+conversation through the real Effects SDK at 0.60, AGC2 and the chain; the desktop's
+`docs/native-platform-audio.md` has the numbers). hw.17's strict gate sends only confirmed speech, and
+the detector confirms p50 60 / p90 110 ms after a word's first audible frame, so 63% of sentence starts
+lost 20 ms or more (p90 69 ms) on the 12 profiles the SDK does not dominate.
+
+### The look-ahead
+
+- **What runs on the current frame:** the gate's level measurement (`NoiseGate::process_split`, block
+  by block), the speech gate's verdict and control, auto sensitivity's update and the envelope. The
+  gain that decides is applied to the post-gain frame `speech_lookahead_ms` older, kept in a delay line
+  of whole frames (`frame_delay::FrameDelay`, 6 frames allocated in `DspChain::new`). The input volume
+  ramp, the clamp and the transmit gate then run on that older frame, which is what is sent.
+- **When:** Gate mode with a probability and no push-to-talk (`gate_audio`); 40 ms by default.
+  `RootAudioControl.speech_lookahead_ms` (28) sets it: clamped to 0..60, rounded to whole 10 ms frames
+  (halves up), non-finite is 40, a session start forgets it. 0 is hw.17's gate bit for bit. Off, Ring,
+  push-to-talk, frames without a probability and unsupported frames never delay.
+- **Edges:** starting it (or changing its length) sends that many frames of silence first; nothing is
+  repeated. Ending it (Off/Ring, push-to-talk, no probability, an unsupported frame) drops what it held:
+  the next frame is sent at once and up to 40 ms of audio is lost. A flush, a reset and a rate change
+  drop it and start it again behind the startup hold. A frame never comes out of the delay line after
+  a newer one (`the_look_ahead_starts_with_silence_ends_by_dropping_and_never_sends_old_audio`).
+- **Startup hold:** it zeroes what goes in (measured and delayed alike). `held` and
+  `startup_hold_frames` describe the frame sent: a stream starts with 20 + 4 held frames in Gate mode.
+- **Mute:** each delayed frame carries whether the transmit gate was open when it went in; the gate is
+  open for the frame sent only if it was then and is now. Muting cuts at once; after an unmute the
+  first frame captured unmuted goes out 40 ms later (and rings then), so nothing captured while muted
+  is sent. Push-to-talk is unchanged (no look-ahead under it).
+- **Speaking (hw.15):** the frame sent carries audio, or the gate is speaking, while the transmit gate
+  is open for the frame sent and it is not held. Every frame that sends audio rings (but the fade of a
+  mute).
+- **Gate input stats:** `gate_in_sumsq` and the block peak are the delayed frame the gain applies to
+  (comparable with what is sent); `gate_in_rms`, `threshold`, `envelope` and the flags are the
+  decisions on the current frame.
+- **Latency:** +40 ms of capture latency in Gate mode. `RootAudioStats.speech_lookahead_ms` (154) is
+  what the last frame got.
+- **Invariants:** nothing a detector never confirms goes out (only the frames up to 40 ms before a
+  confirmation, which is the point); at every frame Gate's threshold is Off's and its envelope never
+  exceeds Off's, and each sample sent is at most what Off's gain would make of the same delayed frame
+  (`gate_never_sends_more_than_off`, against Gate mode with every frame called speech on the same
+  look-ahead); every frame that sends audio rings.
+
+Measured with the bench against this chain (`autosens-bench lookahead`): `DspChain` at 40 ms and the
+bench's rebuild of design C40 differ in 0 of 119,970 frames on all 15 profiles (sent energy, speaking,
+speech), as do 30 ms and C30 and 0 ms and hw.17. Means over the 12 profiles: starts clipped 20 ms or
+more by the gate 63% -> 19%, gate p90 clip 69 -> 38 ms, gate loss of the speech the SDK kept 3.13% ->
+1.93%, speech lost 11.4% -> 10.3%; noise sent while the talker is silent unchanged (TV 317 -> 319 s of
+491 s), false ring 14.3 -> 11.1 s.
+
+The bench lines the SDK's output up 4 frames behind its input (its own stream). In the chain the SDK's
+output lags its input by 30 ms at 48 kHz, 55 ms at 32 kHz and 43 ms at 16 kHz (the real SDK 1.7.2: it
+returns a frame from the first call, holds 1920/1440 samples at 48/16 kHz, and bursts 480-754 samples
+early on, which the aligner's pre-roll drains). At 48 kHz the detector therefore leads the gated audio
+by 10 ms less than the bench assumed, and 40 ms of look-ahead in a call is about the bench's C30 (24%
+of starts, p90 48 ms); 50 ms would be its C40. Not changed: 40 ms is the approved default, and the
+control makes 50 a desktop change.
+
+### The Effects SDK is not fed digital silence
+
+After a 40 s hardware mute in a noisy room the SDK erased 62-82% of the speech in the next 30 s (fan
+at -55 dBFS, mains hum, a TV); not feeding it the silent frames brought that to 0-3%. A fresh pipeline
+at the unmute was worse on three profiles, so nothing restarts.
+
+- `RootCaptureProcessor` does not call the slot for a frame whose raw capture the decorator flagged
+  (`capture_silent`, hw.11) while the denoiser is wanted, and hands the chain
+  `DenoiserOutput::Skipped` (kind 3): the frame is silence before the gain; the aligner neither pushes
+  nor pops, the empty-output count, the slot's slow/stall counters and the startup hold's wait for the
+  denoiser are untouched, and no NS gap is counted. A flush owed on a skipped frame waits for the next
+  fed one. Frames skipped are counted natively (`denoiser_skipped_frames`, harness only).
+- **Latency:** the SDK's stream carries on where it stopped, so its latency after the silence is what
+  it was (the detector keeps its lead). What it held from before the silence (its 30-55 ms) comes out
+  first, delayed by the silence: within a silence of 1-3 frames (a glitch) that is the right audio a
+  little late; after a hardware mute it is the last 30-55 ms before the mute, which goes out only if
+  the gate opens within those frames of the unmute (speech confirmed that fast, look-ahead included).
+  Dropping it would need the SDK's latency, which it does not report (fed minus returned samples is 0
+  or negative: it pads internally), and would lose real audio after every glitch.
+
+### Tuning stats (149-154)
+
+- `speech_denoiser_erased_frames` (149): frames of steady confirmed speech (confirmed, and 10 frames
+  or more into a run the detector rates 0.3 or more; transmit open, not held) whose aligned denoiser
+  output is 15 dB or more under every pre-denoise frame of the last 10 frames, which hold the frame it
+  came from at any rate (the SDK's latency is at most 55 ms). A lower bound: it never counts what the
+  SDK kept, nor noise the SDK removed in the 300 ms hang after speech.
+- `speech_gate_cut_frames` (150): frames sent whose audio was steady confirmed speech above -66 dBFS
+  (not erased) when it went in, while the noise gate was shut for the whole frame (under the
+  threshold), transmit open, push-to-talk not in use.
+- `auto_sensitivity_floor_db` (151, NaN while off), `open_threshold_db` (152, before the gain: auto
+  sensitivity's open threshold, or the manual threshold less the gain, at least -140) and
+  `threshold_term` (153, `RootAudioThresholdTerm`: FLOOR the floor plus 8 dB, MINIMUM the minimum
+  lowered by the gain above 11 dB, MANUAL; `AutoSensitivity::floor_sets_open_at`).
+- `speech_lookahead_ms` (154).
+
+All with the DSP stats; no capability bit, caps stay 32767: a library that predates them skips control
+28 and sends none of 149-154.
+
+Tests: `rootapp-voice-dsp` (`speech_gate.rs`: the setting in whole frames, only in Gate mode, a word's
+start sent when the confirmation comes within the look-ahead and frames before it never, the startup
+hold, every edge (mode, push-to-talk, length changes, a flush, rates, an unsupported frame, a mute, no
+probability) with fingerprinted frames that name their source, the property test against Gate with
+constant speech on the same look-ahead, the mute and hang tests on the new timing; `frame_delay.rs`;
+`noise_gate.rs` the split; `chain.rs` skipped frames keep the aligner and stall count, are no denoiser
+for the hold, the two counters and the threshold stats; the golden vectors: Gate with constant speech
+and no look-ahead is Off bit for bit, and with 40 ms makes Off's decisions on every frame and sends
+Off's frame f - 4 at frame f wherever Off's gain held over both (13,413 frames compared);
+`no_alloc`/`no_panic` vary the look-ahead and the skip), webrtc-sys
+(`root_capture_processor_never_feeds_the_denoiser_digital_silence`,
+`root_capture_processor_applies_the_speech_lookahead_it_is_given`, the speech tests on the new timing,
+`root_voice_a_hardware_mute_never_reaches_the_denoiser_and_nothing_falls_back`,
+`adm_proxy_controller_stores_the_speech_lookahead_until_a_reset`), and the livekit and livekit-ffi
+conversions.
+
+## hw.18 (2026-10-19)
+
+The speech gate's 40 ms look-ahead (control 28), the Effects SDK no longer fed digital silence, and
+the tuning stats 149-154 (caps 32767): see "Speech gate look-ahead, hardware mute and tuning stats".
 
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
