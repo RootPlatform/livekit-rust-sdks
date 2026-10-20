@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <map>
 #include <memory>
 #include <string>
@@ -325,6 +326,20 @@ class AdmProxyHarness {
   void engine_terminate() const;
   // What the proxy's destructor does to the devices.
   void shutdown() const;
+  // Called from a thread of their own, as CoreAudio's notification queue.
+  void notify_devices_changed() const;
+  void notify_format_changed() const;
+  void notify_default_output_changed() const;
+  void set_listener_restarts(bool restarts) const;
+  uint32_t listener_calls() const;
+  bool listeners_ran_on_device_thread() const;
+  uint32_t overlapping_device_calls() const;
+  uint32_t core_audio_listeners() const;
+  uint64_t routed_listeners() const;
+  uint64_t delivered_listener_notifications() const;
+  bool add_listener_from_test_thread(bool adm_listener) const;
+  void remove_listener_from_test_thread(bool adm_listener) const;
+  uint32_t foreign_listener_calls() const;
   AudioDeviceRequestOutcome select(const AudioDeviceSelection& recording,
                                    bool set_recording,
                                    const AudioDeviceSelection& playout,
@@ -392,6 +407,8 @@ class AdmProxyHarness {
     bool installed = false;
   };
   std::shared_ptr<DeviceFormats> formats_ = std::make_shared<DeviceFormats>();
+  std::shared_ptr<std::atomic<uint32_t>> foreign_calls_ =
+      std::make_shared<std::atomic<uint32_t>>(0);
 };
 
 std::unique_ptr<AdmProxyHarness> new_adm_proxy_harness(

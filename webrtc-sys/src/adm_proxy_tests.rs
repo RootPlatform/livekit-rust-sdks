@@ -1602,3 +1602,140 @@ fn adm_proxy_stats_count_mixer_source_levels() {
     assert!(stats.mix_source_levels_available);
     assert!(stats.mix_source_levels.is_empty());
 }
+
+fn settle(h: &AdmProxyHarness) -> Vec<String> {
+    h.flush();
+    h.flush();
+    h.take_calls()
+}
+
+#[test]
+fn adm_proxy_runs_the_platform_adms_listeners_on_the_device_thread() {
+    let h = platform(&["{spk}"], &["{mic}"]);
+    h.hold(true);
+    assert_eq!(calls(&h), [default_device("Playout"), "InitPlayout".into(), "StartPlayout".into()]);
+    assert_eq!(
+        h.routed_listeners(),
+        2,
+        "Init's devices listener and InitPlayout's format listener"
+    );
+
+    h.notify_devices_changed();
+    assert_eq!(
+        settle(&h),
+        ["listener: devices", "StopPlayout", "SetPlayoutDevice(0)", "InitPlayout", "StartPlayout"]
+    );
+    assert!(h.listeners_ran_on_device_thread());
+    assert!(h.platform_playing());
+    assert_eq!(h.overlapping_device_calls(), 0);
+}
+
+#[test]
+fn adm_proxy_holds_a_listener_notification_until_the_device_operation_in_progress_ends() {
+    let h = platform(&["{spk}"], &["{mic}"]);
+    h.block_next_start_playout();
+    h.hold(true);
+    assert!(h.start_playout_blocked());
+
+    h.notify_devices_changed();
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(h.listener_calls(), 0, "the notification waits for the device thread");
+
+    h.release_start_playout(0);
+    assert_eq!(
+        settle(&h),
+        [
+            default_device("Playout"),
+            "InitPlayout".into(),
+            "StartPlayout".into(),
+            "listener: devices".into(),
+            "StopPlayout".into(),
+            "SetPlayoutDevice(0)".into(),
+            "InitPlayout".into(),
+            "StartPlayout".into()
+        ]
+    );
+    assert_eq!(h.overlapping_device_calls(), 0);
+    assert!(h.platform_playing());
+}
+
+#[test]
+fn adm_proxy_reopens_what_the_platform_adms_listener_closed() {
+    let h = platform(&["{spk}"], &["{mic}"]);
+    h.hold(true);
+    calls(&h);
+    h.set_listener_restarts(false);
+
+    h.notify_devices_changed();
+    assert_eq!(
+        settle(&h),
+        [
+            "listener: devices".into(),
+            "StopPlayout".into(),
+            default_device("Playout"),
+            "InitPlayout".into(),
+            "StartPlayout".into()
+        ]
+    );
+    assert!(h.platform_playing());
+}
+
+#[test]
+fn adm_proxy_drops_a_notification_whose_listener_was_removed_before_it_ran() {
+    let h = platform(&["{spk}"], &["{mic}"]);
+    h.block_next_start_playout();
+    h.hold(true);
+    assert!(h.start_playout_blocked());
+    h.hold(false);
+    h.notify_format_changed();
+    assert_eq!(h.delivered_listener_notifications(), 1);
+
+    h.release_start_playout(0);
+    assert_eq!(
+        settle(&h),
+        [
+            default_device("Playout"),
+            "InitPlayout".into(),
+            "StartPlayout".into(),
+            "StopPlayout".into()
+        ]
+    );
+    assert_eq!(h.listener_calls(), 0, "StopPlayout removed the format listener before it ran");
+}
+
+#[test]
+fn adm_proxy_runs_no_listener_after_shutdown() {
+    let h = platform(&["{spk}"], &["{mic}"]);
+    assert!(h.add_listener_from_test_thread(true));
+    h.shutdown();
+    h.take_calls();
+
+    h.notify_default_output_changed();
+    assert_eq!(h.delivered_listener_notifications(), 1);
+    assert_eq!(settle(&h), Vec::<String>::new());
+    assert_eq!(h.listener_calls(), 0);
+    h.remove_listener_from_test_thread(true);
+    assert_eq!(h.core_audio_listeners(), 0);
+}
+
+#[test]
+fn adm_listener_router_routes_only_the_platform_adms_listeners() {
+    let h = platform(&["{spk}"], &["{mic}"]);
+    assert!(!h.add_listener_from_test_thread(false), "another listener goes to CoreAudio as it is");
+    assert!(
+        h.add_listener_from_test_thread(true),
+        "the ADM's own listener is routed wherever it is added"
+    );
+    assert!(h.add_listener_from_test_thread(true));
+    assert_eq!(h.core_audio_listeners(), 3, "Init's, the foreign one and one routed listener");
+
+    h.notify_devices_changed();
+    assert_eq!(h.foreign_listener_calls(), 1, "called on CoreAudio's thread before it returned");
+    h.notify_default_output_changed();
+    assert_eq!(settle(&h), ["listener: devices", "listener: default output"]);
+    assert!(h.listeners_ran_on_device_thread());
+
+    h.remove_listener_from_test_thread(false);
+    h.remove_listener_from_test_thread(true);
+    assert_eq!(h.core_audio_listeners(), 1, "Init's devices listener");
+}

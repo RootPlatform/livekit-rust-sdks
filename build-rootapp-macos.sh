@@ -251,6 +251,13 @@ verify_dylib() {
     fail=1
   fi
 
+  if nm -u "$f" 2>/dev/null | grep -q -E '(^|[[:space:]])_AudioObject(Add|Remove)PropertyListener$'; then
+    rk_info "imports CoreAudio's property listener calls: libwebrtc's bypass AdmListenerRouter"
+    fail=1
+  else
+    rk_info "CoreAudio property listeners: libwebrtc's go through AdmListenerRouter"
+  fi
+
   for probe in livekit_ffi_initialize VTDecompressionSession; do
     if grep -aqF -- "$probe" "$f"; then
       rk_info "capability string: $probe"

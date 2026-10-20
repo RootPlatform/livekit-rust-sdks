@@ -119,6 +119,157 @@ class LevelTransport : public webrtc::AudioTransport {
   const int16_t level_;
 };
 
+constexpr uint32_t FourCc(const char (&code)[5]) {
+  return (static_cast<uint32_t>(code[0]) << 24) |
+         (static_cast<uint32_t>(code[1]) << 16) |
+         (static_cast<uint32_t>(code[2]) << 8) | static_cast<uint32_t>(code[3]);
+}
+
+constexpr uint32_t kFakeSystemObject = 1;
+constexpr uint32_t kFakeOutputDevice = 42;
+constexpr AdmListenerAddress kFakeDevicesAddress{FourCc("dev#"), FourCc("glob"),
+                                                 0};
+constexpr AdmListenerAddress kFakeDefaultOutputAddress{FourCc("dOut"),
+                                                       FourCc("glob"), 0};
+constexpr AdmListenerAddress kFakeFormatAddress{FourCc("sfmt"), FourCc("outp"),
+                                                0};
+
+using FakeListenerProc = int32_t (*)(uint32_t object,
+                                     uint32_t count,
+                                     const AdmListenerAddress* addresses,
+                                     void* client);
+
+int32_t CountingListener(uint32_t,
+                         uint32_t,
+                         const AdmListenerAddress*,
+                         void* client) {
+  static_cast<std::atomic<uint32_t>*>(client)->fetch_add(1);
+  return 0;
+}
+
+// Reached through the router as AudioObjectAddPropertyListener is on macOS.
+class FakeCoreAudio {
+ public:
+  int32_t AddListener(uint32_t object,
+                      AdmListenerAddress address,
+                      FakeListenerProc proc,
+                      void* client) {
+    const std::optional<int32_t> routed = AdmListenerRegistry::Get().Add(
+        KeyOf(object, address, proc, client), &Invoke, [&](uint64_t id) {
+          return Register({object, address, &Routed, ClientOf(id)});
+        });
+    return routed ? *routed : Register({object, address, proc, client});
+  }
+
+  int32_t RemoveListener(uint32_t object,
+                         AdmListenerAddress address,
+                         FakeListenerProc proc,
+                         void* client) {
+    const std::optional<int32_t> routed = AdmListenerRegistry::Get().Remove(
+        KeyOf(object, address, proc, client), [&](uint64_t id) {
+          return Unregister({object, address, &Routed, ClientOf(id)});
+        });
+    return routed ? *routed : Unregister({object, address, proc, client});
+  }
+
+  bool HasOriginal(uint32_t object,
+                   AdmListenerAddress address,
+                   FakeListenerProc proc,
+                   void* client) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return std::find(entries_.begin(), entries_.end(),
+                     Entry{object, address, proc, client}) != entries_.end();
+  }
+
+  uint32_t Count() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return static_cast<uint32_t>(entries_.size());
+  }
+
+  void Notify(uint32_t object, AdmListenerAddress address) {
+    std::vector<Entry> matching;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      for (const Entry& entry : entries_) {
+        if (entry.object == object && entry.address == address) {
+          matching.push_back(entry);
+        }
+      }
+    }
+    std::thread queue([&matching, object, address] {
+      for (const Entry& entry : matching) {
+        entry.proc(object, 1, &address, entry.client);
+      }
+    });
+    queue.join();
+  }
+
+ private:
+  struct Entry {
+    uint32_t object = 0;
+    AdmListenerAddress address;
+    FakeListenerProc proc = nullptr;
+    void* client = nullptr;
+
+    bool operator==(const Entry& other) const = default;
+  };
+
+  static AdmListenerKey KeyOf(uint32_t object,
+                              AdmListenerAddress address,
+                              FakeListenerProc proc,
+                              void* client) {
+    AdmListenerKey key;
+    key.object = object;
+    key.address = address;
+    key.proc = reinterpret_cast<const void*>(proc);
+    key.client = client;
+    return key;
+  }
+
+  static void* ClientOf(uint64_t id) {
+    return reinterpret_cast<void*>(static_cast<uintptr_t>(id));
+  }
+
+  static void Invoke(const AdmListenerKey& key,
+                     uint32_t object,
+                     const std::vector<AdmListenerAddress>& addresses) {
+    reinterpret_cast<FakeListenerProc>(const_cast<void*>(key.proc))(
+        object, static_cast<uint32_t>(addresses.size()), addresses.data(),
+        key.client);
+  }
+
+  static int32_t Routed(uint32_t object,
+                        uint32_t count,
+                        const AdmListenerAddress* addresses,
+                        void* client) {
+    AdmListenerRegistry::Get().Notify(
+        reinterpret_cast<uintptr_t>(client), object,
+        std::vector<AdmListenerAddress>(addresses, addresses + count));
+    return 0;
+  }
+
+  int32_t Register(const Entry& entry) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (std::find(entries_.begin(), entries_.end(), entry) == entries_.end()) {
+      entries_.push_back(entry);
+    }
+    return 0;
+  }
+
+  int32_t Unregister(const Entry& entry) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto found = std::find(entries_.begin(), entries_.end(), entry);
+    if (found == entries_.end()) {
+      return -1;
+    }
+    entries_.erase(found);
+    return 0;
+  }
+
+  mutable std::mutex mutex_;
+  std::vector<Entry> entries_;
+};
+
 }  // namespace
 
 // Records the state-changing calls it gets and behaves like a platform ADM:
@@ -143,6 +294,28 @@ class FakePlatformAdm
     std::lock_guard<std::mutex> lock(mutex_);
     playout_guids_ = std::move(playout);
     recording_guids_ = std::move(recording);
+  }
+
+  FakeCoreAudio& core_audio() { return core_audio_; }
+  void SetListenerRestarts(bool restarts) {
+    listener_restarts_.store(restarts);
+  }
+  uint32_t ListenerCalls() const { return listener_calls_.load(); }
+  std::vector<std::thread::id> ListenerThreads() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return listener_threads_;
+  }
+  uint32_t OverlappingCalls() const { return overlapping_calls_.load(); }
+
+  static int32_t Listener(uint32_t object,
+                          uint32_t count,
+                          const AdmListenerAddress* addresses,
+                          void* client) {
+    auto* adm = static_cast<FakePlatformAdm*>(client);
+    for (uint32_t i = 0; i < count; ++i) {
+      adm->OnListener(addresses[i]);
+    }
+    return 0;
   }
 
   void FailNextStopRecording(int32_t result) {
@@ -205,8 +378,18 @@ class FakePlatformAdm
     buffer_.RegisterAudioCallback(callback_.load());
   }
 
-  int32_t Init() override { return Record("Init"); }
-  int32_t Terminate() override { return Record("Terminate"); }
+  int32_t Init() override {
+    const DeviceCall call(this);
+    core_audio_.AddListener(kFakeSystemObject, kFakeDevicesAddress, &Listener,
+                            this);
+    return Record("Init");
+  }
+  int32_t Terminate() override {
+    const DeviceCall call(this);
+    core_audio_.RemoveListener(kFakeSystemObject, kFakeDevicesAddress,
+                               &Listener, this);
+    return Record("Terminate");
+  }
   int32_t RegisterAudioCallback(webrtc::AudioTransport* transport) override {
     callback_.store(transport);
     buffer_.RegisterAudioCallback(transport);
@@ -244,20 +427,28 @@ class FakePlatformAdm
   }
 
   int32_t SetPlayoutDevice(uint16_t index) override {
+    const DeviceCall call(this);
     return Record("SetPlayoutDevice(" + std::to_string(index) + ")");
   }
   int32_t SetPlayoutDevice(WindowsDeviceType) override {
+    const DeviceCall call(this);
     return Record("SetPlayoutDevice(default)");
   }
   int32_t SetRecordingDevice(uint16_t index) override {
+    const DeviceCall call(this);
     return Record("SetRecordingDevice(" + std::to_string(index) + ")");
   }
   int32_t SetRecordingDevice(WindowsDeviceType) override {
+    const DeviceCall call(this);
     return Record("SetRecordingDevice(default)");
   }
 
   int32_t InitPlayout() override {
-    playout_initialized_.store(true);
+    const DeviceCall call(this);
+    if (!playout_initialized_.exchange(true)) {
+      core_audio_.AddListener(kFakeOutputDevice, kFakeFormatAddress, &Listener,
+                              this);
+    }
     buffer_.SetPlayoutSampleRate(48000);
     buffer_.SetPlayoutChannels(stereo_playout_.load() ? 2 : 1);
     RecordChannel(stereo_playout_.load() ? "InitPlayout stereo"
@@ -313,6 +504,7 @@ class FakePlatformAdm
     return playout_initialized_.load();
   }
   int32_t StartPlayout() override {
+    const DeviceCall call(this);
     Record(playout_worker_left_.exchange(false) ? "StartPlayout over a worker"
                                                 : "StartPlayout");
     if (block_start_.exchange(false)) {
@@ -331,8 +523,13 @@ class FakePlatformAdm
     return 0;
   }
   int32_t StopPlayout() override {
+    const DeviceCall call(this);
     Record("StopPlayout");
     const bool open = playout_initialized_.exchange(false);
+    if (open) {
+      core_audio_.RemoveListener(kFakeOutputDevice, kFakeFormatAddress,
+                                 &Listener, this);
+    }
     playout_worker_left_.store(false);
     playing_.store(false);
     buffer_.StopPlayout();
@@ -341,6 +538,7 @@ class FakePlatformAdm
   bool Playing() const override { return playing_.load(); }
 
   int32_t InitRecording() override {
+    const DeviceCall call(this);
     recording_initialized_.store(true);
     return Record("InitRecording");
   }
@@ -348,6 +546,7 @@ class FakePlatformAdm
     return recording_initialized_.load();
   }
   int32_t StartRecording() override {
+    const DeviceCall call(this);
     Record(recording_worker_left_.exchange(false) ? "StartRecording over a worker"
                                                   : "StartRecording");
     if (!recording_initialized_.load()) {
@@ -361,6 +560,7 @@ class FakePlatformAdm
     return 0;
   }
   int32_t StopRecording() override {
+    const DeviceCall call(this);
     Record("StopRecording");
     const bool open = recording_initialized_.exchange(false);
     recording_worker_left_.store(false);
@@ -391,6 +591,46 @@ class FakePlatformAdm
   bool BuiltInNSIsAvailable() const override { return true; }
 
  private:
+  class DeviceCall {
+   public:
+    explicit DeviceCall(FakePlatformAdm* adm) : adm_(adm) {
+      if (adm_->in_device_call_.fetch_add(1) > 0) {
+        adm_->overlapping_calls_.fetch_add(1);
+      }
+    }
+    ~DeviceCall() { adm_->in_device_call_.fetch_sub(1); }
+
+   private:
+    FakePlatformAdm* const adm_;
+  };
+
+  // AudioDeviceMac::HandleDeviceChange for an output device that went away.
+  void OnListener(const AdmListenerAddress& address) {
+    listener_calls_.fetch_add(1);
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      listener_threads_.push_back(std::this_thread::get_id());
+    }
+    if (address == kFakeFormatAddress) {
+      Record("listener: format");
+      return;
+    }
+    if (address == kFakeDefaultOutputAddress) {
+      Record("listener: default output");
+      return;
+    }
+    Record("listener: devices");
+    if (!playout_initialized_.load()) {
+      return;
+    }
+    const bool was_playing = playing_.load();
+    StopPlayout();
+    if (was_playing && listener_restarts_.load() && SetPlayoutDevice(0) == 0) {
+      InitPlayout();
+      StartPlayout();
+    }
+  }
+
   int32_t Record(std::string call) {
     std::lock_guard<std::mutex> lock(mutex_);
     calls_.push_back(std::move(call));
@@ -427,6 +667,12 @@ class FakePlatformAdm
   std::atomic<bool> block_start_{false};
   webrtc::Event start_entered_;
   webrtc::Event start_release_;
+  FakeCoreAudio core_audio_;
+  std::atomic<bool> listener_restarts_{true};
+  std::atomic<uint32_t> listener_calls_{0};
+  std::vector<std::thread::id> listener_threads_;
+  std::atomic<uint32_t> in_device_call_{0};
+  std::atomic<uint32_t> overlapping_calls_{0};
 };
 
 // libwebrtc's side of the device callbacks. With a re-entry target it calls
@@ -836,6 +1082,84 @@ void AdmProxyHarness::engine_terminate() const {
 
 void AdmProxyHarness::shutdown() const {
   proxy_->ShutdownForTest();
+}
+
+void AdmProxyHarness::notify_devices_changed() const {
+  fake_->core_audio().Notify(kFakeSystemObject, kFakeDevicesAddress);
+}
+
+void AdmProxyHarness::notify_format_changed() const {
+  fake_->core_audio().Notify(kFakeOutputDevice, kFakeFormatAddress);
+}
+
+void AdmProxyHarness::notify_default_output_changed() const {
+  fake_->core_audio().Notify(kFakeSystemObject, kFakeDefaultOutputAddress);
+}
+
+void AdmProxyHarness::set_listener_restarts(bool restarts) const {
+  fake_->SetListenerRestarts(restarts);
+}
+
+uint32_t AdmProxyHarness::listener_calls() const {
+  return fake_->ListenerCalls();
+}
+
+bool AdmProxyHarness::listeners_ran_on_device_thread() const {
+  std::thread::id device;
+  proxy_->RunOnDeviceThreadForTest(
+      [&device] { device = std::this_thread::get_id(); });
+  const std::vector<std::thread::id> threads = fake_->ListenerThreads();
+  return !threads.empty() &&
+         std::all_of(threads.begin(), threads.end(),
+                     [&device](std::thread::id id) { return id == device; });
+}
+
+uint32_t AdmProxyHarness::overlapping_device_calls() const {
+  return fake_->OverlappingCalls();
+}
+
+uint32_t AdmProxyHarness::core_audio_listeners() const {
+  return fake_->core_audio().Count();
+}
+
+uint64_t AdmProxyHarness::routed_listeners() const {
+  return proxy_->RoutedListenersForTest();
+}
+
+uint64_t AdmProxyHarness::delivered_listener_notifications() const {
+  return proxy_->DeliveredListenerNotificationsForTest();
+}
+
+bool AdmProxyHarness::add_listener_from_test_thread(bool adm_listener) const {
+  if (adm_listener) {
+    fake_->core_audio().AddListener(kFakeSystemObject,
+                                    kFakeDefaultOutputAddress,
+                                    &FakePlatformAdm::Listener, fake_.get());
+    return !fake_->core_audio().HasOriginal(
+        kFakeSystemObject, kFakeDefaultOutputAddress,
+        &FakePlatformAdm::Listener, fake_.get());
+  }
+  fake_->core_audio().AddListener(kFakeSystemObject, kFakeDevicesAddress,
+                                  &CountingListener, foreign_calls_.get());
+  return !fake_->core_audio().HasOriginal(
+      kFakeSystemObject, kFakeDevicesAddress, &CountingListener,
+      foreign_calls_.get());
+}
+
+void AdmProxyHarness::remove_listener_from_test_thread(
+    bool adm_listener) const {
+  if (adm_listener) {
+    fake_->core_audio().RemoveListener(kFakeSystemObject,
+                                       kFakeDefaultOutputAddress,
+                                       &FakePlatformAdm::Listener, fake_.get());
+    return;
+  }
+  fake_->core_audio().RemoveListener(kFakeSystemObject, kFakeDevicesAddress,
+                                     &CountingListener, foreign_calls_.get());
+}
+
+uint32_t AdmProxyHarness::foreign_listener_calls() const {
+  return foreign_calls_->load();
 }
 
 namespace {

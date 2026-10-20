@@ -675,13 +675,45 @@ AdmProxy::AdmProxy(
   // registered yet it gets silence.
   synthetic_adm_->RegisterAudioCallback(&synthetic_transport_);
 
+#if !LK_ADM_MOBILE
+  device_thread_ = webrtc::Thread::Create();
+  device_thread_->SetName("audio-device", nullptr);
+  device_thread_->Start();
+#if defined(WEBRTC_WIN)
+  device_thread_->PostTask(
+      [] { CoInitializeEx(nullptr, COINIT_MULTITHREADED); });
+#endif
+  listener_router_ = std::make_shared<AdmListenerRouter>(
+      [this](absl::AnyInvocable<void() &&> notification) {
+        PostDeviceTask(
+            [this, notification = std::move(notification)]() mutable {
+              RunListenerNotification(std::move(notification));
+            });
+      });
+  device_thread_->PostTask([router = listener_router_.get()] {
+    AdmListenerRegistry::SetThreadRouter(router);
+  });
+#endif
+
   if (platform_adm_) {
-    int32_t init_result = platform_adm_->Init();
+    int32_t init_result = 0;
+    {
+#if !LK_ADM_MOBILE
+      AdmListenerScope listeners(listener_router_.get());
+#endif
+      init_result = platform_adm_->Init();
+    }
     if (init_result != 0) {
       RTC_LOG(LS_ERROR) << "AdmProxy: Platform ADM Init() failed with error=" << init_result;
       platform_adm_ = nullptr;
     }
   }
+#if defined(WEBRTC_MAC) && !defined(WEBRTC_IOS)
+  if (platform_adm_ && listener_router_->routed() == 0) {
+    RTC_LOG(LS_WARNING) << "AdmProxy: the platform ADM's CoreAudio listeners "
+                           "are not routed to the device thread";
+  }
+#endif
 
   if (platform_adm_) {
 #if !LK_ADM_MOBILE
@@ -703,16 +735,6 @@ AdmProxy::AdmProxy(
     platform_adm_->RegisterAudioCallback(&tap_);
     platform_raw_.store(platform_adm_.get(), std::memory_order_release);
   }
-
-#if !LK_ADM_MOBILE
-  device_thread_ = webrtc::Thread::Create();
-  device_thread_->SetName("audio-device", nullptr);
-  device_thread_->Start();
-#if defined(WEBRTC_WIN)
-  device_thread_->PostTask(
-      [] { CoInitializeEx(nullptr, COINIT_MULTITHREADED); });
-#endif
-#endif
 }
 
 AdmProxy::~AdmProxy() {
@@ -727,6 +749,9 @@ AdmProxy::~AdmProxy() {
     CoUninitialize();
 #endif
   });
+  if (listener_router_) {
+    listener_router_->Detach();
+  }
   if (device_thread_) {
     device_thread_->Stop();
   }
@@ -1409,6 +1434,18 @@ void AdmProxy::ShutdownLocked() {
   PublishStateLocked(Desired());
 }
 
+void AdmProxy::RunListenerNotification(
+    absl::AnyInvocable<void() &&> notification) {
+  {
+    AdmLock lock(&mutex_);
+    if (terminated_) {
+      return;
+    }
+    std::move(notification)();
+  }
+  RequestReconcile();
+}
+
 // =============================================================================
 // Platform ADM Lifecycle Management
 // =============================================================================
@@ -1693,6 +1730,18 @@ void AdmProxy::PollDeviceFormatsForTest() {
     AdmLock lock(&mutex_);
     PollDeviceFormatsLocked();
   });
+}
+
+uint64_t AdmProxy::RoutedListenersForTest() const {
+  return listener_router_ ? listener_router_->routed() : 0;
+}
+
+uint64_t AdmProxy::DeliveredListenerNotificationsForTest() const {
+  return listener_router_ ? listener_router_->delivered() : 0;
+}
+
+void AdmProxy::RunOnDeviceThreadForTest(absl::AnyInvocable<void() &&> task) {
+  RunDeviceTaskAndWait(std::move(task));
 }
 #endif
 

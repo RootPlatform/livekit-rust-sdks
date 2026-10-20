@@ -705,6 +705,19 @@ pub mod ffi {
         fn engine_terminate(self: &AdmProxyHarness);
         /// What the proxy's destructor does to the devices.
         fn shutdown(self: &AdmProxyHarness);
+        fn notify_devices_changed(self: &AdmProxyHarness);
+        fn notify_format_changed(self: &AdmProxyHarness);
+        fn notify_default_output_changed(self: &AdmProxyHarness);
+        fn set_listener_restarts(self: &AdmProxyHarness, restarts: bool);
+        fn listener_calls(self: &AdmProxyHarness) -> u32;
+        fn listeners_ran_on_device_thread(self: &AdmProxyHarness) -> bool;
+        fn overlapping_device_calls(self: &AdmProxyHarness) -> u32;
+        fn core_audio_listeners(self: &AdmProxyHarness) -> u32;
+        fn routed_listeners(self: &AdmProxyHarness) -> u64;
+        fn delivered_listener_notifications(self: &AdmProxyHarness) -> u64;
+        fn add_listener_from_test_thread(self: &AdmProxyHarness, adm_listener: bool) -> bool;
+        fn remove_listener_from_test_thread(self: &AdmProxyHarness, adm_listener: bool);
+        fn foreign_listener_calls(self: &AdmProxyHarness) -> u32;
         fn select(
             self: &AdmProxyHarness,
             recording: &AudioDeviceSelection,

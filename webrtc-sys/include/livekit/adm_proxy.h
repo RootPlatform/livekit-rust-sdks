@@ -29,6 +29,7 @@
 #include "api/audio/audio_frame.h"
 #include "api/environment/environment.h"
 #include "api/scoped_refptr.h"
+#include "livekit/adm_listener_router.h"
 #include "livekit/synthetic_audio_device.h"
 #include "modules/audio_device/include/audio_device.h"
 #include "modules/audio_device/include/audio_device_defines.h"
@@ -512,6 +513,9 @@ class AdmProxy : public webrtc::AudioDeviceModule {
   /// Whether enumeration serializes with device operations (Linux) and how
   /// long it waits for one in progress.
   void SetEnumerationLockForTest(bool serialize, int wait_ms);
+  uint64_t RoutedListenersForTest() const;
+  uint64_t DeliveredListenerNotificationsForTest() const;
+  void RunOnDeviceThreadForTest(absl::AnyInvocable<void() &&> task);
 #endif
 
   // ===========================================================================
@@ -683,6 +687,7 @@ class AdmProxy : public webrtc::AudioDeviceModule {
   bool PollFormatLocked(bool playout);
   void ScheduleFormatWatchLocked();
   void ShutdownLocked();
+  void RunListenerNotification(absl::AnyInvocable<void() &&> notification);
   DesiredState Desired() const;
 
   class EnumerationGuard;
@@ -698,6 +703,7 @@ class AdmProxy : public webrtc::AudioDeviceModule {
   webrtc::Thread* worker_thread_;
   const webrtc::scoped_refptr<RootAudioMixer> mixer_;
   std::unique_ptr<webrtc::Thread> device_thread_;
+  std::shared_ptr<AdmListenerRouter> listener_router_;
 
   // Held for every device operation (on desktop only the device thread runs
   // those) and for the rarely used settings calls that forward to an ADM.
