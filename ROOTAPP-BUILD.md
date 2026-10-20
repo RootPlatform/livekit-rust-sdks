@@ -2318,6 +2318,60 @@ are not routed" warning.
 hw.19's production cleanup plus the macOS ADM's CoreAudio listeners on the device thread (see
 above). Caps stay 32767.
 
+## Capture I420 buffer pool (`rootapp/i420-pool`)
+
+`CaptureVideoFrame` used to convert every frame into a new I420 buffer. Blocks over about 1 MB come
+straight from `VirtualAlloc`, so each frame paid first-touch page faults on fresh pages: 340, 760
+and 1350 of them at 720p, 1080p and 1440p: 62%, 36% and 35% of the request with libyuv's AVX2
+rows (measured below).
+
+Each FFI video source now owns an `I420BufferPool` (`video_frame::native` in libwebrtc), capped at
+8 buffers. It wraps libwebrtc's `webrtc::VideoFrameBufferPool` (`zero_initialize = false`) behind a
+`webrtc::Mutex`, in `webrtc-sys/src/video_frame_buffer.cpp`.
+- A buffer is handed out again only when the pool holds its only reference (`HasOneRef`). A frame
+  still queued for or inside the encoder, VideoStreamEncoder's pending frame, the screenshare
+  cadence adapter's repeat frame, or one an FFI sink or client handle holds is never overwritten.
+- When all 8 are in use, `create` allocates a buffer outside the pool; it never waits or drops.
+- A new size purges the old buffers at the next capture. Buffers still held stay valid until
+  released.
+- The pool only grows to the number of frames in flight at once (one in the sink benchmark below).
+  It keeps them until the source is disposed or the size changes: 8 buffers at 1440p is 44 MB at
+  worst.
+
+Why 8: the frame being converted; the tasks libwebrtc's frame cadence adapter and
+VideoStreamEncoder post for each frame (about two each when the encoder queue lags); the frame
+inside `Encode` or VideoStreamEncoder's pending frame; and two for an FFI preview sink (its
+one-frame queue and the frame the client holds). The MF encoder copies its input into its own
+sample (`CreateInputSample`/`CreateD3DInputSample`), and simulcast layers are scaled into their
+own buffers, so neither holds a capture buffer after `Encode` returns. Past 8, frames fall back to
+plain allocation, as before.
+
+Covered: the RGBA, ABGR, ARGB, BGRA and RGB24 conversions, and I420/I420A copies whose strides
+are already packed. Padded I420 keeps its strides and a plain buffer; I422, I444, I010, NV12 and
+the receive side are unchanged. Every conversion writes each byte, including the odd-size chroma
+edge, so recycled contents never leak.
+
+Measured on a Ryzen 9 9950X3D: `livekit_ffi_request(CaptureVideoFrame)` with BGRA, release DLLs
+from `build-rootapp-windows.ps1`, medians of two interleaved runs of 300 frames, in ms. "Sink" is a
+local `VideoStream` (I420) on the source's track, its frames released 2 ms later.
+
+| | 1280x720 | 1920x1080 | 2560x1440 |
+|---|---|---|---|
+| before, no sink | 0.222 | 0.618 | 1.169 |
+| pool, no sink | 0.085 | 0.395 | 0.756 |
+| before, sink | 0.323 | 0.661 | 1.121 |
+| pool, sink | 0.205 | 0.476 | 0.842 |
+
+Without a sink the request is now the AVX2 conversion alone (0.083 / 0.403 / 0.751 ms into a warm
+buffer). The sink received 330 frames from one pooled buffer, against 19-29 distinct addresses
+before.
+
+Tests: `cargo test -p libwebrtc --lib --release video_frame` (reuse, a buffer held by a
+`VideoFrame` or by a real local `NativeVideoStream` sink is skipped, the cap, a size change) and
+`cargo test -p livekit-ffi --lib --release colorcvt` (pooled output byte-identical to the
+unpooled path for all five packed types at 641x359, 1280x720, 3x3 and 1x1, into a reused buffer
+pre-filled with other bytes).
+
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
 | Commit | Change |
