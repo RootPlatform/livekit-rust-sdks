@@ -117,10 +117,11 @@ pub use error::{AudioError, AudioResult};
 pub use processing::{AudioProcessingOptions, AudioProcessingType};
 pub use rootapp::{
     sanitize_volume, AudioDeviceResults, AudioDeviceSelection, CaptureFormat, DenoiserCompletion,
-    DenoiserState, DeviceFormatStats, EchoModel, EchoModelReason, EchoModelState, EchoModelStats,
-    EffectPlay, GainEngine, GainLimit, LocalSpeaking, MixSourceLevel, MonitorError, OutputDeviceKind,
-    PushToTalk, ReturnedPipeline, ReturnedPipelines, RootAudioControl, RootAudioStats,
-    SpeechDetection, ThresholdTerm, ECHO_MODEL_AVAILABLE, MAX_VOICE_GAIN_DB, MAX_VOLUME,
+    DenoiserState, DeviceChangeStats, DeviceFormatStats, EchoModel, EchoModelReason,
+    EchoModelState, EchoModelStats, EffectPlay, GainEngine, GainLimit, LocalSpeaking,
+    MixSourceLevel, MonitorError, OutputDeviceKind, PushToTalk, ReturnedPipeline,
+    ReturnedPipelines, RootAudioControl, RootAudioStats, SpeechDetection, ThresholdTerm,
+    ECHO_MODEL_AVAILABLE, MAX_VOICE_GAIN_DB, MAX_VOLUME,
 };
 
 // Re-export RtcAudioSource for convenience

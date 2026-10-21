@@ -700,6 +700,41 @@ message RootAudioStats {
   // The speech gate's look-ahead the last frame got, ms (0 without one: detection not GATE, no
   // probability, push-to-talk): the capture latency it adds.
   optional uint32 speech_lookahead_ms = 154;
+
+  // Platform device changes, where native follows them itself (macOS; absent elsewhere and from
+  // libraries that predate them). The macOS ADM runs both directions of one CoreAudio device in one
+  // IOProc and picks it from what is open at each open, so native opens playout before a microphone
+  // on its device (stopping the microphone first where needed), follows device-list and
+  // default-device changes itself instead of the ADM's own listener, and reopens playout that
+  // rendered nothing for 500 ms while capture went on.
+  // The CoreAudio UID of each open direction's device (empty while that direction is closed), and
+  // whether both are open on one device (a headset, a dock).
+  optional string playout_device_uid = 155;
+  optional string recording_device_uid = 156;
+  optional bool same_device = 157;
+  // The platform ADM's CoreAudio notifications by property: the device list, the default output and
+  // input (native's own; the ADM no longer gets them), the stream format and the rest (processor
+  // overloads; both handed on to the ADM). Cumulative for the engine's life.
+  optional uint64 device_list_notifications = 158;
+  optional uint64 default_output_notifications = 159;
+  optional uint64 default_input_notifications = 160;
+  optional uint64 stream_format_notifications = 161;
+  optional uint64 other_device_notifications = 162;
+  // Directions stopped and opened again, by reason: a selection or the app's restart request; a new
+  // system default the direction follows; its device gone (opening the system default in its place
+  // until the device is back or the selection changes) or back; a format change under playout
+  // (playout_device_format_reopens counts the same reopens as requested); and playout that rendered
+  // nothing (render_stall_recoveries). Cumulative.
+  optional uint64 user_select_reopens = 163;
+  optional uint64 default_change_reopens = 164;
+  optional uint64 device_lost_reopens = 165;
+  optional uint64 format_change_reopens = 166;
+  optional uint64 render_stall_reopens = 167;
+  // Reopens that stopped the microphone (and playout on its device) so that playout opened first.
+  optional uint64 coupled_reopens = 168;
+  // Playout that rendered nothing for 500 ms while capture went on (at most once every 5 s), reopened
+  // together with a microphone on its device.
+  optional uint64 render_stall_recoveries = 169;
 }
 // One playout mixer source (a remote audio stream): its audio as it reached the mixer, decoded and
 // before its gain (tile volume, master volume, deafen; a muted frame counts as silence), as a sum of

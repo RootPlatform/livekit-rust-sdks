@@ -1235,7 +1235,24 @@ impl From<RootAudioStats> for proto::RootAudioStats {
     fn from(stats: RootAudioStats) -> Self {
         let echo = stats.echo_model;
         let formats = stats.device_formats;
+        let changes = stats.device_changes;
+        let change = |field: fn(&livekit::DeviceChangeStats) -> u64| changes.as_ref().map(field);
         Self {
+            playout_device_uid: changes.as_ref().map(|c| c.playout_uid.clone()),
+            recording_device_uid: changes.as_ref().map(|c| c.recording_uid.clone()),
+            same_device: changes.as_ref().map(|c| c.same_device),
+            device_list_notifications: change(|c| c.device_list_notifications),
+            default_output_notifications: change(|c| c.default_output_notifications),
+            default_input_notifications: change(|c| c.default_input_notifications),
+            stream_format_notifications: change(|c| c.stream_format_notifications),
+            other_device_notifications: change(|c| c.other_notifications),
+            user_select_reopens: change(|c| c.user_select_reopens),
+            default_change_reopens: change(|c| c.default_change_reopens),
+            device_lost_reopens: change(|c| c.device_lost_reopens),
+            format_change_reopens: change(|c| c.format_change_reopens),
+            render_stall_reopens: change(|c| c.render_stall_reopens),
+            coupled_reopens: change(|c| c.coupled_reopens),
+            render_stall_recoveries: change(|c| c.render_stall_recoveries),
             playout_device_sample_rate: formats.map(|f| f.playout_rate),
             playout_device_channels: formats.map(|f| f.playout_channels),
             recording_device_sample_rate: formats.map(|f| f.recording_rate),
@@ -1609,6 +1626,65 @@ mod tests {
             (None, None)
         );
         assert_eq!(absent.recording_device_format_changes, None);
+    }
+
+    #[test]
+    fn rootapp_audio_device_change_stats_convert_and_stay_absent_where_not_followed() {
+        let stats = RootAudioStats {
+            device_changes: Some(livekit::DeviceChangeStats {
+                playout_uid: "BuiltInSpeakerDevice".into(),
+                recording_uid: "BuiltInMicrophoneDevice".into(),
+                same_device: false,
+                device_list_notifications: 1,
+                default_output_notifications: 2,
+                default_input_notifications: 3,
+                stream_format_notifications: 4,
+                other_notifications: 5,
+                user_select_reopens: 6,
+                default_change_reopens: 7,
+                device_lost_reopens: 8,
+                format_change_reopens: 9,
+                render_stall_reopens: 10,
+                coupled_reopens: 11,
+                render_stall_recoveries: 12,
+            }),
+            ..Default::default()
+        };
+        let p: proto::RootAudioStats = stats.into();
+        assert_eq!(p.playout_device_uid.as_deref(), Some("BuiltInSpeakerDevice"));
+        assert_eq!(p.recording_device_uid.as_deref(), Some("BuiltInMicrophoneDevice"));
+        assert_eq!(p.same_device, Some(false));
+        assert_eq!(
+            (
+                p.device_list_notifications,
+                p.default_output_notifications,
+                p.default_input_notifications,
+                p.stream_format_notifications,
+                p.other_device_notifications
+            ),
+            (Some(1), Some(2), Some(3), Some(4), Some(5))
+        );
+        assert_eq!(
+            (
+                p.user_select_reopens,
+                p.default_change_reopens,
+                p.device_lost_reopens,
+                p.format_change_reopens,
+                p.render_stall_reopens
+            ),
+            (Some(6), Some(7), Some(8), Some(9), Some(10))
+        );
+        assert_eq!((p.coupled_reopens, p.render_stall_recoveries), (Some(11), Some(12)));
+
+        let absent: proto::RootAudioStats = RootAudioStats::default().into();
+        assert_eq!((absent.playout_device_uid, absent.recording_device_uid), (None, None));
+        assert_eq!(absent.same_device, None);
+        assert_eq!(
+            (absent.device_list_notifications, absent.other_device_notifications),
+            (None, None)
+        );
+        assert_eq!((absent.user_select_reopens, absent.render_stall_reopens), (None, None));
+        assert_eq!((absent.coupled_reopens, absent.render_stall_recoveries), (None, None));
     }
 
     #[test]

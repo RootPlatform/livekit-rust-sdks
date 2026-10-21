@@ -421,6 +421,33 @@ pub struct DeviceFormatStats {
     pub recording_changes: u64,
 }
 
+/// How native follows device changes itself (the FFI `RootAudioStats` fields
+/// 155-169), where it does (macOS): the CoreAudio UIDs of the open
+/// directions' devices (empty while closed) and whether both are open on one
+/// device; the platform ADM's CoreAudio notifications by property; directions
+/// stopped and opened again by reason; reopens that stopped the microphone so
+/// that playout opened first; and playout reopened because it rendered
+/// nothing while capture went on. Counters are cumulative for the engine's
+/// life.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeviceChangeStats {
+    pub playout_uid: String,
+    pub recording_uid: String,
+    pub same_device: bool,
+    pub device_list_notifications: u64,
+    pub default_output_notifications: u64,
+    pub default_input_notifications: u64,
+    pub stream_format_notifications: u64,
+    pub other_notifications: u64,
+    pub user_select_reopens: u64,
+    pub default_change_reopens: u64,
+    pub device_lost_reopens: u64,
+    pub format_change_reopens: u64,
+    pub render_stall_reopens: u64,
+    pub coupled_reopens: u64,
+    pub render_stall_recoveries: u64,
+}
+
 /// The echo model's state and costs (the FFI `RootAudioStats` fields 114-124).
 /// Counters are cumulative for the engine's life; the inference mean and
 /// maximum are since the previous read (NaN and 0 without an inference).
@@ -991,6 +1018,9 @@ pub struct RootAudioStats {
 
     // `None` where native does not read device formats.
     pub device_formats: Option<DeviceFormatStats>,
+
+    // `None` where native does not follow device changes itself.
+    pub device_changes: Option<DeviceChangeStats>,
 }
 
 impl Default for RootAudioStats {
@@ -1120,6 +1150,7 @@ impl Default for RootAudioStats {
             speech_unavailable_frames: None,
             echo_model: None,
             device_formats: None,
+            device_changes: None,
         }
     }
 }
@@ -1160,6 +1191,23 @@ impl RootAudioStats {
                 playout_changes: native.playout_format_changes,
                 playout_reopens: native.playout_format_reopens,
                 recording_changes: native.recording_format_changes,
+            }),
+            device_changes: native.device_changes_available.then(|| DeviceChangeStats {
+                playout_uid: native.playout_device_uid.clone(),
+                recording_uid: native.recording_device_uid.clone(),
+                same_device: native.same_device,
+                device_list_notifications: native.device_list_notifications,
+                default_output_notifications: native.default_output_notifications,
+                default_input_notifications: native.default_input_notifications,
+                stream_format_notifications: native.stream_format_notifications,
+                other_notifications: native.other_device_notifications,
+                user_select_reopens: native.user_select_reopens,
+                default_change_reopens: native.default_change_reopens,
+                device_lost_reopens: native.device_lost_reopens,
+                format_change_reopens: native.format_change_reopens,
+                render_stall_reopens: native.render_stall_reopens,
+                coupled_reopens: native.coupled_reopens,
+                render_stall_recoveries: native.render_stall_recoveries,
             }),
             monitor_active: monitor.then_some(native.monitor_active),
             monitor_frames: monitor.then_some(native.monitor_frames),
@@ -1991,6 +2039,55 @@ mod tests {
         });
         assert_eq!(without.device_formats, None);
         assert_eq!(RootAudioStats::default().device_formats, None);
+    }
+
+    #[test]
+    fn root_audio_stats_fill_the_device_changes_only_where_native_follows_them() {
+        let native = NativeAudioStats {
+            device_changes_available: true,
+            playout_device_uid: "AppleUSBAudioEngine:Jabra:Link:1".into(),
+            recording_device_uid: "AppleUSBAudioEngine:Jabra:Link:1".into(),
+            same_device: true,
+            device_list_notifications: 2,
+            default_output_notifications: 3,
+            default_input_notifications: 4,
+            stream_format_notifications: 5,
+            other_device_notifications: 6,
+            user_select_reopens: 7,
+            default_change_reopens: 8,
+            device_lost_reopens: 9,
+            format_change_reopens: 10,
+            render_stall_reopens: 11,
+            coupled_reopens: 12,
+            render_stall_recoveries: 13,
+            ..Default::default()
+        };
+        assert_eq!(
+            RootAudioStats::from_native(native).device_changes,
+            Some(DeviceChangeStats {
+                playout_uid: "AppleUSBAudioEngine:Jabra:Link:1".into(),
+                recording_uid: "AppleUSBAudioEngine:Jabra:Link:1".into(),
+                same_device: true,
+                device_list_notifications: 2,
+                default_output_notifications: 3,
+                default_input_notifications: 4,
+                stream_format_notifications: 5,
+                other_notifications: 6,
+                user_select_reopens: 7,
+                default_change_reopens: 8,
+                device_lost_reopens: 9,
+                format_change_reopens: 10,
+                render_stall_reopens: 11,
+                coupled_reopens: 12,
+                render_stall_recoveries: 13,
+            })
+        );
+        let without = RootAudioStats::from_native(NativeAudioStats {
+            coupled_reopens: 1,
+            ..Default::default()
+        });
+        assert_eq!(without.device_changes, None);
+        assert_eq!(RootAudioStats::default().device_changes, None);
     }
 
     #[test]
