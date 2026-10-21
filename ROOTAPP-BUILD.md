@@ -2272,6 +2272,8 @@ The prebuilt cannot be patched, so `AdmListenerRouter` (`webrtc-sys/src/adm_list
 
 What the ADM does on a device change (switch to the default when its device goes away, follow the
 default) is unchanged; only the thread is new. No FFI request, proto field, stat or caps bit changed.
+Since hw.22 the ADM no longer gets the device-list and default-device notifications at all; `AdmProxy`
+follows those changes itself (see "macOS: one device for both directions").
 
 Detection:
 - On macOS `AdmProxy` logs a warning when the platform ADM's `Init` registered no routed listener (the
@@ -2293,7 +2295,10 @@ calls. The tests:
 - `adm_listener_router_routes_only_the_platform_adms_listeners`
 
 With routing switched off all six fail; in the race test the listener ran on the notification thread
-while `StartPlayout` was in progress.
+while `StartPlayout` was in progress. hw.22 moved these tests onto the format listener (the one
+notification the ADM still gets besides processor overloads), and
+`adm_proxy_keeps_device_changes_from_the_platform_adms_listener` replaced
+`adm_proxy_reopens_what_the_platform_adms_listener_closed`.
 
 Not verified:
 - The macOS link: whether Apple's linker binds libwebrtc's references to these definitions. The build
@@ -2371,6 +2376,215 @@ Tests: `cargo test -p libwebrtc --lib --release video_frame` (reuse, a buffer he
 `cargo test -p livekit-ffi --lib --release colorcvt` (pooled output byte-identical to the
 unpooled path for all five packed types at 641x359, 1280x720, 3x3 and 1x1, into a reused buffer
 pre-filled with other bytes).
+
+## macOS: one device for both directions (`rootapp/mac-same-device`, hw.22)
+
+Mac report: a headset unplugged and plugged back in mid-call, after which nobody was heard. Capture
+worked, `Playing()` was true, and the render callbacks had stopped (Sentry: `playing=True, init/start
+0/0`, render callbacks frozen). It happens only on devices that are one CoreAudio device for both
+directions (USB and wired headsets, docks), not on AirPods, whose `:input` and `:output` are two
+devices.
+
+webrtc-sdk m150's `AudioDeviceMac` (89d790b, `audio_device_mac.cc`) runs both directions of one device
+in one IOProc (`deviceIOProc`), and gives the microphone an IOProc of its own (`inDeviceIOProc`) while
+playout is on another device. It decides this at each Init from what is open at that moment:
+- `_twoDevices` is recomputed whenever a direction initializes its device (415-418, 471-474).
+- InitRecording creates the microphone's own IOProc when `_twoDevices` is true. When it is false, it
+  creates the shared IOProc, but only if playout is not initialized (1257-1263).
+- InitPlayout creates the shared IOProc only when `_twoDevices` is true or the microphone is not
+  initialized (1065-1068). StartPlayout starts it on the same condition, but sets `_playing` either way
+  (1438-1442).
+- Only `implDeviceIOProc`, the shared IOProc, renders (2259-2331).
+
+So playout that moves onto the device of a microphone that has its own IOProc gets no IOProc, and
+renders nothing while `Playing()` is true. That was the report: the mic went to the re-plugged headset
+first (the desktop re-selects the mic first, and the ADM's own default-device listener restarts one
+direction at a time in CoreAudio's order), then playout followed.
+
+From there the state does not recover:
+- StopRecording now takes the shared branch (1320) and waits 2 s for a stop signal only the missing
+  IOProc sends (1354, 2288). It then stops a stale IOProc id, and the microphone's own IOProc runs
+  until the process exits.
+- StopPlayout also waits 2 s (1468).
+- Every later playout-only reopen onto that device lands in the same state.
+
+The reverse hazard: playout leaving the device whose shared IOProc a microphone uses creates its new
+IOProc under the same `_deviceIOProcID` (1065). The old IOProc keeps running, no longer captures
+(`_twoDevices` is now true), and both devices pull the render ring.
+
+`AdmProxy` translates a UID to the current AudioObjectID at every open, so stale ids were not the
+cause. Its reconcile could not see the state either, since the ADM reported initialized and playing.
+
+### Playout opens before a microphone on its device
+
+With a device probe (macOS: `CoreAudioDeviceIdentity`, `CoreAudioDeviceAlive` in `adm_proxy.cpp`),
+`AdmProxy` records what each open direction opened on:
+- The AudioObjectID and UID, identified right after its Init, from the GUID the selection resolved to,
+  or from the default device at that moment.
+- For the microphone, which IOProc the ADM gave it:
+  - shared, when playout was open on its device;
+  - its own, when playout was open elsewhere;
+  - unknown, when playout was closed or a device could not be identified.
+
+Before each reconcile pass (`StopForSameDeviceLocked`), if playout is about to open or reopen while a
+microphone is open, `AdmProxy` checks whether the microphone's IOProc suits the device playout will open
+on. It suits when the IOProc is shared and playout is on that device, or when it is the microphone's
+own and playout is elsewhere. If it does not suit, the pass:
+1. stops the microphone;
+2. stops playout (if open);
+3. opens playout;
+4. opens the microphone.
+
+The microphone then opens next to playout and always gets the right IOProc. This covers every path
+that opens playout, because all of them go through the reconcile:
+- `SelectDevices` (either direction, in one request or two, in either order);
+- `RestartDevices`;
+- the hold, the app and the monitor;
+- the hw.13 format watch's reopen;
+- the device changes and the render-stall guard below.
+
+This is narrower than "reopen both whenever both resolve to one device" in two cases, on purpose. A
+microphone that opens or moves onto the device where playout already runs shares playout's IOProc
+correctly (1257-1263 with `_playIsInitialized`, 1298-1303), so playout is not restarted at every call's
+publish on a USB headset. Playout reopening on the device whose IOProc a microphone shares (the format
+watch's reopen) keeps that IOProc running; StopPlayout leaves it alone while recording (2276), so the
+microphone is not restarted either. It is wider in two cases the "both on one device" rule misses:
+- playout leaving the shared device (above);
+- a microphone opened while playout was closed. That microphone got whichever IOProc the ADM's last
+  output device suggested, so it is always reopened after playout.
+
+The stop order is microphone first. Since the microphone's IOProc only ever opens next to a playout it
+suits, `_twoDevices` at its stop is what it was at its open, and both orders stop cleanly without a
+wait. The one exception is the silent state itself, where both directions are open on one device and
+the microphone has its own IOProc (reached through a race, see the guard below). There StopRecording
+would take the shared branch. So `AdmProxy`:
+1. stops playout first (its 2 s wait cannot be avoided);
+2. points the closed output at another device (`SetPlayoutDevice` plus `InitSpeaker`, which recomputes
+   `_twoDevices` to true, 406-419);
+3. stops the microphone, which now stops its own IOProc (`PointSpeakerAwayLocked`).
+
+Without another output device it warns, and the microphone's IOProc may stay running, as before.
+
+### AdmProxy follows device changes itself
+
+`RunListenerNotification` keeps three notification types from the ADM's listener:
+- `kAudioHardwarePropertyDevices`;
+- `kAudioHardwarePropertyDefaultOutputDevice`;
+- `kAudioHardwarePropertyDefaultInputDevice`.
+
+The ADM only gets the rest: the stream format (still needed, see hw.13) and processor overloads.
+`HandleDeviceChange` and `HandleDefault*DeviceChange` therefore never run, and with them the ADM's
+own stop/restart threads (the 10/16 and 10/20 crash class). On the device thread,
+`FollowDeviceChangesLocked` checks each open direction:
+- **Gone:** the device is gone when CoreAudio no longer lists it or reports it not alive
+  (`kAudioDevicePropertyDeviceIsAlive` 0, or a bad device or bad object error). The direction reopens.
+  If a specific device was selected, that selection falls back to the system default, as the ADM did,
+  until the selection changes or the device is listed again. It then reopens on the device, with no new
+  selection needed.
+- **Default moved:** a direction opened as the system default (or under the fallback) reopens when
+  the default moves away from the device it opened.
+
+Both go through the restart generations, so they reopen as above. The hw.13 format watch's saved
+device is the one each reopen opened. The desktop re-selecting or restarting after these changes
+still works the same way: a selection or restart is applied as before, usually as one more reopen.
+
+### Render-stall guard
+
+The device thread polls every 100 ms while platform playout plays. It reopens playout when all of these
+hold:
+- the render callback count has not moved for 500 ms;
+- capture callbacks went on, at least 10 since then and some since the last poll;
+- no playout format change is settling.
+
+Recoveries are at most one every 5 s. When both directions are open on one device, the microphone is
+reopened with playout (forced coupled). macOS only.
+
+### Stats (155-169) and logs
+
+`RootAudioStats` gains these fields. They are optional, and present only where native follows device
+changes (macOS); absent elsewhere and from older libraries. livekit: `RootAudioStats::device_changes`
+(`DeviceChangeStats`).
+
+| # | Field | |
+|---|---|---|
+| 155, 156 | `playout_device_uid`, `recording_device_uid` | CoreAudio UID of each open direction's device; empty while closed |
+| 157 | `same_device` | both open on one device |
+| 158-162 | `device_list_notifications`, `default_output_notifications`, `default_input_notifications`, `stream_format_notifications`, `other_device_notifications` | the ADM's CoreAudio notifications by property |
+| 163-167 | `user_select_reopens`, `default_change_reopens`, `device_lost_reopens`, `format_change_reopens`, `render_stall_reopens` | directions stopped and opened again, by reason; `RestartDevices` counts as a user select, and a return from the fallback as device lost |
+| 168 | `coupled_reopens` | passes that stopped the microphone (and playout on its device) so that playout opened first |
+| 169 | `render_stall_recoveries` | |
+
+All counters are cumulative for the engine's life. No new control, and caps stay 32767.
+
+Logs:
+- `AdmProxy: stopping the microphone on device <id> so that playout opens first`
+- `playout on device <id> has no IOProc; stopping it, then the microphone`
+- `<direction> device <id> went away; reopening`
+- `the default <direction> device is <id>, not <id>; reopening`
+- `the selected <direction> device went away; opening the system default`
+- `playout on device <id> rendered nothing for <n> ms while capture went on; reopening`
+- `<direction> opened on device <id> (<uid>)` (info)
+
+### Tests
+
+Windows harness, `cargo test -p webrtc-sys --lib --release --features harness`.
+
+`FakeMacAdm` in `adm_proxy_harness.cpp` models `AudioDeviceMac`'s rules over a fake HAL:
+- `_twoDevices`, the speaker and microphone mixers;
+- `_deviceIOProcID` and `_inDeviceIOProcID`, including stale ids;
+- the stop branches, with a 2 s wait counted when no IOProc answers;
+- IOProcs that run only on a live device;
+- which IOProc renders and captures.
+
+`mac_rules(probe)` switches the fake to it; `probe` gives the proxy a device probe over the fake's
+devices.
+
+| Test | What it checks |
+|---|---|
+| `adm_proxy_mac_playout_joining_the_microphones_device_renders` | The report's sequence (mic to the headset, then playout): the coupled reopen, one shared IOProc, no wait, stats, nothing running after the call. Run against hw.21's `AdmProxy` first, it failed with 0 render callbacks for 50 capture callbacks. |
+| `adm_proxy_mac_fake_goes_silent_when_each_direction_reopens_alone` | Without the probe (the earlier behaviour), the fake reproduces the report: no render, `Playing()` true, then a 2 s StopRecording wait, a stale IOProc stop, and the microphone's IOProc left running. |
+| `adm_proxy_mac_follows_a_new_default_device_in_either_notification_order` | A re-plugged headset becomes the default, with input or output notified first, in one pass or two. |
+| `adm_proxy_mac_follows_the_default_when_the_default_device_goes_away` | Unplugging the default headset moves both directions to the new defaults. |
+| `adm_proxy_mac_falls_back_to_the_defaults_while_the_selected_device_is_gone` | An unplugged selected headset falls back to the defaults and returns when the headset is back. |
+| `adm_proxy_mac_render_stall_guard_reopens_silent_playout` | A default change that races the playout open leaves playout silent. The guard recovers it in the playout-first order and leaks no IOProc. It does not fire without capture. |
+| `adm_proxy_mac_reopens_a_microphone_opened_before_playout` | A microphone opened before playout is reopened, with its own IOProc and with a shared one. |
+| `adm_proxy_mac_playout_leaving_the_shared_device_keeps_the_microphone` | Playout leaving the shared device keeps the microphone capturing. |
+| `adm_proxy_mac_leaves_a_suited_direction_alone` | The format watch's reopen under a shared IOProc, and next to the microphone's own IOProc on another device, leaves the microphone alone. |
+| `adm_proxy_keeps_device_changes_from_the_platform_adms_listener` | Device notifications are no longer forwarded to the ADM's listener. |
+
+With the coupling switched off, five of the Mac tests fail. The other suites:
+- `cargo test -p livekit --lib --release platform_audio` (`root_audio_stats_fill_the_device_changes_only_where_native_follows_them`);
+- `cargo test -p livekit-ffi --lib --release` (`rootapp_audio_device_change_stats_convert_and_stay_absent_where_not_followed`).
+
+### Not verified until a Mac build or a live test
+
+- The macOS branches compile here only as a syntax check:
+  - files: `adm_proxy.cpp` (the CoreAudio probe, the selector static_asserts), `adm_listener_router.cpp`,
+    `audio_device_controller.cpp` and `adm_proxy_harness.cpp`;
+  - tool: clang-cl 23 `/Zs /W4` with `WEBRTC_POSIX` and `WEBRTC_MAC`;
+  - stubs: CoreAudio and CoreFoundation, with SDK 15's types and values.
+
+  Not checked: AppleClang, Apple's libc++ and SDK, and linking.
+- The model of `AudioDeviceMac` is from the source. Real IOProc timing, and a dead device's stops
+  (each waits 2 s, as the ADM's own handler did), are only seen on a Mac.
+- The render-stall guard's threshold against Bluetooth profile switches. A switch that stalls output
+  over 500 ms while the built-in microphone captures reopens playout. Watch
+  `render_stall_recoveries` on AirPods switches.
+
+To verify on a Mac (platform engine, a USB or wired headset with a microphone, `ROOTAPP_CALL_DIAG=1`):
+1. Join a call on the built-in devices with the headset unplugged.
+2. Plug the headset in. Both directions should follow it, and the other side should still hear you
+   and you them.
+3. Unplug it and plug it back. Same result.
+4. In stats: `same_device` true, both UIDs the headset's, `render_stall_recoveries` 0, and
+   `coupled_reopens` above 0.
+5. In the log: no 2 s "Timed out stopping" while the headset is connected.
+
+## hw.22 (2026-10-21)
+
+The macOS same-device fix: playout opens before a microphone on its device, native follows device
+changes itself, and a render-stall guard (stats 155-169, no control, caps 32767). See "macOS: one
+device for both directions". Carries hw.21's capture I420 buffer pool.
 
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
