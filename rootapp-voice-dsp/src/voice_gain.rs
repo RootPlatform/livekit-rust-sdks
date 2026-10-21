@@ -112,7 +112,8 @@ pub enum GainLimit {
     Target,
     /// The most it boosts.
     Max,
-    /// The noise after the denoiser stays under its cap.
+    /// The noise stays under its cap: after the denoiser for this gain, the input's floor before it
+    /// for a host's gain ahead of the denoiser.
     Noise,
     /// The room before the denoiser stays under its cap.
     Room,

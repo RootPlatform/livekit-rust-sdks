@@ -183,7 +183,8 @@ pub enum GainLimit {
     Target,
     /// The most it boosts.
     Max,
-    /// The noise after the denoiser stays under its cap.
+    /// The noise stays under its cap: after the denoiser for the chain's
+    /// voice gain, the input's floor before it for AGC2.
     Noise,
     /// The room before the denoiser stays under its cap (the chain's only).
     Room,

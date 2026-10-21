@@ -10,7 +10,7 @@ use crate::speech_gate::{
 use crate::transmit_gate::TransmitGate;
 use crate::voice_gain::{GainLimit, VoiceGain, VoiceGainOptions};
 use crate::{
-    clamp_f64, Agc2Tuning, Aligned, AlignerStats, DenoiserOutput, DspCommands, DspOutputs,
+    clamp_f64, pow10, Agc2Tuning, Aligned, AlignerStats, DenoiserOutput, DspCommands, DspOutputs,
     DspSettings, GainEngine, PreDenoise, PushToTalk, ThresholdTerm, DENOISER_OUTPUT_FRAMES,
     DENOISER_STALL_FRAMES, MAX_DENOISER_WAIT_FRAMES, MAX_FRAME, MAX_LOOKAHEAD_FRAMES, MAX_RATE,
     MAX_VOICE_GAIN_DB, MIN_RATE, STARTUP_HOLD_FRAMES, TRANSMIT_FADE_MS,
@@ -157,12 +157,27 @@ impl ThresholdView {
     }
 }
 
+/// A host's gain as the chain takes it: clamped to 0..AGC2's highest maximum, non-finite 0.
+fn external_gain_db(gain_db: f32) -> f64 {
+    if gain_db.is_finite() {
+        clamp_f64(f64::from(gain_db), 0.0, f64::from(Agc2Tuning::MAX.max_gain_db))
+    } else {
+        0.0
+    }
+}
+
 /// What holds the host's gain (External): its maximum, or its noise cap over the floor the chain's
-/// voice gain measures, within 1 dB; the talker's level otherwise, once the voice gain heard enough
-/// speech to have one.
-fn external_limit(gain: &VoiceGain, applied_db: f64, tuning: &Agc2Tuning) -> GainLimit {
+/// voice gain measures (the input's own floor when the gain ran before the denoiser), within 1 dB;
+/// the talker's level otherwise, once the voice gain heard enough speech to have one.
+fn external_limit(
+    gain: &VoiceGain,
+    applied_db: f64,
+    tuning: &Agc2Tuning,
+    before_denoiser: bool,
+) -> GainLimit {
     let t = tuning.sanitized();
-    let noise_cap = f64::from(t.max_output_noise_dbfs) - gain.floor_db();
+    let floor = if before_denoiser { gain.input_floor_db() } else { gain.floor_db() };
+    let noise_cap = f64::from(t.max_output_noise_dbfs) - floor;
     if applied_db >= f64::from(t.max_gain_db) - 1.0 {
         GainLimit::Max
     } else if applied_db >= noise_cap - 1.0 {
@@ -240,6 +255,10 @@ pub struct DspChain {
     aligned_ran: bool,
     aligned_level: f64,
     threshold_view: ThresholdView,
+    /// The host's gain on the prepared frame ahead of the denoiser (pre_denoise_gain), dB.
+    input_gain_db: Option<f64>,
+    /// The host's gain the aligned frame carries, for post_gain.
+    aligned_gain_db: Option<f64>,
 }
 
 impl DspChain {
@@ -287,6 +306,8 @@ impl DspChain {
             aligned_ran: false,
             aligned_level: 0.0,
             threshold_view: ThresholdView::NONE,
+            input_gain_db: None,
+            aligned_gain_db: None,
         }
     }
 
@@ -402,6 +423,7 @@ impl DspChain {
         out.samples = u32::try_from(frame.len()).unwrap_or(u32::MAX);
         out.reset = false;
         out.flushed = false;
+        self.input_gain_db = None;
         self.pending.add(commands);
         let rate = settings.sample_rate;
         if !self.supported(rate, frame.len()) {
@@ -454,6 +476,36 @@ impl DspChain {
         PreDenoise { flush_denoiser: flushed, supported: true }
     }
 
+    /// GainEngine::External ahead of the denoiser, as Chrome's capture chain runs AGC2: the host
+    /// applied gain_db (clamped to 0..50, non-finite: 0) to `frame` (FloatS16) after pre_denoise
+    /// and hands this frame to the denoiser. It is sanitised in place and becomes what a frame
+    /// without denoiser output passes, so that path keeps the gain. The levels the chain measures
+    /// (the denoised level, auto sensitivity's input, the voice gain's view) stay before the gain;
+    /// post_denoise_align takes the denoiser's output as carrying this frame's gain, which is off
+    /// by at most the host's gain change over the denoiser's latency. post_gain then takes this
+    /// gain whatever it is handed. Returns false, changing nothing, without a matching
+    /// pre_denoise.
+    pub fn pre_denoise_gain(
+        &mut self,
+        frame: &mut [f32],
+        gain_db: f32,
+        out: &mut DspOutputs,
+    ) -> bool {
+        let len = match self.prepared {
+            Some(len) if len == frame.len() => len,
+            _ => return false,
+        };
+        let Some(work) = self.work.get_mut(..len) else {
+            return false;
+        };
+        out.non_finite_samples = out.non_finite_samples.saturating_add(sanitize::sanitize(frame));
+        for (w, &x) in work.iter_mut().zip(frame.iter()) {
+            *w = x * TO_UNIT;
+        }
+        self.input_gain_db = Some(external_gain_db(gain_db));
+        true
+    }
+
     /// Same frame and settings as the preceding pre_denoise. Writes the processed FloatS16 frame.
     /// Called without a matching pre_denoise, the frame is treated as unsupported.
     /// post_denoise_align, then post_gain with the chain's own voice gain.
@@ -470,9 +522,10 @@ impl DspChain {
     }
 
     /// The denoise stage: the denoiser's output through the aligner (or the frame as it is when no
-    /// denoiser is in use), written to `frame` (FloatS16) before any gain. A host's own gain
-    /// (GainEngine::External) runs on it next; post_gain finishes the frame. Called without a
-    /// matching pre_denoise, the frame is left alone and post_gain treats it as unsupported.
+    /// denoiser is in use), written to `frame` (FloatS16) before any gain, or with the gain
+    /// pre_denoise_gain was given. A host's own gain (GainEngine::External) runs on it next unless
+    /// it already did; post_gain finishes the frame. Called without a matching pre_denoise, the
+    /// frame is left alone and post_gain treats it as unsupported.
     pub fn post_denoise_align(
         &mut self,
         frame: &mut [f32],
@@ -482,6 +535,8 @@ impl DspChain {
     ) -> Aligned {
         self.aligned = None;
         self.aligned_ran = false;
+        self.aligned_gain_db = None;
+        let input_gain_db = self.input_gain_db.take();
         let prepared = match self.prepared.take() {
             Some(len) if len == frame.len() && settings.sample_rate == self.rate => Some(len),
             _ => None,
@@ -549,17 +604,26 @@ impl DspChain {
                 aligner.pop(w);
             }
         }
-        out.denoised_sumsq = sanitize::sum_squares(w) * SUMSQ_TO_S16;
+        let sum_squares = sanitize::sum_squares(w) * SUMSQ_TO_S16;
+        let pre_gain_rms = rms(w);
+        let (denoised_sumsq, pre_gain_rms) = match input_gain_db {
+            Some(db) => {
+                let undo = pow10(-db / 20.0);
+                (sum_squares * undo * undo, (f64::from(pre_gain_rms) * undo) as f32)
+            }
+            None => (sum_squares, pre_gain_rms),
+        };
+        out.denoised_sumsq = denoised_sumsq;
         out.denoiser_ran = ran;
         out.denoiser_skipped = skipped;
         out.denoiser_stalled = *empty_outputs >= DENOISER_STALL_FRAMES;
-        let pre_gain_rms = rms(w);
         for (x, &v) in frame.iter_mut().zip(w.iter()) {
             *x = v * FULL_SCALE;
         }
         self.aligned = Some(len);
         self.aligned_ran = ran;
         self.aligned_level = out.denoised_sumsq / len as f64;
+        self.aligned_gain_db = input_gain_db;
         Aligned { supported: true, pre_gain_rms }
     }
 
@@ -568,7 +632,8 @@ impl DspChain {
     /// gain to `frame` and gain_db is that gain (clamped to 0..50, non-finite: 0); the chain's own
     /// voice gain runs on a copy of the aligned frame from before it, for the room, the talker's
     /// level and settled. Legacy: the chain's own voice gain boosts the frame and gain_db is
-    /// ignored.
+    /// ignored. After pre_denoise_gain the frame is External with the gain given there, whatever
+    /// the settings name.
     pub fn post_gain(
         &mut self,
         frame: &mut [f32],
@@ -577,6 +642,7 @@ impl DspChain {
         settings: &DspSettings,
         out: &mut DspOutputs,
     ) {
+        let carried_db = self.aligned_gain_db.take();
         let aligned = match self.aligned.take() {
             Some(len) if len == frame.len() && settings.sample_rate == self.rate => Some(len),
             _ => None,
@@ -615,10 +681,16 @@ impl DspChain {
         let Some(w) = work.get_mut(..len) else {
             return;
         };
-        let external = settings.gain_engine == GainEngine::External;
-        if external && *voice_gain_enabled {
+        let engine = if carried_db.is_some() { GainEngine::External } else { settings.gain_engine };
+        if engine == GainEngine::External && *voice_gain_enabled {
             if let Some(observed) = scratch.get_mut(..len) {
                 observed.copy_from_slice(w);
+                if let Some(db) = carried_db {
+                    let undo = pow10(-db / 20.0) as f32;
+                    for s in observed.iter_mut() {
+                        *s *= undo;
+                    }
+                }
                 voice_gain.process_with_probability(observed, settings.speech_probability);
             }
         }
@@ -626,22 +698,18 @@ impl DspChain {
             *s = x * TO_UNIT;
         }
 
-        *gain_engine = settings.gain_engine;
+        *gain_engine = engine;
         let mut applied_db = 0.0;
         if *voice_gain_enabled {
-            let limit = match settings.gain_engine {
+            let limit = match engine {
                 GainEngine::Legacy => {
                     voice_gain.process_with_probability(w, settings.speech_probability);
                     applied_db = voice_gain.gain_db();
                     voice_gain.limit()
                 }
                 GainEngine::External => {
-                    applied_db = if gain_db.is_finite() {
-                        clamp_f64(f64::from(gain_db), 0.0, f64::from(Agc2Tuning::MAX.max_gain_db))
-                    } else {
-                        0.0
-                    };
-                    external_limit(voice_gain, applied_db, &settings.agc2)
+                    applied_db = carried_db.unwrap_or_else(|| external_gain_db(gain_db));
+                    external_limit(voice_gain, applied_db, &settings.agc2, carried_db.is_some())
                 }
             };
             *voice_gain_db = applied_db as f32;

@@ -2586,6 +2586,46 @@ The macOS same-device fix: playout opens before a microphone on its device, nati
 changes itself, and a render-stall guard (stats 155-169, no control, caps 32767). See "macOS: one
 device for both directions". Carries hw.21's capture I420 buffer pool.
 
+## AGC2 ahead of the denoiser (`rootapp/agc2-before-denoiser`)
+
+Users heard voices on native calls as lower quality, with small artifacts, against the DotNetBrowser
+path. Desktop Chrome runs AGC2 too (adaptive digital, libwebrtc's defaults), but inside its APM,
+before the page's Effects SDK; hw.14 put it after the SDK. The Effects SDK depends on the absolute
+level it gets: it erases more of a quiet voice, clips word starts after pauses, and leaves a chirpy
+residual that a gain after it lifts by up to 30 dB. Offline A/B of 2026-10-21 (real Effects SDK 1.7.2
+at 0.60, gd_probe's AGC2; Jesse's headset capture, native order -> Chrome order): speech frames erased
+13.5 -> 4.2 %, the first 200 ms after a pause 14 -> 0.9 dB under the rest, audible musical blips in
+pauses 4.1 -> 0.8 /s, DNSMOS OVRL 2.56 -> 2.69 (worst 10 % 1.88 -> 2.08). A -48 dBFS LibriVox talker:
+blips 30 -> 1.2 /s, pause noise 38 -> 55 dB under the speech. Cost: on Jesse's room, about 9 dB more
+(smoother) hiss in pauses, which the gate mostly removes. AGC2's 30 dB maximum never bound.
+
+Pipeline (gain_engine AGC2): APM -> pre_denoise -> speech detector -> AGC2 -> `pre_denoise_gain` ->
+Effects SDK -> aligner (`post_denoise_align`) -> `post_gain`. The legacy engine keeps hw.14's order.
+- The speech detector and the digital-silence decision still see the frame before the gain.
+- `DspChain::pre_denoise_gain(frame, gain_db)` copies the gained frame into what a frame without
+  denoiser output passes (Missed, NotInUse, a bypassed pipeline), so the level never drops by the gain
+  on those frames.
+- `post_denoise_align` reports the denoised level and `pre_gain_rms` divided by that gain, and
+  `post_gain` takes it as the External gain the frame carries (the `gain_db` it is handed is ignored),
+  de-gains the copy the chain's voice gain measures, and judges NOISE against the input's floor before
+  the denoiser. Auto sensitivity, the erased-speech count and every reported level stay before the
+  gain, as before.
+- The SDK's output lags its input by its own latency (about 40 ms) that the aligner cannot see (the
+  SDK returns full frames from the first call), so the de-gain uses the current frame's gain: off by at
+  most AGC2's gain change over that latency (6 dB/s: 0.24 dB; the 20 dB/s maximum: 0.8 dB). Turning
+  AGC2 off mid-stream leaves about 40 ms of gained output measured as ungained.
+
+No control, stat or capability change (caps 32767); proto comments only. Golden vectors unchanged
+(legacy order bit for bit). Tests: the crate (`a_gain_before_the_denoiser_stays_on_every_frame_and_the_levels_stay_before_it`,
+`auto_sensitivity_learns_the_same_with_the_gain_before_or_after_the_denoiser`,
+`speech_the_denoiser_erases_is_counted_before_a_gain_ahead_of_it`,
+`pre_denoise_gain_needs_its_pre_denoise_and_lasts_one_frame`; the no-alloc and no-panic runs);
+`agc2_tests` (`root_capture_processor_agc2_runs_ahead_of_the_denoiser`: a -100 dBFS tone a rounding
+fake erases at its own level survives with AGC2 and not with the legacy engine;
+`..._frames_the_denoiser_skips_keep_the_gain`: missed and rate-bypassed frames within 0.3 dB of
+denoised ones; `..._ahead_of_the_denoiser_learns_the_room_before_the_gain`: auto sensitivity's floor
+-80 dBFS at 25 dB of gain, the gate never opens).
+
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
 | Commit | Change |

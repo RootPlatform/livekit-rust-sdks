@@ -162,6 +162,13 @@ fn the_chain_never_allocates_or_frees_after_new() {
             chain.pre_denoise(frame, &settings, &commands, &mut out);
             if f % 3 == 0 {
                 chain.post_denoise(frame, output, &settings, &mut out);
+            } else if f % 7 == 1 {
+                for s in frame.iter_mut() {
+                    *s *= 4.0;
+                }
+                chain.pre_denoise_gain(frame, 12.0, &mut out);
+                let aligned = chain.post_denoise_align(frame, output, &settings, &mut out);
+                chain.post_gain(frame, aligned.pre_gain_rms, f32::NAN, &settings, &mut out);
             } else {
                 let aligned = chain.post_denoise_align(frame, output, &settings, &mut out);
                 if aligned.supported {

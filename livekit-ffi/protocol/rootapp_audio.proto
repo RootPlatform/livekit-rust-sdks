@@ -101,9 +101,11 @@ enum RootAudioGainEngine {
   // The chain's own voice gain (the managed engine's VoiceGain). Native's value while no platform audio
   // handle is open (before the first and after the last one closes).
   ROOT_AUDIO_GAIN_ENGINE_LEGACY = 0;
-  // libwebrtc's AGC2 (GainController2, adaptive digital only, as Chrome runs it) on the aligned voice
-  // after the Effects SDK, before auto sensitivity: a second APM with nothing else enabled, built off the
-  // audio thread for the processor's rate. Each gain reset (gain_reset_db), each change of the agc2_*
+  // libwebrtc's AGC2 (GainController2, adaptive digital only) on the APM output ahead of the Effects
+  // SDK, as Chrome's capture chain runs it: a second APM with nothing else enabled, built off the audio
+  // thread for the processor's rate. The denoiser works on the voice at AGC2's level and a frame it does
+  // not return passes with the same gain; auto sensitivity and the levels reported stay before the gain.
+  // Each gain reset (gain_reset_db), each change of the agc2_*
   // settings and each processor rate is a new AGC2 starting from that gain (a rate change: from the gain
   // applied last); frames at a rate it has no AGC2 for yet (at most one 10 ms poll after a rate change)
   // get the chain's voice gain. Native's value from the first platform audio handle's open until a
@@ -113,8 +115,8 @@ enum RootAudioGainEngine {
 
 // What held the voice gain on the last frame (RootAudioStats.voice_gain_limit), as the chain's voice gain
 // sees it. With AGC2 it is inferred from AGC2's applied gain: MAX within 1 dB of agc2_max_gain_db, NOISE
-// within 1 dB of agc2_max_output_noise_dbfs over voice_gain_floor_db, else TARGET (NONE before 0.5 s of
-// speech).
+// within 1 dB of agc2_max_output_noise_dbfs over the input's floor before the denoiser, else TARGET
+// (NONE before 0.5 s of speech).
 enum RootAudioGainLimit {
   // Under 0.5 s of speech heard: the start gain holds (the chain's room cap may still lower it: ROOM).
   ROOT_AUDIO_GAIN_LIMIT_NONE = 0;
@@ -122,7 +124,8 @@ enum RootAudioGainLimit {
   ROOT_AUDIO_GAIN_LIMIT_TARGET = 1;
   // The most it boosts.
   ROOT_AUDIO_GAIN_LIMIT_MAX = 2;
-  // The noise after the denoiser stays under its cap.
+  // The noise stays under its cap: after the denoiser for the chain's voice gain, the input's floor
+  // before it for AGC2.
   ROOT_AUDIO_GAIN_LIMIT_NOISE = 3;
   // The room before the denoiser stays under -50 dBFS (the chain's voice gain only).
   ROOT_AUDIO_GAIN_LIMIT_ROOM = 4;
@@ -438,8 +441,9 @@ message RootAudioStats {
   required uint64 effects_dropped = 27;
 
   // Capture processing (zero until the processor runs). Stage levels are channel 0 of every processed
-  // frame: the APM output, after the denoiser (and its aligner), the noise gate's input (after the
-  // voice gain and the startup hold) and what is sent; stage_samples counts the samples behind each.
+  // frame: the APM output, after the denoiser (and its aligner) before any gain, the noise gate's input
+  // (after the voice gain and the startup hold) and what is sent; stage_samples counts the samples behind
+  // each.
   // denoised_sumsq, gate_in_sumsq, fields 38-45 and 74-83 come from the DSP chain (capability DSP);
   // without it they stay 0, false, or NaN for dB values.
   required uint64 processed_frames = 30;

@@ -83,7 +83,7 @@ constexpr float kRootMaxGainResetDb = 50.0f;
 enum class RootGainEngine : uint32_t {
   // The chain's own voice gain (the managed engine's twin).
   kLegacy = 0,
-  // libwebrtc's AGC2 (RootAgc2) between the aligner and auto sensitivity.
+  // libwebrtc's AGC2 (RootAgc2) ahead of the denoiser, as Chrome runs it.
   kAgc2 = 1,
 };
 
@@ -457,15 +457,17 @@ RootCaptureFormatSnapshot ReadCaptureFormat(const RootCaptureState& state);
 // count. It runs the voice chain (rootapp-voice-dsp) on channel 0 around the
 // denoiser slot and copies the result to the other channels:
 //   sanitise, voice gain level -> speech detector (while speech_detection is
-//   set; 16, 32 and 48 kHz) -> denoiser slot (Effects SDK; a frame whose raw
-//   input the decorator found digitally silent is not handed to it and is
-//   silence) -> aligner -> voice gain: AGC2 (gain_engine kAgc2, RootAgc2) or
-//   the chain's (its level from the frames the detector rates as speech, with
-//   the host's tunables; also the frames AGC2 has no instance at their rate
-//   for yet) -> auto sensitivity (learning nothing from a digitally silent
-//   frame) -> startup hold -> noise gate (with the speech gate; in GATE mode
-//   it decides on each frame and gates the frame speech_lookahead_ms older)
-//   -> input volume (20 ms ramp) -> mute/PTT gate (5 ms fade each way).
+//   set; 16, 32 and 48 kHz) -> AGC2 (gain_engine kAgc2, RootAgc2; Chrome's
+//   order, ahead of the denoiser) -> denoiser slot (Effects SDK; a frame whose
+//   raw input the decorator found digitally silent is not handed to it and is
+//   silence) -> aligner -> the chain's voice gain (gain_engine kLegacy; its
+//   level from the frames the detector rates as speech, with the host's
+//   tunables; also the frames AGC2 has no instance at their rate for yet) ->
+//   auto sensitivity (learning nothing from a digitally silent frame, and
+//   before any gain either way) -> startup hold -> noise gate (with the
+//   speech gate; in GATE mode it decides on each frame and gates the frame
+//   speech_lookahead_ms older) -> input volume (20 ms ramp) -> mute/PTT gate
+//   (5 ms fade each way).
 // Real-time code: no locks, allocation, logging or APM calls (AGC2's own APM,
 // built and initialized off the audio thread, is the one this thread uses
 // alone). Initialize runs under both APM locks on up to four threads and only

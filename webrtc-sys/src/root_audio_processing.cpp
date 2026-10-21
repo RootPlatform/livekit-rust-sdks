@@ -569,6 +569,27 @@ void RootCaptureProcessor::Process(webrtc::AudioBuffer* audio) {
   }
   speech_running_ = detect;
 
+  // AGC2 ahead of the denoiser, as Chrome's capture chain runs it: the
+  // denoiser works on the voice at the level AGC2 brings it to (a quiet mic
+  // is not left under the level the Effects SDK erases), and a frame the
+  // denoiser does not return passes with the same gain.
+  float gain_db = std::numeric_limits<float>::quiet_NaN();
+  if (settings.gain_engine == static_cast<uint32_t>(RootGainEngine::kAgc2) &&
+      pre.supported && settings.auto_gain) {
+    RootAgc2* agc2 = state.agc2.get();
+    const RootAgc2::Frame applied =
+        agc2 != nullptr ? agc2->Process(samples, frames, rate)
+                        : RootAgc2::Frame{};
+    if (applied.ran) {
+      gain_db = applied.gain_db;
+      settings.agc2 = applied.tuning;
+      dsp_->pre_denoise_gain(frame, gain_db, outputs);
+    } else {
+      // No AGC2 at this rate yet (the control side builds it within 10 ms).
+      settings.gain_engine = static_cast<uint32_t>(RootGainEngine::kLegacy);
+    }
+  }
+
   // Digital silence (a hardware mute, a device gating its own mic) is not
   // handed to the pipeline: its noise model would learn the silence and
   // erase speech for tens of seconds after it. The pipeline's stream carries
@@ -596,21 +617,6 @@ void RootCaptureProcessor::Process(webrtc::AudioBuffer* audio) {
       frame, static_cast<uint8_t>(denoised.kind),
       rust::Slice<const float>(denoise_out_.data(), denoised_samples),
       denoised.restart, settings, outputs);
-  float gain_db = std::numeric_limits<float>::quiet_NaN();
-  if (settings.gain_engine == static_cast<uint32_t>(RootGainEngine::kAgc2) &&
-      aligned.supported && settings.auto_gain) {
-    RootAgc2* agc2 = state.agc2.get();
-    const RootAgc2::Frame applied =
-        agc2 != nullptr ? agc2->Process(samples, frames, rate)
-                        : RootAgc2::Frame{};
-    if (applied.ran) {
-      gain_db = applied.gain_db;
-      settings.agc2 = applied.tuning;
-    } else {
-      // No AGC2 at this rate yet (the control side builds it within 10 ms).
-      settings.gain_engine = static_cast<uint32_t>(RootGainEngine::kLegacy);
-    }
-  }
   dsp_->post_gain(frame, aligned.pre_gain_rms, gain_db, settings, outputs);
   if (slot != nullptr && outputs.denoiser_stalled && !stalled_) {
     slot->LatchBypass(RootDenoiserBypass::kOutputStalled);

@@ -273,6 +273,16 @@ fn abrupt_changes_and_commands_in_every_state_never_panic() {
                 let gain_db = [12.0, f32::NAN][(v % 2) as usize];
                 chain.post_gain(frame, 0.1, gain_db, &settings, &mut out);
             }
+            6 => {
+                chain.pre_denoise(frame, &settings, &commands, &mut out);
+                for s in frame.iter_mut() {
+                    *s *= 30.0;
+                }
+                let gain_db = [30.0, f32::NAN, f32::INFINITY, -1e30, 1e30][(v % 5) as usize];
+                chain.pre_denoise_gain(frame, gain_db, &mut out);
+                let aligned = chain.post_denoise_align(frame, output, &settings, &mut out);
+                chain.post_gain(frame, aligned.pre_gain_rms, gain_db, &settings, &mut out);
+            }
             _ => {
                 chain.pre_denoise(frame, &settings, &commands, &mut out);
                 chain.post_denoise(frame, output, &settings, &mut out);

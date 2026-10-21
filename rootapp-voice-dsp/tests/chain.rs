@@ -1166,6 +1166,194 @@ fn post_denoise_is_align_then_the_chain_gain() {
     assert!(split.out.unsupported, "post_gain without post_denoise_align");
 }
 
+/// A host's gain ahead of the denoiser (pre_denoise_gain), as the capture processor runs AGC2:
+/// `db` applied to the frame after pre_denoise, then the denoiser's `denoised` kind; a Ran
+/// denoiser returns the gained frame scaled by `kept`. post_gain is handed a gain it must ignore.
+/// Returns the frame sent and the pre-gain RMS post_denoise_align reported.
+fn run_before(h: &mut Harness, input: &[f32], db: f32, denoised: Denoised) -> (Vec<f32>, f32) {
+    let mut frame = input.to_vec();
+    if h.pre(&mut frame).supported {
+        let scale = 10f32.powf(db / 20.0);
+        for s in frame.iter_mut() {
+            *s *= scale;
+        }
+        assert!(h.chain.pre_denoise_gain(&mut frame, db, &mut h.out));
+    }
+    let returned: Vec<f32> = match denoised {
+        Denoised::Ran(kept) => frame.iter().map(|v| v * kept).collect(),
+        _ => vec![],
+    };
+    let output = match denoised {
+        Denoised::Ran(_) => DenoiserOutput::Ran { samples: &returned, restart: false },
+        Denoised::Missed => DenoiserOutput::Missed,
+        Denoised::NotInUse => DenoiserOutput::NotInUse,
+    };
+    let aligned = h.chain.post_denoise_align(&mut frame, output, &h.settings, &mut h.out);
+    h.chain.post_gain(&mut frame, aligned.pre_gain_rms, 99.0, &h.settings, &mut h.out);
+    h.position += input.len();
+    (frame, aligned.pre_gain_rms)
+}
+
+#[derive(Clone, Copy)]
+enum Denoised {
+    Ran(f32),
+    Missed,
+    NotInUse,
+}
+
+fn rms_unit(frame: &[f32]) -> f32 {
+    (frame.iter().map(|v| f64::from(*v) * f64::from(*v)).sum::<f64>() / frame.len() as f64).sqrt()
+        as f32
+        / 32768.0
+}
+
+/// A gain ahead of the denoiser stays on the frame whether the denoiser runs, misses or is not in
+/// use, so a frame it does not return never drops by the gain; what the chain measures (the
+/// denoised level, the RMS auto sensitivity learns, the voice gain's view) stays before the gain,
+/// and the gain sent is the one pre_denoise_gain was given.
+#[test]
+fn a_gain_before_the_denoiser_stays_on_every_frame_and_the_levels_stay_before_it() {
+    let mut h = Harness::new(48000);
+    h.settings.gain_engine = GainEngine::External;
+    h.settings.agc2 = Agc2Tuning::DEFAULT;
+    h.settings.auto_sensitivity = false;
+    h.settings.gate_threshold = 0.0;
+    let amplitude = (10f64.powf(-40.0 / 20.0) * 2f64.sqrt()) as f32 * 32768.0;
+    let gain = 10f32.powf(12.0 / 20.0);
+    for f in 0..HOLD + 600 {
+        let input = if f % 30 < 20 { h.tone(amplitude, 220.0) } else { vec![0.0; 480] };
+        let kind = match f % 10 {
+            3 => Denoised::Missed,
+            7 => Denoised::NotInUse,
+            _ => Denoised::Ran(1.0),
+        };
+        let (sent, pre_gain_rms) = run_before(&mut h, &input, 12.0, kind);
+        if f < HOLD + 10 {
+            continue;
+        }
+        let expected: Vec<f32> = input.iter().map(|v| v * gain).collect();
+        let kind_name = ["ran", "missed", "not in use"][match kind {
+            Denoised::Ran(_) => 0,
+            Denoised::Missed => 1,
+            Denoised::NotInUse => 2,
+        }];
+        if (5..20).contains(&(f % 30)) {
+            assert!(
+                near(f64::from(rms_unit(&sent)), f64::from(rms_unit(&expected)), 1e-6),
+                "frame {f} ({kind_name}): the gain is on the frame"
+            );
+        }
+        assert!(
+            near(f64::from(pre_gain_rms), f64::from(rms_unit(&input)), 1e-6),
+            "frame {f} ({kind_name}): {pre_gain_rms}"
+        );
+        let input_sumsq: f64 = input.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
+        assert!(
+            (h.out.denoised_sumsq - input_sumsq).abs() <= 1e-6 * input_sumsq,
+            "frame {f} ({kind_name}): {} vs {input_sumsq}",
+            h.out.denoised_sumsq
+        );
+        assert_eq!(h.out.voice_gain_db, 12.0, "the gain given, not post_gain's 99");
+        assert_eq!(h.out.gain_engine, GainEngine::External);
+    }
+    assert!(
+        near(f64::from(h.out.voice_gain_speech_level_db), -40.0, 1.5),
+        "the talker before the gain: {}",
+        h.out.voice_gain_speech_level_db
+    );
+}
+
+/// With a gain ahead of the denoiser, auto sensitivity learns what it learns with the same gain
+/// after it, and the frames sent are the same.
+#[test]
+fn auto_sensitivity_learns_the_same_with_the_gain_before_or_after_the_denoiser() {
+    let mut after = Harness::new(48000);
+    after.settings.gain_engine = GainEngine::External;
+    let mut before = Harness::new(48000);
+    before.settings.gain_engine = GainEngine::External;
+    let mut manual_after = Harness::new(48000);
+    manual_after.settings.gain_engine = GainEngine::External;
+    manual_after.settings.auto_sensitivity = false;
+    let mut manual_before = Harness::new(48000);
+    manual_before.settings.gain_engine = GainEngine::External;
+    manual_before.settings.auto_sensitivity = false;
+    let mut rng = Rng::new(21);
+    for f in 0..900 {
+        let level = if f % 30 < 20 { 0.01 } else { 0.0003 };
+        let input: Vec<f32> = (0..480).map(|_| level * 32768.0 * rng.symmetric()).collect();
+        let db = if f < 450 { 12.0 } else { 20.0 };
+        run_external(&mut after, &input, db);
+        run_before(&mut before, &input, db, Denoised::NotInUse);
+        let a = run_external(&mut manual_after, &input, db);
+        let (b, _) = run_before(&mut manual_before, &input, db, Denoised::NotInUse);
+        assert_eq!(a, b, "frame {f}");
+        if f > 100 {
+            let diff = 20.0 * f64::from(before.out.threshold / after.out.threshold).log10();
+            assert!(diff.abs() < 0.01, "frame {f}: {diff} dB");
+            assert!(
+                near(
+                    f64::from(before.out.auto_sensitivity_floor_db),
+                    f64::from(after.out.auto_sensitivity_floor_db),
+                    0.01
+                ),
+                "frame {f}"
+            );
+        }
+    }
+}
+
+/// Speech the denoiser erases is judged against its input before the gain, so a gain ahead of the
+/// denoiser does not hide it: 20 dB under the input is erased with or without 20 dB of gain.
+#[test]
+fn speech_the_denoiser_erases_is_counted_before_a_gain_ahead_of_it() {
+    let count = |db: f32| {
+        let mut h = Harness::new(48000);
+        h.settings.gain_engine = GainEngine::External;
+        h.settings.auto_sensitivity = false;
+        h.settings.gate_threshold = 0.0;
+        h.settings.denoiser_wanted = true;
+        h.settings.speech_detection = SpeechDetection::Gate;
+        let amplitude = 10f32.powf(-30.0 / 20.0) * std::f32::consts::SQRT_2 * 32768.0;
+        let mut erased = 0;
+        for f in 0..120 {
+            h.settings.speech_probability = if f >= 40 { 0.9 } else { 0.0 };
+            let input = h.tone(amplitude, 220.0);
+            run_before(&mut h, &input, db, Denoised::Ran(0.1));
+            if h.out.speech_denoiser_erased {
+                erased += 1;
+            }
+        }
+        erased
+    };
+    let plain = count(0.0);
+    assert!(plain > 50, "{plain}");
+    assert_eq!(count(20.0), plain);
+}
+
+/// pre_denoise_gain needs the matching pre_denoise: without one, or for another frame length, it
+/// changes nothing; a later frame without it is the plain chain again.
+#[test]
+fn pre_denoise_gain_needs_its_pre_denoise_and_lasts_one_frame() {
+    let mut h = Harness::pass_through(48000);
+    let mut frame = vec![100.0f32; 480];
+    assert!(!h.chain.pre_denoise_gain(&mut frame, 12.0, &mut h.out));
+    let mut short = vec![100.0f32; 479];
+    h.pre(&mut frame);
+    assert!(!h.chain.pre_denoise_gain(&mut short, 12.0, &mut h.out));
+    frame[0] = f32::NAN;
+    assert!(h.chain.pre_denoise_gain(&mut frame, f32::NAN, &mut h.out));
+    assert_eq!((frame[0], h.out.non_finite_samples), (0.0, 1));
+    let aligned =
+        h.chain.post_denoise_align(&mut frame, DenoiserOutput::NotInUse, &h.settings, &mut h.out);
+    h.chain.post_gain(&mut frame, aligned.pre_gain_rms, 5.0, &h.settings, &mut h.out);
+    assert_eq!(h.out.gain_engine, GainEngine::External);
+    for _ in 0..HOLD {
+        h.run(100.0);
+    }
+    assert_eq!(h.run(100.0), vec![100.0; 480]);
+    assert_eq!(h.out.gain_engine, GainEngine::Legacy);
+}
+
 /// A frame of `value` everywhere.
 fn flat(value: f32) -> Vec<f32> {
     vec![value; 480]

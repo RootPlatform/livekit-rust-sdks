@@ -30,8 +30,8 @@ pub mod ffi {
     /// it did not run); capture_silent the decorator found this frame's raw
     /// input digitally silent; auto_sensitivity_minimum_db, voice_gain and
     /// speech_lookahead_ms as the host set them (NaN: the chain's default);
-    /// gain_engine 0 the chain's voice gain, 1 AGC2 between post_denoise_align
-    /// and post_gain (anything else 0), with the AGC2 that ran in agc2.
+    /// gain_engine 0 the chain's voice gain, 1 AGC2 (anything else 0), with the
+    /// AGC2 that ran in agc2.
     #[derive(Debug, Clone, Copy, Default)]
     pub struct RootDspSettings {
         pub sample_rate: u32,
@@ -176,9 +176,19 @@ pub mod ffi {
             commands: &RootDspCommands,
             outputs: &mut RootDspOutputs,
         ) -> RootDspPre;
+        /// AGC2 ahead of the denoiser: the gain (dB) it applied to `frame`
+        /// after pre_denoise; the frame is what the denoiser gets. False
+        /// without a matching pre_denoise.
+        fn pre_denoise_gain(
+            self: &mut RootDspChain,
+            frame: &mut [f32],
+            gain_db: f32,
+            outputs: &mut RootDspOutputs,
+        ) -> bool;
         /// kind: 0 not in use, 1 missed, 2 ran (denoised and restart are used
         /// only for 2), 3 skipped (not handed to the denoiser: silence). Leaves
-        /// the aligned voice before any gain in `frame`.
+        /// the aligned voice in `frame`, before any gain or with the one
+        /// pre_denoise_gain was given; pre_gain_rms is before it either way.
         fn post_denoise_align(
             self: &mut RootDspChain,
             frame: &mut [f32],
@@ -188,7 +198,8 @@ pub mod ffi {
             settings: &RootDspSettings,
             outputs: &mut RootDspOutputs,
         ) -> RootDspAligned;
-        /// gain_db: the gain AGC2 applied to `frame` (gain_engine 1).
+        /// gain_db: the gain AGC2 applied to `frame` (gain_engine 1); ignored
+        /// after pre_denoise_gain, whose gain the frame carries.
         fn post_gain(
             self: &mut RootDspChain,
             frame: &mut [f32],
@@ -676,6 +687,17 @@ impl RootDspChain {
         let pre = self.chain.pre_denoise(frame, &dsp_settings(settings), &commands, &mut self.out);
         copy_outputs(&self.out, outputs);
         ffi::RootDspPre { flush_denoiser: pre.flush_denoiser, supported: pre.supported }
+    }
+
+    fn pre_denoise_gain(
+        &mut self,
+        frame: &mut [f32],
+        gain_db: f32,
+        outputs: &mut ffi::RootDspOutputs,
+    ) -> bool {
+        let applied = self.chain.pre_denoise_gain(frame, gain_db, &mut self.out);
+        copy_outputs(&self.out, outputs);
+        applied
     }
 
     fn post_denoise_align(
@@ -1975,6 +1997,109 @@ mod agc2_tests {
         assert_eq!((h.dsp(false).gain_engine_applied, h.dsp(false).voice_gain_db), (0, 4.0));
         h.reset_controls();
         assert_eq!(h.dsp(false).gain_engine, AGC2, "a session start takes AGC2 again");
+    }
+
+    /// AGC2 runs ahead of the denoiser, as Chrome's chain does: a -100 dBFS
+    /// tone, which a denoiser rounding to whole FloatS16 steps erases at its
+    /// own level, reaches it 18 dB louder and survives. The chain's own gain
+    /// still runs after the denoiser and gets nothing to boost.
+    #[test]
+    fn root_capture_processor_agc2_runs_ahead_of_the_denoiser() {
+        for (engine, survives) in [(AGC2, true), (0, false)] {
+            let h = agc2_with(48000, 18.0, false, tuning(f32::NAN, -30.0));
+            h.set_gain_engine(engine);
+            h.set_denoiser_wanted(true);
+            assert!(h.install_fake_denoiser(48000, 1.0, 0, 0, 0, 0));
+            let mut position = 0;
+            let mut sent = 0.0;
+            for f in 0..80 {
+                let out = h.process(48000, 1, &tone(48000, -100.0, &mut position)).samples;
+                if f >= 40 {
+                    sent += power(&out);
+                }
+            }
+            assert_eq!(sent > 0.0, survives, "engine {engine}");
+            assert_eq!(h.dsp(false).gain_engine_applied, engine);
+            assert_eq!(h.fake_denoiser().process_calls, 80);
+        }
+    }
+
+    /// A frame the denoiser does not return (the slot busy, or a pipeline at
+    /// another rate bypassed) passes dry with AGC2's gain on it, so the level
+    /// never drops by the gain; the denoised level the stats report stays
+    /// before the gain.
+    #[test]
+    fn root_capture_processor_agc2_frames_the_denoiser_skips_keep_the_gain() {
+        let h = agc2_with(48000, 18.0, false, tuning(f32::NAN, -30.0));
+        h.set_denoiser_wanted(true);
+        assert!(h.install_fake_denoiser(48000, 1.0, 0, 0, 0, 0));
+        let mut position = 0;
+        let input = power(&tone(48000, -65.0, &mut 0));
+        let mut ran = 0.0;
+        for _ in 0..60 {
+            ran = power(&h.process(48000, 1, &tone(48000, -65.0, &mut position)).samples);
+        }
+        assert!((dbfs(ran) - dbfs(input) - 18.0).abs() < 0.3, "{:.2} dB", dbfs(ran) - dbfs(input));
+        let before = h.dsp(false);
+        h.process(48000, 1, &tone(48000, -65.0, &mut position));
+        let after = h.dsp(false);
+        let denoised = after.denoised_sumsq - before.denoised_sumsq;
+        let apm = after.apm_out_sumsq - before.apm_out_sumsq;
+        assert!((10.0 * (denoised / apm).log10()).abs() < 0.3, "{:.2} dB", 10.0 * (denoised / apm).log10());
+
+        assert!(h.hold_denoiser_slot(true));
+        let missed = power(&h.process(48000, 1, &tone(48000, -65.0, &mut position)).samples);
+        assert!(h.hold_denoiser_slot(false));
+        assert_eq!(h.fake_denoiser().misses, 1);
+        assert!((dbfs(missed) - dbfs(ran)).abs() < 0.3, "missed: {:.2} dB", dbfs(missed) - dbfs(ran));
+
+        assert!(h.install_fake_denoiser(16000, 1.0, 0, 0, 0, 0));
+        let mut bypassed = 0.0;
+        for _ in 0..3 {
+            bypassed = power(&h.process(48000, 1, &tone(48000, -65.0, &mut position)).samples);
+        }
+        assert_eq!(h.fake_denoiser().bypass, 1);
+        assert!(
+            (dbfs(bypassed) - dbfs(ran)).abs() < 0.3,
+            "bypassed: {:.2} dB",
+            dbfs(bypassed) - dbfs(ran)
+        );
+    }
+
+    /// With AGC2 ahead of the denoiser, auto sensitivity still learns the
+    /// room before the gain: its floor is the room's level, and room noise
+    /// never opens the gate at 25 dB of gain.
+    #[test]
+    fn root_capture_processor_agc2_ahead_of_the_denoiser_learns_the_room_before_the_gain() {
+        let h = agc2(48000, 25.0, true);
+        h.set_denoiser_wanted(true);
+        assert!(h.install_fake_denoiser(48000, 1.0, 0, 0, 0, 0));
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let a = (32768.0 * 10f64.powf(-80.0 / 20.0) * 3f64.sqrt()) as f32;
+        let mut open_after_learning = 0;
+        for f in 0..2000 {
+            let frame: Vec<f32> = (0..480)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    a * ((seed >> 11) as f32 / (1u64 << 53) as f32 * 2.0 - 1.0)
+                })
+                .collect();
+            h.process(48000, 1, &frame);
+            if f == 600 {
+                open_after_learning = h.dsp(false).gate_open_frames;
+            }
+        }
+        let dsp = h.dsp(false);
+        assert!(dsp.voice_gain_db >= 24.0, "{}", dsp.voice_gain_db);
+        assert!(
+            (f64::from(dsp.auto_sensitivity_floor_db) + 80.0).abs() < 2.0,
+            "the floor before the gain: {}",
+            dsp.auto_sensitivity_floor_db
+        );
+        assert_eq!(dsp.gate_open_frames, open_after_learning, "the gate opened on the room");
+        assert_eq!(dsp.gain_engine_applied, AGC2);
     }
 
     /// Not a unit test: a recording through AGC2 in the processor (the gate

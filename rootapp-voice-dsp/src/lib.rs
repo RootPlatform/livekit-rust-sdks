@@ -84,9 +84,10 @@ pub enum GainEngine {
     /// The chain's own (`voice_gain::VoiceGain`, the managed engine's twin).
     #[default]
     Legacy,
-    /// The host's, between `post_denoise_align` and `post_gain` (libwebrtc's AGC2), which hands the
-    /// gain it applied to `post_gain`. The chain's voice gain still measures the room and the
-    /// talker's level for the stats, and its speech heard says when the gain is settled.
+    /// The host's (libwebrtc's AGC2), between `post_denoise_align` and `post_gain`, or ahead of the
+    /// denoiser through `pre_denoise_gain`; `post_gain` gets the gain it applied. The chain's voice
+    /// gain still measures the room and the talker's level for the stats, and its speech heard says
+    /// when the gain is settled.
     External,
 }
 
@@ -220,7 +221,8 @@ pub struct PreDenoise {
 }
 
 /// What `post_denoise_align` left in the frame: the aligned voice before any gain (FloatS16) for the
-/// host's gain, and its RMS (±1 units) for `post_gain`. An unsupported frame is left as it came.
+/// host's gain, or with the gain `pre_denoise_gain` was given, and its RMS before any gain (±1
+/// units) for `post_gain`. An unsupported frame is left as it came.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Aligned {
     pub supported: bool,
