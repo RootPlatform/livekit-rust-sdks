@@ -31,6 +31,13 @@
 
 namespace livekit_ffi {
 
+// CoreAudio property selectors (four-character codes) that AdmProxy tells
+// apart in the platform ADM's notifications.
+constexpr uint32_t kAdmSelectorDevices = 0x64657623;        // 'dev#'
+constexpr uint32_t kAdmSelectorDefaultOutput = 0x644F7574;  // 'dOut'
+constexpr uint32_t kAdmSelectorDefaultInput = 0x64496E20;   // 'dIn '
+constexpr uint32_t kAdmSelectorStreamFormat = 0x73666D74;   // 'sfmt'
+
 struct AdmListenerAddress {
   uint32_t selector = 0;
   uint32_t scope = 0;
@@ -53,11 +60,20 @@ using AdmListenerInvoker =
              uint32_t object,
              const std::vector<AdmListenerAddress>& addresses);
 
+// One notification for a routed listener: the addresses CoreAudio passed,
+// and the listener to run for those of them its router hands on (unless the
+// listener was removed by then).
+struct AdmListenerNotification {
+  uint32_t object = 0;
+  std::vector<AdmListenerAddress> addresses;
+  absl::AnyInvocable<void(const std::vector<AdmListenerAddress>&) &&> invoke;
+};
+
 class AdmListenerRouter
     : public std::enable_shared_from_this<AdmListenerRouter> {
  public:
   // Called with the router's lock held; must not wait.
-  using Post = std::function<void(absl::AnyInvocable<void() &&>)>;
+  using Post = std::function<void(AdmListenerNotification)>;
 
   explicit AdmListenerRouter(Post post);
 
@@ -70,7 +86,7 @@ class AdmListenerRouter
  private:
   friend class AdmListenerRegistry;
 
-  void Deliver(absl::AnyInvocable<void() &&> notification);
+  void Deliver(AdmListenerNotification notification);
 
   mutable webrtc::Mutex mutex_;
   Post post_ RTC_GUARDED_BY(mutex_);

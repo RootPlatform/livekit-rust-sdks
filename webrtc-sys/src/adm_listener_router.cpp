@@ -52,7 +52,7 @@ uint64_t AdmListenerRouter::delivered() const {
   return delivered_.load(std::memory_order_relaxed);
 }
 
-void AdmListenerRouter::Deliver(absl::AnyInvocable<void() &&> notification) {
+void AdmListenerRouter::Deliver(AdmListenerNotification notification) {
   webrtc::MutexLock lock(&mutex_);
   if (!post_) {
     return;
@@ -162,12 +162,16 @@ void AdmListenerRegistry::Notify(uint64_t id,
     }
     registration = found->second;
   }
-  registration->router->Deliver(
-      [registration, object, addresses = std::move(addresses)] {
+  AdmListenerNotification notification;
+  notification.object = object;
+  notification.addresses = std::move(addresses);
+  notification.invoke =
+      [registration, object](const std::vector<AdmListenerAddress>& handed) {
         if (!registration->removed.load(std::memory_order_acquire)) {
-          registration->invoke(registration->key, object, addresses);
+          registration->invoke(registration->key, object, handed);
         }
-      });
+      };
+  registration->router->Deliver(std::move(notification));
 }
 
 #if defined(WEBRTC_MAC) && !defined(WEBRTC_IOS)

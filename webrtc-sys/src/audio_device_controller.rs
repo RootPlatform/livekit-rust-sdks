@@ -72,6 +72,31 @@ pub mod ffi {
         pub samples: Vec<i16>,
     }
 
+    /// The callbacks the harness's fake made under AudioDeviceMac's rules
+    /// (tests only).
+    #[cfg(feature = "harness")]
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct AdmMacIo {
+        pub render_callbacks: u32,
+        pub capture_callbacks: u32,
+    }
+
+    /// The fake's AudioDeviceMac state (tests only): IOProcs started and not
+    /// stopped, of them the microphone's own (inDeviceIOProc) and the shared
+    /// one (deviceIOProc); `_twoDevices`; stop waits that timed out (the ADM
+    /// waits 2 s for an IOProc that never runs); Stop/Destroy/Start calls on
+    /// an IOProc id that is gone or belongs to another device.
+    #[cfg(feature = "harness")]
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct AdmMacState {
+        pub running_ioprocs: u32,
+        pub running_input_ioprocs: u32,
+        pub running_shared_ioprocs: u32,
+        pub two_devices: bool,
+        pub stop_timeouts: u32,
+        pub bad_ioproc_calls: u32,
+    }
+
     /// One playout mixer source (a remote audio stream): its audio as it
     /// reached the mixer, before its gain (a muted frame counts as silence),
     /// cumulative since it was added; `source_id` tells a stream added again
@@ -143,6 +168,31 @@ pub mod ffi {
         pub playout_format_changes: u64,
         pub playout_format_reopens: u64,
         pub recording_format_changes: u64,
+
+        /// Native follows device changes itself (macOS). The CoreAudio UID
+        /// of each open direction's device (empty while closed), whether
+        /// both are open on one device, the platform ADM's CoreAudio
+        /// notifications by property, each direction stopped and opened
+        /// again by reason, the reopens that stopped the microphone (and
+        /// playout on its device) so that playout opened first, and
+        /// playout reopened because it rendered nothing while capture went
+        /// on.
+        pub device_changes_available: bool,
+        pub playout_device_uid: String,
+        pub recording_device_uid: String,
+        pub same_device: bool,
+        pub device_list_notifications: u64,
+        pub default_output_notifications: u64,
+        pub default_input_notifications: u64,
+        pub stream_format_notifications: u64,
+        pub other_device_notifications: u64,
+        pub user_select_reopens: u64,
+        pub default_change_reopens: u64,
+        pub device_lost_reopens: u64,
+        pub format_change_reopens: u64,
+        pub render_stall_reopens: u64,
+        pub coupled_reopens: u64,
+        pub render_stall_recoveries: u64,
 
         /// The DSP chain, the denoiser slot and the APM decorator exist; the
         /// fields of the ones that do not stay at their defaults.
@@ -708,7 +758,25 @@ pub mod ffi {
         fn notify_devices_changed(self: &AdmProxyHarness);
         fn notify_format_changed(self: &AdmProxyHarness);
         fn notify_default_output_changed(self: &AdmProxyHarness);
-        fn set_listener_restarts(self: &AdmProxyHarness, restarts: bool);
+        fn notify_default_input_changed(self: &AdmProxyHarness);
+        /// The fake follows AudioDeviceMac's IOProc rules from now on; with
+        /// `probe` the proxy also gets a device probe over the fake's
+        /// devices, as CoreAudio answers it on macOS.
+        fn mac_rules(self: &AdmProxyHarness, probe: bool);
+        /// The device CoreAudio calls the default now (index 0 opens it).
+        fn set_default_device(self: &AdmProxyHarness, playout: bool, id: &str);
+        /// A device that is not alive keeps its IOProcs from running.
+        fn set_device_alive(self: &AdmProxyHarness, id: &str, alive: bool);
+        /// The default output becomes `id` as the ADM's next InitPlayout
+        /// resolves it (a change racing the open).
+        fn set_default_output_at_next_playout_open(self: &AdmProxyHarness, id: &str);
+        /// `cycles` IO cycles under those rules, on a device thread.
+        fn mac_io(self: &AdmProxyHarness, cycles: u32) -> AdmMacIo;
+        fn mac_state(self: &AdmProxyHarness) -> AdmMacState;
+        /// The render-stall guard with these limits, run only by
+        /// `poll_render_stall`.
+        fn set_render_stall_guard(self: &AdmProxyHarness, stall_ms: u32, min_interval_ms: u32);
+        fn poll_render_stall(self: &AdmProxyHarness);
         fn listener_calls(self: &AdmProxyHarness) -> u32;
         fn listeners_ran_on_device_thread(self: &AdmProxyHarness) -> bool;
         fn overlapping_device_calls(self: &AdmProxyHarness) -> u32;

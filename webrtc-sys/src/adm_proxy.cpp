@@ -63,8 +63,14 @@ constexpr webrtc::TimeDelta kPlayoutDelayRefresh =
     webrtc::TimeDelta::Millis(100);
 constexpr webrtc::TimeDelta kStopFailureRetry = webrtc::TimeDelta::Seconds(1);
 constexpr webrtc::TimeDelta kFormatWatchPeriod = webrtc::TimeDelta::Millis(100);
+constexpr webrtc::TimeDelta kRenderStallWatchPeriod =
+    webrtc::TimeDelta::Millis(100);
 #endif
 constexpr int64_t kFormatReopenMinIntervalNs = 1'000'000'000;
+constexpr int64_t kRenderStallNs = 500'000'000;
+constexpr int64_t kRenderStallMinIntervalNs = 5'000'000'000;
+// 100 ms of capture while nothing rendered.
+constexpr uint64_t kRenderStallMinCaptures = 10;
 
 int64_t NowNs() {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -242,6 +248,117 @@ std::optional<AdmDeviceFormat> CoreAudioDeviceFormat(bool playout,
   result.bytes_per_frame = format.mBytesPerFrame;
   result.format_flags = format.mFormatFlags;
   return result;
+}
+
+static_assert(kAdmSelectorDevices == kAudioHardwarePropertyDevices);
+static_assert(kAdmSelectorDefaultOutput ==
+              kAudioHardwarePropertyDefaultOutputDevice);
+static_assert(kAdmSelectorDefaultInput ==
+              kAudioHardwarePropertyDefaultInputDevice);
+static_assert(kAdmSelectorStreamFormat == kAudioDevicePropertyStreamFormat);
+
+std::optional<AudioObjectID> ParseAudioObjectId(const std::string& id) {
+  AudioObjectID device = kAudioObjectUnknown;
+  const char* end = id.data() + id.size();
+  const std::from_chars_result parsed = std::from_chars(id.data(), end, device);
+  if (id.empty() || parsed.ec != std::errc() || parsed.ptr != end ||
+      device == kAudioObjectUnknown) {
+    return std::nullopt;
+  }
+  return device;
+}
+
+AudioObjectID CoreAudioDefaultDevice(bool playout) {
+  const AudioObjectPropertyAddress address = {
+      playout ? kAudioHardwarePropertyDefaultOutputDevice
+              : kAudioHardwarePropertyDefaultInputDevice,
+      kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
+  AudioObjectID device = kAudioObjectUnknown;
+  UInt32 size = static_cast<UInt32>(sizeof(device));
+  if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &address, 0, nullptr,
+                                 &size, &device) != noErr) {
+    return kAudioObjectUnknown;
+  }
+  return device;
+}
+
+std::string CoreAudioDeviceUid(AudioObjectID device) {
+  const AudioObjectPropertyAddress address = {kAudioDevicePropertyDeviceUID,
+                                              kAudioObjectPropertyScopeGlobal,
+                                              kAudioObjectPropertyElementMain};
+  CFStringRef uid = nullptr;
+  UInt32 size = static_cast<UInt32>(sizeof(uid));
+  if (AudioObjectGetPropertyData(device, &address, 0, nullptr, &size, &uid) !=
+          noErr ||
+      uid == nullptr) {
+    return std::string();
+  }
+  const CFIndex capacity = CFStringGetMaximumSizeForEncoding(
+                               CFStringGetLength(uid), kCFStringEncodingUTF8) +
+                           1;
+  std::vector<char> buffer(static_cast<size_t>(capacity), '\0');
+  std::string result;
+  if (CFStringGetCString(uid, buffer.data(), capacity, kCFStringEncodingUTF8)) {
+    result = buffer.data();
+  }
+  CFRelease(uid);
+  return result;
+}
+
+// The device the macOS ADM opens for a GUID (its AudioObjectID; empty: index
+// 0, the default device at the open).
+std::optional<AdmDeviceIdentity> CoreAudioDeviceIdentity(
+    bool playout,
+    const std::string& guid) {
+  const std::optional<AudioObjectID> device =
+      guid.empty()
+          ? std::optional<AudioObjectID>(CoreAudioDefaultDevice(playout))
+          : ParseAudioObjectId(guid);
+  if (!device || *device == kAudioObjectUnknown) {
+    return std::nullopt;
+  }
+  AdmDeviceIdentity identity;
+  identity.id = std::to_string(*device);
+  identity.uid = CoreAudioDeviceUid(*device);
+  return identity;
+}
+
+// As AudioDeviceMac::HandleDeviceChange: gone when CoreAudio no longer lists
+// it, or answers its kAudioDevicePropertyDeviceIsAlive with 0 or a bad
+// device. Another error keeps it.
+bool CoreAudioDeviceAlive(const std::string& id) {
+  const std::optional<AudioObjectID> device = ParseAudioObjectId(id);
+  if (!device) {
+    return false;
+  }
+  const AudioObjectPropertyAddress devices = {kAudioHardwarePropertyDevices,
+                                              kAudioObjectPropertyScopeGlobal,
+                                              kAudioObjectPropertyElementMain};
+  UInt32 size = 0;
+  if (AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &devices, 0,
+                                     nullptr, &size) == noErr) {
+    std::vector<AudioObjectID> listed(size / sizeof(AudioObjectID));
+    if (!listed.empty() &&
+        AudioObjectGetPropertyData(kAudioObjectSystemObject, &devices, 0,
+                                   nullptr, &size, listed.data()) == noErr) {
+      listed.resize(size / sizeof(AudioObjectID));
+      if (std::find(listed.begin(), listed.end(), *device) == listed.end()) {
+        return false;
+      }
+    }
+  }
+  const AudioObjectPropertyAddress alive = {kAudioDevicePropertyDeviceIsAlive,
+                                            kAudioObjectPropertyScopeGlobal,
+                                            kAudioObjectPropertyElementMain};
+  UInt32 value = 1;
+  size = static_cast<UInt32>(sizeof(value));
+  const OSStatus status =
+      AudioObjectGetPropertyData(*device, &alive, 0, nullptr, &size, &value);
+  if (status == kAudioHardwareBadDeviceError ||
+      status == kAudioHardwareBadObjectError) {
+    return false;
+  }
+  return status != noErr || value != 0;
 }
 #endif
 
@@ -539,6 +656,14 @@ void AdmTransportTap::ResetRenderClock() {
   render_.previous_ns.store(0, std::memory_order_relaxed);
 }
 
+uint64_t AdmTransportTap::capture_callbacks() const {
+  return capture_.callbacks.load(std::memory_order_relaxed);
+}
+
+uint64_t AdmTransportTap::render_callbacks() const {
+  return render_.callbacks.load(std::memory_order_relaxed);
+}
+
 void AdmTransportTap::set_playout_delay_ms(uint16_t delay_ms) {
   playout_delay_ms_.store(delay_ms, std::memory_order_relaxed);
 }
@@ -661,7 +786,14 @@ AdmProxy::AdmProxy(
   format_reader_ = CoreAudioDeviceFormat;
   format_watch_periodic_ = true;
   device_formats_available_.store(true, std::memory_order_relaxed);
+  probe_.identify = CoreAudioDeviceIdentity;
+  probe_.alive = CoreAudioDeviceAlive;
+  device_changes_available_.store(true, std::memory_order_relaxed);
+  render_stall_guard_ = true;
+  render_stall_periodic_ = true;
 #endif
+  render_stall_ns_ = kRenderStallNs;
+  render_stall_interval_ns_ = kRenderStallMinIntervalNs;
   serialize_enumeration_.store(kSerializeEnumeration);
   enumeration_wait_ms_.store(kEnumerationWaitMs);
   // Create the synthetic ADM for synthetic mode. SyntheticAudioDevice pumps
@@ -684,7 +816,7 @@ AdmProxy::AdmProxy(
       [] { CoInitializeEx(nullptr, COINIT_MULTITHREADED); });
 #endif
   listener_router_ = std::make_shared<AdmListenerRouter>(
-      [this](absl::AnyInvocable<void() &&> notification) {
+      [this](AdmListenerNotification notification) {
         PostDeviceTask(
             [this, notification = std::move(notification)]() mutable {
               RunListenerNotification(std::move(notification));
@@ -846,16 +978,180 @@ void AdmProxy::SetPlayoutOpenedSink(AdmPlayoutOpenedSink sink) {
   playout_opened_sink_ = std::move(sink);
 }
 
+bool AdmProxy::PlayoutWanted(const DesiredState& desired) {
+  return desired.ref_count > 0 && desired.playout_enabled &&
+         (desired.engine_playout || desired.hold || desired.app_playout ||
+          desired.monitor);
+}
+
+bool AdmProxy::RecordingWanted(const DesiredState& desired) {
+  return desired.ref_count > 0 && desired.recording_enabled &&
+         (desired.engine_recording || desired.app_recording || desired.monitor);
+}
+
 void AdmProxy::ReconcileLocked(AdmRequestOutcome* outcome) {
   const DesiredState desired = Desired();
   if (!terminated_) {
-    ReconcilePlayoutLocked(desired, outcome ? &outcome->playout : nullptr);
-    ReconcileRecordingLocked(desired, outcome ? &outcome->recording : nullptr);
+    AdmDirectionOutcome* playout = outcome ? &outcome->playout : nullptr;
+    AdmDirectionOutcome* recording = outcome ? &outcome->recording : nullptr;
+    if (StopForSameDeviceLocked(desired, recording, playout)) {
+      ReconcilePlayoutLocked(desired, playout);
+      ReconcileRecordingLocked(desired, recording);
+    }
   }
   PublishStateLocked(desired);
+  PublishDevicesLocked();
   if (outcome) {
     CompleteOutcomeLocked(desired, outcome);
   }
+}
+
+bool AdmProxy::StaleLocked(bool playout, const DesiredState& desired) const {
+  return playout
+             ? playout_opened_selection_gen_ != desired.playout_selection_gen ||
+                   playout_opened_restart_gen_ != desired.playout_restart_gen
+             : recording_opened_selection_gen_ !=
+                       desired.recording_selection_gen ||
+                   recording_opened_restart_gen_ !=
+                       desired.recording_restart_gen;
+}
+
+void AdmProxy::CountReopenLocked(bool playout, const DesiredState& desired) {
+  const bool selected =
+      playout
+          ? playout_opened_selection_gen_ != desired.playout_selection_gen
+          : recording_opened_selection_gen_ != desired.recording_selection_gen;
+  AdmReopenReason reason = AdmReopenReason::kUserSelect;
+  if (!selected) {
+    reason = playout ? desired.playout_restart_reason
+                     : desired.recording_restart_reason;
+  }
+  reopens_[static_cast<size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+}
+
+// AudioDeviceMac (audio_device_mac.cc, m150 89d790b) runs both directions of
+// one device in one IOProc and picks the IOProcs at each Init from what is
+// open then. A microphone opened while playout is on another device gets an
+// IOProc of its own (1257-1263); playout joining its device then creates and
+// starts none (1065-1068, 1438-1442) yet plays, and only the shared IOProc
+// renders (2259-2331). Playout leaving the device whose IOProc a microphone
+// shares creates one elsewhere under the same id (1065), and the shared one
+// no longer captures. So a microphone's IOProc suits playout on its device
+// when it is shared, and playout elsewhere when it is its own; otherwise the
+// microphone stops first and opens after playout, which always gets it the
+// right one.
+bool AdmProxy::StopForSameDeviceLocked(const DesiredState& desired,
+                                       AdmDirectionOutcome* recording,
+                                       AdmDirectionOutcome* playout) {
+  const bool forced = std::exchange(force_coupled_, false);
+  webrtc::AudioDeviceModule* platform_adm = platform();
+  if (!platform_adm || !probe_.identify ||
+      !(platform_adm->Recording() || platform_adm->RecordingIsInitialized())) {
+    return true;
+  }
+  const bool playout_open =
+      platform_adm->Playing() || platform_adm->PlayoutIsInitialized();
+  const bool same = playout_open && !playout_device_.id.empty() &&
+                    playout_device_.id == recording_device_.id;
+  bool couple = forced && same;
+  if (!couple && PlayoutWanted(desired) &&
+      (!playout_open || StaleLocked(true, desired))) {
+    const std::optional<std::string> target = PlayoutTargetLocked(desired);
+    couple = target.has_value() && !MicIoProcSuitsLocked(*target);
+  }
+  if (!couple) {
+    return true;
+  }
+  coupled_reopens_.fetch_add(1, std::memory_order_relaxed);
+  auto stop = [&](bool direction, AdmDirectionOutcome* outcome) {
+    if (StaleLocked(direction, desired) &&
+        (direction ? PlayoutWanted(desired) : RecordingWanted(desired))) {
+      CountReopenLocked(direction, desired);
+    }
+    return StopDeviceLocked(direction, outcome);
+  };
+  if (same && mic_ioproc_ == MicIoProc::kOwn) {
+    // Playout joined the device of a microphone with its own IOProc (it
+    // renders nothing). Its StopPlayout waits 2 s for an IOProc that does not
+    // run (1468), and StopRecording, seeing one device, would wait for the
+    // shared IOProc instead and leave the microphone's running (1320-1363).
+    // InitSpeaker on another device makes the microphone's own IOProc the one
+    // StopRecording stops.
+    RTC_LOG(LS_WARNING) << "AdmProxy: playout on device " << playout_device_.id
+                        << " has no IOProc; stopping it, then the microphone";
+    if (!stop(true, playout)) {
+      return false;
+    }
+    if (!PointSpeakerAwayLocked()) {
+      RTC_LOG(LS_WARNING) << "AdmProxy: no other output device; the "
+                             "microphone's IOProc may stay running";
+    }
+    return stop(false, recording);
+  }
+  RTC_LOG(LS_INFO) << "AdmProxy: stopping the microphone on device "
+                   << recording_device_.id << " so that playout opens first";
+  if (!stop(false, recording)) {
+    return false;
+  }
+  return !playout_open || stop(true, playout);
+}
+
+std::optional<std::string> AdmProxy::PlayoutTargetLocked(
+    const DesiredState& desired) {
+  AdmPlayoutOpened matched;
+  if (ResolveSelectionLocked(true, desired.playout_selection, &matched) ==
+          kAdmResolveNotFound &&
+      !FallbackLocked(true, desired)) {
+    return std::nullopt;
+  }
+  // Unresolved under the fallback, `matched` is the default (empty GUID).
+  const std::optional<AdmDeviceIdentity> device =
+      probe_.identify(true, matched.guid);
+  return device ? device->id : std::string();
+}
+
+bool AdmProxy::MicIoProcSuitsLocked(const std::string& playout_device) const {
+  if (playout_device.empty() || recording_device_.id.empty()) {
+    return false;
+  }
+  switch (mic_ioproc_) {
+    case MicIoProc::kShared:
+      return playout_device == recording_device_.id;
+    case MicIoProc::kOwn:
+      return playout_device != recording_device_.id;
+    case MicIoProc::kNone:
+    case MicIoProc::kUnknown:
+      break;
+  }
+  return false;
+}
+
+// AudioDeviceMac's StopRecording picks its IOProc by _twoDevices (1320), which
+// InitSpeaker recomputes from the output device it resolves (406-419; only
+// while playout is not playing).
+bool AdmProxy::PointSpeakerAwayLocked() {
+  webrtc::AudioDeviceModule* platform_adm = platform();
+  const std::string& microphone = recording_device_.id;
+  const int count = platform_adm->PlayoutDevices();
+  int away = -1;
+  for (int index = 1; index < count && away < 0; ++index) {
+    AdmNameBuffers buffers;
+    if (platform_adm->PlayoutDeviceName(static_cast<uint16_t>(index),
+                                        buffers.name, buffers.guid) == 0 &&
+        buffers.Guid() != microphone) {
+      away = index;
+    }
+  }
+  if (away < 0 && count > 0) {
+    const std::optional<AdmDeviceIdentity> output =
+        probe_.identify(true, std::string());
+    if (output && output->id != microphone) {
+      away = 0;
+    }
+  }
+  return away >= 0 &&
+         platform_adm->SetPlayoutDevice(static_cast<uint16_t>(away)) == 0 &&
+         platform_adm->InitSpeaker() == 0;
 }
 
 // What the monitor queued is stale once a device stops or starts: the render
@@ -881,6 +1177,7 @@ bool AdmProxy::StopDeviceLocked(bool playout, AdmDirectionOutcome* outcome) {
   }
   if (result == 0) {
     ForgetFormatLocked(playout);
+    ForgetOpenedLocked(playout);
 #if !LK_ADM_MOBILE
     if (playout && playout_opened_sink_) {
       AdmPlayoutOpened closed;
@@ -912,15 +1209,14 @@ void AdmProxy::ReconcilePlayoutLocked(const DesiredState& desired,
   webrtc::AudioDeviceModule* platform_adm = platform();
   const bool platform_mode =
       platform_adm && desired.ref_count > 0 && desired.playout_enabled;
-  const bool want_platform =
-      platform_mode && (desired.engine_playout || desired.hold ||
-                        desired.app_playout || desired.monitor);
+  const bool want_platform = platform_mode && PlayoutWanted(desired);
 
   if (platform_adm &&
       (platform_adm->Playing() || platform_adm->PlayoutIsInitialized())) {
-    const bool stale =
-        playout_opened_selection_gen_ != desired.playout_selection_gen ||
-        playout_opened_restart_gen_ != desired.playout_restart_gen;
+    const bool stale = StaleLocked(true, desired);
+    if (want_platform && stale) {
+      CountReopenLocked(true, desired);
+    }
     if ((!want_platform || stale) && !StopDeviceLocked(true, outcome)) {
       return;
     }
@@ -948,7 +1244,8 @@ void AdmProxy::ReconcilePlayoutLocked(const DesiredState& desired,
   if (!platform_adm->PlayoutIsInitialized()) {
     playout_opened_selection_gen_ = desired.playout_selection_gen;
     playout_opened_restart_gen_ = desired.playout_restart_gen;
-    int32_t result = ApplySelectionLocked(true, desired.playout_selection);
+    int32_t result = ApplySelectionLocked(true, desired.playout_selection,
+                                          FallbackLocked(true, desired));
     std::optional<AdmDeviceFormat> before;
     if (result == 0) {
       before = ReadFormatLocked(true, last_playout_identity_.guid);
@@ -973,6 +1270,7 @@ void AdmProxy::ReconcilePlayoutLocked(const DesiredState& desired,
       RTC_LOG(LS_WARNING) << "AdmProxy: InitPlayout failed: " << result;
       return;
     }
+    IdentifyOpenedLocked(true);
     WatchOpenedLocked(true, before);
 #if !LK_ADM_MOBILE
     if (playout_opened_sink_) {
@@ -1008,6 +1306,8 @@ void AdmProxy::ReconcilePlayoutLocked(const DesiredState& desired,
       tap_.set_playout_delay_ms(delay_ms);
     }
     SchedulePlayoutDelayRefreshLocked();
+    render_stall_ = RenderStallWatch{};
+    ScheduleRenderStallWatchLocked();
   }
 }
 
@@ -1017,14 +1317,13 @@ void AdmProxy::ReconcileRecordingLocked(const DesiredState& desired,
   if (!platform_adm) {
     return;
   }
-  const bool want =
-      desired.ref_count > 0 && desired.recording_enabled &&
-      (desired.engine_recording || desired.app_recording || desired.monitor);
+  const bool want = RecordingWanted(desired);
 
   if (platform_adm->Recording() || platform_adm->RecordingIsInitialized()) {
-    const bool stale =
-        recording_opened_selection_gen_ != desired.recording_selection_gen ||
-        recording_opened_restart_gen_ != desired.recording_restart_gen;
+    const bool stale = StaleLocked(false, desired);
+    if (want && stale) {
+      CountReopenLocked(false, desired);
+    }
     if ((!want || stale) && !StopDeviceLocked(false, outcome)) {
       return;
     }
@@ -1036,7 +1335,8 @@ void AdmProxy::ReconcileRecordingLocked(const DesiredState& desired,
   if (!platform_adm->RecordingIsInitialized()) {
     recording_opened_selection_gen_ = desired.recording_selection_gen;
     recording_opened_restart_gen_ = desired.recording_restart_gen;
-    int32_t result = ApplySelectionLocked(false, desired.recording_selection);
+    int32_t result = ApplySelectionLocked(false, desired.recording_selection,
+                                          FallbackLocked(false, desired));
     std::optional<AdmDeviceFormat> before;
     if (result == 0) {
       before = ReadFormatLocked(false, last_recording_guid_);
@@ -1052,6 +1352,7 @@ void AdmProxy::ReconcileRecordingLocked(const DesiredState& desired,
       RTC_LOG(LS_WARNING) << "AdmProxy: InitRecording failed: " << result;
       return;
     }
+    IdentifyOpenedLocked(false);
     WatchOpenedLocked(false, before);
   }
 
@@ -1201,7 +1502,8 @@ int AdmProxy::ResolveSelectionLocked(
 
 int32_t AdmProxy::ApplySelectionLocked(
     [[maybe_unused]] bool playout,
-    [[maybe_unused]] const AdmDeviceSelection& selection) {
+    [[maybe_unused]] const AdmDeviceSelection& selection,
+    [[maybe_unused]] bool fallback) {
 #if LK_ADM_MOBILE
   return 0;
 #else
@@ -1210,12 +1512,20 @@ int32_t AdmProxy::ApplySelectionLocked(
     return -1;
   }
   AdmPlayoutOpened matched;
-  const int index = ResolveSelectionLocked(
-      playout, selection, playout || format_reader_ ? &matched : nullptr);
+  AdmPlayoutOpened* identity =
+      playout || format_reader_ || probe_.identify ? &matched : nullptr;
+  int index = ResolveSelectionLocked(playout, selection, identity);
+  if (index == kAdmResolveNotFound && fallback) {
+    RTC_LOG(LS_WARNING) << "AdmProxy: the selected "
+                        << (playout ? "playout" : "recording")
+                        << " device went away; opening the system default";
+    index = ResolveSelectionLocked(playout, AdmDeviceSelection{}, identity);
+  }
   if (playout) {
     last_playout_identity_ = std::move(matched);
   } else {
     last_recording_guid_ = matched.guid;
+    last_recording_default_ = matched.system_default;
   }
   if (index == kAdmResolveNotFound) {
     RTC_LOG(LS_WARNING) << "AdmProxy: the selected "
@@ -1382,10 +1692,7 @@ void AdmProxy::PollDeviceFormatsLocked() {
                       << Describe(*playout_watch_.pending);
   playout_watch_.pending.reset();
   playout_watch_.unsettled = false;
-  {
-    AdmLock lock(&state_mutex_);
-    desired_.playout_restart_gen++;
-  }
+  RequestRestartLocked(true, AdmReopenReason::kFormatChange);
   RequestReconcile();
 }
 
@@ -1408,6 +1715,186 @@ void AdmProxy::ScheduleFormatWatchLocked() {
 #endif
 }
 
+void AdmProxy::RequestRestartLocked(bool playout, AdmReopenReason reason) {
+  AdmLock lock(&state_mutex_);
+  if (playout) {
+    desired_.playout_restart_gen++;
+    desired_.playout_restart_reason = reason;
+  } else {
+    desired_.recording_restart_gen++;
+    desired_.recording_restart_reason = reason;
+  }
+}
+
+bool AdmProxy::FallbackLocked(bool playout, const DesiredState& desired) const {
+  const std::optional<uint64_t>& gen =
+      playout ? playout_fallback_gen_ : recording_fallback_gen_;
+  return gen.has_value() && *gen == (playout ? desired.playout_selection_gen
+                                             : desired.recording_selection_gen);
+}
+
+void AdmProxy::IdentifyOpenedLocked(bool playout) {
+  if (!probe_.identify) {
+    return;
+  }
+  const std::optional<AdmDeviceIdentity> found = probe_.identify(
+      playout, playout ? last_playout_identity_.guid : last_recording_guid_);
+  AdmDeviceIdentity& device = playout ? playout_device_ : recording_device_;
+  device = found.value_or(AdmDeviceIdentity{});
+  if (playout) {
+    playout_follows_default_ = last_playout_identity_.system_default;
+  } else {
+    recording_follows_default_ = last_recording_default_;
+    webrtc::AudioDeviceModule* platform_adm = platform();
+    const bool playout_open = platform_adm &&
+                              platform_adm->PlayoutIsInitialized() &&
+                              !playout_device_.id.empty();
+    if (device.id.empty() || !playout_open) {
+      mic_ioproc_ = MicIoProc::kUnknown;
+    } else if (device.id == playout_device_.id) {
+      mic_ioproc_ = MicIoProc::kShared;
+    } else {
+      mic_ioproc_ = MicIoProc::kOwn;
+    }
+  }
+  RTC_LOG(LS_INFO) << "AdmProxy: " << (playout ? "playout" : "recording")
+                   << " opened on device " << device.id << " (" << device.uid
+                   << ")";
+}
+
+void AdmProxy::ForgetOpenedLocked(bool playout) {
+  (playout ? playout_device_ : recording_device_) = AdmDeviceIdentity{};
+  if (!playout) {
+    mic_ioproc_ = MicIoProc::kNone;
+  }
+}
+
+void AdmProxy::PublishDevicesLocked() {
+  same_device_.store(
+      !playout_device_.id.empty() && playout_device_.id == recording_device_.id,
+      std::memory_order_relaxed);
+  AdmLock lock(&devices_mutex_);
+  playout_uid_ = playout_device_.uid;
+  recording_uid_ = recording_device_.uid;
+}
+
+// The ADM's own listener (HandleDeviceChange, HandleDefault*DeviceChange)
+// stops, re-selects and restarts one direction at a time; the proxy does
+// it instead, on the desired selection, through the reconcile. A selected
+// device that went away opens the system default, as the ADM did, until the
+// selection changes or the device is back.
+void AdmProxy::FollowDeviceChangesLocked(bool devices,
+                                         bool default_output,
+                                         bool default_input) {
+  webrtc::AudioDeviceModule* platform_adm = platform();
+  if (!platform_adm || !probe_.identify || !probe_.alive) {
+    return;
+  }
+  const DesiredState desired = Desired();
+  for (const bool playout : {true, false}) {
+    const AdmDeviceIdentity& device =
+        playout ? playout_device_ : recording_device_;
+    const bool open = playout ? platform_adm->PlayoutIsInitialized()
+                              : platform_adm->RecordingIsInitialized();
+    if (!open || device.id.empty()) {
+      continue;
+    }
+    const char* direction = playout ? "playout" : "recording";
+    const AdmDeviceSelection& selection =
+        playout ? desired.playout_selection : desired.recording_selection;
+    std::optional<AdmReopenReason> reason;
+    if (!probe_.alive(device.id)) {
+      RTC_LOG(LS_WARNING) << "AdmProxy: " << direction << " device "
+                          << device.id << " went away; reopening";
+      reason = AdmReopenReason::kDeviceLost;
+      if (selection.kind != AdmSelectionKind::kDefault) {
+        (playout ? playout_fallback_gen_ : recording_fallback_gen_) =
+            playout ? desired.playout_selection_gen
+                    : desired.recording_selection_gen;
+      }
+    } else if ((playout ? playout_follows_default_
+                        : recording_follows_default_) &&
+               (devices || (playout ? default_output : default_input))) {
+      const std::optional<AdmDeviceIdentity> current =
+          probe_.identify(playout, std::string());
+      if (current && current->id != device.id) {
+        RTC_LOG(LS_WARNING)
+            << "AdmProxy: the default " << direction << " device is "
+            << current->id << ", not " << device.id << "; reopening";
+        reason = AdmReopenReason::kDefaultChange;
+      }
+    }
+    if (!reason && devices && FallbackLocked(playout, desired) &&
+        ResolveSelectionLocked(playout, selection) != kAdmResolveNotFound) {
+      RTC_LOG(LS_INFO) << "AdmProxy: the selected " << direction
+                       << " device is back; reopening";
+      reason = AdmReopenReason::kDeviceLost;
+    }
+    if (reason) {
+      RequestRestartLocked(playout, *reason);
+    }
+  }
+}
+
+// AudioDeviceMac renders only from an IOProc; with none running its render
+// worker waits on a full ring while Playing() stays true.
+void AdmProxy::PollRenderStallLocked() {
+  if (terminated_ || !render_stall_guard_) {
+    return;
+  }
+  const int64_t now = NowNs();
+  const uint64_t render = tap_.render_callbacks();
+  const uint64_t capture = tap_.capture_callbacks();
+  const uint64_t previous_capture =
+      std::exchange(render_stall_.last_capture, capture);
+  if (!platform_playing_.load(std::memory_order_acquire) ||
+      render_stall_.since_ns == 0 || render != render_stall_.render) {
+    render_stall_ = RenderStallWatch{render, capture, capture, now};
+    return;
+  }
+  if (now - render_stall_.since_ns < render_stall_ns_ ||
+      capture < render_stall_.capture + kRenderStallMinCaptures ||
+      capture == previous_capture || playout_watch_.unsettled ||
+      (last_render_stall_recovery_ns_ != 0 &&
+       now - last_render_stall_recovery_ns_ < render_stall_interval_ns_)) {
+    return;
+  }
+  RTC_LOG(LS_WARNING) << "AdmProxy: playout on device " << playout_device_.id
+                      << " rendered nothing for "
+                      << (now - render_stall_.since_ns) / 1'000'000
+                      << " ms while capture went on; reopening";
+  last_render_stall_recovery_ns_ = now;
+  render_stall_ = RenderStallWatch{render, capture, capture, now};
+  render_stall_recoveries_.fetch_add(1, std::memory_order_relaxed);
+  RequestRestartLocked(true, AdmReopenReason::kRenderStall);
+  if (!playout_device_.id.empty() &&
+      playout_device_.id == recording_device_.id) {
+    RequestRestartLocked(false, AdmReopenReason::kRenderStall);
+    force_coupled_ = true;
+  }
+  RequestReconcile();
+}
+
+void AdmProxy::ScheduleRenderStallWatchLocked() {
+#if !LK_ADM_MOBILE
+  if (render_stall_scheduled_ || !render_stall_guard_ ||
+      !render_stall_periodic_) {
+    return;
+  }
+  render_stall_scheduled_ = true;
+  device_thread_->PostDelayedTask(
+      [this] {
+        AdmLock lock(&mutex_);
+        render_stall_scheduled_ = false;
+        PollRenderStallLocked();
+        if (!terminated_ && platform_playing_.load(std::memory_order_acquire)) {
+          ScheduleRenderStallWatchLocked();
+        }
+      },
+      kRenderStallWatchPeriod);
+#endif
+}
+
 void AdmProxy::ShutdownLocked() {
   if (terminated_) {
     return;
@@ -1420,6 +1907,9 @@ void AdmProxy::ShutdownLocked() {
     platform_adm->StopRecording();
     ForgetFormatLocked(true);
     ForgetFormatLocked(false);
+    ForgetOpenedLocked(true);
+    ForgetOpenedLocked(false);
+    PublishDevicesLocked();
     if (capture_state_) {
       capture_state_->ClearSpeaking();
     }
@@ -1434,14 +1924,49 @@ void AdmProxy::ShutdownLocked() {
   PublishStateLocked(Desired());
 }
 
-void AdmProxy::RunListenerNotification(
-    absl::AnyInvocable<void() &&> notification) {
+// The device list and the default devices are the proxy's (see
+// FollowDeviceChangesLocked); the ADM's listener gets the rest (the stream
+// format, processor overloads).
+void AdmProxy::RunListenerNotification(AdmListenerNotification notification) {
   {
     AdmLock lock(&mutex_);
     if (terminated_) {
       return;
     }
-    std::move(notification)();
+    bool devices = false;
+    bool default_output = false;
+    bool default_input = false;
+    std::vector<AdmListenerAddress> forwarded;
+    for (const AdmListenerAddress& address : notification.addresses) {
+      switch (address.selector) {
+        case kAdmSelectorDevices:
+          devices = true;
+          device_list_notifications_.fetch_add(1, std::memory_order_relaxed);
+          break;
+        case kAdmSelectorDefaultOutput:
+          default_output = true;
+          default_output_notifications_.fetch_add(1, std::memory_order_relaxed);
+          break;
+        case kAdmSelectorDefaultInput:
+          default_input = true;
+          default_input_notifications_.fetch_add(1, std::memory_order_relaxed);
+          break;
+        case kAdmSelectorStreamFormat:
+          stream_format_notifications_.fetch_add(1, std::memory_order_relaxed);
+          forwarded.push_back(address);
+          break;
+        default:
+          other_notifications_.fetch_add(1, std::memory_order_relaxed);
+          forwarded.push_back(address);
+          break;
+      }
+    }
+    if (!forwarded.empty()) {
+      std::move(notification.invoke)(forwarded);
+    }
+    if (devices || default_output || default_input) {
+      FollowDeviceChangesLocked(devices, default_output, default_input);
+    }
   }
   RequestReconcile();
 }
@@ -1611,9 +2136,11 @@ void AdmProxy::RestartDevices(bool recording,
     AdmLock lock(&state_mutex_);
     if (recording) {
       desired_.recording_restart_gen++;
+      desired_.recording_restart_reason = AdmReopenReason::kUserSelect;
     }
     if (playout) {
       desired_.playout_restart_gen++;
+      desired_.playout_restart_reason = AdmReopenReason::kUserSelect;
     }
   }
   PostRequest(recording, playout, std::move(done));
@@ -1732,6 +2259,33 @@ void AdmProxy::PollDeviceFormatsForTest() {
   });
 }
 
+void AdmProxy::SetDeviceProbeForTest(AdmDeviceProbe probe) {
+  AdmLock lock(&mutex_);
+  device_changes_available_.store(static_cast<bool>(probe.identify),
+                                  std::memory_order_relaxed);
+  probe_ = std::move(probe);
+}
+
+void AdmProxy::SetRenderStallGuardForTest(bool enabled,
+                                          bool periodic,
+                                          int stall_ms,
+                                          int min_interval_ms) {
+  AdmLock lock(&mutex_);
+  render_stall_guard_ = enabled;
+  render_stall_periodic_ = periodic;
+  render_stall_ns_ = int64_t{stall_ms} * 1'000'000;
+  render_stall_interval_ns_ = int64_t{min_interval_ms} * 1'000'000;
+  render_stall_ = RenderStallWatch{};
+  last_render_stall_recovery_ns_ = 0;
+}
+
+void AdmProxy::PollRenderStallForTest() {
+  RunDeviceTaskAndWait([this] {
+    AdmLock lock(&mutex_);
+    PollRenderStallLocked();
+  });
+}
+
 uint64_t AdmProxy::RoutedListenersForTest() const {
   return listener_router_ ? listener_router_->routed() : 0;
 }
@@ -1783,6 +2337,30 @@ AdmNativeStats AdmProxy::ReadNativeStats() {
       playout_format_reopens_.load(std::memory_order_relaxed);
   stats.recording_format_changes =
       recording_format_changes_.load(std::memory_order_relaxed);
+  stats.device_changes_available =
+      device_changes_available_.load(std::memory_order_relaxed);
+  {
+    AdmLock lock(&devices_mutex_);
+    stats.playout_device_uid = playout_uid_;
+    stats.recording_device_uid = recording_uid_;
+  }
+  stats.same_device = same_device_.load(std::memory_order_relaxed);
+  stats.device_list_notifications =
+      device_list_notifications_.load(std::memory_order_relaxed);
+  stats.default_output_notifications =
+      default_output_notifications_.load(std::memory_order_relaxed);
+  stats.default_input_notifications =
+      default_input_notifications_.load(std::memory_order_relaxed);
+  stats.stream_format_notifications =
+      stream_format_notifications_.load(std::memory_order_relaxed);
+  stats.other_notifications =
+      other_notifications_.load(std::memory_order_relaxed);
+  for (size_t reason = 0; reason < kAdmReopenReasons; ++reason) {
+    stats.reopens[reason] = reopens_[reason].load(std::memory_order_relaxed);
+  }
+  stats.coupled_reopens = coupled_reopens_.load(std::memory_order_relaxed);
+  stats.render_stall_recoveries =
+      render_stall_recoveries_.load(std::memory_order_relaxed);
   if (mixer_) {
     RootAudioMixerStats mix = mixer_->ReadStats();
     stats.mix_calls = mix.mix_calls;

@@ -1616,15 +1616,12 @@ fn adm_proxy_runs_the_platform_adms_listeners_on_the_device_thread() {
     assert_eq!(calls(&h), [default_device("Playout"), "InitPlayout".into(), "StartPlayout".into()]);
     assert_eq!(
         h.routed_listeners(),
-        2,
-        "Init's devices listener and InitPlayout's format listener"
+        4,
+        "Init's device list and default device listeners and InitPlayout's format listener"
     );
 
-    h.notify_devices_changed();
-    assert_eq!(
-        settle(&h),
-        ["listener: devices", "StopPlayout", "SetPlayoutDevice(0)", "InitPlayout", "StartPlayout"]
-    );
+    h.notify_format_changed();
+    assert_eq!(settle(&h), ["listener: format"]);
     assert!(h.listeners_ran_on_device_thread());
     assert!(h.platform_playing());
     assert_eq!(h.overlapping_device_calls(), 0);
@@ -1637,7 +1634,7 @@ fn adm_proxy_holds_a_listener_notification_until_the_device_operation_in_progres
     h.hold(true);
     assert!(h.start_playout_blocked());
 
-    h.notify_devices_changed();
+    h.notify_format_changed();
     std::thread::sleep(Duration::from_millis(100));
     assert_eq!(h.listener_calls(), 0, "the notification waits for the device thread");
 
@@ -1648,35 +1645,42 @@ fn adm_proxy_holds_a_listener_notification_until_the_device_operation_in_progres
             default_device("Playout"),
             "InitPlayout".into(),
             "StartPlayout".into(),
-            "listener: devices".into(),
-            "StopPlayout".into(),
-            "SetPlayoutDevice(0)".into(),
-            "InitPlayout".into(),
-            "StartPlayout".into()
+            "listener: format".into()
         ]
     );
     assert_eq!(h.overlapping_device_calls(), 0);
     assert!(h.platform_playing());
 }
 
+/// AudioDeviceMac's listener restarted a direction itself on a device-list
+/// or default-device change, one direction at a time (and on CoreAudio's
+/// thread before hw.20). Those notifications are the proxy's now: the ADM's
+/// listener never gets them, and without a device probe (Windows, Linux,
+/// where nothing is routed anyway) nothing reopens.
 #[test]
-fn adm_proxy_reopens_what_the_platform_adms_listener_closed() {
+fn adm_proxy_keeps_device_changes_from_the_platform_adms_listener() {
     let h = platform(&["{spk}"], &["{mic}"]);
     h.hold(true);
     calls(&h);
-    h.set_listener_restarts(false);
 
     h.notify_devices_changed();
+    h.notify_default_output_changed();
+    h.notify_default_input_changed();
+    h.notify_format_changed();
+    assert_eq!(settle(&h), ["listener: format"]);
+    assert_eq!(h.listener_calls(), 1);
+    let stats = h.stats();
     assert_eq!(
-        settle(&h),
-        [
-            "listener: devices".into(),
-            "StopPlayout".into(),
-            default_device("Playout"),
-            "InitPlayout".into(),
-            "StartPlayout".into()
-        ]
+        (
+            stats.device_list_notifications,
+            stats.default_output_notifications,
+            stats.default_input_notifications,
+            stats.stream_format_notifications,
+            stats.other_device_notifications
+        ),
+        (1, 1, 1, 1, 0)
     );
+    assert!(!stats.device_changes_available);
     assert!(h.platform_playing());
 }
 
@@ -1710,12 +1714,425 @@ fn adm_proxy_runs_no_listener_after_shutdown() {
     h.shutdown();
     h.take_calls();
 
-    h.notify_default_output_changed();
+    h.notify_format_changed();
     assert_eq!(h.delivered_listener_notifications(), 1);
     assert_eq!(settle(&h), Vec::<String>::new());
     assert_eq!(h.listener_calls(), 0);
     h.remove_listener_from_test_thread(true);
     assert_eq!(h.core_audio_listeners(), 0);
+}
+
+/// A Mac-shaped platform: the built-in speakers (73) and microphone (74) are
+/// the system defaults, and a USB headset (80) is one CoreAudio device for
+/// both directions. The fake follows AudioDeviceMac's IOProc rules; with
+/// `probe` the proxy reads CoreAudio's devices as on macOS.
+fn mac_platform(probe: bool) -> UniquePtr<AdmProxyHarness> {
+    let h = platform(&["default", "73", "80"], &["default", "74", "80"]);
+    h.set_default_device(true, "73");
+    h.set_default_device(false, "74");
+    h.mac_rules(probe);
+    h
+}
+
+/// A call on the built-in devices: the hold's playout, then the published
+/// microphone (its own IOProc, since playout is on another device).
+fn mac_call(h: &AdmProxyHarness) {
+    h.hold(true);
+    h.engine_start_recording();
+    calls(h);
+    let io = h.mac_io(10);
+    assert_eq!((io.render_callbacks, io.capture_callbacks), (10, 10));
+}
+
+fn assert_flowing(h: &AdmProxyHarness, what: &str) {
+    let io = h.mac_io(20);
+    assert_eq!((io.render_callbacks, io.capture_callbacks), (20, 20), "{what}");
+}
+
+fn uids(h: &AdmProxyHarness) -> (String, String) {
+    let stats = h.stats();
+    (stats.playout_device_uid, stats.recording_device_uid)
+}
+
+fn uid_pair(playout: &str, recording: &str) -> (String, String) {
+    (playout.to_string(), recording.to_string())
+}
+
+/// The re-plug report: a USB headset plugged in mid-call, the desktop
+/// selecting it for the microphone first, then for playout. The microphone
+/// got its own IOProc on the headset while playout was on the speakers;
+/// with playout joining that device AudioDeviceMac's _twoDevices turned
+/// false, InitPlayout created no IOProc, StartPlayout started none and
+/// Playing() stayed true: capture went on, nothing rendered.
+#[test]
+fn adm_proxy_mac_playout_joining_the_microphones_device_renders() {
+    let h = mac_platform(true);
+    mac_call(&h);
+
+    h.select(&guid("80"), true, &unset(), false);
+    assert_eq!(
+        h.take_calls(),
+        ["StopRecording", "SetRecordingDevice(2)", "InitRecording", "StartRecording"]
+    );
+    assert!(h.mac_state().two_devices, "the microphone has its own IOProc");
+
+    h.select(&unset(), false, &guid("80"), true);
+    assert_eq!(
+        h.take_calls(),
+        [
+            "StopRecording",
+            "StopPlayout",
+            "SetPlayoutDevice(2)",
+            "InitPlayout",
+            "StartPlayout",
+            "SetRecordingDevice(2)",
+            "InitRecording",
+            "StartRecording"
+        ],
+        "the microphone stops first and opens after playout"
+    );
+    assert_flowing(&h, "playout renders on the headset");
+    let state = h.mac_state();
+    assert_eq!((state.running_ioprocs, state.running_shared_ioprocs), (1, 1), "one shared IOProc");
+    assert_eq!((state.stop_timeouts, state.bad_ioproc_calls), (0, 0));
+    let stats = h.stats();
+    assert!(stats.device_changes_available && stats.same_device);
+    assert_eq!(uids(&h), uid_pair("UID-80", "UID-80"));
+    assert_eq!((stats.user_select_reopens, stats.coupled_reopens), (2, 1));
+
+    h.hold(false);
+    h.engine_stop_recording();
+    calls(&h);
+    let state = h.mac_state();
+    assert_eq!((state.running_ioprocs, state.stop_timeouts), (0, 0), "nothing left running");
+    assert_eq!(uids(&h), uid_pair("", ""));
+    assert!(!h.stats().same_device);
+}
+
+/// The fake reproduces the report under the proxy's earlier behaviour (no
+/// device probe: each direction reopened on its own). Capture goes on and
+/// nothing renders; stopping the microphone then waits 2 s for the shared
+/// IOProc, stops an IOProc id that is gone, and leaves the microphone's own
+/// running.
+#[test]
+fn adm_proxy_mac_fake_goes_silent_when_each_direction_reopens_alone() {
+    let h = mac_platform(false);
+    mac_call(&h);
+    h.select(&guid("80"), true, &unset(), false);
+    h.select(&unset(), false, &guid("80"), true);
+    assert_eq!(
+        h.take_calls(),
+        [
+            "StopRecording",
+            "SetRecordingDevice(2)",
+            "InitRecording",
+            "StartRecording",
+            "StopPlayout",
+            "SetPlayoutDevice(2)",
+            "InitPlayout",
+            "StartPlayout"
+        ]
+    );
+    let io = h.mac_io(50);
+    assert_eq!((io.render_callbacks, io.capture_callbacks), (0, 50));
+    assert!(h.platform_playing(), "Playing() is true");
+    let state = h.mac_state();
+    assert!(!state.two_devices);
+    assert_eq!((state.running_ioprocs, state.running_input_ioprocs), (1, 1));
+
+    h.engine_stop_recording();
+    calls(&h);
+    let state = h.mac_state();
+    assert_eq!(state.stop_timeouts, 1, "StopRecording waited for the shared IOProc");
+    assert_eq!(state.bad_ioproc_calls, 2, "then stopped and destroyed a stale IOProc id");
+    assert_eq!(state.running_input_ioprocs, 1, "the microphone's IOProc stays running");
+}
+
+/// A USB headset plugged in while the call follows the system default: it
+/// becomes the default output and input, and CoreAudio notifies the two in
+/// either order, in one device thread pass or two. The proxy follows each
+/// (the ADM's listener never runs), and playout ends on the headset with the
+/// microphone sharing its IOProc.
+#[test]
+fn adm_proxy_mac_follows_a_new_default_device_in_either_notification_order() {
+    for input_first in [true, false] {
+        for apart in [true, false] {
+            let what = format!("input first {input_first}, apart {apart}");
+            let h = mac_platform(true);
+            mac_call(&h);
+            h.set_default_device(true, "80");
+            h.set_default_device(false, "80");
+            if input_first {
+                h.notify_default_input_changed();
+            } else {
+                h.notify_default_output_changed();
+            }
+            if apart {
+                settle(&h);
+            }
+            if input_first {
+                h.notify_default_output_changed();
+            } else {
+                h.notify_default_input_changed();
+            }
+            settle(&h);
+            assert_flowing(&h, &what);
+            let state = h.mac_state();
+            assert_eq!((state.running_ioprocs, state.stop_timeouts), (1, 0), "{what}");
+            let stats = h.stats();
+            assert!(stats.same_device, "{what}");
+            assert_eq!(uids(&h), uid_pair("UID-80", "UID-80"), "{what}");
+            assert_eq!(stats.default_change_reopens, 2, "{what}");
+            assert_eq!(
+                (stats.default_output_notifications, stats.default_input_notifications),
+                (1, 1),
+                "{what}"
+            );
+            assert_eq!(h.listener_calls(), 0, "{what}: the ADM's listener never ran");
+        }
+    }
+}
+
+/// The default headset unplugged while the call follows the default: both
+/// directions reopen on the new defaults. A device that went away answers no
+/// stop, so each stop waits as long as the ADM's own handler waited.
+#[test]
+fn adm_proxy_mac_follows_the_default_when_the_default_device_goes_away() {
+    let h = mac_platform(true);
+    h.set_default_device(true, "80");
+    h.set_default_device(false, "80");
+    mac_call(&h);
+    assert!(h.stats().same_device);
+
+    h.set_device_alive("80", false);
+    h.set_devices(&strings(&["default", "73"]), &strings(&["default", "74"]));
+    h.set_default_device(true, "73");
+    h.set_default_device(false, "74");
+    h.notify_devices_changed();
+    h.notify_default_output_changed();
+    h.notify_default_input_changed();
+    settle(&h);
+    assert_flowing(&h, "on the built-in devices");
+    assert_eq!(uids(&h), uid_pair("UID-73", "UID-74"));
+    let stats = h.stats();
+    assert_eq!((stats.device_lost_reopens, stats.default_change_reopens), (2, 0));
+    let state = h.mac_state();
+    assert_eq!((state.running_shared_ioprocs, state.running_input_ioprocs), (1, 1));
+    assert_eq!(state.stop_timeouts, 2);
+}
+
+/// The selected USB headset unplugged mid-call: both directions fall back to
+/// the system defaults, as AudioDeviceMac did, and return to the headset
+/// once it is back, with no new selection.
+#[test]
+fn adm_proxy_mac_falls_back_to_the_defaults_while_the_selected_device_is_gone() {
+    let h = mac_platform(true);
+    h.select(&guid("80"), true, &guid("80"), true);
+    mac_call(&h);
+    assert!(h.stats().same_device);
+
+    h.set_device_alive("80", false);
+    h.set_devices(&strings(&["default", "73"]), &strings(&["default", "74"]));
+    h.notify_devices_changed();
+    settle(&h);
+    assert_flowing(&h, "on the defaults");
+    assert_eq!(uids(&h), uid_pair("UID-73", "UID-74"));
+    let stats = h.stats();
+    assert_eq!(stats.device_lost_reopens, 2);
+    assert_eq!((stats.playout_init_result, stats.recording_init_result), (0, 0));
+
+    h.set_devices(&strings(&["default", "73", "80"]), &strings(&["default", "74", "80"]));
+    h.set_device_alive("80", true);
+    h.notify_devices_changed();
+    settle(&h);
+    assert_flowing(&h, "back on the headset");
+    assert_eq!(uids(&h), uid_pair("UID-80", "UID-80"));
+    assert_eq!(h.stats().device_lost_reopens, 4);
+    assert_eq!(h.mac_state().running_ioprocs, 1);
+    assert_eq!(h.listener_calls(), 0);
+}
+
+/// A default output that changes while playout opens (the proxy read the
+/// speakers as the default, the ADM opened the headset, where the
+/// microphone has its own IOProc) leaves playout silent. The render-stall
+/// guard reopens both: playout stopped first (it waits for its missing
+/// IOProc), the closed output pointed at the speakers so that StopRecording
+/// stops the microphone's own IOProc, then playout and the microphone in
+/// that order.
+#[test]
+fn adm_proxy_mac_render_stall_guard_reopens_silent_playout() {
+    let h = mac_platform(true);
+    h.select(&guid("80"), true, &unset(), false);
+    mac_call(&h);
+    h.set_render_stall_guard(50, 10_000);
+    h.set_default_output_at_next_playout_open("80");
+    h.restart(false, true);
+    calls(&h);
+    let io = h.mac_io(20);
+    assert_eq!((io.render_callbacks, io.capture_callbacks), (0, 20), "silent");
+
+    h.poll_render_stall();
+    std::thread::sleep(Duration::from_millis(60));
+    h.poll_render_stall();
+    assert_eq!(calls(&h), Vec::<String>::new(), "no capture since: no recovery");
+    h.mac_io(20);
+    h.poll_render_stall();
+    assert_eq!(
+        calls(&h),
+        [
+            "StopPlayout".into(),
+            "SetPlayoutDevice(1)".into(),
+            "InitSpeaker".into(),
+            "StopRecording".into(),
+            default_device("Playout"),
+            "InitPlayout".into(),
+            "StartPlayout".into(),
+            "SetRecordingDevice(2)".into(),
+            "InitRecording".into(),
+            "StartRecording".into()
+        ]
+    );
+    assert_flowing(&h, "recovered");
+    let state = h.mac_state();
+    assert_eq!((state.running_ioprocs, state.running_input_ioprocs), (1, 0), "no IOProc left");
+    assert_eq!(state.stop_timeouts, 1, "only the silent playout's stop waited");
+    let stats = h.stats();
+    assert_eq!(
+        (stats.render_stall_recoveries, stats.render_stall_reopens, stats.coupled_reopens),
+        (1, 2, 1)
+    );
+
+    std::thread::sleep(Duration::from_millis(60));
+    h.mac_io(20);
+    h.poll_render_stall();
+    assert_eq!(calls(&h), Vec::<String>::new(), "it renders");
+}
+
+/// A microphone opened while playout was closed got whichever IOProc the
+/// ADM's last output device suggested. Playout opening next stops it first
+/// either way: onto its device (it had its own IOProc there) or elsewhere (it
+/// shared the device's IOProc, which playout would take over).
+#[test]
+fn adm_proxy_mac_reopens_a_microphone_opened_before_playout() {
+    let h = mac_platform(true);
+    h.select(&guid("80"), true, &guid("80"), true);
+    h.app_recording(true);
+    assert_eq!(calls(&h), ["SetRecordingDevice(2)", "InitRecording", "StartRecording"]);
+    assert!(h.mac_state().two_devices, "its own IOProc");
+    h.hold(true);
+    assert_eq!(
+        calls(&h),
+        [
+            "StopRecording",
+            "SetPlayoutDevice(2)",
+            "InitPlayout",
+            "StartPlayout",
+            "SetRecordingDevice(2)",
+            "InitRecording",
+            "StartRecording"
+        ]
+    );
+    assert_flowing(&h, "onto its device");
+
+    let h = mac_platform(true);
+    h.set_default_device(true, "80");
+    h.set_default_device(false, "80");
+    h.select(&unset(), false, &guid("73"), true);
+    h.app_recording(true);
+    calls(&h);
+    assert!(!h.mac_state().two_devices, "it shares the headset's IOProc");
+    h.hold(true);
+    assert_eq!(
+        calls(&h),
+        [
+            "StopRecording".into(),
+            "SetPlayoutDevice(1)".into(),
+            "InitPlayout".into(),
+            "StartPlayout".into(),
+            default_device("Recording"),
+            "InitRecording".into(),
+            "StartRecording".into()
+        ]
+    );
+    assert_flowing(&h, "elsewhere");
+    let state = h.mac_state();
+    assert_eq!(
+        (state.running_shared_ioprocs, state.running_input_ioprocs, state.stop_timeouts),
+        (1, 1, 0)
+    );
+}
+
+/// Both directions share the headset's IOProc. Playout moving to the
+/// speakers would take that IOProc over (capture stops, both devices pull the
+/// render), so the microphone stops first and opens again with its own.
+#[test]
+fn adm_proxy_mac_playout_leaving_the_shared_device_keeps_the_microphone() {
+    let h = mac_platform(true);
+    h.select(&guid("80"), true, &guid("80"), true);
+    mac_call(&h);
+    h.select(&unset(), false, &guid("73"), true);
+    assert_eq!(
+        h.take_calls(),
+        [
+            "StopRecording",
+            "StopPlayout",
+            "SetPlayoutDevice(1)",
+            "InitPlayout",
+            "StartPlayout",
+            "SetRecordingDevice(2)",
+            "InitRecording",
+            "StartRecording"
+        ]
+    );
+    assert_flowing(&h, "split");
+    let state = h.mac_state();
+    assert_eq!(
+        (
+            state.running_shared_ioprocs,
+            state.running_input_ioprocs,
+            state.stop_timeouts,
+            state.bad_ioproc_calls
+        ),
+        (1, 1, 0, 0)
+    );
+    assert!(!h.stats().same_device);
+}
+
+/// The format watch's reopen (hw.13) and a microphone that moves leave the
+/// other direction alone where its IOProc suits: the microphone sharing the
+/// headset's IOProc while playout reopens there, and a microphone with its
+/// own IOProc on another device (AirPods' input and output are two devices).
+#[test]
+fn adm_proxy_mac_leaves_a_suited_direction_alone() {
+    let h = mac_platform(true);
+    h.select(&guid("80"), true, &guid("80"), true);
+    h.set_device_format(true, "80", 48_000, 2);
+    mac_call(&h);
+    h.set_device_format(true, "80", 24_000, 1);
+    h.poll_device_formats();
+    h.poll_device_formats();
+    assert_eq!(calls(&h), ["StopPlayout", "SetPlayoutDevice(2)", "InitPlayout", "StartPlayout"]);
+    assert_flowing(&h, "playout reopened under the shared IOProc");
+    assert_eq!(h.stats().format_change_reopens, 1);
+
+    h.select(&guid("74"), true, &unset(), false);
+    assert_eq!(
+        h.take_calls(),
+        ["StopRecording", "SetRecordingDevice(1)", "InitRecording", "StartRecording"]
+    );
+    assert_flowing(&h, "the microphone moved to the built-in one");
+    std::thread::sleep(Duration::from_millis(1_100));
+    h.set_device_format(true, "80", 48_000, 2);
+    h.poll_device_formats();
+    h.poll_device_formats();
+    assert_eq!(calls(&h), ["StopPlayout", "SetPlayoutDevice(2)", "InitPlayout", "StartPlayout"]);
+    assert_flowing(&h, "playout reopened next to the microphone's own IOProc");
+    let state = h.mac_state();
+    assert_eq!(
+        (state.running_shared_ioprocs, state.running_input_ioprocs, state.stop_timeouts),
+        (1, 1, 0)
+    );
+    assert_eq!(h.stats().coupled_reopens, 0);
 }
 
 #[test]
@@ -1727,15 +2144,19 @@ fn adm_listener_router_routes_only_the_platform_adms_listeners() {
         "the ADM's own listener is routed wherever it is added"
     );
     assert!(h.add_listener_from_test_thread(true));
-    assert_eq!(h.core_audio_listeners(), 3, "Init's, the foreign one and one routed listener");
+    assert_eq!(
+        h.core_audio_listeners(),
+        5,
+        "Init's three, the foreign one and one routed listener"
+    );
 
     h.notify_devices_changed();
     assert_eq!(h.foreign_listener_calls(), 1, "called on CoreAudio's thread before it returned");
-    h.notify_default_output_changed();
-    assert_eq!(settle(&h), ["listener: devices", "listener: default output"]);
+    h.notify_format_changed();
+    assert_eq!(settle(&h), ["listener: format"], "the device list is the proxy's own");
     assert!(h.listeners_ran_on_device_thread());
 
     h.remove_listener_from_test_thread(false);
     h.remove_listener_from_test_thread(true);
-    assert_eq!(h.core_audio_listeners(), 1, "Init's devices listener");
+    assert_eq!(h.core_audio_listeners(), 3, "Init's device list and default device listeners");
 }

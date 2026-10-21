@@ -138,6 +138,37 @@ using AdmDeviceFormatReader = std::function<std::optional<AdmDeviceFormat>(
     bool playout,
     const std::string& guid)>;
 
+// A device as CoreAudio names it: its AudioObjectID (the macOS ADM's GUID)
+// and its UID.
+struct AdmDeviceIdentity {
+  std::string id;
+  std::string uid;
+
+  bool operator==(const AdmDeviceIdentity& other) const = default;
+};
+
+// What the proxy asks CoreAudio about devices (macOS; none elsewhere).
+struct AdmDeviceProbe {
+  // The device a direction opens for an ADM GUID (empty: the OS default
+  // now); nullopt when there is none.
+  std::function<std::optional<AdmDeviceIdentity>(bool playout,
+                                                 const std::string& guid)>
+      identify;
+  // Whether a device is still listed and alive.
+  std::function<bool(const std::string& id)> alive;
+};
+
+// Why an open direction was stopped and opened again.
+enum class AdmReopenReason : uint8_t {
+  // SelectDevices, and the app's RestartDevices.
+  kUserSelect = 0,
+  kDefaultChange = 1,
+  kDeviceLost = 2,
+  kFormatChange = 3,
+  kRenderStall = 4,
+};
+constexpr size_t kAdmReopenReasons = 5;
+
 struct AdmDirectionOutcome {
   bool requested = false;
   bool found = true;
@@ -200,6 +231,23 @@ struct AdmNativeStats {
   uint64_t playout_format_changes = 0;
   uint64_t playout_format_reopens = 0;
   uint64_t recording_format_changes = 0;
+  // The proxy follows device changes itself (macOS): the open directions'
+  // device UIDs (empty while closed), whether both are open on one device,
+  // the ADM's CoreAudio notifications by property, each direction reopened
+  // by reason, reopens that took the other direction along, and render
+  // stalls recovered.
+  bool device_changes_available = false;
+  std::string playout_device_uid;
+  std::string recording_device_uid;
+  bool same_device = false;
+  uint64_t device_list_notifications = 0;
+  uint64_t default_output_notifications = 0;
+  uint64_t default_input_notifications = 0;
+  uint64_t stream_format_notifications = 0;
+  uint64_t other_notifications = 0;
+  std::array<uint64_t, kAdmReopenReasons> reopens{};
+  uint64_t coupled_reopens = 0;
+  uint64_t render_stall_recoveries = 0;
 };
 
 // Registered with the platform ADM in place of libwebrtc's AudioTransport, from
@@ -280,6 +328,10 @@ class AdmTransportTap : public webrtc::AudioTransport {
   // The next callback after these does not count the time before it as a gap.
   void ResetCaptureClock();
   void ResetRenderClock();
+
+  // Device callbacks counted so far.
+  uint64_t capture_callbacks() const;
+  uint64_t render_callbacks() const;
 
   void set_playout_delay_ms(uint16_t delay_ms);
   uint16_t playout_delay_ms() const;
@@ -415,6 +467,15 @@ enum class AdmMonitorResult : uint8_t {
 /// the call at the wrong speed. There the device thread reads each open
 /// direction's format every 100 ms and reopens playout once a change held
 /// for two reads.
+///
+/// The macOS ADM shares one IOProc between the directions of one device and
+/// chooses at each Init from what is open then: playout that joins the device
+/// of a microphone with its own IOProc gets no IOProc and renders nothing
+/// while Playing() is true. There playout always opens before a microphone
+/// on its device (the microphone is stopped first and opened again after),
+/// the proxy follows device-list and default-device changes itself instead
+/// of the ADM's listener, and playout that renders nothing for 500 ms while
+/// capture goes on is reopened.
 class AdmProxy : public webrtc::AudioDeviceModule {
  public:
   AdmProxy(const webrtc::Environment& env,
@@ -493,7 +554,8 @@ class AdmProxy : public webrtc::AudioDeviceModule {
   /// device) and stop. Set once, before any device opens.
   void SetPlayoutOpenedSink(AdmPlayoutOpenedSink sink);
 
-  /// Atomics only; the max gaps are reset on read.
+  /// Atomics, and the device UIDs under a lock no device or audio thread
+  /// waits on; the max gaps are reset on read.
   AdmNativeStats ReadNativeStats();
 
 #if defined(ROOTAPP_HARNESS)
@@ -510,6 +572,17 @@ class AdmProxy : public webrtc::AudioDeviceModule {
   void SetDeviceFormatReaderForTest(AdmDeviceFormatReader reader,
                                     bool periodic);
   void PollDeviceFormatsForTest();
+  /// Replaces the CoreAudio device probe (macOS; none elsewhere). With one,
+  /// playout opens before a microphone on its device and the proxy follows
+  /// device-list and default-device changes itself.
+  void SetDeviceProbeForTest(AdmDeviceProbe probe);
+  /// The render-stall guard (on on macOS); without `periodic` only
+  /// PollRenderStallForTest runs it.
+  void SetRenderStallGuardForTest(bool enabled,
+                                  bool periodic,
+                                  int stall_ms,
+                                  int min_interval_ms);
+  void PollRenderStallForTest();
   /// Whether enumeration serializes with device operations (Linux) and how
   /// long it waits for one in progress.
   void SetEnumerationLockForTest(bool serialize, int wait_ms);
@@ -633,7 +706,17 @@ class AdmProxy : public webrtc::AudioDeviceModule {
     uint64_t recording_selection_gen = 0;
     uint64_t playout_restart_gen = 0;
     uint64_t recording_restart_gen = 0;
+    AdmReopenReason playout_restart_reason = AdmReopenReason::kUserSelect;
+    AdmReopenReason recording_restart_reason = AdmReopenReason::kUserSelect;
   };
+
+  // The microphone's IOProc as the macOS ADM chose it when it opened: the
+  // one it shares with playout on its device, its own, or unknown (playout
+  // was closed, or a device could not be identified).
+  enum class MicIoProc : uint8_t { kNone, kShared, kOwn, kUnknown };
+
+  static bool PlayoutWanted(const DesiredState& desired);
+  static bool RecordingWanted(const DesiredState& desired);
 
   webrtc::AudioDeviceModule* platform() const {
     return platform_raw_.load(std::memory_order_acquire);
@@ -654,6 +737,32 @@ class AdmProxy : public webrtc::AudioDeviceModule {
                                 AdmDirectionOutcome* outcome);
   // Returns false when the stop failed and the direction must wait.
   bool StopDeviceLocked(bool playout, AdmDirectionOutcome* outcome);
+  // With a device probe: stops the microphone (and playout on its device)
+  // before playout opens where the microphone's IOProc does not suit it, so
+  // playout opens first. False when a stop failed (the pass waits for the
+  // retry).
+  bool StopForSameDeviceLocked(const DesiredState& desired,
+                               AdmDirectionOutcome* recording,
+                               AdmDirectionOutcome* playout);
+  // The device playout would open on now: nullopt when its selection
+  // resolves to none, empty when the device cannot be identified.
+  std::optional<std::string> PlayoutTargetLocked(const DesiredState& desired);
+  bool MicIoProcSuitsLocked(const std::string& playout_device) const;
+  bool PointSpeakerAwayLocked();
+  bool StaleLocked(bool playout, const DesiredState& desired) const;
+  void CountReopenLocked(bool playout, const DesiredState& desired);
+  // The selected device went away: until the selection changes, a selection
+  // that resolves to no device opens the system default.
+  bool FallbackLocked(bool playout, const DesiredState& desired) const;
+  void IdentifyOpenedLocked(bool playout);
+  void ForgetOpenedLocked(bool playout);
+  void PublishDevicesLocked();
+  void RequestRestartLocked(bool playout, AdmReopenReason reason);
+  void FollowDeviceChangesLocked(bool devices,
+                                 bool default_output,
+                                 bool default_input);
+  void PollRenderStallLocked();
+  void ScheduleRenderStallWatchLocked();
   void ResyncMonitorLocked();
   void CompleteOutcomeLocked(const DesiredState& desired,
                              AdmRequestOutcome* outcome);
@@ -662,7 +771,8 @@ class AdmProxy : public webrtc::AudioDeviceModule {
   // close.
   void NotifyPlayoutOpened();
   int32_t ApplySelectionLocked(bool playout,
-                               const AdmDeviceSelection& selection);
+                               const AdmDeviceSelection& selection,
+                               bool fallback);
   // With `matched`, also the identity of the device it resolved, read with
   // the resolution (index 0's name for the default).
   int ResolveSelectionLocked(bool playout,
@@ -687,7 +797,7 @@ class AdmProxy : public webrtc::AudioDeviceModule {
   bool PollFormatLocked(bool playout);
   void ScheduleFormatWatchLocked();
   void ShutdownLocked();
-  void RunListenerNotification(absl::AnyInvocable<void() &&> notification);
+  void RunListenerNotification(AdmListenerNotification notification);
   DesiredState Desired() const;
 
   class EnumerationGuard;
@@ -751,12 +861,51 @@ class AdmProxy : public webrtc::AudioDeviceModule {
   std::atomic<uint64_t> playout_format_reopens_{0};
   std::atomic<uint64_t> recording_format_changes_{0};
   std::atomic<bool> device_formats_available_{false};
+  // Guarded by mutex_: the device probe, the devices the open directions
+  // opened on, whether they follow the system default, the microphone's
+  // IOProc and the selection generations whose device went away.
+  AdmDeviceProbe probe_;
+  AdmDeviceIdentity playout_device_;
+  AdmDeviceIdentity recording_device_;
+  bool playout_follows_default_ = false;
+  bool recording_follows_default_ = false;
+  bool last_recording_default_ = false;
+  MicIoProc mic_ioproc_ = MicIoProc::kNone;
+  std::optional<uint64_t> playout_fallback_gen_;
+  std::optional<uint64_t> recording_fallback_gen_;
+  bool force_coupled_ = false;
+  struct RenderStallWatch {
+    uint64_t render = 0;
+    uint64_t capture = 0;
+    uint64_t last_capture = 0;
+    int64_t since_ns = 0;
+  };
+  RenderStallWatch render_stall_;
+  int64_t last_render_stall_recovery_ns_ = 0;
+  bool render_stall_guard_ = false;
+  bool render_stall_periodic_ = false;
+  int64_t render_stall_ns_ = 0;
+  int64_t render_stall_interval_ns_ = 0;
+  mutable webrtc::Mutex devices_mutex_;
+  std::string playout_uid_;
+  std::string recording_uid_;
+  std::atomic<bool> same_device_{false};
+  std::atomic<bool> device_changes_available_{false};
+  std::atomic<uint64_t> device_list_notifications_{0};
+  std::atomic<uint64_t> default_output_notifications_{0};
+  std::atomic<uint64_t> default_input_notifications_{0};
+  std::atomic<uint64_t> stream_format_notifications_{0};
+  std::atomic<uint64_t> other_notifications_{0};
+  std::array<std::atomic<uint64_t>, kAdmReopenReasons> reopens_{};
+  std::atomic<uint64_t> coupled_reopens_{0};
+  std::atomic<uint64_t> render_stall_recoveries_{0};
   // capture_state_'s monitor, set with it.
   std::atomic<RootAudioMonitor*> monitor_{nullptr};
 #if !LK_ADM_MOBILE
   bool delay_refresh_scheduled_ = false;
   bool retry_scheduled_ = false;
   bool format_watch_scheduled_ = false;
+  bool render_stall_scheduled_ = false;
 #endif
   bool terminated_ = false;
 

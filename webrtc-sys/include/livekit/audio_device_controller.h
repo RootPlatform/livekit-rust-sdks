@@ -47,6 +47,8 @@ class RootMonitorHarness;
 struct RootMonitorStats;
 struct RootVoiceFakeCounts;
 struct AdmDeviceRender;
+struct AdmMacIo;
+struct AdmMacState;
 struct RootControlState;
 #endif
 struct AudioDeviceSelection;
@@ -330,7 +332,27 @@ class AdmProxyHarness {
   void notify_devices_changed() const;
   void notify_format_changed() const;
   void notify_default_output_changed() const;
-  void set_listener_restarts(bool restarts) const;
+  void notify_default_input_changed() const;
+  // The fake follows AudioDeviceMac's IOProc rules from now on; with
+  // `probe` the proxy also gets a device probe over the fake's devices, as
+  // CoreAudio answers it on macOS.
+  void mac_rules(bool probe) const;
+  // The device CoreAudio calls the default now, by its id (the GUID in the
+  // device lists); index 0 opens it.
+  void set_default_device(bool playout, rust::Str id) const;
+  // A device that is not alive keeps its IOProcs from running.
+  void set_device_alive(rust::Str id, bool alive) const;
+  // The default output becomes `id` as the ADM's next InitPlayout resolves
+  // it (a change racing the open: the proxy read the old default before).
+  void set_default_output_at_next_playout_open(rust::Str id) const;
+  // `cycles` IO cycles under those rules, on a device thread.
+  AdmMacIo mac_io(uint32_t cycles) const;
+  AdmMacState mac_state() const;
+  // The render-stall guard with these limits, run only by
+  // poll_render_stall.
+  void set_render_stall_guard(uint32_t stall_ms,
+                              uint32_t min_interval_ms) const;
+  void poll_render_stall() const;
   uint32_t listener_calls() const;
   bool listeners_ran_on_device_thread() const;
   uint32_t overlapping_device_calls() const;

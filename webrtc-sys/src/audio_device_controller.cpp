@@ -349,6 +349,25 @@ RootAudioNativeStats AudioDeviceController::root_audio_stats() const {
   stats.playout_format_changes = native.playout_format_changes;
   stats.playout_format_reopens = native.playout_format_reopens;
   stats.recording_format_changes = native.recording_format_changes;
+  stats.device_changes_available = native.device_changes_available;
+  stats.playout_device_uid = rust::String::lossy(native.playout_device_uid);
+  stats.recording_device_uid = rust::String::lossy(native.recording_device_uid);
+  stats.same_device = native.same_device;
+  stats.device_list_notifications = native.device_list_notifications;
+  stats.default_output_notifications = native.default_output_notifications;
+  stats.default_input_notifications = native.default_input_notifications;
+  stats.stream_format_notifications = native.stream_format_notifications;
+  stats.other_device_notifications = native.other_notifications;
+  auto reopens = [&native](AdmReopenReason reason) {
+    return native.reopens[static_cast<size_t>(reason)];
+  };
+  stats.user_select_reopens = reopens(AdmReopenReason::kUserSelect);
+  stats.default_change_reopens = reopens(AdmReopenReason::kDefaultChange);
+  stats.device_lost_reopens = reopens(AdmReopenReason::kDeviceLost);
+  stats.format_change_reopens = reopens(AdmReopenReason::kFormatChange);
+  stats.render_stall_reopens = reopens(AdmReopenReason::kRenderStall);
+  stats.coupled_reopens = native.coupled_reopens;
+  stats.render_stall_recoveries = native.render_stall_recoveries;
 
   const double nan = std::numeric_limits<double>::quiet_NaN();
   stats.erl_db = nan;

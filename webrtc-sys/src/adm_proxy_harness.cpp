@@ -23,6 +23,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <utility>
@@ -131,8 +132,14 @@ constexpr AdmListenerAddress kFakeDevicesAddress{FourCc("dev#"), FourCc("glob"),
                                                  0};
 constexpr AdmListenerAddress kFakeDefaultOutputAddress{FourCc("dOut"),
                                                        FourCc("glob"), 0};
+constexpr AdmListenerAddress kFakeDefaultInputAddress{FourCc("dIn "),
+                                                      FourCc("glob"), 0};
 constexpr AdmListenerAddress kFakeFormatAddress{FourCc("sfmt"), FourCc("outp"),
                                                 0};
+static_assert(kFakeDevicesAddress.selector == kAdmSelectorDevices);
+static_assert(kFakeDefaultOutputAddress.selector == kAdmSelectorDefaultOutput);
+static_assert(kFakeDefaultInputAddress.selector == kAdmSelectorDefaultInput);
+static_assert(kFakeFormatAddress.selector == kAdmSelectorStreamFormat);
 
 using FakeListenerProc = int32_t (*)(uint32_t object,
                                      uint32_t count,
@@ -270,6 +277,413 @@ class FakeCoreAudio {
   std::vector<Entry> entries_;
 };
 
+// AudioDeviceMac's device and IOProc bookkeeping (webrtc-sdk m150 89d790b,
+// audio_device_mac.cc) over a fake HAL: devices by AudioObjectID, a default
+// per direction, and IOProcs that run while started on a device that is
+// alive. Waits for an IOProc that never runs are counted, not slept.
+class FakeMacAdm {
+ public:
+  struct Io {
+    bool render = false;
+    bool capture = false;
+  };
+
+  struct State {
+    uint32_t running = 0;
+    uint32_t running_input = 0;
+    uint32_t running_shared = 0;
+    bool two_devices = true;
+    uint32_t stop_timeouts = 0;
+    uint32_t bad_ioproc_calls = 0;
+    bool play_init = false;
+    bool playing = false;
+    bool rec_init = false;
+    bool recording = false;
+  };
+
+  void SetDevices(std::vector<std::string> playout,
+                  std::vector<std::string> recording) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    playout_guids_ = std::move(playout);
+    recording_guids_ = std::move(recording);
+  }
+
+  void SetDefault(bool playout, std::string id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    (playout ? default_output_ : default_input_) = std::move(id);
+  }
+
+  void SetAlive(const std::string& id, bool alive) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (alive) {
+      dead_.erase(id);
+    } else {
+      dead_.insert(id);
+    }
+  }
+
+  // The default output becomes `id` as the next InitPlayout resolves it.
+  void SetDefaultOutputAtNextInitPlayout(std::string id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    default_output_at_init_ = std::move(id);
+  }
+
+  std::optional<std::string> DeviceFor(bool playout, const std::string& guid) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const std::string id =
+        guid.empty() ? (playout ? default_output_ : default_input_) : guid;
+    if (!AliveLocked(id)) {
+      return std::nullopt;
+    }
+    return id;
+  }
+
+  bool Alive(const std::string& id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return AliveLocked(id);
+  }
+
+  int32_t SetPlayoutDevice(uint16_t index) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (play_init_ || index >= playout_guids_.size()) {
+      return -1;
+    }
+    output_index_ = index;
+    return 0;
+  }
+
+  int32_t SetRecordingDevice(uint16_t index) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (rec_init_ || index >= recording_guids_.size()) {
+      return -1;
+    }
+    input_index_ = index;
+    return 0;
+  }
+
+  int32_t InitSpeaker() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return InitSpeakerLocked() ? 0 : -1;
+  }
+
+  // The model fails an Init whose device does not resolve; the ADM only
+  // warns and fails a little later, reading the stale device's format.
+  int32_t InitPlayout() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (playing_) {
+      return -1;
+    }
+    if (play_init_) {
+      return 0;
+    }
+    if (default_output_at_init_) {
+      default_output_ = *default_output_at_init_;
+      default_output_at_init_.reset();
+    }
+    if (!InitSpeakerLocked()) {
+      return -1;
+    }
+    if (!mic_mixer_ && !recording_) {
+      const std::string input = ResolveLocked(true, input_index_);
+      if (!input.empty()) {
+        input_id_ = input;
+        two_devices_ = input_id_ != output_id_;
+      }
+    }
+    if (two_devices_ || !rec_init_) {
+      device_ioproc_ = CreateLocked(output_id_, false);
+    }
+    play_init_ = true;
+    render_alive_ = true;
+    return 0;
+  }
+
+  int32_t StartPlayout() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!play_init_) {
+      return -1;
+    }
+    if (playing_) {
+      return 0;
+    }
+    if ((two_devices_ || !recording_) &&
+        !StartLocked(output_id_, device_ioproc_)) {
+      return -1;
+    }
+    playing_ = true;
+    return 0;
+  }
+
+  int32_t StopPlayout() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!play_init_) {
+      return 0;
+    }
+    if (playing_ && render_alive_) {
+      playing_ = false;
+      if (!AnyRunningLocked(false)) {
+        ++stop_timeouts_;
+        StopAndDestroyLocked(output_id_, device_ioproc_);
+      } else if (two_devices_ || !recording_) {
+        StopAndDestroyLocked(output_id_, device_ioproc_);
+      }
+    } else if (two_devices_ || !rec_init_) {
+      DestroyLocked(output_id_, device_ioproc_);
+    }
+    render_alive_ = false;
+    play_init_ = false;
+    playing_ = false;
+    return 0;
+  }
+
+  int32_t InitRecording() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (recording_) {
+      return -1;
+    }
+    if (rec_init_) {
+      return 0;
+    }
+    if (!InitMicrophoneLocked()) {
+      return -1;
+    }
+    if (!speaker_mixer_ && !playing_) {
+      const std::string output = ResolveLocked(false, output_index_);
+      if (!output.empty()) {
+        output_id_ = output;
+        two_devices_ = input_id_ != output_id_;
+      }
+    }
+    if (two_devices_) {
+      in_device_ioproc_ = CreateLocked(input_id_, true);
+    } else if (!play_init_) {
+      device_ioproc_ = CreateLocked(input_id_, false);
+    }
+    rec_init_ = true;
+    capture_alive_ = true;
+    return 0;
+  }
+
+  int32_t StartRecording() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!rec_init_) {
+      return -1;
+    }
+    if (recording_) {
+      return 0;
+    }
+    if (two_devices_) {
+      if (!StartLocked(input_id_, in_device_ioproc_)) {
+        return -1;
+      }
+    } else if (!playing_ && !StartLocked(input_id_, device_ioproc_)) {
+      return -1;
+    }
+    recording_ = true;
+    return 0;
+  }
+
+  int32_t StopRecording() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!rec_init_) {
+      return 0;
+    }
+    if (two_devices_ && capture_alive_) {
+      if (recording_) {
+        recording_ = false;
+        if (!AnyRunningLocked(true)) {
+          ++stop_timeouts_;
+        }
+        StopAndDestroyLocked(input_id_, in_device_ioproc_);
+      } else {
+        DestroyLocked(input_id_, in_device_ioproc_);
+      }
+    } else if (recording_ && capture_alive_) {
+      recording_ = false;
+      if (!AnyRunningLocked(false)) {
+        ++stop_timeouts_;
+        StopAndDestroyLocked(output_id_, device_ioproc_);
+      } else if (two_devices_ || !playing_) {
+        StopAndDestroyLocked(output_id_, device_ioproc_);
+      }
+    } else if (!playing_ && !play_init_) {
+      DestroyLocked(output_id_, device_ioproc_);
+    }
+    capture_alive_ = false;
+    rec_init_ = false;
+    recording_ = false;
+    return 0;
+  }
+
+  // One IO cycle: implDeviceIOProc renders while playout plays and captures
+  // while _twoDevices is false; implInDeviceIOProc captures.
+  Io Cycle() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Io io;
+    const bool shared = AnyRunningLocked(false);
+    io.render = playing_ && shared;
+    io.capture =
+        recording_ && (AnyRunningLocked(true) || (!two_devices_ && shared));
+    return io;
+  }
+
+  State Read() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    State state;
+    for (const auto& entry : ioprocs_) {
+      if (entry.second.running) {
+        ++state.running;
+        ++(entry.second.input_only ? state.running_input
+                                   : state.running_shared);
+      }
+    }
+    state.two_devices = two_devices_;
+    state.stop_timeouts = stop_timeouts_;
+    state.bad_ioproc_calls = bad_ioproc_calls_;
+    state.play_init = play_init_;
+    state.playing = playing_;
+    state.rec_init = rec_init_;
+    state.recording = recording_;
+    return state;
+  }
+
+ private:
+  struct IoProc {
+    std::string device;
+    bool input_only = false;
+    bool running = false;
+  };
+
+  bool AliveLocked(const std::string& id) const {
+    if (id.empty() || dead_.count(id) != 0) {
+      return false;
+    }
+    auto listed = [&id](const std::vector<std::string>& guids) {
+      return std::find(guids.begin() + std::min<size_t>(1, guids.size()),
+                       guids.end(), id) != guids.end();
+    };
+    return listed(playout_guids_) || listed(recording_guids_);
+  }
+
+  // InitDevice: index 0 is the system default, the others the listed ids.
+  std::string ResolveLocked(bool input, uint16_t index) const {
+    const std::vector<std::string>& guids =
+        input ? recording_guids_ : playout_guids_;
+    if (index >= guids.size()) {
+      return {};
+    }
+    const std::string id =
+        index == 0 ? (input ? default_input_ : default_output_) : guids[index];
+    return AliveLocked(id) ? id : std::string();
+  }
+
+  bool InitSpeakerLocked() {
+    if (playing_) {
+      return false;
+    }
+    const std::string id = ResolveLocked(false, output_index_);
+    if (id.empty()) {
+      return false;
+    }
+    output_id_ = id;
+    two_devices_ = input_id_ != output_id_;
+    speaker_mixer_ = true;
+    return true;
+  }
+
+  bool InitMicrophoneLocked() {
+    if (recording_) {
+      return false;
+    }
+    const std::string id = ResolveLocked(true, input_index_);
+    if (id.empty()) {
+      return false;
+    }
+    input_id_ = id;
+    two_devices_ = input_id_ != output_id_;
+    mic_mixer_ = true;
+    return true;
+  }
+
+  bool AnyRunningLocked(bool input_only) const {
+    for (const auto& entry : ioprocs_) {
+      const IoProc& ioproc = entry.second;
+      if (ioproc.running && ioproc.input_only == input_only &&
+          dead_.count(ioproc.device) == 0) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  int CreateLocked(const std::string& device, bool input_only) {
+    const int id = next_ioproc_++;
+    ioprocs_[id] = IoProc{device, input_only, false};
+    return id;
+  }
+
+  bool StartLocked(const std::string& device, int id) {
+    const auto found = ioprocs_.find(id);
+    if (found == ioprocs_.end() || found->second.device != device ||
+        !AliveLocked(device)) {
+      ++bad_ioproc_calls_;
+      return false;
+    }
+    found->second.running = true;
+    return true;
+  }
+
+  void StopAndDestroyLocked(const std::string& device, int id) {
+    const auto found = ioprocs_.find(id);
+    if (found == ioprocs_.end() || found->second.device != device) {
+      bad_ioproc_calls_ += 2;
+      return;
+    }
+    ioprocs_.erase(found);
+  }
+
+  void DestroyLocked(const std::string& device, int id) {
+    const auto found = ioprocs_.find(id);
+    if (found == ioprocs_.end() || found->second.device != device) {
+      ++bad_ioproc_calls_;
+      return;
+    }
+    ioprocs_.erase(found);
+  }
+
+  std::mutex mutex_;
+  std::vector<std::string> playout_guids_;
+  std::vector<std::string> recording_guids_;
+  std::string default_output_;
+  std::string default_input_;
+  std::optional<std::string> default_output_at_init_;
+  std::set<std::string> dead_;
+  std::map<int, IoProc> ioprocs_;
+  int next_ioproc_ = 1;
+  // _deviceIOProcID and _inDeviceIOProcID: whatever was created last, also
+  // once destroyed.
+  int device_ioproc_ = 0;
+  int in_device_ioproc_ = 0;
+  // _inputDeviceID, _outputDeviceID and the indices SetRecordingDevice and
+  // SetPlayoutDevice stored.
+  std::string input_id_;
+  std::string output_id_;
+  uint16_t input_index_ = 0;
+  uint16_t output_index_ = 0;
+  bool two_devices_ = true;
+  // The mixer manager's speaker and microphone stay open once opened.
+  bool speaker_mixer_ = false;
+  bool mic_mixer_ = false;
+  bool play_init_ = false;
+  bool playing_ = false;
+  bool rec_init_ = false;
+  bool recording_ = false;
+  bool render_alive_ = false;
+  bool capture_alive_ = false;
+  uint32_t stop_timeouts_ = 0;
+  uint32_t bad_ioproc_calls_ = 0;
+};
+
 }  // namespace
 
 // Records the state-changing calls it gets and behaves like a platform ADM:
@@ -291,15 +705,39 @@ class FakePlatformAdm
 
   void SetDevices(std::vector<std::string> playout,
                   std::vector<std::string> recording) {
+    mac_.SetDevices(playout, recording);
     std::lock_guard<std::mutex> lock(mutex_);
     playout_guids_ = std::move(playout);
     recording_guids_ = std::move(recording);
   }
 
-  FakeCoreAudio& core_audio() { return core_audio_; }
-  void SetListenerRestarts(bool restarts) {
-    listener_restarts_.store(restarts);
+  // Device calls follow AudioDeviceMac's rules from now on (FakeMacAdm).
+  void SetMacRules(bool mac) { mac_rules_.store(mac); }
+  FakeMacAdm& mac() { return mac_; }
+
+  // One IO cycle under AudioDeviceMac's rules, on the calling thread: the
+  // capture and render callbacks its IOProcs would make.
+  FakeMacAdm::Io MacCycle() {
+    const FakeMacAdm::Io io = mac_.Cycle();
+    if (io.capture) {
+      if (webrtc::AudioTransport* transport = callback_.load()) {
+        std::array<int16_t, kDeviceFrames * 2> samples{};
+        uint32_t new_mic_level = 0;
+        transport->RecordedDataIsAvailable(samples.data(), kDeviceFrames, 4, 2,
+                                           48000, 10, 0, 0, false,
+                                           new_mic_level);
+      }
+    }
+    if (io.render) {
+      std::vector<int16_t> device(webrtc::kMaxBufferSizeBytes /
+                                  sizeof(int16_t));
+      buffer_.RequestPlayoutData(kDeviceFrames);
+      buffer_.GetPlayoutData(device.data());
+    }
+    return io;
   }
+
+  FakeCoreAudio& core_audio() { return core_audio_; }
   uint32_t ListenerCalls() const { return listener_calls_.load(); }
   std::vector<std::thread::id> ListenerThreads() {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -378,16 +816,23 @@ class FakePlatformAdm
     buffer_.RegisterAudioCallback(callback_.load());
   }
 
+  // As AudioDeviceMac::Init: the device list and both defaults.
   int32_t Init() override {
     const DeviceCall call(this);
-    core_audio_.AddListener(kFakeSystemObject, kFakeDevicesAddress, &Listener,
-                            this);
+    for (const AdmListenerAddress& address :
+         {kFakeDevicesAddress, kFakeDefaultOutputAddress,
+          kFakeDefaultInputAddress}) {
+      core_audio_.AddListener(kFakeSystemObject, address, &Listener, this);
+    }
     return Record("Init");
   }
   int32_t Terminate() override {
     const DeviceCall call(this);
-    core_audio_.RemoveListener(kFakeSystemObject, kFakeDevicesAddress,
-                               &Listener, this);
+    for (const AdmListenerAddress& address :
+         {kFakeDevicesAddress, kFakeDefaultOutputAddress,
+          kFakeDefaultInputAddress}) {
+      core_audio_.RemoveListener(kFakeSystemObject, address, &Listener, this);
+    }
     return Record("Terminate");
   }
   int32_t RegisterAudioCallback(webrtc::AudioTransport* transport) override {
@@ -428,23 +873,40 @@ class FakePlatformAdm
 
   int32_t SetPlayoutDevice(uint16_t index) override {
     const DeviceCall call(this);
-    return Record("SetPlayoutDevice(" + std::to_string(index) + ")");
+    Record("SetPlayoutDevice(" + std::to_string(index) + ")");
+    return mac_rules_.load() ? mac_.SetPlayoutDevice(index) : 0;
   }
   int32_t SetPlayoutDevice(WindowsDeviceType) override {
     const DeviceCall call(this);
-    return Record("SetPlayoutDevice(default)");
+    Record("SetPlayoutDevice(default)");
+    return mac_rules_.load() ? mac_.SetPlayoutDevice(0) : 0;
   }
   int32_t SetRecordingDevice(uint16_t index) override {
     const DeviceCall call(this);
-    return Record("SetRecordingDevice(" + std::to_string(index) + ")");
+    Record("SetRecordingDevice(" + std::to_string(index) + ")");
+    return mac_rules_.load() ? mac_.SetRecordingDevice(index) : 0;
   }
   int32_t SetRecordingDevice(WindowsDeviceType) override {
     const DeviceCall call(this);
-    return Record("SetRecordingDevice(default)");
+    Record("SetRecordingDevice(default)");
+    return mac_rules_.load() ? mac_.SetRecordingDevice(0) : 0;
   }
 
   int32_t InitPlayout() override {
     const DeviceCall call(this);
+    if (mac_rules_.load()) {
+      Record("InitPlayout");
+      const bool was_initialized = playout_initialized_.load();
+      const int32_t result = mac_.InitPlayout();
+      SyncMac();
+      if (!was_initialized && playout_initialized_.load()) {
+        core_audio_.AddListener(kFakeOutputDevice, kFakeFormatAddress,
+                                &Listener, this);
+      }
+      buffer_.SetPlayoutSampleRate(48000);
+      buffer_.SetPlayoutChannels(stereo_playout_.load() ? 2 : 1);
+      return result;
+    }
     if (!playout_initialized_.exchange(true)) {
       core_audio_.AddListener(kFakeOutputDevice, kFakeFormatAddress, &Listener,
                               this);
@@ -479,6 +941,11 @@ class FakePlatformAdm
   // As the Windows ADM: no speaker or microphone (re)initialization while
   // that direction runs.
   int32_t InitSpeaker() override {
+    if (mac_rules_.load()) {
+      const DeviceCall call(this);
+      Record("InitSpeaker");
+      return mac_.InitSpeaker();
+    }
     return RecordChannel("InitSpeaker", playing_.load() ? -1 : 0);
   }
   int32_t InitMicrophone() override {
@@ -505,6 +972,12 @@ class FakePlatformAdm
   }
   int32_t StartPlayout() override {
     const DeviceCall call(this);
+    if (mac_rules_.load()) {
+      Record("StartPlayout");
+      const int32_t result = mac_.StartPlayout();
+      SyncMac();
+      return result;
+    }
     Record(playout_worker_left_.exchange(false) ? "StartPlayout over a worker"
                                                 : "StartPlayout");
     if (block_start_.exchange(false)) {
@@ -525,6 +998,16 @@ class FakePlatformAdm
   int32_t StopPlayout() override {
     const DeviceCall call(this);
     Record("StopPlayout");
+    if (mac_rules_.load()) {
+      const bool was_initialized = playout_initialized_.load();
+      const int32_t result = mac_.StopPlayout();
+      SyncMac();
+      if (was_initialized && !playout_initialized_.load()) {
+        core_audio_.RemoveListener(kFakeOutputDevice, kFakeFormatAddress,
+                                   &Listener, this);
+      }
+      return result;
+    }
     const bool open = playout_initialized_.exchange(false);
     if (open) {
       core_audio_.RemoveListener(kFakeOutputDevice, kFakeFormatAddress,
@@ -539,6 +1022,12 @@ class FakePlatformAdm
 
   int32_t InitRecording() override {
     const DeviceCall call(this);
+    if (mac_rules_.load()) {
+      Record("InitRecording");
+      const int32_t result = mac_.InitRecording();
+      SyncMac();
+      return result;
+    }
     recording_initialized_.store(true);
     return Record("InitRecording");
   }
@@ -547,6 +1036,12 @@ class FakePlatformAdm
   }
   int32_t StartRecording() override {
     const DeviceCall call(this);
+    if (mac_rules_.load()) {
+      Record("StartRecording");
+      const int32_t result = mac_.StartRecording();
+      SyncMac();
+      return result;
+    }
     Record(recording_worker_left_.exchange(false) ? "StartRecording over a worker"
                                                   : "StartRecording");
     if (!recording_initialized_.load()) {
@@ -562,6 +1057,11 @@ class FakePlatformAdm
   int32_t StopRecording() override {
     const DeviceCall call(this);
     Record("StopRecording");
+    if (mac_rules_.load()) {
+      const int32_t result = mac_.StopRecording();
+      SyncMac();
+      return result;
+    }
     const bool open = recording_initialized_.exchange(false);
     recording_worker_left_.store(false);
     recording_.store(false);
@@ -604,7 +1104,9 @@ class FakePlatformAdm
     FakePlatformAdm* const adm_;
   };
 
-  // AudioDeviceMac::HandleDeviceChange for an output device that went away.
+  // AudioDeviceMac's objectListenerProc. Its device-list and default-device
+  // handlers restarted devices themselves; the proxy keeps those
+  // notifications, so only their arrival is recorded.
   void OnListener(const AdmListenerAddress& address) {
     listener_calls_.fetch_add(1);
     {
@@ -613,21 +1115,12 @@ class FakePlatformAdm
     }
     if (address == kFakeFormatAddress) {
       Record("listener: format");
-      return;
-    }
-    if (address == kFakeDefaultOutputAddress) {
+    } else if (address == kFakeDefaultOutputAddress) {
       Record("listener: default output");
-      return;
-    }
-    Record("listener: devices");
-    if (!playout_initialized_.load()) {
-      return;
-    }
-    const bool was_playing = playing_.load();
-    StopPlayout();
-    if (was_playing && listener_restarts_.load() && SetPlayoutDevice(0) == 0) {
-      InitPlayout();
-      StartPlayout();
+    } else if (address == kFakeDefaultInputAddress) {
+      Record("listener: default input");
+    } else {
+      Record("listener: devices");
     }
   }
 
@@ -641,6 +1134,20 @@ class FakePlatformAdm
     std::lock_guard<std::mutex> lock(mutex_);
     channel_calls_.push_back(std::move(call));
     return result;
+  }
+
+  void SyncMac() {
+    const FakeMacAdm::State state = mac_.Read();
+    playout_initialized_.store(state.play_init);
+    recording_initialized_.store(state.rec_init);
+    recording_.store(state.recording);
+    if (playing_.exchange(state.playing) != state.playing) {
+      if (state.playing) {
+        buffer_.StartPlayout();
+      } else {
+        buffer_.StopPlayout();
+      }
+    }
   }
 
   static constexpr size_t kDeviceFrames = 480;
@@ -668,11 +1175,12 @@ class FakePlatformAdm
   webrtc::Event start_entered_;
   webrtc::Event start_release_;
   FakeCoreAudio core_audio_;
-  std::atomic<bool> listener_restarts_{true};
   std::atomic<uint32_t> listener_calls_{0};
   std::vector<std::thread::id> listener_threads_;
   std::atomic<uint32_t> in_device_call_{0};
   std::atomic<uint32_t> overlapping_calls_{0};
+  std::atomic<bool> mac_rules_{false};
+  FakeMacAdm mac_;
 };
 
 // libwebrtc's side of the device callbacks. With a re-entry target it calls
@@ -783,6 +1291,8 @@ AdmProxyHarness::AdmProxyHarness(
       with_platform ? webrtc::scoped_refptr<webrtc::AudioDeviceModule>(fake_)
                     : nullptr);
   proxy_->SetDeviceFormatReaderForTest(nullptr, false);
+  proxy_->SetDeviceProbeForTest(AdmDeviceProbe{});
+  proxy_->SetRenderStallGuardForTest(false, false, 0, 0);
   proxy_->SetCaptureState(capture_);
   proxy_->SetPlayoutOpenedSink(
       [log = opened_](const AdmPlayoutOpened& opened) {
@@ -1096,8 +1606,76 @@ void AdmProxyHarness::notify_default_output_changed() const {
   fake_->core_audio().Notify(kFakeSystemObject, kFakeDefaultOutputAddress);
 }
 
-void AdmProxyHarness::set_listener_restarts(bool restarts) const {
-  fake_->SetListenerRestarts(restarts);
+void AdmProxyHarness::notify_default_input_changed() const {
+  fake_->core_audio().Notify(kFakeSystemObject, kFakeDefaultInputAddress);
+}
+
+void AdmProxyHarness::mac_rules(bool probe) const {
+  fake_->SetMacRules(true);
+  if (!probe) {
+    return;
+  }
+  AdmDeviceProbe device_probe;
+  device_probe.identify = [fake = fake_](bool playout, const std::string& guid)
+      -> std::optional<AdmDeviceIdentity> {
+    const std::optional<std::string> id = fake->mac().DeviceFor(playout, guid);
+    if (!id) {
+      return std::nullopt;
+    }
+    return AdmDeviceIdentity{*id, "UID-" + *id};
+  };
+  device_probe.alive = [fake = fake_](const std::string& id) {
+    return fake->mac().Alive(id);
+  };
+  proxy_->SetDeviceProbeForTest(std::move(device_probe));
+}
+
+void AdmProxyHarness::set_render_stall_guard(uint32_t stall_ms,
+                                             uint32_t min_interval_ms) const {
+  proxy_->SetRenderStallGuardForTest(true, false, static_cast<int>(stall_ms),
+                                     static_cast<int>(min_interval_ms));
+}
+
+void AdmProxyHarness::poll_render_stall() const {
+  proxy_->PollRenderStallForTest();
+}
+
+void AdmProxyHarness::set_default_device(bool playout, rust::Str id) const {
+  fake_->mac().SetDefault(playout, std::string(id));
+}
+
+void AdmProxyHarness::set_device_alive(rust::Str id, bool alive) const {
+  fake_->mac().SetAlive(std::string(id), alive);
+}
+
+void AdmProxyHarness::set_default_output_at_next_playout_open(
+    rust::Str id) const {
+  fake_->mac().SetDefaultOutputAtNextInitPlayout(std::string(id));
+}
+
+AdmMacIo AdmProxyHarness::mac_io(uint32_t cycles) const {
+  AdmMacIo result{};
+  std::thread device_thread([this, cycles, &result] {
+    for (uint32_t i = 0; i < cycles; ++i) {
+      const FakeMacAdm::Io io = fake_->MacCycle();
+      result.render_callbacks += io.render ? 1 : 0;
+      result.capture_callbacks += io.capture ? 1 : 0;
+    }
+  });
+  device_thread.join();
+  return result;
+}
+
+AdmMacState AdmProxyHarness::mac_state() const {
+  const FakeMacAdm::State state = fake_->mac().Read();
+  AdmMacState result{};
+  result.running_ioprocs = state.running;
+  result.running_input_ioprocs = state.running_input;
+  result.running_shared_ioprocs = state.running_shared;
+  result.two_devices = state.two_devices;
+  result.stop_timeouts = state.stop_timeouts;
+  result.bad_ioproc_calls = state.bad_ioproc_calls;
+  return result;
 }
 
 uint32_t AdmProxyHarness::listener_calls() const {
@@ -1132,12 +1710,11 @@ uint64_t AdmProxyHarness::delivered_listener_notifications() const {
 
 bool AdmProxyHarness::add_listener_from_test_thread(bool adm_listener) const {
   if (adm_listener) {
-    fake_->core_audio().AddListener(kFakeSystemObject,
-                                    kFakeDefaultOutputAddress,
+    fake_->core_audio().AddListener(kFakeOutputDevice, kFakeFormatAddress,
                                     &FakePlatformAdm::Listener, fake_.get());
     return !fake_->core_audio().HasOriginal(
-        kFakeSystemObject, kFakeDefaultOutputAddress,
-        &FakePlatformAdm::Listener, fake_.get());
+        kFakeOutputDevice, kFakeFormatAddress, &FakePlatformAdm::Listener,
+        fake_.get());
   }
   fake_->core_audio().AddListener(kFakeSystemObject, kFakeDevicesAddress,
                                   &CountingListener, foreign_calls_.get());
@@ -1149,8 +1726,7 @@ bool AdmProxyHarness::add_listener_from_test_thread(bool adm_listener) const {
 void AdmProxyHarness::remove_listener_from_test_thread(
     bool adm_listener) const {
   if (adm_listener) {
-    fake_->core_audio().RemoveListener(kFakeSystemObject,
-                                       kFakeDefaultOutputAddress,
+    fake_->core_audio().RemoveListener(kFakeOutputDevice, kFakeFormatAddress,
                                        &FakePlatformAdm::Listener, fake_.get());
     return;
   }
@@ -1534,6 +2110,8 @@ RootVoiceHarness::RootVoiceHarness()
   proxy_ = webrtc::make_ref_counted<AdmProxy>(webrtc::CreateEnvironment(),
                                               nullptr, mixer_, fake_);
   proxy_->SetDeviceFormatReaderForTest(nullptr, false);
+  proxy_->SetDeviceProbeForTest(AdmDeviceProbe{});
+  proxy_->SetRenderStallGuardForTest(false, false, 0, 0);
   proxy_->SetCaptureState(capture_);
   controller_ = std::make_unique<AudioDeviceController>(proxy_, mixer_, apm_,
                                                         capture_);
@@ -1793,6 +2371,8 @@ RootEngineHarness::RootEngineHarness() : parts_(std::make_unique<Parts>()) {
                                               p.fake);
   });
   p.proxy->SetDeviceFormatReaderForTest(nullptr, false);
+  p.proxy->SetDeviceProbeForTest(AdmDeviceProbe{});
+  p.proxy->SetRenderStallGuardForTest(false, false, 0, 0);
   p.proxy->SetCaptureState(p.capture);
 
   webrtc::PeerConnectionFactoryDependencies dependencies;
