@@ -108,6 +108,7 @@ pub mod ffi {
         fn should_receive(self: &VideoTrack) -> bool;
         fn content_hint(self: &VideoTrack) -> ContentHint;
         fn set_content_hint(self: &VideoTrack, hint: ContentHint);
+        fn request_key_frame(self: &VideoTrack);
         fn new_native_video_sink(observer: Box<VideoSinkWrapper>) -> SharedPtr<NativeVideoSink>;
 
         fn video_resolution(self: &VideoTrackSource) -> VideoResolution;

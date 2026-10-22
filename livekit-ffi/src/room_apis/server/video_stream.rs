@@ -14,7 +14,7 @@
 
 use futures_util::StreamExt;
 use livekit::{
-    prelude::Track,
+    prelude::{RemoteVideoTrack, Track},
     webrtc::{
         prelude::*,
         video_stream::native::{NativeVideoStream, NativeVideoStreamOptions},
@@ -22,7 +22,7 @@ use livekit::{
 };
 use tokio::sync::{broadcast, mpsc, oneshot};
 
-use super::{colorcvt, room::FfiTrack, FfiHandle};
+use super::{colorcvt, room::FfiTrack, video_stall::StallWatch, FfiHandle};
 use crate::server::utils;
 use crate::{proto, server, FfiError, FfiHandleId, FfiResult};
 use livekit::webrtc::video_frame::FrameMetadata;
@@ -36,6 +36,13 @@ pub struct FfiVideoStream {
 }
 
 impl FfiHandle for FfiVideoStream {}
+
+fn remote_video(track: &Track) -> Option<RemoteVideoTrack> {
+    match track {
+        Track::RemoteVideo(track) => Some(track.clone()),
+        _ => None,
+    }
+}
 
 fn frame_metadata_to_proto(metadata: Option<FrameMetadata>) -> Option<proto::FrameMetadata> {
     metadata.map(|metadata| proto::FrameMetadata {
@@ -83,6 +90,7 @@ impl FfiVideoStream {
                     new_stream.format.and_then(|_| Some(new_stream.format())),
                     new_stream.normalize_stride.unwrap_or(true),
                     NativeVideoStream::with_options(rtc_track, options),
+                    remote_video(&ffi_track.track),
                     self_dropped_rx,
                     server.watch_handle_dropped(new_stream.track_handle),
                     true,
@@ -136,10 +144,12 @@ impl FfiVideoStream {
         dst_type: Option<proto::VideoBufferType>,
         normalize_stride: bool,
         mut native_stream: NativeVideoStream,
+        remote_track: Option<RemoteVideoTrack>,
         mut self_dropped_rx: oneshot::Receiver<()>,
         mut handle_dropped_rx: oneshot::Receiver<()>,
         send_eos: bool,
     ) {
+        let stall_watch = remote_track.map(|track| StallWatch::start(server, track));
         loop {
             tokio::select! {
                 _ = &mut self_dropped_rx => {
@@ -152,6 +162,9 @@ impl FfiVideoStream {
                     let Some(frame) = frame else {
                         break;
                     };
+                    if let Some(stall_watch) = &stall_watch {
+                        stall_watch.on_frame();
+                    }
 
                     let metadata = frame_metadata_to_proto(frame.frame_metadata);
                     let timestamp_us = frame.timestamp_us;
@@ -246,6 +259,7 @@ impl FfiVideoStream {
                 let MediaStreamTrack::Video(rtc_track) = rtc_track else {
                     continue;
                 };
+                let remote_track = remote_video(&track);
                 let (c_tx, c_rx) = oneshot::channel::<()>();
                 let (handle_dropped_tx, handle_dropped_rx) = oneshot::channel::<()>();
                 let (done_tx, mut done_rx) = oneshot::channel::<()>();
@@ -273,6 +287,7 @@ impl FfiVideoStream {
                         dst_type,
                         normalize_stride,
                         NativeVideoStream::with_options(rtc_track, options),
+                        remote_track,
                         c_rx,
                         handle_dropped_rx,
                         false,

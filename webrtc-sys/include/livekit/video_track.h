@@ -57,6 +57,9 @@ class VideoTrack : public MediaStreamTrack {
   bool should_receive() const;
   ContentHint content_hint() const;
   void set_content_hint(ContentHint hint) const;
+  // On a remote track, asks the sender for a keyframe (an RTCP PLI). Waits
+  // for WebRTC's worker thread.
+  void request_key_frame() const;
 
  private:
   webrtc::VideoTrackInterface* track() const {

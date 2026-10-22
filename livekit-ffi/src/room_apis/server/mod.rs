@@ -51,6 +51,7 @@ pub mod rootapp_audio;
 pub mod rootapp_screen_audio;
 mod utils;
 pub mod video_source;
+mod video_stall;
 pub mod video_stream;
 
 #[cfg(test)]

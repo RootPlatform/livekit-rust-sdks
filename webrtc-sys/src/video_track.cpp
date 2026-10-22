@@ -110,6 +110,12 @@ void VideoTrack::set_content_hint(ContentHint hint) const {
       static_cast<webrtc::VideoTrackInterface::ContentHint>(hint));
 }
 
+void VideoTrack::request_key_frame() const {
+  if (webrtc::VideoTrackSourceInterface* source = track()->GetSource()) {
+    source->GenerateKeyFrame();
+  }
+}
+
 NativeVideoSink::NativeVideoSink(rust::Box<VideoSinkWrapper> observer)
     : observer_(std::move(observer)) {}
 

@@ -53,4 +53,8 @@ impl RtcVideoTrack {
     pub fn packet_trailer_handler(&self) -> Option<PacketTrailerHandler> {
         self.packet_trailer_handler.lock().clone()
     }
+
+    pub fn request_key_frame(&self) {
+        self.sys_handle.request_key_frame();
+    }
 }
