@@ -333,10 +333,12 @@ still apply. Flags accept `1/true/yes/on`. `LK_MF_ALLOW_AMD` also accepts `0/fal
 | `LK_DISABLE_MF_DECODE=1` | The MF decoder factory reports no H.264 decoder, so decoding uses FFmpeg. |
 | `LK_MF_ENCODER_ADAPTER=nvidia\|amd\|intel` | Try that vendor's encoder MFT first. |
 | `LK_MF_ALLOW_AMD=0` | Skip AMD encoder MFTs (browser-parity workaround for AMD CBP black remote video). Allowed by default. |
+| `LK_MF_D3D11_SHARING=off` | Every MF encoder and decoder opens a D3D11 device of its own, and `livekit_ffi_d3d11_acquire_shared_device` returns `DXGI_ERROR_UNSUPPORTED`, so the host creates its own (see "MF decode watchdog"). Read on every acquire. |
 
 The library's other support switches are `LK_FFI_LOG_LEVEL` (see Logging) and
-`LK_FFI_WORKER_THREADS` (see Tokio runtime size). The D3D11 sharing A/B switches
-(`LK_MF_D3D11_SHARING`, `LK_MF_D3D11_DRIVER_THREADING`) were removed in `rootapp/prod-cleanup`.
+`LK_FFI_WORKER_THREADS` (see Tokio runtime size). `LK_MF_D3D11_DRIVER_THREADING` was removed in
+`rootapp/prod-cleanup`; `LK_MF_D3D11_SHARING` came back, with `off` only, in
+`rootapp/mf-decode-watchdog`.
 
 Fault injection, for testing recovery only. A release library does not read these: they are
 compiled in only with webrtc-sys's `mf-fault-injection` feature (off by default; the release
@@ -605,8 +607,9 @@ D3D calls, so neither side waits inside `Map`:
   signalled after its copy and is mapped with `DO_NOT_WAIT` only once that value has completed.
   When the oldest slot is still busy, the ring grows by one slot, up to 5, and logs
   `MF encoder upload ring grown to N`. At 5 the encoder waits on the fence.
-- Without `ID3D11Fence` (before WDDM 2.0) both poll with `DO_NOT_WAIT`. After 200 ms both fall
-  back to a blocking `Map`.
+- Without `ID3D11Fence` (before WDDM 2.0) both poll with `DO_NOT_WAIT`. After 200 ms the encoder
+  falls back to a blocking `Map`. The decoder never does: a readback not finished after 500 ms fails
+  the frame and the stream goes to the software decoder (see "MF decode watchdog").
 
 ## Sharing the D3D11 device with the host (Windows only)
 
@@ -2844,6 +2847,130 @@ header past `MAX_PATH`, and webrtc-sys fails with C1083 (`constexpr_parser.h`).
 hw.24 and upstream `livekit-ffi/v0.13.1` together (see "Upstream livekit-ffi/v0.13.1" and the three
 hw.24 sections). Caps 32767; proto changes are hw.24's (RoomEvent 1000, RootAudioStats 170-172)
 and upstream's additive ones (capture, pre-encoded video).
+
+## MF decode watchdog (`rootapp/mf-decode-watchdog`)
+
+Two receive-side video freezes in desktop 0.9.153's Sentry data (2026-10-22), on top of
+v0.13.1-hw.1.
+
+### A Decode() call that never returns (ROOT-DESKTOP-3QM)
+
+A GTX 1660 SUPER with an AMD iGPU (driver 32.0.16.1742, Windows 10 19045) froze a remote camera
+after 187 decoded frames; 17 s after an app restart it happened again. Over the 2 s sample:
+`frames_received 60, frames_decoded 0, frames_dropped 0, packets_lost 0, pli_total 0`, decoder
+"MediaFoundation H264 Decoder (DXVA)". Those counters mean the decoder is stuck *inside* a
+`Decode()` call (m150 sources):
+
+- `VideoReceiveStream2::OnEncodedFrame` posts the decode to the stream's decode queue, and only
+  that task's completion calls `StartNextDecode`. While the call hangs no other frame is handed
+  over, so none is decoded or dropped, but frames keep completing in the frame buffer and count as
+  received (until its 800 slots fill).
+- `VCMGenericDecoder` drops frames ("Too many frames backed up in the decoder") once 10 are
+  pending without output. A decoder that returned OK without output would have shown
+  `frames_dropped` of about 60, not 0.
+- No PLI: the no-decodable-frame timeout returns early while `decoder_ready_for_new_frame_` is
+  false, and the decode-error path never runs. Unsubscribing waits for the decode queue, which
+  fits GelCloud's "rejoin loads forever" after the same freeze.
+
+Every MF decoder and encoder on an adapter shares one multithread-protected device, so a call
+that holds its lock stalls every stream's D3D calls; GelCloud saw screen and camera freeze
+together. Until now the decoder's readback fell back to a blocking `Map` after 200 ms, which
+holds that lock until the GPU finishes, forever on a stuck GPU or driver sync. Which call hung on
+3QM is not known (no logs from that call).
+
+Fixes, all Windows:
+
+- **`MFDecodeWatchdog`** (`webrtc-sys/src/mf/mf_decode_watchdog.{h,cpp}`) wraps the MF decoder
+  inside the software fallback wrapper. Every call into the decoder runs on a thread of its own,
+  and the decode queue waits for it with a limit (`WaitForSingleObject`, so time asleep does not
+  count): Configure 5 s, Decode and Release 1.5 s. A call past its limit is left running; the
+  decoder (and the frame's refcounted bitstream) stays alive until it returns, its output never
+  reaches WebRTC again, and the thread destroys the decoder afterwards. The first such hang turns MF
+  decoding off for the rest of the process (`Configure` returns false, so new streams start on
+  FFmpeg): on 3QM's machine a fresh process hung again. A hang also retires the adapter's shared
+  device (`RetireD3D11Device`, on a thread of its own), so encoders and the host's capture opened
+  later get a new one instead of queueing behind the hung call.
+- The watchdog also gives up on a stream whose decoder returns OK from 20 calls in a row, over at
+  least 1.5 s, without a frame. That stream goes to software; MF decoding stays on for the others.
+- After giving up on a keyframe it returns `WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE`, so FFmpeg decodes
+  that keyframe at once. After a delta frame it returns `WEBRTC_VIDEO_CODEC_ERROR`, so
+  `VideoReceiveStream2` sends a PLI and hands over only keyframes, and the next call falls back.
+- **`MapStaging` never blocks**: it waits on the fence, polls `DO_NOT_WAIT`, and returns
+  `DXGI_ERROR_WAS_STILL_DRAWING` after 500 ms, which sends the stream to software. 500 ms is below
+  the watchdog's limit, so a slow readback falls back cleanly rather than being abandoned.
+- **`LK_MF_D3D11_SHARING=off`**: the release-safe A/B for the shared device. Each codec opens a
+  device of its own and the host is refused one (`DXGI_ERROR_UNSUPPORTED`), as before the shared
+  device. Testers can set it next to `LK_DISABLE_MF_DECODE=1` to tell a device-lock hang from a
+  decoder one.
+
+Reporting: the watchdog logs at error level with the prefix `MF H264 decoder watchdog:` (libwebrtc
+target, so it reaches the desktop's CallDiag file and Report Issue ring). The desktop can read the
+process counts through a new Windows export, resolved like the D3D11 ones:
+
+```c
+void livekit_ffi_mf_decode_watchdog_counts(uint32_t* hangs, uint32_t* silences);
+```
+
+A stream that fell back shows in its stats as `FFmpeg (fallback from: MediaFoundation H264
+Decoder)`; the watchdog sees the MF decoder before Configure, so the name says no DXVA.
+
+Not covered: an MF *encoder* on the hung device still blocks its own thread (its upload ring keeps
+the 200 ms blocking `Map` fallback); an abandoned call that later returns tears its MFT down on the
+shared deferred-release thread.
+
+### no_frames without a PLI (ROOT-DESKTOP-3RQ)
+
+Five events from four users (GTX 1660 SUPER, RX 570, RX 9070, GTX 1080 Ti), all Watch Stream
+screen shares on the MF decoder: 145-547 packets and 136-601 KB in the 2 s sample, `frames_received
+0`, NACKs 13-81, `pli 0`. The totals tell a different story from 3QM: `frames_received_total`
+equals `frames_decoded_total` in every event (15/15, 3965/3962, 164234/164234, 3168/3168), so
+nothing waited on the decoder. Frames stopped completing before they reached it, and the MF path
+is not involved. `pli_total` is 1 in four of them, so the receiver did send a PLI:
+
+- With H.264 (the legacy `PacketBuffer`, and `H26xPacketBuffer` alike) a delta frame after a packet
+  that never arrives is not assembled, and the reference finder stashes what follows, until the next
+  keyframe. NACK repeats for that packet (`kMaxNackRetries` is 100 in m150), which is the steady
+  13-81 NACKs per window with no new loss. Candidates: a padding packet the SFU cannot retransmit, or
+  a packet lost again on a very lossy link (226 lost in one window).
+- `VideoReceiveStream2::OnDecodableFrameTimeout` sends the PLI 3 s after the last frame was handed
+  to the decoder (`max_wait_for_frame`; rtx-time is not signalled), and every 3 s after that.
+- The desktop flags a freeze 3 s after the last drawn frame and samples stats 2 s apart, so its
+  window runs from about 3.4 s to 5.5 s: just after the first PLI and before the second.
+  `rx_pli 0` is that window; `rx_pli_total 1` is the PLI. The freezes' call-end durations
+  (cqVideoLongestFreezeMs 4.1-9.6 s, mostly 4.5-5 s) are that PLI plus the keyframe's trip.
+
+Fix: `livekit-ffi/src/room_apis/server/video_stall.rs`. While an FFI video stream runs on a remote
+track, a task watches its frames. After 1 s without one it reads the track's inbound-rtp every
+500 ms. When payload bytes keep arriving (at least 16 KB/s, so padding probes, paused and still
+streams do not count) and `framesReceived` does not move, it asks the sender for a keyframe through
+`RtcVideoTrack::request_key_frame` (`VideoTrackSourceInterface::GenerateKeyFrame` ->
+`VideoReceiveStream2::GenerateKeyFrame` -> PLI), at most every 3 s, logging a warning each time.
+That moves the first PLI from 3 s to about 1.5 s after the last frame. Idle streams are read every
+2 s instead, and a stream that never completed a frame is left to WebRTC, which asks every 200 ms
+while it waits for the first keyframe. A frame that does not decode (`framesReceived` moving) is
+the watchdog's business, not this one.
+
+Desktop follow-ups (not in this branch): measure PLIs over the whole freeze instead of the 2 s
+window, report `livekit_ffi_mf_decode_watchdog_counts` and the decoder fallback as a Sentry event,
+and consider keeping `LK_DISABLE_MF_DECODE` on a machine whose watchdog fired.
+
+### Tests
+
+- `cargo test -p webrtc-sys --lib --release -- mf_` (Windows): the watchdog over fake decoders that
+  decode, hang on a delta frame, hang on a keyframe, stay silent, or hang in Configure; the watchdog
+  behind WebRTC's `VideoDecoderSoftwareFallbackWrapper` (a hung delta returns ERROR, the next
+  keyframe is decoded by the software decoder, the name reads "Fake SW (fallback from: Fake HW)");
+  30 OpenH264 frames through the real MF decoder via the factory and the watchdog's thread (skipped
+  without DXVA); `host_device_contract` now also checks that codecs share a device, that a retired
+  device is not handed out again, and `LK_MF_D3D11_SHARING=off`.
+- `cargo test -p libwebrtc --lib --release -- video_track`: a sender and a receiver
+  PeerConnection over loopback ICE; `request_key_frame` on the received track raises the sender's
+  outbound `pliCount` (and the test times out without the call).
+- `cargo test -p livekit-ffi --lib --release -- video_stall`: the request policy, including 3RQ's
+  windows.
+
+Not verified: the hang itself (no machine here reproduces it), and a Watch Stream stall through a
+LiveKit server.
 
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
