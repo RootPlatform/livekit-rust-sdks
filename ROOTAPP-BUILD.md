@@ -2839,6 +2839,12 @@ The worktree's path matters on Windows without long paths: a checkout path more 
 characters longer than `C:\Users\daerc\Documents\GitHub\livekit-rust-sdks` puts a libwebrtc abseil
 header past `MAX_PATH`, and webrtc-sys fails with C1083 (`constexpr_parser.h`).
 
+## v0.13.1-hw.1 (2026-10-21)
+
+hw.24 and upstream `livekit-ffi/v0.13.1` together (see "Upstream livekit-ffi/v0.13.1" and the three
+hw.24 sections). Caps 32767; proto changes are hw.24's (RoomEvent 1000, RootAudioStats 170-172)
+and upstream's additive ones (capture, pre-encoded video).
+
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
 | Commit | Change |
