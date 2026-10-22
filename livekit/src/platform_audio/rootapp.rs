@@ -449,6 +449,20 @@ pub struct DeviceChangeStats {
     pub render_stall_recoveries: u64,
 }
 
+/// Playout on native's own stream where the platform ADM cannot open it (the
+/// FFI `RootAudioStats` fields 170-172), where native has one (Windows: a
+/// shared WASAPI stream the audio engine converts to the device's mix
+/// format). `active` while playout runs on it; `opens` counts the opens that
+/// took it (cumulative); `init_detail` is why the platform ADM's last
+/// playout Init failed (the step, its HRESULT, the format it asked for and
+/// the mix format), empty when it succeeded.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlayoutFallbackStats {
+    pub active: bool,
+    pub opens: u64,
+    pub init_detail: String,
+}
+
 /// The echo model's state and costs (the FFI `RootAudioStats` fields 114-124).
 /// Counters are cumulative for the engine's life; the inference mean and
 /// maximum are since the previous read (NaN and 0 without an inference).
@@ -785,8 +799,13 @@ fn device_result(outcome: AudioDeviceOutcome) -> AudioResult<()> {
         )));
     }
     if outcome.attempted && failed(outcome.init_result) {
+        let detail = if outcome.init_detail.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", outcome.init_detail)
+        };
         return Err(AudioError::OperationFailed(format!(
-            "device init failed ({})",
+            "device init failed ({}){detail}",
             outcome.init_result
         )));
     }
@@ -1022,6 +1041,9 @@ pub struct RootAudioStats {
 
     // `None` where native does not follow device changes itself.
     pub device_changes: Option<DeviceChangeStats>,
+
+    // `None` where native has no playout fallback.
+    pub playout_fallback: Option<PlayoutFallbackStats>,
 }
 
 impl Default for RootAudioStats {
@@ -1152,6 +1174,7 @@ impl Default for RootAudioStats {
             echo_model: None,
             device_formats: None,
             device_changes: None,
+            playout_fallback: None,
         }
     }
 }
@@ -1209,6 +1232,11 @@ impl RootAudioStats {
                 render_stall_reopens: native.render_stall_reopens,
                 coupled_reopens: native.coupled_reopens,
                 render_stall_recoveries: native.render_stall_recoveries,
+            }),
+            playout_fallback: native.playout_fallback_available.then(|| PlayoutFallbackStats {
+                active: native.playout_fallback,
+                opens: native.playout_fallback_opens,
+                init_detail: native.playout_init_detail.clone(),
             }),
             monitor_active: monitor.then_some(native.monitor_active),
             monitor_frames: monitor.then_some(native.monitor_frames),
@@ -1352,7 +1380,34 @@ mod tests {
             stop_result: ADM_RESULT_NOT_ATTEMPTED,
             init_result: init,
             start_result: start,
+            init_detail: String::new(),
         }
+    }
+
+    #[test]
+    fn device_results_carry_why_the_init_failed() {
+        let detail = "Initialize 0x88890008 AUDCLNT_E_UNSUPPORTED_FORMAT, asking 8000 Hz 1 ch \
+                      16-bit PCM; mix format 48000 Hz 8 ch 32-bit float";
+        let failed =
+            AudioDeviceOutcome { init_detail: detail.into(), ..outcome(true, true, -1, 1) };
+        let results = AudioDeviceResults::from_outcome(
+            Some(AudioDeviceRequestOutcome { recording: None, playout: Some(failed) }),
+            (false, true),
+        );
+        assert_eq!(
+            results.playout,
+            Some(Err(AudioError::OperationFailed(format!("device init failed (-1): {detail}"))))
+        );
+
+        let fell_back = AudioDeviceOutcome {
+            init_detail: format!("{detail}; playing through the fallback"),
+            ..outcome(true, true, 0, 0)
+        };
+        let results = AudioDeviceResults::from_outcome(
+            Some(AudioDeviceRequestOutcome { recording: None, playout: Some(fell_back) }),
+            (false, true),
+        );
+        assert_eq!(results.playout, Some(Ok(())), "the fallback opened the device");
     }
 
     #[test]

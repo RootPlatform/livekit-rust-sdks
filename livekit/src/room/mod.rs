@@ -204,6 +204,17 @@ pub enum RoomEvent {
         quality: ConnectionQuality,
         participant: Participant,
     },
+    /// The SFU paused or resumed forwarding a subscribed track to this
+    /// participant (its `StreamStateUpdate`). While paused the track receives
+    /// no media: the SFU's allocator found no layer it can forward (the
+    /// subscriber's bandwidth estimate, or a publisher that sends nothing
+    /// usable). Sent only on a change of the subscribed track's
+    /// [`RemoteTrack::stream_state`].
+    TrackStreamStateChanged {
+        participant: RemoteParticipant,
+        publication: RemoteTrackPublication,
+        stream_state: StreamState,
+    },
     DataReceived {
         payload: Arc<Vec<u8>>,
         topic: Option<String>,
@@ -1150,6 +1161,7 @@ impl RoomSession {
             EngineEvent::ConnectionQuality { updates } => {
                 self.handle_connection_quality_update(updates)
             }
+            EngineEvent::StreamStateUpdate { states } => self.handle_stream_state_update(states),
             EngineEvent::LocalTrackSubscribed { track_sid } => {
                 self.handle_track_subscribed(track_sid)
             }
@@ -1484,6 +1496,40 @@ impl RoomSession {
 
             participant.set_connection_quality(quality);
             self.dispatcher.dispatch(&RoomEvent::ConnectionQualityChanged { participant, quality });
+        }
+    }
+
+    /// Stores the SFU's stream states on the subscribed tracks they name and
+    /// reports the ones that changed. A state for a publication whose track
+    /// is not there yet waits for it (see `on_track_subscribed`); states of
+    /// unknown participants or publications are dropped.
+    fn handle_stream_state_update(&self, states: Vec<proto::StreamStateInfo>) {
+        for info in states {
+            let stream_state: StreamState = info.state().into();
+            let Ok(participant_sid) = ParticipantSid::try_from(info.participant_sid) else {
+                continue;
+            };
+            let Ok(track_sid) = TrackSid::try_from(info.track_sid) else {
+                continue;
+            };
+            let Some(participant) = self.get_participant_by_sid(&participant_sid) else {
+                continue;
+            };
+            let Some(publication) = participant.get_track_publication(&track_sid) else {
+                continue;
+            };
+            let Some(track) = publication.track() else {
+                publication.set_pending_stream_state(stream_state);
+                continue;
+            };
+            if !track.set_stream_state(stream_state) {
+                continue;
+            }
+            self.dispatcher.dispatch(&RoomEvent::TrackStreamStateChanged {
+                participant,
+                publication,
+                stream_state,
+            });
         }
     }
 
@@ -2202,8 +2248,20 @@ impl RoomSession {
                     track: track.clone(),
                     publication: publication.clone(),
                 };
+                // A track starts active; the SFU may have paused it already.
+                let paused = publication
+                    .take_pending_stream_state()
+                    .filter(|state| track.set_stream_state(*state))
+                    .map(|stream_state| RoomEvent::TrackStreamStateChanged {
+                        participant: participant.clone(),
+                        publication: publication.clone(),
+                        stream_state,
+                    });
                 e2ee_manager.on_track_subscribed(track, publication, participant);
                 dispatcher.dispatch(&event);
+                if let Some(paused) = paused {
+                    dispatcher.dispatch(&paused);
+                }
             }
         });
 

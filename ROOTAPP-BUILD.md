@@ -2629,12 +2629,164 @@ fake erases at its own level survives with AGC2 and not with the legacy engine;
 denoised ones; `..._ahead_of_the_denoiser_learns_the_room_before_the_gain`: auto sensitivity's floor
 -80 dBFS at 25 dB of gain, the gate never opens).
 
+## Windows playout the ADM cannot open (`rootapp/hw24-fixes`)
+
+Reports from 0.9.152 (Windows 10 19045 and Insider build 26300): platform playout never opened on the
+system default output (`playout init/start -1/1`, "device init failed (-1)" on every restart), while
+the desktop's probe of the same device opened.
+
+The platform ADM is webrtc-89d790b's `AudioDeviceWindowsCore` (the prebuilt has no
+`CreateWindowsCoreAudioAudioDeviceModule`). Its `InitPlayout` searches 16-bit PCM at 48000, 44100,
+16000, 96000, 32000 and 8000 Hz in two then one channel (`IsFormatSupported`, shared mode), and calls
+`IAudioClient::Initialize` (shared, `AUDCLNT_STREAMFLAGS_EVENTCALLBACK`, no
+`AUTOCONVERTPCM`) with the format it found, or with the last one it tried when none matched. Without
+conversion the audio engine accepts only its own mix format's rate and channel count, so the open
+fails with `AUDCLNT_E_UNSUPPORTED_FORMAT` on a device whose mix format has more than two channels (5.1
+or 7.1, which surround gaming headsets and their virtual devices use) or another rate (88.2, 176.4 or
+192 kHz, 24 kHz). The ADM's `_TraceCOMError` line is the only place its HRESULT appears. The desktop's
+probe opens with `AutoConvertPcm | SrcDefaultQuality`, which inserts the engine's channel matrixer and
+resampler, so it opens on the same device. Nothing here is specific to build 26300.
+
+`AdmProxy` (Windows):
+- After a failed `InitPlayout` it repeats the ADM's open on the same endpoint (the selected GUID, or
+  the console default) with a client it never starts (`DiagnoseWasapiPlayout`,
+  `root_wasapi_playout.cpp`): the format search, then `Initialize`, `SetEventHandle` and
+  `GetService`. It reports the step that failed, its HRESULT, the format asked for (and the closest
+  match when none was supported), the mix format, and whether a client opens with the engine's
+  conversion. For example: `Initialize 0x88890008 AUDCLNT_E_UNSUPPORTED_FORMAT, asking 8000 Hz 1 ch
+  16-bit PCM (no 16-bit PCM format of the ADM's list is supported; closest 48000 Hz 8 ch 32-bit
+  float); mix format 48000 Hz 8 ch 32-bit float (extensible, mask 0x63F); opens with the engine's
+  conversion`.
+- Where the converted client opens, playout runs on the proxy's own stream instead
+  (`AdmPlayoutFallback`, `CreateWasapiPlayoutFallback`): shared, event driven, 48 kHz int16 in
+  libwebrtc's channel count, `AUTOCONVERTPCM | SRC_DEFAULT_QUALITY | NOPERSIST`, a 30 ms buffer
+  filled 10 ms at a time through the transport tap (render callbacks, the monitor and the guards work
+  as on the ADM) on an MMCSS "Pro Audio" thread. Its delay (padding plus stream latency) feeds
+  `PlayoutDelay`. Stops and failed starts close it; a stop that cannot join its thread within 2 s is
+  retried a second later, as the ADM's.
+- Every open tries the ADM first, so a device whose mix format changes back opens natively again.
+- The open reports success when the fallback opened. The text reaches the request outcome
+  (`AudioDeviceOutcome::init_detail`; livekit appends it to "device init failed (n): ", so a failed
+  selection or restart carries it), the log (`AdmProxy: InitPlayout failed: -1; <text>`), and
+  `RootAudioStats` 170-172:
+
+| # | Field | |
+|---|---|---|
+| 170 | `playout_fallback` | playout runs on the fallback now |
+| 171 | `playout_fallback_opens` | opens that took it, cumulative |
+| 172 | `playout_init_detail` | the last playout open's diagnosis and what the fallback did; empty when the ADM opened |
+
+The fields are present where native has a fallback (Windows), absent elsewhere and from older
+libraries; livekit: `RootAudioStats::playout_fallback` (`PlayoutFallbackStats`). No control or
+capability change (caps stay 32767). Recording has the same format search (a 4-channel microphone
+array would fail the same way) and is not covered.
+
+Tests (`cargo test -p webrtc-sys --lib --release`): `adm_proxy_playout_falls_back_where_the_platform_adm_cannot_open_it`
+(the default and a selected device through the fallback, renders through the tap, libwebrtc's view,
+the delay, back on the ADM once it opens), `adm_proxy_playout_fallback_follows_libwebrtcs_mono_and_closes_with_the_device`,
+`adm_proxy_playout_failure_carries_the_diagnosis_when_nothing_opens` (no fallback where a converted
+client does not open; a fallback that fails too), `adm_proxy_without_a_playout_fallback_reports_the_bare_failure`.
+`wasapi_playout_diagnosis_and_fallback_on_the_default_output` runs the real diagnosis and the
+fallback on the default output for 300 ms (silence) with `LK_HW_AUDIO_TESTS=1`; on Jesse's machine
+(48 kHz stereo float): the repeated open succeeds, 30 renders, 20 ms delay, a 1440 frame buffer.
+livekit `device_results_carry_why_the_init_failed`; livekit-ffi
+`rootapp_audio_playout_fallback_stats_convert_and_stay_absent_without_a_fallback`.
+
+Not verified: a device with a surround or 192 kHz mix format (none here, and changing the default
+format is a system setting), and the fallback in a live call.
+
+## PlatformAudio create apart from room connect (`rootapp/hw24-fixes`)
+
+Report from 0.9.152 (a Windows machine with 10 recording and 15 playout devices): a
+`NewPlatformAudio` had not returned after 10 s; a managed call started 11 s later connected only
+0.2 s before that create returned, and an earlier platform call's join took 17 s.
+
+Two things serialized the create with a connect:
+- `LkRuntime::instance()` builds the `PeerConnectionFactory` under the global runtime lock, and room
+  connect takes that lock first (`EngineInner::connect`). The factory created the platform ADM on the
+  worker thread (`BlockingCall` in the `PeerConnectionFactory` constructor):
+  `CreateAudioDeviceModule(kPlatformDefaultAudio)` runs `AudioDeviceWindowsCore::CoreAudioIsSupported`,
+  which builds, `Init`s and terminates a throwaway ADM, then `AdmProxy` `Init`s the real one. Each
+  `Init` is `_EnumerateEndpointDevicesAll` for both directions (webrtc-89d790b, disassembled): every
+  active, disabled and unplugged endpoint, with `GetId`, the property store, `GetState` and an
+  `IAudioEndpointVolume` activation with its range and step queries. So four full endpoint sweeps ran
+  under the lock a connect waits for. The runtime is a weak reference, so this happens again whenever
+  no room, track, source or PlatformAudio keeps one alive.
+- Whatever the worker asked of `AdmProxy` while a device operation held the device thread waited for
+  it: `RegisterAudioCallback` ran on the device thread (`RunDeviceTaskAndWait`), and
+  `StereoPlayoutIsAvailable`, `StereoRecordingIsAvailable` and `SetStereoRecording` took the device
+  mutex, which every device open and stop holds (a Windows `InitPlayout`, a 2 s `StopPlayout` join).
+  A PeerConnection's first media engine reference initializes the voice engine on the worker
+  (`adm_helpers::Init`, `RegisterAudioCallback`), so a connect waited for the device.
+
+Which step took the 10 s on that machine is not known (here, the factory takes 347 ms and the platform
+ADM 17 ms); the steps are now logged. The connect no longer waits for any of them:
+- On desktop the factory's `AdmProxy` gets an `AdmLazyPlatform`: the platform ADM is created and
+  initialized on the device thread by the first `AcquirePlatformAdm` (the first `PlatformAudio`), which
+  waits for it; the worker and the runtime lock do not. A managed call never creates it. Mobile is
+  unchanged. Created on the device thread, it is also released there (the Windows ADM uninitializes
+  the COM apartment it entered). Before it exists the proxy lists no devices, as without a platform ADM.
+- `RegisterAudioCallback` swaps the tap's transport atomically. On desktop the stereo queries answer
+  what the platform ADM said when it was attached (stereo before), and `SetStereoRecording` is kept and
+  applied before every recording open, as the playout channels are; a wish made before the platform
+  ADM existed becomes what the ADM can do (the engine always asks for what is available).
+- The FFI's `NewPlatformAudio` reads the device counts (`PlatformAudio::recording_device_count`,
+  `playout_device_count`) instead of listing every name and ID (three enumerations per device on
+  Windows, about 75 for 25 devices).
+
+Logs (warnings when slow, info otherwise; the desktop forwards warnings):
+- `AdmProxy: the platform ADM was created in <n> ms (creation <n> ms, Init and setup <n> ms)` (1 s)
+- `PlatformAudio: created in <n> ms (handle lock, runtime, platform ADM, enable, device counts, audio
+  processing <n> ms each): <r> recording / <p> playout devices` (2 s)
+- `[PLATFORM_AUDIO_FFI] PlatformAudio created in <n> ms (PlatformAudio::new, device counts, session)` (2 s)
+- `LkRuntime: PeerConnectionFactory created in <n> ms` (1 s)
+
+Tests: `root_engine_a_peer_connection_never_waits_for_a_device_open` (the device thread blocked in
+`StartPlayout` holding the device mutex; a PeerConnection's engine reference on the worker finishes at
+once) and `root_engine_the_platform_adm_is_created_with_the_first_reference_without_holding_up_a_peer_connection`
+(no creation for a managed call; with the creation held, the handle's acquire waits and a
+PeerConnection does not; one creation for later handles). With `RegisterAudioCallback`'s old
+device-thread wait put back, both fail. livekit `create_steps_log_each_steps_own_time`;
+`test_audio_device_controller_bridge` (`LK_HW_AUDIO_TESTS=1`) now acquires before it lists.
+
+## Track stream state (`rootapp/hw24-fixes`)
+
+The desktop's video health telemetry (0.9.152) puts most remote-video freezes at `no_media`: no RTP
+while the sender's connection quality is poor, for example a Watch Stream screen share with no
+inbound stream for 12 s. The SFU tells the subscriber when it stops forwarding a track
+(`SignalResponse.stream_state_update`: participant SID, track SID, `ACTIVE` or `PAUSED`), which its
+allocator does when no layer fits (this subscriber's bandwidth estimate, or a publisher that sends
+nothing usable). The Rust SDK dropped the message: `TrackInfo.stream_state` and the FFI
+`TrackInfo.stream_state` existed (upstream too) but stayed `ACTIVE`. Upstream rust-sdks (main of
+2026-10-21) still drops it; the JS SDK has `RoomEvent.TrackStreamStateChanged`.
+
+- livekit: `SessionEvent` / `EngineEvent::StreamStateUpdate`, and the room stores each state on the
+  subscribed track it names (`RemoteTrack::stream_state`) and, when it changed, sends
+  `RoomEvent::TrackStreamStateChanged { participant, publication, stream_state }`. A track starts
+  `Active`. A state for a publication whose track is not there yet (the SFU can pause a subscription
+  before the media track arrives, the never-started case) waits on the publication and is applied
+  when the track is set, reported right after `TrackSubscribed`; unsubscribing drops it (JS drops
+  such states). States for unknown participants or publications are dropped.
+- livekit-ffi: `RoomEvent.track_stream_state_changed = 1000` (`TrackStreamStateChanged`:
+  `participant_identity`, `track_sid`, `state` as the FFI `StreamState`). RootApp cases of
+  `RoomEvent` are numbered from 1000, as in `rootapp_audio.proto`, so upstream's next cases cannot
+  collide. `TrackInfo.stream_state` (track info requests) now follows the SFU too.
+
+Tests: livekit `stream_state_follows_the_sfu_and_reports_only_changes`,
+`a_stream_state_before_the_track_waits_for_it_and_an_unsubscription_drops_it`; livekit-ffi
+`track_stream_state_changed_is_a_room_event_of_its_own` (the case's field number on the wire). The
+path from the signal client to the room event is not covered by a test here: that needs a LiveKit
+server (an e2e test could pause a track with `SimulateScenario { subscriber_bandwidth }`, which the
+Rust SDK does not send yet).
+
 ## Upstream livekit-ffi/v0.13.1 (`rootapp/upstream-v0.13.1`)
 
 hw.23 merged with upstream's `livekit-ffi/v0.13.1` (7187f6a4, 107 commits; one Swift-only commit
 behind upstream `main` on 2026-10-21). A merge, not a rebase, so the fork's history stays as it was.
 Both sides pin `webrtc-89d790b`, so libwebrtc itself is unchanged. The FFI version is now 0.13.1;
-release tags for this line are `rootapp-ffi/v0.13.1-hw.<n>`.
+release tags for this line are `rootapp-ffi/v0.13.1-hw.<n>`. hw.24 was merged in afterwards; the
+upstream fixes it carried as cherry-picks (#1392, #1466, #1518, #1546, #1549) are the same changes
+the upstream merge brought.
 
 What the fork takes from upstream: a resume needs evidence that each PeerConnection recovered
 (#1331; `PC_RECONNECT_SETTLE_DELAY` 1 s -> 3 s) and reports its reason (#1338); a server `Leave` is
@@ -2663,8 +2815,9 @@ Decisions where both sides changed the same code:
   rewrite (#1212). Upstream marshals every device call onto libwebrtc's worker with a blocking hop;
   the fork exists so that neither the worker nor an FFI caller waits for a device. From #1212 the
   controller now holds the `RtcRuntime`, so the worker thread outlives the APM decorator and the voice
-  engine hold while Rust can reach them. Upstream's lazy platform ADM creation is not taken (the
-  fork still creates it with the factory on desktop).
+  engine hold while Rust can reach them. Upstream's lazy platform ADM creation on the worker is not
+  taken; since hw.24 the fork creates it lazily on its own device thread (see "PlatformAudio create
+  apart from room connect").
 - **Device ids**: upstream's synthesized `index:<N>` GUIDs for ADMs without GUIDs (#1529, Linux) are
   folded into the fork's lossy name handling. The desktop selects by MMDevice id, CoreAudio UID or
   PulseAudio name through `RootAudioSelectDevices`, which this does not touch.

@@ -39,6 +39,8 @@
 
 #if defined(WEBRTC_WIN)
 #include <objbase.h>
+
+#include "livekit/root_wasapi_playout.h"
 #endif
 
 #if defined(WEBRTC_MAC) && !defined(WEBRTC_IOS)
@@ -71,6 +73,8 @@ constexpr int64_t kRenderStallNs = 500'000'000;
 constexpr int64_t kRenderStallMinIntervalNs = 5'000'000'000;
 // 100 ms of capture while nothing rendered.
 constexpr uint64_t kRenderStallMinCaptures = 10;
+// A platform ADM creation that took this long is logged as a warning.
+constexpr int64_t kSlowPlatformCreateMs = 1000;
 
 int64_t NowNs() {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -767,20 +771,47 @@ void AdmSyntheticTransport::PullRenderData(int bits_per_sample,
 // AdmProxy
 // =============================================================================
 
+#if LK_ADM_MOBILE
 AdmProxy::AdmProxy(const webrtc::Environment& env,
                    webrtc::Thread* worker_thread,
                    webrtc::scoped_refptr<RootAudioMixer> mixer)
     : AdmProxy(env, worker_thread, std::move(mixer), CreatePlatformAdm(env)) {}
+#else
+AdmProxy::AdmProxy(const webrtc::Environment& env,
+                   webrtc::Thread* worker_thread,
+                   webrtc::scoped_refptr<RootAudioMixer> mixer)
+    : AdmProxy(env,
+               worker_thread,
+               std::move(mixer),
+               AdmLazyPlatform{[env] { return CreatePlatformAdm(env); }}) {
+#if defined(WEBRTC_WIN)
+  playout_diagnoser_ = DiagnoseWasapiPlayout;
+  playout_fallback_factory_ = CreateWasapiPlayoutFallback;
+  playout_fallback_available_.store(true, std::memory_order_relaxed);
+#endif
+}
+#endif
 
 AdmProxy::AdmProxy(
     const webrtc::Environment& env,
     webrtc::Thread* worker_thread,
     webrtc::scoped_refptr<RootAudioMixer> mixer,
     webrtc::scoped_refptr<webrtc::AudioDeviceModule> platform_adm)
+    : AdmProxy(env, worker_thread, std::move(mixer), AdmLazyPlatform{}) {
+  if (platform_adm) {
+    AdmLock lock(&mutex_);
+    AttachPlatformAdmLocked(std::move(platform_adm));
+  }
+}
+
+AdmProxy::AdmProxy(const webrtc::Environment& env,
+                   webrtc::Thread* worker_thread,
+                   webrtc::scoped_refptr<RootAudioMixer> mixer,
+                   AdmLazyPlatform lazy)
     : env_(env),
       worker_thread_(worker_thread),
       mixer_(std::move(mixer)),
-      platform_adm_(std::move(platform_adm)) {
+      lazy_platform_(std::move(lazy)) {
 #if defined(WEBRTC_MAC) && !defined(WEBRTC_IOS)
   uid_translator_ = CoreAudioUidToGuid;
   format_reader_ = CoreAudioDeviceFormat;
@@ -826,47 +857,87 @@ AdmProxy::AdmProxy(
     AdmListenerRegistry::SetThreadRouter(router);
   });
 #endif
+}
 
-  if (platform_adm_) {
-    int32_t init_result = 0;
-    {
+bool AdmProxy::AttachPlatformAdmLocked(
+    webrtc::scoped_refptr<webrtc::AudioDeviceModule> adm) {
+  int32_t init_result = 0;
+  {
 #if !LK_ADM_MOBILE
-      AdmListenerScope listeners(listener_router_.get());
+    AdmListenerScope listeners(listener_router_.get());
 #endif
-      init_result = platform_adm_->Init();
-    }
-    if (init_result != 0) {
-      RTC_LOG(LS_ERROR) << "AdmProxy: Platform ADM Init() failed with error=" << init_result;
-      platform_adm_ = nullptr;
-    }
+    init_result = adm->Init();
+  }
+  if (init_result != 0) {
+    RTC_LOG(LS_ERROR) << "AdmProxy: Platform ADM Init() failed with error=" << init_result;
+    return false;
   }
 #if defined(WEBRTC_MAC) && !defined(WEBRTC_IOS)
-  if (platform_adm_ && listener_router_->routed() == 0) {
+  if (listener_router_->routed() == 0) {
     RTC_LOG(LS_WARNING) << "AdmProxy: the platform ADM's CoreAudio listeners "
                            "are not routed to the device thread";
   }
 #endif
-
-  if (platform_adm_) {
 #if !LK_ADM_MOBILE
-    // Otherwise Windows can open the mic through the voice capture DMO (16 kHz,
-    // WebRTC's echo canceller off).
-    platform_adm_->EnableBuiltInAEC(false);
-    platform_adm_->EnableBuiltInAGC(false);
-    platform_adm_->EnableBuiltInNS(false);
+  // Otherwise Windows can open the mic through the voice capture DMO (16 kHz,
+  // WebRTC's echo canceller off).
+  adm->EnableBuiltInAEC(false);
+  adm->EnableBuiltInAGC(false);
+  adm->EnableBuiltInNS(false);
 #if defined(WEBRTC_WIN)
-    platform_adm_->SetPlayoutDevice(webrtc::AudioDeviceModule::kDefaultDevice);
-    platform_adm_->SetRecordingDevice(
-        webrtc::AudioDeviceModule::kDefaultDevice);
+  adm->SetPlayoutDevice(webrtc::AudioDeviceModule::kDefaultDevice);
+  adm->SetRecordingDevice(webrtc::AudioDeviceModule::kDefaultDevice);
 #endif
-#endif
-    // From the start: the hold, the app or the monitor can open the device
-    // before libwebrtc registers its transport (m150 does that with the first
-    // PeerConnection), and AudioDeviceBuffer with no transport plays its
-    // playout samples as they are, uninitialized on the first pull.
-    platform_adm_->RegisterAudioCallback(&tap_);
-    platform_raw_.store(platform_adm_.get(), std::memory_order_release);
+  // What adm_helpers::Init would read from the ADM, for the worker to read
+  // without waiting; a recording wish made before the ADM existed becomes
+  // what it can do, as the engine's init sets it.
+  bool available = false;
+  stereo_playout_available_.store(
+      adm->StereoPlayoutIsAvailable(&available) == 0 && available,
+      std::memory_order_release);
+  available = false;
+  const bool stereo_recording =
+      adm->StereoRecordingIsAvailable(&available) == 0 && available;
+  stereo_recording_available_.store(stereo_recording,
+                                    std::memory_order_release);
+  if (stereo_recording_before_platform_.exchange(false)) {
+    stereo_recording_.store(stereo_recording, std::memory_order_release);
   }
+#endif
+  // From the start: the hold, the app or the monitor can open the device
+  // before libwebrtc registers its transport (m150 does that with the first
+  // PeerConnection), and AudioDeviceBuffer with no transport plays its
+  // playout samples as they are, uninitialized on the first pull.
+  adm->RegisterAudioCallback(&tap_);
+  platform_adm_ = std::move(adm);
+  platform_raw_.store(platform_adm_.get(), std::memory_order_release);
+  return true;
+}
+
+// The caller (the FFI's NewPlatformAudio) waits; the worker does not.
+void AdmProxy::EnsurePlatformAdm() {
+  if (platform()) {
+    return;
+  }
+  RunDeviceTaskAndWait([this] {
+    AdmLock lock(&mutex_);
+    if (platform_adm_ || terminated_ || !lazy_platform_.create) {
+      return;
+    }
+    const auto create = std::exchange(lazy_platform_.create, nullptr);
+    const int64_t start_ns = NowNs();
+    webrtc::scoped_refptr<webrtc::AudioDeviceModule> adm = create();
+    const int64_t created_ns = NowNs();
+    const bool attached = adm && AttachPlatformAdmLocked(std::move(adm));
+    const int64_t done_ns = NowNs();
+    const int64_t total_ms = (done_ns - start_ns) / 1'000'000;
+    RTC_LOG_V(total_ms >= kSlowPlatformCreateMs ? webrtc::LS_WARNING
+                                                : webrtc::LS_INFO)
+        << "AdmProxy: the platform ADM " << (attached ? "was" : "could not be")
+        << " created in " << total_ms << " ms (creation "
+        << (created_ns - start_ns) / 1'000'000 << " ms, Init and setup "
+        << (done_ns - created_ns) / 1'000'000 << " ms)";
+  });
 }
 
 AdmProxy::~AdmProxy() {
@@ -876,6 +947,12 @@ AdmProxy::~AdmProxy() {
     {
       AdmLock lock(&mutex_);
       ShutdownLocked();
+#if !LK_ADM_MOBILE
+      // Created (or at least initialized) on this thread, so released on it:
+      // the Windows ADM uninitializes the COM apartment it entered there.
+      platform_raw_.store(nullptr, std::memory_order_release);
+      platform_adm_ = nullptr;
+#endif
     }
 #if defined(WEBRTC_WIN) && !LK_ADM_MOBILE
     CoUninitialize();
@@ -1165,10 +1242,15 @@ void AdmProxy::ResyncMonitorLocked() {
 bool AdmProxy::StopDeviceLocked(bool playout, AdmDirectionOutcome* outcome) {
   webrtc::AudioDeviceModule* platform_adm = platform();
   ResyncMonitorLocked();
-  const int32_t result =
-      playout ? platform_adm->StopPlayout() : platform_adm->StopRecording();
+  const int32_t result = !playout            ? platform_adm->StopRecording()
+                         : playout_fallback_ ? playout_fallback_->Stop()
+                                             : platform_adm->StopPlayout();
   if (outcome) {
     outcome->stop_result = result;
+  }
+  if (playout && result == 0 && playout_fallback_) {
+    playout_fallback_.reset();
+    playout_fallback_active_.store(false, std::memory_order_relaxed);
   }
   if (!playout && capture_state_) {
     // No frame may clear it now. After a failed stop a device thread that
@@ -1204,6 +1286,70 @@ bool AdmProxy::StopDeviceLocked(bool playout, AdmDirectionOutcome* outcome) {
 #endif
 }
 
+bool AdmProxy::PlayoutPlayingLocked() const {
+  if (playout_fallback_) {
+    return playout_fallback_->Playing();
+  }
+  webrtc::AudioDeviceModule* platform_adm = platform();
+  return platform_adm && platform_adm->Playing();
+}
+
+bool AdmProxy::PlayoutInitializedLocked() const {
+  webrtc::AudioDeviceModule* platform_adm = platform();
+  return playout_fallback_ ||
+         (platform_adm && platform_adm->PlayoutIsInitialized());
+}
+
+void AdmProxy::RefreshPlayoutDelayLocked() {
+  if (playout_fallback_) {
+    tap_.set_playout_delay_ms(playout_fallback_->DelayMs());
+    return;
+  }
+  uint16_t delay_ms = 0;
+  webrtc::AudioDeviceModule* platform_adm = platform();
+  if (platform_adm && platform_adm->PlayoutDelay(&delay_ms) == 0) {
+    tap_.set_playout_delay_ms(delay_ms);
+  }
+}
+
+// The diagnosis runs whenever the platform ADM fails; the fallback opens only
+// where the diagnosis found that a converted stream opens (a device in use or
+// gone would refuse it as well).
+int32_t AdmProxy::FallBackPlayoutLocked(int32_t result, std::string* detail) {
+  if (!playout_diagnoser_ && !playout_fallback_factory_) {
+    return result;
+  }
+  const std::string endpoint = last_playout_identity_.system_default
+                                   ? std::string()
+                                   : last_playout_identity_.guid;
+  const bool stereo = stereo_playout_.load(std::memory_order_acquire);
+  bool converted_opens = true;
+  if (playout_diagnoser_) {
+    AdmPlayoutDiagnosis diagnosis = playout_diagnoser_(endpoint, stereo);
+    *detail = std::move(diagnosis.text);
+    converted_opens = diagnosis.converted_opens;
+  }
+  if (!playout_fallback_factory_ || !converted_opens) {
+    return result;
+  }
+  std::unique_ptr<AdmPlayoutFallback> fallback =
+      playout_fallback_factory_(&tap_);
+  if (!fallback) {
+    return result;
+  }
+  if (fallback->Init(endpoint, stereo ? 2 : 1) != 0) {
+    *detail += "; the playout fallback failed too: " + fallback->Describe();
+    return result;
+  }
+  *detail += "; playing through the fallback: " + fallback->Describe();
+  RTC_LOG(LS_WARNING) << "AdmProxy: InitPlayout failed: " << result << "; "
+                      << *detail;
+  playout_fallback_ = std::move(fallback);
+  playout_fallback_active_.store(true, std::memory_order_relaxed);
+  playout_fallback_opens_.fetch_add(1, std::memory_order_relaxed);
+  return 0;
+}
+
 void AdmProxy::ReconcilePlayoutLocked(const DesiredState& desired,
                                       AdmDirectionOutcome* outcome) {
   webrtc::AudioDeviceModule* platform_adm = platform();
@@ -1211,8 +1357,7 @@ void AdmProxy::ReconcilePlayoutLocked(const DesiredState& desired,
       platform_adm && desired.ref_count > 0 && desired.playout_enabled;
   const bool want_platform = platform_mode && PlayoutWanted(desired);
 
-  if (platform_adm &&
-      (platform_adm->Playing() || platform_adm->PlayoutIsInitialized())) {
+  if (platform_adm && (PlayoutPlayingLocked() || PlayoutInitializedLocked())) {
     const bool stale = StaleLocked(true, desired);
     if (want_platform && stale) {
       CountReopenLocked(true, desired);
@@ -1241,7 +1386,7 @@ void AdmProxy::ReconcilePlayoutLocked(const DesiredState& desired,
     return;
   }
 
-  if (!platform_adm->PlayoutIsInitialized()) {
+  if (!PlayoutInitializedLocked()) {
     playout_opened_selection_gen_ = desired.playout_selection_gen;
     playout_opened_restart_gen_ = desired.playout_restart_gen;
     int32_t result = ApplySelectionLocked(true, desired.playout_selection,
@@ -1257,17 +1402,27 @@ void AdmProxy::ReconcilePlayoutLocked(const DesiredState& desired,
       RTC_LOG(LS_WARNING) << "AdmProxy: SetStereoPlayout refused";
     }
 #endif
+    std::string init_detail;
     if (result == 0) {
       result = platform_adm->InitPlayout();
+      if (result != 0) {
+        result = FallBackPlayoutLocked(result, &init_detail);
+      }
+    }
+    {
+      AdmLock lock(&devices_mutex_);
+      playout_init_detail_ = init_detail;
     }
     playout_init_result_.store(result, std::memory_order_relaxed);
     if (outcome) {
       outcome->attempted = true;
       outcome->init_result = result;
       outcome->found = result != kAdmResultDeviceNotFound;
+      outcome->init_detail = init_detail;
     }
     if (result != 0) {
-      RTC_LOG(LS_WARNING) << "AdmProxy: InitPlayout failed: " << result;
+      RTC_LOG(LS_WARNING) << "AdmProxy: InitPlayout failed: " << result
+                          << (init_detail.empty() ? "" : "; ") << init_detail;
       return;
     }
     IdentifyOpenedLocked(true);
@@ -1279,13 +1434,14 @@ void AdmProxy::ReconcilePlayoutLocked(const DesiredState& desired,
 #endif
   }
 
-  if (!platform_adm->Playing()) {
+  if (!PlayoutPlayingLocked()) {
     tap_.ResetRenderClock();
     if (mixer_) {
       mixer_->ResetGapClock();
     }
     ResyncMonitorLocked();
-    const int32_t result = platform_adm->StartPlayout();
+    const int32_t result = playout_fallback_ ? playout_fallback_->Start()
+                                             : platform_adm->StartPlayout();
     playout_start_result_.store(result, std::memory_order_relaxed);
     if (outcome) {
       outcome->attempted = true;
@@ -1293,6 +1449,10 @@ void AdmProxy::ReconcilePlayoutLocked(const DesiredState& desired,
     }
     if (result != 0) {
       RTC_LOG(LS_WARNING) << "AdmProxy: StartPlayout failed: " << result;
+      if (playout_fallback_) {
+        RTC_LOG(LS_WARNING) << "AdmProxy: playout fallback: "
+                            << playout_fallback_->Describe();
+      }
       // The macOS ADM spawns its render thread before starting the device and
       // keeps it when the start fails (a device that is going away); its next
       // StartPlayout joins that thread in a move assignment and aborts when
@@ -1301,10 +1461,7 @@ void AdmProxy::ReconcilePlayoutLocked(const DesiredState& desired,
       StopDeviceLocked(true, nullptr);
       return;
     }
-    uint16_t delay_ms = 0;
-    if (platform_adm->PlayoutDelay(&delay_ms) == 0) {
-      tap_.set_playout_delay_ms(delay_ms);
-    }
+    RefreshPlayoutDelayLocked();
     SchedulePlayoutDelayRefreshLocked();
     render_stall_ = RenderStallWatch{};
     ScheduleRenderStallWatchLocked();
@@ -1338,6 +1495,14 @@ void AdmProxy::ReconcileRecordingLocked(const DesiredState& desired,
     int32_t result = ApplySelectionLocked(false, desired.recording_selection,
                                           FallbackLocked(false, desired));
     std::optional<AdmDeviceFormat> before;
+#if !LK_ADM_MOBILE
+    if (result == 0 &&
+        stereo_recording_set_.load(std::memory_order_acquire) &&
+        platform_adm->SetStereoRecording(
+            stereo_recording_.load(std::memory_order_acquire)) != 0) {
+      RTC_LOG(LS_WARNING) << "AdmProxy: SetStereoRecording refused";
+    }
+#endif
     if (result == 0) {
       before = ReadFormatLocked(false, last_recording_guid_);
       result = platform_adm->InitRecording();
@@ -1397,9 +1562,9 @@ void AdmProxy::PublishStateLocked(const DesiredState& desired) {
       platform_adm && desired.ref_count > 0 && desired.playout_enabled;
   const bool recording_mode =
       platform_adm && desired.ref_count > 0 && desired.recording_enabled;
-  const bool platform_playing = platform_adm && platform_adm->Playing();
+  const bool platform_playing = platform_adm && PlayoutPlayingLocked();
   const bool platform_playout_initialized =
-      platform_adm && platform_adm->PlayoutIsInitialized();
+      platform_adm && PlayoutInitializedLocked();
   const bool platform_recording = platform_adm && platform_adm->Recording();
   const bool platform_recording_initialized =
       platform_adm && platform_adm->RecordingIsInitialized();
@@ -1566,10 +1731,7 @@ void AdmProxy::SchedulePlayoutDelayRefreshLocked() {
             !platform_playing_.load(std::memory_order_acquire)) {
           return;
         }
-        uint16_t delay_ms = 0;
-        if (platform_adm->PlayoutDelay(&delay_ms) == 0) {
-          tap_.set_playout_delay_ms(delay_ms);
-        }
+        RefreshPlayoutDelayLocked();
         SchedulePlayoutDelayRefreshLocked();
       },
       kPlayoutDelayRefresh);
@@ -1902,6 +2064,10 @@ void AdmProxy::ShutdownLocked() {
   terminated_ = true;
   // The Windows ADM's Terminate releases its clients without stopping the
   // device threads, so stop them first.
+  if (playout_fallback_ && playout_fallback_->Stop() == 0) {
+    playout_fallback_.reset();
+  }
+  playout_fallback_active_.store(false, std::memory_order_relaxed);
   if (webrtc::AudioDeviceModule* platform_adm = platform()) {
     platform_adm->StopPlayout();
     platform_adm->StopRecording();
@@ -2019,6 +2185,9 @@ bool AdmProxy::AcquirePlatformAdm() {
     }
   }
 #else
+#if !LK_ADM_MOBILE
+  EnsurePlatformAdm();
+#endif
   if (!platform()) {
     RTC_LOG(LS_ERROR) << "AdmProxy::AcquirePlatformAdm() - Platform ADM not available";
     return false;
@@ -2343,7 +2512,14 @@ AdmNativeStats AdmProxy::ReadNativeStats() {
     AdmLock lock(&devices_mutex_);
     stats.playout_device_uid = playout_uid_;
     stats.recording_device_uid = recording_uid_;
+    stats.playout_init_detail = playout_init_detail_;
   }
+  stats.playout_fallback_available =
+      playout_fallback_available_.load(std::memory_order_relaxed);
+  stats.playout_fallback =
+      playout_fallback_active_.load(std::memory_order_relaxed);
+  stats.playout_fallback_opens =
+      playout_fallback_opens_.load(std::memory_order_relaxed);
   stats.same_device = same_device_.load(std::memory_order_relaxed);
   stats.device_list_notifications =
       device_list_notifications_.load(std::memory_order_relaxed);
@@ -2389,12 +2565,11 @@ int32_t AdmProxy::ActiveAudioLayer(AudioLayer* audioLayer) const {
 }
 
 // The platform ADM keeps the tap registered (until shutdown), which plays
-// silence while libwebrtc has no transport.
+// silence while libwebrtc has no transport. The tap reads the transport once
+// per callback, so the worker (the voice engine's init and terminate) swaps it
+// without waiting for the device thread or a device.
 int32_t AdmProxy::RegisterAudioCallback(webrtc::AudioTransport* transport) {
-  RunDeviceTaskAndWait([this, transport] {
-    AdmLock lock(&mutex_);
-    tap_.set_transport(transport);
-  });
+  tap_.set_transport(transport);
   return 0;
 }
 
@@ -2480,6 +2655,15 @@ bool AdmProxy::LockForEnumeration() {
 }
 
 #if defined(ROOTAPP_HARNESS)
+void AdmProxy::SetPlayoutFallbackForTest(AdmPlayoutFallbackFactory factory,
+                                         AdmPlayoutDiagnoser diagnoser) {
+  AdmLock lock(&mutex_);
+  playout_fallback_available_.store(factory != nullptr,
+                                    std::memory_order_relaxed);
+  playout_fallback_factory_ = std::move(factory);
+  playout_diagnoser_ = std::move(diagnoser);
+}
+
 void AdmProxy::SetEnumerationLockForTest(bool serialize, int wait_ms) {
   serialize_enumeration_.store(serialize);
   enumeration_wait_ms_.store(wait_ms);
@@ -2867,12 +3051,19 @@ int32_t AdmProxy::MicrophoneMute(bool* enabled) const {
 #endif
 }
 
+// On desktop the voice engine's init on the worker asks these; they answer
+// what the Platform ADM said when it was attached, without the device mutex
+// a device open holds.
 int32_t AdmProxy::StereoPlayoutIsAvailable(bool* available) const {
+#if LK_ADM_MOBILE
   AdmLock lock(&mutex_);
   if (webrtc::AudioDeviceModule* platform_adm = platform()) {
     return platform_adm->StereoPlayoutIsAvailable(available);
   }
   *available = true;
+#else
+  *available = stereo_playout_available_.load(std::memory_order_acquire);
+#endif
   return 0;
 }
 
@@ -2906,28 +3097,45 @@ int32_t AdmProxy::StereoPlayout(bool* enabled) const {
 }
 
 int32_t AdmProxy::StereoRecordingIsAvailable(bool* available) const {
+#if LK_ADM_MOBILE
   AdmLock lock(&mutex_);
   if (webrtc::AudioDeviceModule* platform_adm = platform()) {
     return platform_adm->StereoRecordingIsAvailable(available);
   }
   *available = false;
+#else
+  *available = stereo_recording_available_.load(std::memory_order_acquire);
+#endif
   return 0;
 }
 
+// On desktop the wish is kept and applied before every recording open, as
+// the playout channels are.
 int32_t AdmProxy::SetStereoRecording(bool enable) {
+#if LK_ADM_MOBILE
   AdmLock lock(&mutex_);
   if (webrtc::AudioDeviceModule* platform_adm = platform()) {
     return platform_adm->SetStereoRecording(enable);
   }
+#else
+  stereo_recording_.store(enable, std::memory_order_release);
+  stereo_recording_set_.store(true, std::memory_order_release);
+  stereo_recording_before_platform_.store(platform() == nullptr,
+                                          std::memory_order_release);
+#endif
   return 0;
 }
 
 int32_t AdmProxy::StereoRecording(bool* enabled) const {
+#if LK_ADM_MOBILE
   AdmLock lock(&mutex_);
   if (webrtc::AudioDeviceModule* platform_adm = platform()) {
     return platform_adm->StereoRecording(enabled);
   }
   *enabled = false;
+#else
+  *enabled = stereo_recording_.load(std::memory_order_acquire);
+#endif
   return 0;
 }
 

@@ -176,6 +176,49 @@ struct AdmDirectionOutcome {
   int32_t stop_result = kAdmResultNotAttempted;
   int32_t init_result = kAdmResultNotAttempted;
   int32_t start_result = kAdmResultNotAttempted;
+  // Why the platform ADM's Init failed (empty when it was not looked into),
+  // also when the playout fallback opened the device instead.
+  std::string init_detail;
+};
+
+// Why the platform ADM could not open playout, found by repeating its open
+// on the same device (Windows): the step that failed, its HRESULT and the
+// formats, and whether the device opens for a client whose format the audio
+// engine converts.
+struct AdmPlayoutDiagnosis {
+  std::string text;
+  bool converted_opens = false;
+};
+using AdmPlayoutDiagnoser =
+    std::function<AdmPlayoutDiagnosis(const std::string& endpoint_id,
+                                      bool stereo)>;
+
+// Playout the proxy runs itself where the platform ADM cannot open a device
+// (Windows: a shared WASAPI stream the audio engine converts to its mix
+// format). It pulls 10 ms of 48 kHz int16 audio at a time through the
+// transport it was created with, on a thread of its own.
+class AdmPlayoutFallback {
+ public:
+  virtual ~AdmPlayoutFallback() = default;
+  // An empty `endpoint_id` opens the default console output. 0 when open.
+  virtual int32_t Init(const std::string& endpoint_id, size_t channels) = 0;
+  virtual int32_t Start() = 0;
+  // Stops and closes; non-zero while its thread did not stop (a later Stop
+  // waits for it again).
+  virtual int32_t Stop() = 0;
+  virtual bool Playing() const = 0;
+  virtual uint16_t DelayMs() const = 0;
+  // What it opened, or the step that failed and its HRESULT.
+  virtual std::string Describe() const = 0;
+};
+using AdmPlayoutFallbackFactory =
+    std::function<std::unique_ptr<AdmPlayoutFallback>(
+        webrtc::AudioTransport* transport)>;
+
+// Creates the platform ADM (not yet initialized) when the first platform
+// reference is taken, on the device thread; null when there is none.
+struct AdmLazyPlatform {
+  std::function<webrtc::scoped_refptr<webrtc::AudioDeviceModule>()> create;
 };
 
 struct AdmRequestOutcome {
@@ -248,6 +291,13 @@ struct AdmNativeStats {
   std::array<uint64_t, kAdmReopenReasons> reopens{};
   uint64_t coupled_reopens = 0;
   uint64_t render_stall_recoveries = 0;
+  // The proxy has a playout fallback (Windows): playout runs on it, the
+  // opens that took it, and why the platform ADM's last playout Init failed
+  // (empty when it succeeded).
+  bool playout_fallback_available = false;
+  bool playout_fallback = false;
+  uint64_t playout_fallback_opens = 0;
+  std::string playout_init_detail;
 };
 
 // Registered with the platform ADM in place of libwebrtc's AudioTransport, from
@@ -476,6 +526,25 @@ enum class AdmMonitorResult : uint8_t {
 /// the proxy follows device-list and default-device changes itself instead
 /// of the ADM's listener, and playout that renders nothing for 500 ms while
 /// capture goes on is reopened.
+///
+/// The Windows ADM opens playout only as 16-bit PCM at 48, 44.1, 16, 96, 32
+/// or 8 kHz in one or two channels, without the audio engine's conversion, so
+/// it fails on a device whose shared-mode mix format is anything else (a
+/// surround headset's 6 or 8 channels, 88.2 or 192 kHz). After a failed
+/// InitPlayout the proxy repeats the ADM's open to report why, and plays
+/// through a shared stream of its own that the engine converts
+/// (AdmPlayoutFallback) when that opens.
+///
+/// On desktop the platform ADM is created and initialized on the device
+/// thread when the first platform reference is taken, not with the factory:
+/// the Windows ADM's creation runs two full endpoint sweeps (every active,
+/// disabled and unplugged endpoint, each with its endpoint volume activated),
+/// which took over 10 s on a machine with 25 endpoints, and the factory is
+/// built under the runtime lock a room connect waits for. A managed call
+/// never creates it. What the worker asks of the proxy (the voice engine's
+/// init, the transport, the stereo settings) never waits for the device
+/// thread or a device, so a device that is slow to create, open or stop
+/// cannot hold up a PeerConnection.
 class AdmProxy : public webrtc::AudioDeviceModule {
  public:
   AdmProxy(const webrtc::Environment& env,
@@ -487,6 +556,12 @@ class AdmProxy : public webrtc::AudioDeviceModule {
            webrtc::Thread* worker_thread,
            webrtc::scoped_refptr<RootAudioMixer> mixer,
            webrtc::scoped_refptr<webrtc::AudioDeviceModule> platform_adm);
+  // Creates the Platform ADM with `lazy` at the first AcquirePlatformAdm, on
+  // the device thread (desktop).
+  AdmProxy(const webrtc::Environment& env,
+           webrtc::Thread* worker_thread,
+           webrtc::scoped_refptr<RootAudioMixer> mixer,
+           AdmLazyPlatform lazy);
   ~AdmProxy() override;
 
   // ===========================================================================
@@ -586,6 +661,10 @@ class AdmProxy : public webrtc::AudioDeviceModule {
   /// Whether enumeration serializes with device operations (Linux) and how
   /// long it waits for one in progress.
   void SetEnumerationLockForTest(bool serialize, int wait_ms);
+  /// Replaces the diagnosis of a failed playout Init and the playout
+  /// fallback (WASAPI on Windows, none elsewhere); null turns either off.
+  void SetPlayoutFallbackForTest(AdmPlayoutFallbackFactory factory,
+                                 AdmPlayoutDiagnoser diagnoser);
   uint64_t RoutedListenersForTest() const;
   uint64_t DeliveredListenerNotificationsForTest() const;
   void RunOnDeviceThreadForTest(absl::AnyInvocable<void() &&> task);
@@ -737,6 +816,14 @@ class AdmProxy : public webrtc::AudioDeviceModule {
                                 AdmDirectionOutcome* outcome);
   // Returns false when the stop failed and the direction must wait.
   bool StopDeviceLocked(bool playout, AdmDirectionOutcome* outcome);
+  // Playout as it is open: on the platform ADM or on the fallback.
+  bool PlayoutPlayingLocked() const;
+  bool PlayoutInitializedLocked() const;
+  // After the platform ADM's InitPlayout failed: why, and the fallback's open
+  // in its place. 0 when the fallback opened.
+  int32_t FallBackPlayoutLocked(int32_t result, std::string* detail);
+  // The open playout device's delay into the tap.
+  void RefreshPlayoutDelayLocked();
   // With a device probe: stops the microphone (and playout on its device)
   // before playout opens where the microphone's IOProc does not suit it, so
   // playout opens first. False when a stop failed (the pass waits for the
@@ -808,6 +895,13 @@ class AdmProxy : public webrtc::AudioDeviceModule {
 #if defined(__ANDROID__)
   bool EnsurePlatformAdmCreated();
 #endif
+  // Initializes `adm` as the Platform ADM and sets it up (built-in effects
+  // off, default devices, the tap, the stereo settings); false when its Init
+  // failed.
+  bool AttachPlatformAdmLocked(
+      webrtc::scoped_refptr<webrtc::AudioDeviceModule> adm);
+  // Desktop: the lazy Platform ADM, created on the device thread once.
+  void EnsurePlatformAdm();
 
   const webrtc::Environment env_;
   webrtc::Thread* worker_thread_;
@@ -899,6 +993,16 @@ class AdmProxy : public webrtc::AudioDeviceModule {
   std::array<std::atomic<uint64_t>, kAdmReopenReasons> reopens_{};
   std::atomic<uint64_t> coupled_reopens_{0};
   std::atomic<uint64_t> render_stall_recoveries_{0};
+  // Guarded by mutex_: the diagnosis, the fallback's factory and the open
+  // fallback (playout runs on it while set); the last Init's diagnosis is
+  // under devices_mutex_ for the stats.
+  AdmPlayoutDiagnoser playout_diagnoser_;
+  AdmPlayoutFallbackFactory playout_fallback_factory_;
+  std::unique_ptr<AdmPlayoutFallback> playout_fallback_;
+  std::string playout_init_detail_;
+  std::atomic<bool> playout_fallback_available_{false};
+  std::atomic<bool> playout_fallback_active_{false};
+  std::atomic<uint64_t> playout_fallback_opens_{0};
   // capture_state_'s monitor, set with it.
   std::atomic<RootAudioMonitor*> monitor_{nullptr};
 #if !LK_ADM_MOBILE
@@ -928,6 +1032,17 @@ class AdmProxy : public webrtc::AudioDeviceModule {
   std::atomic<bool> device_track_noise_suppression_{false};
   // Desktop: libwebrtc's SetStereoPlayout, applied before every playout open.
   std::atomic<bool> stereo_playout_{true};
+  // Desktop: what the Platform ADM answered when it was attached (stereo
+  // until then), and libwebrtc's SetStereoRecording, applied before every
+  // recording open once set (a wish made before the Platform ADM existed is
+  // replaced by what the ADM can do when it is attached).
+  std::atomic<bool> stereo_playout_available_{true};
+  std::atomic<bool> stereo_recording_available_{true};
+  std::atomic<bool> stereo_recording_{false};
+  std::atomic<bool> stereo_recording_set_{false};
+  std::atomic<bool> stereo_recording_before_platform_{false};
+  // Guarded by mutex_; consumed by the first creation.
+  AdmLazyPlatform lazy_platform_;
 };
 
 }  // namespace livekit_ffi

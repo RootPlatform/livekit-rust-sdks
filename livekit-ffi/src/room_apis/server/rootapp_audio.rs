@@ -1237,7 +1237,11 @@ impl From<RootAudioStats> for proto::RootAudioStats {
         let formats = stats.device_formats;
         let changes = stats.device_changes;
         let change = |field: fn(&livekit::DeviceChangeStats) -> u64| changes.as_ref().map(field);
+        let fallback = stats.playout_fallback;
         Self {
+            playout_fallback: fallback.as_ref().map(|f| f.active),
+            playout_fallback_opens: fallback.as_ref().map(|f| f.opens),
+            playout_init_detail: fallback.map(|f| f.init_detail),
             playout_device_uid: changes.as_ref().map(|c| c.playout_uid.clone()),
             recording_device_uid: changes.as_ref().map(|c| c.recording_uid.clone()),
             same_device: changes.as_ref().map(|c| c.same_device),
@@ -1685,6 +1689,30 @@ mod tests {
         );
         assert_eq!((absent.user_select_reopens, absent.render_stall_reopens), (None, None));
         assert_eq!((absent.coupled_reopens, absent.render_stall_recoveries), (None, None));
+    }
+
+    #[test]
+    fn rootapp_audio_playout_fallback_stats_convert_and_stay_absent_without_a_fallback() {
+        let detail = "Initialize 0x88890008 AUDCLNT_E_UNSUPPORTED_FORMAT, asking 8000 Hz 1 ch \
+                      16-bit PCM; mix format 48000 Hz 8 ch 32-bit float; playing through the \
+                      fallback";
+        let stats = RootAudioStats {
+            playout_fallback: Some(livekit::PlayoutFallbackStats {
+                active: true,
+                opens: 2,
+                init_detail: detail.into(),
+            }),
+            ..Default::default()
+        };
+        let p: proto::RootAudioStats = stats.into();
+        assert_eq!((p.playout_fallback, p.playout_fallback_opens), (Some(true), Some(2)));
+        assert_eq!(p.playout_init_detail.as_deref(), Some(detail));
+
+        let absent: proto::RootAudioStats = RootAudioStats::default().into();
+        assert_eq!(
+            (absent.playout_fallback, absent.playout_fallback_opens, absent.playout_init_detail),
+            (None, None, None)
+        );
     }
 
     #[test]

@@ -119,9 +119,9 @@ pub use rootapp::{
     sanitize_volume, AudioDeviceResults, AudioDeviceSelection, CaptureFormat, DenoiserCompletion,
     DenoiserState, DeviceChangeStats, DeviceFormatStats, EchoModel, EchoModelReason,
     EchoModelState, EchoModelStats, EffectPlay, GainEngine, GainLimit, LocalSpeaking,
-    MixSourceLevel, MonitorError, OutputDeviceKind, PushToTalk, ReturnedPipeline,
-    ReturnedPipelines, RootAudioControl, RootAudioStats, SpeechDetection, ThresholdTerm,
-    ECHO_MODEL_AVAILABLE, MAX_VOICE_GAIN_DB, MAX_VOLUME,
+    MixSourceLevel, MonitorError, OutputDeviceKind, PlayoutFallbackStats, PushToTalk,
+    ReturnedPipeline, ReturnedPipelines, RootAudioControl, RootAudioStats, SpeechDetection,
+    ThresholdTerm, ECHO_MODEL_AVAILABLE, MAX_VOICE_GAIN_DB, MAX_VOLUME,
 };
 
 // Re-export RtcAudioSource for convenience
@@ -130,6 +130,7 @@ pub use libwebrtc::audio_source::RtcAudioSource;
 use std::fmt;
 use std::future::Future;
 use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
 
 // =============================================================================
 // Device Types - Newtypes for type-safe device identification
@@ -313,6 +314,42 @@ lazy_static! {
     static ref PLATFORM_ADM_HANDLE: Mutex<Weak<PlatformAdmHandle>> = Mutex::new(Weak::new());
 }
 
+/// A new handle's creation at or above this is logged as a warning.
+const SLOW_CREATE: Duration = Duration::from_secs(2);
+
+/// The time from the start of a new handle's creation to the end of each of
+/// its steps, for the log: the handle lock, the runtime (the factory, when
+/// none is alive), the Platform ADM's acquisition (its creation and Init on
+/// desktop, the first time), enabling both directions, the device counts and
+/// the audio processing defaults.
+#[derive(Debug, Clone, Copy)]
+struct CreateSteps {
+    locked: Duration,
+    runtime_ready: Duration,
+    acquired: Duration,
+    enabled: Duration,
+    counted: Duration,
+    configured: Duration,
+}
+
+impl fmt::Display for CreateSteps {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let ms = |since: Duration, until: Duration| until.saturating_sub(since).as_millis();
+        write!(
+            f,
+            "{} ms (handle lock {} ms, runtime {} ms, platform ADM {} ms, enable {} ms, device \
+             counts {} ms, audio processing {} ms)",
+            self.configured.as_millis(),
+            self.locked.as_millis(),
+            ms(self.locked, self.runtime_ready),
+            ms(self.runtime_ready, self.acquired),
+            ms(self.acquired, self.enabled),
+            ms(self.enabled, self.counted),
+            ms(self.counted, self.configured),
+        )
+    }
+}
+
 /// Internal handle for platform audio.
 ///
 /// This handle manages the Platform ADM lifecycle via reference counting.
@@ -451,6 +488,7 @@ impl PlatformAudio {
     /// println!("Found {} microphones", audio.recording_devices());
     /// ```
     pub fn new() -> AudioResult<Self> {
+        let started = Instant::now();
         let mut handle_ref = PLATFORM_ADM_HANDLE.lock();
 
         // Try to reuse existing handle
@@ -467,15 +505,22 @@ impl PlatformAudio {
 
         // Create new handle and acquire Platform ADM
         log::debug!("PlatformAudio: creating new handle");
+        let locked = started.elapsed();
         let runtime = LkRuntime::instance();
+        let runtime_ready = started.elapsed();
 
-        // Acquire Platform ADM - this creates the platform-specific audio device module
-        // on first call and increments the reference count on subsequent calls.
+        // Acquire Platform ADM. On desktop the first one creates and
+        // initializes the platform-specific audio device module on the
+        // device thread (the factory no longer does); later ones only count.
         // When this fails, it means no audio hardware is available.
         if !runtime.acquire_platform_adm() {
-            log::error!("PlatformAudio: failed to acquire Platform ADM");
+            log::error!(
+                "PlatformAudio: failed to acquire Platform ADM after {} ms",
+                started.elapsed().as_millis()
+            );
             return Err(AudioError::PlatformInitFailed);
         }
+        let acquired = started.elapsed();
         log::info!(
             "PlatformAudio: acquired Platform ADM (ref_count: {})",
             runtime.platform_adm_ref_count()
@@ -491,13 +536,10 @@ impl PlatformAudio {
         log::info!("PlatformAudio: enabled ADM playout for platform speakers");
 
         // Verify Platform ADM is working by checking device count
+        let enabled = started.elapsed();
         let recording_count = runtime.recording_devices();
         let playout_count = runtime.playout_devices();
-        log::info!(
-            "PlatformAudio: {} recording devices, {} playout devices",
-            recording_count,
-            playout_count
-        );
+        let counted = started.elapsed();
 
         let handle = Arc::new(PlatformAdmHandle { runtime });
         *handle_ref = Arc::downgrade(&handle);
@@ -511,6 +553,23 @@ impl PlatformAudio {
         if let Err(e) = audio.configure_audio_processing(AudioProcessingOptions::default()) {
             log::warn!("PlatformAudio: failed to configure audio processing: {}", e);
         }
+
+        let steps = CreateSteps {
+            locked,
+            runtime_ready,
+            acquired,
+            enabled,
+            counted,
+            configured: started.elapsed(),
+        };
+        let level =
+            if steps.configured >= SLOW_CREATE { log::Level::Warn } else { log::Level::Info };
+        log::log!(
+            level,
+            "PlatformAudio: created in {}: {recording_count} recording / {playout_count} \
+             playout devices",
+            steps
+        );
 
         Ok(audio)
     }
@@ -618,12 +677,15 @@ impl PlatformAudio {
         (0..count).filter_map(move |index| self.playout_device_info(index))
     }
 
-    fn recording_device_count(&self) -> usize {
-        self.handle.runtime.recording_devices() as usize
+    /// The number of recording devices, without reading their names and IDs
+    /// (each of which enumerates the devices again on Windows).
+    pub fn recording_device_count(&self) -> usize {
+        self.handle.runtime.recording_devices().max(0) as usize
     }
 
-    fn playout_device_count(&self) -> usize {
-        self.handle.runtime.playout_devices() as usize
+    /// The number of playout devices, without reading their names and IDs.
+    pub fn playout_device_count(&self) -> usize {
+        self.handle.runtime.playout_devices().max(0) as usize
     }
 
     fn recording_device_info(&self, index: usize) -> Option<RecordingDeviceInfo> {
@@ -1682,5 +1744,24 @@ mod tests {
         set.insert(id1.clone());
         assert!(set.contains(&id2));
         assert!(!set.contains(&id3));
+    }
+
+    #[test]
+    fn create_steps_log_each_steps_own_time() {
+        let ms = Duration::from_millis;
+        let steps = CreateSteps {
+            locked: ms(1),
+            runtime_ready: ms(4),
+            acquired: ms(10_204),
+            enabled: ms(10_205),
+            counted: ms(10_405),
+            configured: ms(10_410),
+        };
+        assert_eq!(
+            steps.to_string(),
+            "10410 ms (handle lock 1 ms, runtime 3 ms, platform ADM 10200 ms, enable 1 ms, \
+             device counts 200 ms, audio processing 5 ms)"
+        );
+        assert!(steps.configured >= SLOW_CREATE, "logged as a warning");
     }
 }

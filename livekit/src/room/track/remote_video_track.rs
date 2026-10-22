@@ -106,6 +106,10 @@ impl RemoteVideoTrack {
         self.inner.info.read().stream_state
     }
 
+    pub(crate) fn set_stream_state(&self, state: StreamState) -> bool {
+        remote_track::set_stream_state(&self.inner, state)
+    }
+
     pub fn is_enabled(&self) -> bool {
         self.inner.rtc_track.enabled()
     }

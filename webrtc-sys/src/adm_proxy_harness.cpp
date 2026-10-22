@@ -44,11 +44,17 @@
 #include "livekit/audio_thread.h"
 #include "livekit/root_audio_mixer.h"
 #include "livekit/root_voice_engine_hold.h"
+#if defined(WEBRTC_WIN)
+#include <objbase.h>
+
+#include "livekit/root_wasapi_playout.h"
+#endif
 #include "modules/audio_device/audio_device_buffer.h"
 #include "modules/audio_device/include/audio_device_default.h"
 #include "pc/connection_context.h"
 #include "rtc_base/event.h"
 #include "rtc_base/thread.h"
+#include "rtc_base/time_utils.h"
 
 namespace livekit_ffi {
 namespace {
@@ -772,6 +778,9 @@ class FakePlatformAdm
   void FailNextStartRecording(int32_t result) {
     next_start_recording_result_.store(result);
   }
+  // Every InitPlayout fails with `result` until it is 0 again, as the
+  // Windows ADM's does on a mix format it cannot open.
+  void FailInitPlayout(int32_t result) { init_playout_result_.store(result); }
   void SetPlayoutDelay(uint16_t delay_ms) { playout_delay_ms_.store(delay_ms); }
   webrtc::AudioTransport* callback() const { return callback_.load(); }
 
@@ -906,6 +915,10 @@ class FakePlatformAdm
       buffer_.SetPlayoutSampleRate(48000);
       buffer_.SetPlayoutChannels(stereo_playout_.load() ? 2 : 1);
       return result;
+    }
+    if (const int32_t failed = init_playout_result_.load()) {
+      Record("InitPlayout");
+      return failed;
     }
     if (!playout_initialized_.exchange(true)) {
       core_audio_.AddListener(kFakeOutputDevice, kFakeFormatAddress, &Listener,
@@ -1168,6 +1181,7 @@ class FakePlatformAdm
   std::atomic<int32_t> next_stop_recording_result_{0};
   std::atomic<int32_t> next_start_playout_result_{0};
   std::atomic<int32_t> next_start_recording_result_{0};
+  std::atomic<int32_t> init_playout_result_{0};
   std::atomic<bool> playout_worker_left_{false};
   std::atomic<bool> recording_worker_left_{false};
   std::atomic<uint16_t> playout_delay_ms_{0};
@@ -1182,6 +1196,71 @@ class FakePlatformAdm
   std::atomic<bool> mac_rules_{false};
   FakeMacAdm mac_;
 };
+
+// What the fake playout fallbacks did, and the open one's transport.
+struct HarnessFallbackLog {
+  webrtc::Mutex mutex;
+  std::vector<std::string> calls;
+  std::atomic<webrtc::AudioTransport*> transport{nullptr};
+  std::atomic<size_t> channels{0};
+  std::atomic<bool> playing{false};
+
+  void Record(std::string call) {
+    webrtc::MutexLock lock(&mutex);
+    calls.push_back(std::move(call));
+  }
+};
+
+namespace {
+
+// The proxy's playout fallback over no device: it records its calls and
+// plays through the tap only when the test pulls a render.
+class FakePlayoutFallback : public AdmPlayoutFallback {
+ public:
+  FakePlayoutFallback(std::shared_ptr<HarnessFallbackLog> log,
+                      webrtc::AudioTransport* transport,
+                      int32_t init_result)
+      : log_(std::move(log)), transport_(transport), init_result_(init_result) {}
+
+  int32_t Init(const std::string& endpoint_id, size_t channels) override {
+    log_->Record("Init(" + (endpoint_id.empty() ? std::string("default") : endpoint_id) +
+                 ", " + std::to_string(channels) + ")");
+    channels_ = channels;
+    return init_result_;
+  }
+  int32_t Start() override {
+    log_->Record("Start");
+    log_->channels.store(channels_);
+    log_->transport.store(transport_);
+    log_->playing.store(true);
+    playing_ = true;
+    return 0;
+  }
+  int32_t Stop() override {
+    log_->Record("Stop");
+    if (playing_) {
+      log_->playing.store(false);
+      log_->transport.store(nullptr);
+    }
+    playing_ = false;
+    return 0;
+  }
+  bool Playing() const override { return playing_; }
+  uint16_t DelayMs() const override { return 25; }
+  std::string Describe() const override {
+    return init_result_ == 0 ? "fake converted stream"
+                             : "Initialize 0x88890008 AUDCLNT_E_UNSUPPORTED_FORMAT";
+  }
+
+ private:
+  const std::shared_ptr<HarnessFallbackLog> log_;
+  webrtc::AudioTransport* const transport_;
+  const int32_t init_result_;
+  size_t channels_ = 0;
+  bool playing_ = false;
+};
+
+}  // namespace
 
 // libwebrtc's side of the device callbacks. With a re-entry target it calls
 // the device side again from inside its own callback, once. It plays silence,
@@ -1517,6 +1596,67 @@ AdmDeviceRender AdmProxyHarness::device_render() const {
     result.frames = fake_->DeviceRender(&samples);
   });
   device_thread.join();
+  for (int16_t sample : samples) {
+    result.samples.push_back(sample);
+  }
+  return result;
+}
+
+void AdmProxyHarness::fail_init_playout(int32_t result) const {
+  fake_->FailInitPlayout(result);
+}
+
+void AdmProxyHarness::set_playout_fallback(rust::Str diagnosis,
+                                           bool converted_opens,
+                                           int32_t init_result) const {
+  auto log = std::make_shared<HarnessFallbackLog>();
+  fallback_log_ = log;
+  proxy_->SetPlayoutFallbackForTest(
+      [log, init_result](webrtc::AudioTransport* transport) {
+        return std::make_unique<FakePlayoutFallback>(log, transport,
+                                                     init_result);
+      },
+      [diagnosis = std::string(diagnosis), converted_opens, log](
+          const std::string& endpoint_id, bool stereo) {
+        log->Record("diagnose(" +
+                    (endpoint_id.empty() ? std::string("default")
+                                         : endpoint_id) +
+                    (stereo ? ", stereo)" : ", mono)"));
+        return AdmPlayoutDiagnosis{diagnosis, converted_opens};
+      });
+}
+
+rust::Vec<rust::String> AdmProxyHarness::take_fallback_calls() const {
+  rust::Vec<rust::String> calls;
+  if (!fallback_log_) {
+    return calls;
+  }
+  webrtc::MutexLock lock(&fallback_log_->mutex);
+  for (const std::string& call : std::exchange(fallback_log_->calls, {})) {
+    calls.push_back(rust::String(call));
+  }
+  return calls;
+}
+
+AdmDeviceRender AdmProxyHarness::fallback_render() const {
+  AdmDeviceRender result{};
+  result.frames = -1;
+  if (!fallback_log_ || !fallback_log_->playing.load()) {
+    return result;
+  }
+  webrtc::AudioTransport* transport = fallback_log_->transport.load();
+  const size_t channels = fallback_log_->channels.load();
+  std::vector<int16_t> samples(480 * channels);
+  std::thread render_thread([&] {
+    size_t samples_out = 0;
+    int64_t elapsed_time_ms = 0;
+    int64_t ntp_time_ms = 0;
+    transport->NeedMorePlayData(480, channels * sizeof(int16_t), channels,
+                                48000, samples.data(), samples_out,
+                                &elapsed_time_ms, &ntp_time_ms);
+    result.frames = static_cast<int32_t>(samples_out / channels);
+  });
+  render_thread.join();
   for (int16_t sample : samples) {
     result.samples.push_back(sample);
   }
@@ -2006,6 +2146,60 @@ std::unique_ptr<AdmProxyHarness> new_adm_proxy_harness_without_platform_adm() {
       false, false);
 }
 
+#if defined(WEBRTC_WIN)
+namespace {
+
+// A COM MTA thread of its own, as the device thread.
+template <class F>
+auto OnMtaThread(F run) {
+  decltype(run()) result{};
+  std::thread thread([&] {
+    const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    result = run();
+    if (SUCCEEDED(com)) {
+      CoUninitialize();
+    }
+  });
+  thread.join();
+  return result;
+}
+
+}  // namespace
+
+rust::String wasapi_playout_diagnosis(rust::Str endpoint_id, bool stereo) {
+  const std::string endpoint(endpoint_id);
+  return rust::String::lossy(OnMtaThread([&] {
+    const AdmPlayoutDiagnosis diagnosis =
+        DiagnoseWasapiPlayout(endpoint, stereo);
+    return diagnosis.text + (diagnosis.converted_opens ? "" : " [no convert]");
+  }));
+}
+
+rust::String wasapi_playout_fallback_run(uint32_t run_ms) {
+  return rust::String::lossy(OnMtaThread([run_ms] {
+    AdmTransportTap tap;
+    std::unique_ptr<AdmPlayoutFallback> fallback =
+        CreateWasapiPlayoutFallback(&tap);
+    if (fallback->Init(std::string(), 2) != 0) {
+      return "Init failed: " + fallback->Describe();
+    }
+    if (fallback->Start() != 0) {
+      return "Start failed: " + fallback->Describe();
+    }
+    const bool playing = fallback->Playing();
+    std::this_thread::sleep_for(std::chrono::milliseconds(run_ms));
+    const uint64_t renders = tap.render_callbacks();
+    const uint16_t delay_ms = fallback->DelayMs();
+    const int32_t stopped = fallback->Stop();
+    return "playing " + std::string(playing ? "true" : "false") + ", " +
+           std::to_string(renders) + " renders, delay " +
+           std::to_string(delay_ms) + " ms, stop " + std::to_string(stopped) +
+           ", after stop playing " + (fallback->Playing() ? "true" : "false") +
+           "; " + fallback->Describe();
+  }));
+}
+#endif
+
 // The voice engine's capture path in miniature (AudioTransportImpl): each
 // recorded frame through the APM as int16 in its own format.
 class HarnessApmTransport : public webrtc::AudioTransport {
@@ -2340,11 +2534,61 @@ struct RootEngineHarness::Parts {
   // Worker thread only.
   std::vector<std::unique_ptr<webrtc::ConnectionContext::MediaEngineReference>>
       peer_connections;
+  // The lazy platform ADM's creations, and a creation held until released.
+  std::atomic<uint32_t> creations{0};
+  std::atomic<bool> hold_creation{false};
+  webrtc::Event creation_entered;
+  webrtc::Event creation_release;
 };
+
+namespace {
+
+// A media engine reference taken on the worker from a thread of its own, as
+// a PeerConnection's creation does; whether it was taken within `wait_ms`
+// and how long it took. The thread is joined by `Join`.
+class EngineReferenceTaker {
+ public:
+  EngineReferenceTaker(
+      webrtc::Thread* worker,
+      webrtc::scoped_refptr<webrtc::ConnectionContext> context,
+      std::vector<std::unique_ptr<
+          webrtc::ConnectionContext::MediaEngineReference>>* references)
+      : start_ms_(webrtc::TimeMillis()) {
+    thread_ = std::thread([this, worker, context, references] {
+      worker->BlockingCall([context, references] {
+        references->push_back(
+            std::make_unique<webrtc::ConnectionContext::MediaEngineReference>(
+                context));
+      });
+      taken_ms_.store(webrtc::TimeMillis() - start_ms_);
+      taken_.Set();
+    });
+  }
+  ~EngineReferenceTaker() { Join(); }
+
+  int64_t Wait(uint32_t wait_ms) {
+    return taken_.Wait(webrtc::TimeDelta::Millis(wait_ms)) ? taken_ms_.load()
+                                                           : -1;
+  }
+  void Join() {
+    if (thread_.joinable()) {
+      thread_.join();
+    }
+  }
+
+ private:
+  const int64_t start_ms_;
+  std::atomic<int64_t> taken_ms_{0};
+  webrtc::Event taken_;
+  std::thread thread_;
+};
+
+}  // namespace
 
 // Wired as PeerConnectionFactory wires it, with fakes for the platform ADM
 // and the video codecs.
-RootEngineHarness::RootEngineHarness() : parts_(std::make_unique<Parts>()) {
+RootEngineHarness::RootEngineHarness(bool lazy_platform)
+    : parts_(std::make_unique<Parts>()) {
   Parts& p = *parts_;
   p.network = webrtc::Thread::CreateWithSocketServer();
   p.network->SetName("engine-network", nullptr);
@@ -2367,8 +2611,20 @@ RootEngineHarness::RootEngineHarness() : parts_(std::make_unique<Parts>()) {
   p.capture->monitor = std::make_shared<RootAudioMonitor>();
   p.apm = CreateRootAudioProcessing(env, p.capture, p.worker.get());
   p.proxy = p.worker->BlockingCall([&] {
-    return webrtc::make_ref_counted<AdmProxy>(env, p.worker.get(), p.mixer,
-                                              p.fake);
+    if (!lazy_platform) {
+      return webrtc::make_ref_counted<AdmProxy>(env, p.worker.get(), p.mixer,
+                                                p.fake);
+    }
+    Parts* parts = &p;
+    return webrtc::make_ref_counted<AdmProxy>(
+        env, p.worker.get(), p.mixer, AdmLazyPlatform{[parts] {
+          parts->creations.fetch_add(1);
+          if (parts->hold_creation.load()) {
+            parts->creation_entered.Set();
+            parts->creation_release.Wait(webrtc::TimeDelta::Seconds(10));
+          }
+          return webrtc::scoped_refptr<webrtc::AudioDeviceModule>(parts->fake);
+        }});
   });
   p.proxy->SetDeviceFormatReaderForTest(nullptr, false);
   p.proxy->SetDeviceProbeForTest(AdmDeviceProbe{});
@@ -2556,8 +2812,63 @@ rust::Vec<rust::String> RootEngineHarness::take_calls() const {
   return calls;
 }
 
+uint32_t RootEngineHarness::platform_creations() const {
+  return parts_->creations.load();
+}
+
+int64_t RootEngineHarness::peer_connection_while_playout_opens(
+    uint32_t wait_ms) const {
+  Parts& p = *parts_;
+  p.fake->BlockNextStartPlayout();
+  p.proxy->AcquirePlatformAdm();
+  p.controller->set_adm_playout_enabled(true);
+  p.controller->set_playout_hold(true);
+  if (!p.fake->WaitStartPlayoutBlocked()) {
+    return -2;
+  }
+  EngineReferenceTaker peer_connection(p.worker.get(), p.context,
+                                       &p.peer_connections);
+  const int64_t taken_ms = peer_connection.Wait(wait_ms);
+  p.fake->ReleaseStartPlayout();
+  peer_connection.Join();
+  flush();
+  return taken_ms;
+}
+
+PlatformCreationTiming
+RootEngineHarness::peer_connection_while_the_platform_adm_is_created(
+    uint32_t wait_ms) const {
+  Parts& p = *parts_;
+  PlatformCreationTiming timing{};
+  p.hold_creation.store(true);
+  webrtc::Event acquired;
+  std::atomic<bool> result{false};
+  std::thread handle([&] {
+    result.store(acquire());
+    acquired.Set();
+  });
+  timing.creation_held =
+      p.creation_entered.Wait(webrtc::TimeDelta::Seconds(5));
+  EngineReferenceTaker peer_connection(p.worker.get(), p.context,
+                                       &p.peer_connections);
+  timing.peer_connection_ms = peer_connection.Wait(wait_ms);
+  timing.acquire_waited_for_the_creation =
+      !acquired.Wait(webrtc::TimeDelta::Zero());
+  p.hold_creation.store(false);
+  p.creation_release.Set();
+  handle.join();
+  peer_connection.Join();
+  flush();
+  timing.acquired = result.load();
+  return timing;
+}
+
 std::unique_ptr<RootEngineHarness> new_root_engine_harness() {
   return std::make_unique<RootEngineHarness>();
+}
+
+std::unique_ptr<RootEngineHarness> new_root_engine_harness_with_lazy_platform() {
+  return std::make_unique<RootEngineHarness>(true);
 }
 
 RootMonitorHarness::RootMonitorHarness()

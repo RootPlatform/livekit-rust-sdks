@@ -515,6 +515,9 @@ message RoomEvent {
     DataTrackPublished data_track_published = 43;
     DataTrackUnpublished data_track_unpublished = 44;
     LocalTrackRepublished local_track_republished = 45;
+
+    // RootApp fork, numbered from 1000.
+    TrackStreamStateChanged track_stream_state_changed = 1000;
   }
 }
 
@@ -663,6 +666,18 @@ message ParticipantPermissionChanged {
 message ConnectionQualityChanged {
   required string participant_identity = 1;
   required ConnectionQuality quality = 2;
+}
+
+// The SFU paused or resumed forwarding a subscribed track to this participant (its
+// StreamStateUpdate). While STATE_PAUSED the track receives no media: the SFU's allocator found no
+// layer it can forward (this subscriber's bandwidth estimate, or a publisher that sends nothing
+// usable), so a video tile freezes on its last frame until STATE_ACTIVE. Sent only when the
+// subscribed track's state changes; tracks start STATE_ACTIVE (TrackInfo.stream_state) and a new
+// subscription starts over. RootApp fork.
+message TrackStreamStateChanged {
+  required string participant_identity = 1;
+  required string track_sid = 2;
+  required StreamState state = 3;
 }
 
 message UserPacket {

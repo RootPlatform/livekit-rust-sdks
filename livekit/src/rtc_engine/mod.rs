@@ -185,6 +185,10 @@ pub enum EngineEvent {
     ConnectionQuality {
         updates: Vec<proto::ConnectionQualityInfo>,
     },
+    /// The SFU paused or resumed forwarding subscribed tracks.
+    StreamStateUpdate {
+        states: Vec<proto::StreamStateInfo>,
+    },
     RoomUpdate {
         room: proto::Room,
     },
@@ -747,6 +751,9 @@ impl EngineInner {
             }
             SessionEvent::ConnectionQuality { updates } => {
                 let _ = self.engine_tx.send(EngineEvent::ConnectionQuality { updates });
+            }
+            SessionEvent::StreamStateUpdate { states } => {
+                let _ = self.engine_tx.send(EngineEvent::StreamStateUpdate { states });
             }
             SessionEvent::RoomUpdate { room } => {
                 let _ = self.engine_tx.send(EngineEvent::RoomUpdate { room });

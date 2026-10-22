@@ -1396,6 +1396,16 @@ async fn forward_event(
                 .into(),
             );
         }
+        RoomEvent::TrackStreamStateChanged { participant, publication, stream_state } => {
+            let _ = send_event(
+                proto::TrackStreamStateChanged {
+                    participant_identity: participant.identity().to_string(),
+                    track_sid: publication.sid().to_string(),
+                    state: proto::StreamState::from(stream_state).into(),
+                }
+                .into(),
+            );
+        }
         RoomEvent::DataReceived { payload, kind, participant, topic } => {
             let handle_id = server.next_id();
             let buffer_info = proto::BufferInfo {
@@ -1752,5 +1762,35 @@ mod tests {
         .expect("closed room event channel should end the event stream");
 
         assert!(event.is_none());
+    }
+
+    #[test]
+    fn track_stream_state_changed_is_a_room_event_of_its_own() {
+        use prost::Message;
+
+        let paused = proto::TrackStreamStateChanged {
+            participant_identity: "streamer".into(),
+            track_sid: "TR_screenshare".into(),
+            state: proto::StreamState::from(livekit::track::StreamState::Paused).into(),
+        };
+        assert_eq!(paused.state(), proto::StreamState::StatePaused);
+        let event = proto::RoomEvent {
+            room_handle: 7,
+            message: Some(proto::room_event::Message::from(paused.clone())),
+        };
+        let decoded = proto::RoomEvent::decode(event.encode_to_vec().as_slice()).expect("decode");
+        assert_eq!(
+            decoded.message,
+            Some(proto::room_event::Message::TrackStreamStateChanged(paused))
+        );
+        // Field 1000 of the oneof: tag (1000 << 3 | 2) as a varint.
+        let field = proto::room_event::Message::TrackStreamStateChanged(Default::default());
+        let mut bytes = Vec::new();
+        field.encode(&mut bytes);
+        assert_eq!(&bytes[..2], &[0xC2, 0x3E]);
+        assert_eq!(
+            proto::StreamState::from(livekit::track::StreamState::Active),
+            proto::StreamState::StateActive
+        );
     }
 }

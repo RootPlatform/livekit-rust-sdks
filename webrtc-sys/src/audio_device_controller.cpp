@@ -38,6 +38,7 @@ AudioDeviceOutcome ToOutcome(const AdmDirectionOutcome& outcome) {
   result.stop_result = outcome.stop_result;
   result.init_result = outcome.init_result;
   result.start_result = outcome.start_result;
+  result.init_detail = rust::String::lossy(outcome.init_detail);
   return result;
 }
 
@@ -439,6 +440,10 @@ RootAudioNativeStats AudioDeviceController::root_audio_stats() const {
   stats.render_stall_reopens = reopens(AdmReopenReason::kRenderStall);
   stats.coupled_reopens = native.coupled_reopens;
   stats.render_stall_recoveries = native.render_stall_recoveries;
+  stats.playout_fallback_available = native.playout_fallback_available;
+  stats.playout_fallback = native.playout_fallback;
+  stats.playout_fallback_opens = native.playout_fallback_opens;
+  stats.playout_init_detail = rust::String::lossy(native.playout_init_detail);
 
   const double nan = std::numeric_limits<double>::quiet_NaN();
   stats.erl_db = nan;

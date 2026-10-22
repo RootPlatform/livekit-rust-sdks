@@ -47,6 +47,8 @@ struct RemoteEvents {
 struct RemoteInfo {
     subscribed: bool,
     allowed: bool,
+    // The SFU's stream state for a subscription whose track is not there yet.
+    pending_stream_state: Option<StreamState>,
 }
 
 struct RemoteInner {
@@ -78,7 +80,11 @@ impl RemoteTrackPublication {
         Self {
             inner: super::new_inner(info, track.map(Into::into)),
             remote: Arc::new(RemoteInner {
-                info: RwLock::new(RemoteInfo { subscribed: auto_subscribe, allowed: true }),
+                info: RwLock::new(RemoteInfo {
+                    subscribed: auto_subscribe,
+                    allowed: true,
+                    pending_stream_state: None,
+                }),
                 events: Default::default(),
             }),
         }
@@ -90,6 +96,9 @@ impl RemoteTrackPublication {
     pub(crate) fn set_track(&self, track: Option<RemoteTrack>) {
         let old_subscription_state = self.subscription_status();
         let old_permission_state = self.permission_status();
+        if track.is_none() {
+            self.remote.info.write().pending_stream_state = None;
+        }
 
         let prev_track = self.track();
 
@@ -113,6 +122,16 @@ impl RemoteTrackPublication {
 
         self.emit_subscription_update(old_subscription_state);
         self.emit_permission_update(old_permission_state);
+    }
+
+    /// Keeps the SFU's stream state of a subscription until its track is set
+    /// (the SFU can pause it first); unsubscribing drops it.
+    pub(crate) fn set_pending_stream_state(&self, state: StreamState) {
+        self.remote.info.write().pending_stream_state = Some(state);
+    }
+
+    pub(crate) fn take_pending_stream_state(&self) -> Option<StreamState> {
+        self.remote.info.write().pending_stream_state.take()
     }
 
     pub(crate) fn emit_subscription_update(&self, old_subscription_state: SubscriptionStatus) {
@@ -402,5 +421,30 @@ impl RemoteTrackPublication {
 
     pub fn frame_metadata_features(&self) -> Vec<PacketTrailerFeature> {
         self.inner.info.read().frame_metadata_features.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stream_state_before_the_track_waits_for_it_and_an_unsubscription_drops_it() {
+        let info = proto::TrackInfo {
+            sid: "TR_screenshare".into(),
+            name: "screen".into(),
+            r#type: proto::TrackType::Video as i32,
+            ..Default::default()
+        };
+        let publication = RemoteTrackPublication::new(info, None, true);
+        assert_eq!(publication.take_pending_stream_state(), None);
+
+        publication.set_pending_stream_state(StreamState::Paused);
+        assert_eq!(publication.take_pending_stream_state(), Some(StreamState::Paused));
+        assert_eq!(publication.take_pending_stream_state(), None, "taken once");
+
+        publication.set_pending_stream_state(StreamState::Paused);
+        publication.set_track(None);
+        assert_eq!(publication.take_pending_stream_state(), None, "an unsubscription drops it");
     }
 }
