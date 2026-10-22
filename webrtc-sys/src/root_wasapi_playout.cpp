@@ -220,8 +220,6 @@ class WasapiPlayoutFallback final : public AdmPlayoutFallback {
     state_->transport = transport;
   }
 
-  // A render thread that did not stop keeps the state, its events and its
-  // handle (they are leaked with it).
   ~WasapiPlayoutFallback() override { Stop(); }
 
   int32_t Init(const std::string& endpoint_id, size_t channels) override {
@@ -267,13 +265,24 @@ class WasapiPlayoutFallback final : public AdmPlayoutFallback {
     return 0;
   }
 
+  // A render thread that does not stop in time is given up: it keeps the
+  // state (its client is released when the thread ends) and both events,
+  // which are leaked with it, and this fallback starts over closed.
   int32_t Stop() override {
     if (thread_) {
       SetEvent(stop_event_);
-      if (WaitForSingleObject(thread_, kStopTimeoutMs) != WAIT_OBJECT_0)
-        return -1;
+      const bool stopped = WaitForSingleObject(thread_, kStopTimeoutMs) == WAIT_OBJECT_0;
       CloseHandle(thread_);
       thread_ = nullptr;
+      if (!stopped) {
+        stop_event_ = nullptr;
+        started_event_ = nullptr;
+        auto fresh = std::make_shared<State>();
+        fresh->transport = state_->transport;
+        state_ = std::move(fresh);
+        describe_ += "; its render thread did not stop within 2 s and was given up";
+        return -1;
+      }
     }
     CloseEvents();
     state_->Close();

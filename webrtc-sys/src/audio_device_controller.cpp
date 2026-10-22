@@ -444,6 +444,8 @@ RootAudioNativeStats AudioDeviceController::root_audio_stats() const {
   stats.playout_fallback = native.playout_fallback;
   stats.playout_fallback_opens = native.playout_fallback_opens;
   stats.playout_init_detail = rust::String::lossy(native.playout_init_detail);
+  stats.capture_stall_guard_available = native.capture_stall_guard_available;
+  stats.capture_stall_recoveries = native.capture_stall_recoveries;
 
   const double nan = std::numeric_limits<double>::quiet_NaN();
   stats.erl_db = nan;

@@ -2301,6 +2301,108 @@ fn adm_proxy_without_a_playout_fallback_reports_the_bare_failure() {
     assert_eq!(outcome.init_result, ADM_RESULT_NOT_ATTEMPTED);
 }
 
+/// A playout fallback whose render thread does not stop (stuck in a device
+/// call) fails its Stop. The proxy gives it up, as the Windows ADM gives up a
+/// render thread it could not join: no second puller in that pass, and the
+/// passes after it open playout again without asking it once more. Kept, it
+/// was asked (and waited 2 s for its thread) in every pass, a microphone
+/// restart's too, and playout never reopened (0.9.153: the desktop's restarts
+/// of output and microphone timed out for minutes after an output change).
+#[test]
+fn adm_proxy_gives_up_a_playout_fallback_that_does_not_stop() {
+    let h = platform(&["{spk}"], &["{mic}"]);
+    h.set_playout_fallback(UNSUPPORTED_MIX, true, 0);
+    h.fail_init_playout(-1);
+    h.hold(true);
+    h.app_recording(true);
+    calls(&h);
+    assert_eq!(h.take_fallback_calls(), ["diagnose(default, stereo)", "Init(default, 2)", "Start"]);
+
+    h.stick_fallback_stop(true);
+    let outcome = h.restart(false, true).playout;
+    assert_eq!((outcome.stop_result, outcome.init_result), (-1, ADM_RESULT_NOT_ATTEMPTED));
+    assert_eq!(h.take_fallback_calls(), ["Stop"]);
+    let stats = h.stats();
+    assert!(!stats.playout_fallback && !stats.playing, "given up");
+    assert_eq!(stats.device_stop_failures, 1);
+
+    // The desktop's microphone restart next (or the retry a second later).
+    let outcome = h.restart(true, false).recording;
+    assert_eq!((outcome.stop_result, outcome.init_result, outcome.start_result), (0, 0, 0));
+    wait_until("playout opens again", || h.stats().playout_fallback);
+    assert_eq!(
+        h.take_fallback_calls(),
+        ["diagnose(default, stereo)", "Init(default, 2)", "Start"],
+        "a new fallback; the one that did not stop is not asked again"
+    );
+    let stats = h.stats();
+    assert!(stats.playing && stats.recording);
+    assert_eq!((stats.device_stop_failures, stats.playout_fallback_opens), (1, 2));
+}
+
+/// The Windows ADM's capture thread ends on an invalidated device or after
+/// 500 ms without a capture event, which a device or default-device change
+/// can cause, and Recording() stays true: the microphone stays silent until
+/// it is opened again (0.9.153: the desktop's watchdog did that 8-12 s later,
+/// mic_pipeline_dead). The proxy reopens a recording that delivered no
+/// capture callback for the guard's time, at most once per interval, and
+/// leaves one that delivers, or no microphone, alone.
+#[test]
+fn adm_proxy_reopens_a_microphone_that_stopped_delivering() {
+    let h = platform(&["{spk}"], &["{mic}"]);
+    h.hold(true);
+    h.app_recording(true);
+    calls(&h);
+    h.set_capture_stall_guard(50, 10_000);
+    h.device_callback(true, false);
+    h.poll_capture_stall();
+    std::thread::sleep(Duration::from_millis(60));
+    h.device_callback(true, false);
+    h.poll_capture_stall();
+    assert_eq!(calls(&h), Vec::<String>::new(), "it delivers");
+
+    std::thread::sleep(Duration::from_millis(60));
+    h.poll_capture_stall();
+    assert_eq!(
+        calls(&h),
+        [
+            "StopRecording".into(),
+            default_device("Recording"),
+            "InitRecording".into(),
+            "StartRecording".into()
+        ],
+        "reopened"
+    );
+    let stats = h.stats();
+    assert!(stats.capture_stall_guard_available && stats.recording && stats.playing);
+    assert_eq!((stats.capture_stall_recoveries, stats.device_lost_reopens), (1, 1));
+
+    std::thread::sleep(Duration::from_millis(60));
+    h.poll_capture_stall();
+    assert_eq!(calls(&h), Vec::<String>::new(), "at most once per interval");
+
+    h.app_recording(false);
+    calls(&h);
+    h.set_capture_stall_guard(50, 0);
+    h.poll_capture_stall();
+    std::thread::sleep(Duration::from_millis(60));
+    h.poll_capture_stall();
+    assert_eq!(calls(&h), Vec::<String>::new(), "no microphone open");
+    assert!(h.stats().playing, "playout is not its business");
+}
+
+#[test]
+fn adm_proxy_capture_stall_guard_is_off_unless_the_platform_has_one() {
+    let h = platform(&["{spk}"], &["{mic}"]);
+    h.app_recording(true);
+    calls(&h);
+    assert!(!h.stats().capture_stall_guard_available, "the harness proxy has none unless set");
+    h.poll_capture_stall();
+    std::thread::sleep(Duration::from_millis(60));
+    h.poll_capture_stall();
+    assert_eq!(calls(&h), Vec::<String>::new());
+}
+
 /// The real WASAPI diagnosis and fallback on this machine's default output:
 /// a client initialized and released (the diagnosis), then the fallback's
 /// stream playing silence for 300 ms. Opens real devices.
@@ -2334,4 +2436,30 @@ fn wasapi_playout_diagnosis_and_fallback_on_the_default_output() {
         .and_then(|count| count.parse().ok())
         .expect("render count");
     assert!(renders >= 20, "about 30 renders of 10 ms in 300 ms: {run}");
+}
+
+/// The real fallback's render thread stuck in its first pull: the first Stop
+/// waits 2 s for it and gives it up, the fallback is closed, and neither a
+/// second Stop nor the destructor waits for that thread again. Opens the
+/// default output.
+#[cfg(windows)]
+#[test]
+fn wasapi_playout_fallback_gives_up_a_render_thread_that_does_not_stop() {
+    use crate::audio_device_controller::ffi::wasapi_playout_fallback_stuck_stop;
+    if std::env::var_os("LK_HW_AUDIO_TESTS").is_none() {
+        eprintln!("skipped: opens the default output; set LK_HW_AUDIO_TESTS=1 to run");
+        return;
+    }
+    let run = wasapi_playout_fallback_stuck_stop();
+    eprintln!("stuck fallback: {run}");
+    let ms = |after: &str| -> u64 {
+        let rest = run.split(after).nth(1).expect(after);
+        rest.split(" ms").next().and_then(|n| n.parse().ok()).expect(after)
+    };
+    assert!(run.starts_with("stop -1 after "), "{run}");
+    assert!(ms("stop -1 after ") >= 1_900, "{run}");
+    assert!(run.contains(", playing false, stop 0 after "), "{run}");
+    assert!(ms(", stop 0 after ") < 100, "{run}");
+    assert!(ms("destroyed after ") < 100, "{run}");
+    assert!(run.ends_with("released true"), "{run}");
 }

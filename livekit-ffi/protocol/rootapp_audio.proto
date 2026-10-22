@@ -755,6 +755,13 @@ message RootAudioStats {
   // then what the fallback did. Empty when the last open succeeded. The same text follows "device
   // init failed (n): " in a failed selection's or restart's error.
   optional string playout_init_detail = 172;
+
+  // Microphones native reopened because they delivered nothing for 1 s while recording (at most once
+  // every 5 s), counted with device_lost_reopens where those are reported. The Windows ADM's capture
+  // thread ends on an invalidated device or after 500 ms without a capture event (a device or
+  // default-device change) while Recording() stays true. Cumulative for the engine's life; present
+  // where native watches for it (Windows), absent elsewhere and from libraries that predate it.
+  optional uint64 capture_stall_recoveries = 173;
 }
 // One playout mixer source (a remote audio stream): its audio as it reached the mixer, decoded and
 // before its gain (tile volume, master volume, deafen; a muted frame counts as silence), as a sum of

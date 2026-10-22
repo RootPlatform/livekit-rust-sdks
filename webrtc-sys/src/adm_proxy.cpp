@@ -67,10 +67,16 @@ constexpr webrtc::TimeDelta kStopFailureRetry = webrtc::TimeDelta::Seconds(1);
 constexpr webrtc::TimeDelta kFormatWatchPeriod = webrtc::TimeDelta::Millis(100);
 constexpr webrtc::TimeDelta kRenderStallWatchPeriod =
     webrtc::TimeDelta::Millis(100);
+constexpr webrtc::TimeDelta kCaptureStallWatchPeriod =
+    webrtc::TimeDelta::Millis(250);
 #endif
 constexpr int64_t kFormatReopenMinIntervalNs = 1'000'000'000;
 constexpr int64_t kRenderStallNs = 500'000'000;
 constexpr int64_t kRenderStallMinIntervalNs = 5'000'000'000;
+// Twice the Windows ADM's 500 ms wait for a capture event, after which its
+// capture thread has ended.
+constexpr int64_t kCaptureStallNs = 1'000'000'000;
+constexpr int64_t kCaptureStallMinIntervalNs = 5'000'000'000;
 // 100 ms of capture while nothing rendered.
 constexpr uint64_t kRenderStallMinCaptures = 10;
 // A platform ADM creation that took this long is logged as a warning.
@@ -788,6 +794,9 @@ AdmProxy::AdmProxy(const webrtc::Environment& env,
   playout_diagnoser_ = DiagnoseWasapiPlayout;
   playout_fallback_factory_ = CreateWasapiPlayoutFallback;
   playout_fallback_available_.store(true, std::memory_order_relaxed);
+  capture_stall_guard_ = true;
+  capture_stall_periodic_ = true;
+  capture_stall_available_.store(true, std::memory_order_relaxed);
 #endif
 }
 #endif
@@ -825,6 +834,8 @@ AdmProxy::AdmProxy(const webrtc::Environment& env,
 #endif
   render_stall_ns_ = kRenderStallNs;
   render_stall_interval_ns_ = kRenderStallMinIntervalNs;
+  capture_stall_ns_ = kCaptureStallNs;
+  capture_stall_interval_ns_ = kCaptureStallMinIntervalNs;
   serialize_enumeration_.store(kSerializeEnumeration);
   enumeration_wait_ms_.store(kEnumerationWaitMs);
   // Create the synthetic ADM for synthetic mode. SyntheticAudioDevice pumps
@@ -1248,7 +1259,10 @@ bool AdmProxy::StopDeviceLocked(bool playout, AdmDirectionOutcome* outcome) {
   if (outcome) {
     outcome->stop_result = result;
   }
-  if (playout && result == 0 && playout_fallback_) {
+  // A fallback whose thread did not stop has given it up, as the Windows ADM
+  // forgets a render thread it could not join: kept, every later pass would
+  // wait for that thread again and playout would never reopen.
+  if (playout && playout_fallback_) {
     playout_fallback_.reset();
     playout_fallback_active_.store(false, std::memory_order_relaxed);
   }
@@ -1538,7 +1552,10 @@ void AdmProxy::ReconcileRecordingLocked(const DesiredState& desired,
       // As for playout: the macOS ADM keeps the capture thread of a failed
       // start, and starting again joins it.
       StopDeviceLocked(false, nullptr);
+      return;
     }
+    capture_stall_ = CaptureStallWatch{};
+    ScheduleCaptureStallWatchLocked();
   }
 }
 
@@ -2057,6 +2074,57 @@ void AdmProxy::ScheduleRenderStallWatchLocked() {
 #endif
 }
 
+// AudioDeviceWindowsCore's capture thread exits on a failed WASAPI call (an
+// invalidated device) or after 500 ms without a capture event, and nothing
+// tells the module: Recording() stays true and the microphone is silent
+// until it is opened again.
+void AdmProxy::PollCaptureStallLocked() {
+  if (terminated_ || !capture_stall_guard_) {
+    return;
+  }
+  const int64_t now = NowNs();
+  const uint64_t capture = tap_.capture_callbacks();
+  if (!platform_recording_.load(std::memory_order_acquire) ||
+      capture_stall_.since_ns == 0 || capture != capture_stall_.capture) {
+    capture_stall_ = CaptureStallWatch{capture, now};
+    return;
+  }
+  if (now - capture_stall_.since_ns < capture_stall_ns_ ||
+      (last_capture_stall_recovery_ns_ != 0 &&
+       now - last_capture_stall_recovery_ns_ < capture_stall_interval_ns_)) {
+    return;
+  }
+  RTC_LOG(LS_WARNING) << "AdmProxy: the microphone delivered nothing for "
+                      << (now - capture_stall_.since_ns) / 1'000'000
+                      << " ms while recording; reopening it";
+  last_capture_stall_recovery_ns_ = now;
+  capture_stall_ = CaptureStallWatch{capture, now};
+  capture_stall_recoveries_.fetch_add(1, std::memory_order_relaxed);
+  RequestRestartLocked(false, AdmReopenReason::kDeviceLost);
+  RequestReconcile();
+}
+
+void AdmProxy::ScheduleCaptureStallWatchLocked() {
+#if !LK_ADM_MOBILE
+  if (capture_stall_scheduled_ || !capture_stall_guard_ ||
+      !capture_stall_periodic_) {
+    return;
+  }
+  capture_stall_scheduled_ = true;
+  device_thread_->PostDelayedTask(
+      [this] {
+        AdmLock lock(&mutex_);
+        capture_stall_scheduled_ = false;
+        PollCaptureStallLocked();
+        if (!terminated_ &&
+            platform_recording_.load(std::memory_order_acquire)) {
+          ScheduleCaptureStallWatchLocked();
+        }
+      },
+      kCaptureStallWatchPeriod);
+#endif
+}
+
 void AdmProxy::ShutdownLocked() {
   if (terminated_) {
     return;
@@ -2064,7 +2132,8 @@ void AdmProxy::ShutdownLocked() {
   terminated_ = true;
   // The Windows ADM's Terminate releases its clients without stopping the
   // device threads, so stop them first.
-  if (playout_fallback_ && playout_fallback_->Stop() == 0) {
+  if (playout_fallback_) {
+    playout_fallback_->Stop();
     playout_fallback_.reset();
   }
   playout_fallback_active_.store(false, std::memory_order_relaxed);
@@ -2455,6 +2524,27 @@ void AdmProxy::PollRenderStallForTest() {
   });
 }
 
+void AdmProxy::SetCaptureStallGuardForTest(bool enabled,
+                                           bool periodic,
+                                           int stall_ms,
+                                           int min_interval_ms) {
+  AdmLock lock(&mutex_);
+  capture_stall_guard_ = enabled;
+  capture_stall_periodic_ = periodic;
+  capture_stall_available_.store(enabled, std::memory_order_relaxed);
+  capture_stall_ns_ = int64_t{stall_ms} * 1'000'000;
+  capture_stall_interval_ns_ = int64_t{min_interval_ms} * 1'000'000;
+  capture_stall_ = CaptureStallWatch{};
+  last_capture_stall_recovery_ns_ = 0;
+}
+
+void AdmProxy::PollCaptureStallForTest() {
+  RunDeviceTaskAndWait([this] {
+    AdmLock lock(&mutex_);
+    PollCaptureStallLocked();
+  });
+}
+
 uint64_t AdmProxy::RoutedListenersForTest() const {
   return listener_router_ ? listener_router_->routed() : 0;
 }
@@ -2520,6 +2610,10 @@ AdmNativeStats AdmProxy::ReadNativeStats() {
       playout_fallback_active_.load(std::memory_order_relaxed);
   stats.playout_fallback_opens =
       playout_fallback_opens_.load(std::memory_order_relaxed);
+  stats.capture_stall_guard_available =
+      capture_stall_available_.load(std::memory_order_relaxed);
+  stats.capture_stall_recoveries =
+      capture_stall_recoveries_.load(std::memory_order_relaxed);
   stats.same_device = same_device_.load(std::memory_order_relaxed);
   stats.device_list_notifications =
       device_list_notifications_.load(std::memory_order_relaxed);

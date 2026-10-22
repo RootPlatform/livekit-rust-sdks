@@ -327,6 +327,8 @@ class AdmProxyHarness {
                             int32_t init_result) const;
   // What the diagnosis and the fallbacks were asked since the last take.
   rust::Vec<rust::String> take_fallback_calls() const;
+  // While stuck, every Stop of a fake fallback fails and it keeps playing.
+  void stick_fallback_stop(bool stuck) const;
   // One 10 ms render callback of the playing fallback from a thread of its
   // own; frames -1 when none plays.
   AdmDeviceRender fallback_render() const;
@@ -376,6 +378,11 @@ class AdmProxyHarness {
   void set_render_stall_guard(uint32_t stall_ms,
                               uint32_t min_interval_ms) const;
   void poll_render_stall() const;
+  // The capture-stall guard with these limits, run only by
+  // poll_capture_stall.
+  void set_capture_stall_guard(uint32_t stall_ms,
+                               uint32_t min_interval_ms) const;
+  void poll_capture_stall() const;
   uint32_t listener_calls() const;
   bool listeners_ran_on_device_thread() const;
   uint32_t overlapping_device_calls() const;
@@ -472,6 +479,9 @@ rust::String wasapi_playout_diagnosis(rust::Str endpoint_id, bool stereo);
 // The real playout fallback on the default output for `run_ms`, playing the
 // tap's silence; what it did.
 rust::String wasapi_playout_fallback_run(uint32_t run_ms);
+// The real playout fallback with a transport that never returns from its
+// first pull: each Stop's result and time, and Playing() after the first.
+rust::String wasapi_playout_fallback_stuck_stop();
 #endif
 
 class HarnessApmTransport;

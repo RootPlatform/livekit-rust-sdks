@@ -1044,6 +1044,11 @@ pub struct RootAudioStats {
 
     // `None` where native has no playout fallback.
     pub playout_fallback: Option<PlayoutFallbackStats>,
+
+    // Microphones native reopened because they stopped delivering while
+    // recording (cumulative); `None` where native does not watch for that
+    // (it does on Windows).
+    pub capture_stall_recoveries: Option<u64>,
 }
 
 impl Default for RootAudioStats {
@@ -1175,6 +1180,7 @@ impl Default for RootAudioStats {
             device_formats: None,
             device_changes: None,
             playout_fallback: None,
+            capture_stall_recoveries: None,
         }
     }
 }
@@ -1238,6 +1244,9 @@ impl RootAudioStats {
                 opens: native.playout_fallback_opens,
                 init_detail: native.playout_init_detail.clone(),
             }),
+            capture_stall_recoveries: native
+                .capture_stall_guard_available
+                .then_some(native.capture_stall_recoveries),
             monitor_active: monitor.then_some(native.monitor_active),
             monitor_frames: monitor.then_some(native.monitor_frames),
             monitor_dropped_frames: monitor.then_some(native.monitor_dropped_frames),
@@ -2144,6 +2153,21 @@ mod tests {
         });
         assert_eq!(without.device_changes, None);
         assert_eq!(RootAudioStats::default().device_changes, None);
+    }
+
+    #[test]
+    fn root_audio_stats_report_capture_stall_recoveries_only_where_native_watches() {
+        let native = NativeAudioStats {
+            capture_stall_guard_available: true,
+            capture_stall_recoveries: 2,
+            ..Default::default()
+        };
+        assert_eq!(RootAudioStats::from_native(native).capture_stall_recoveries, Some(2));
+        let without = RootAudioStats::from_native(NativeAudioStats {
+            capture_stall_recoveries: 2,
+            ..Default::default()
+        });
+        assert_eq!(without.capture_stall_recoveries, None);
     }
 
     #[test]
