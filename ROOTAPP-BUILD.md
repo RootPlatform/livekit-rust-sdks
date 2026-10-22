@@ -2692,6 +2692,60 @@ livekit `device_results_carry_why_the_init_failed`; livekit-ffi
 Not verified: a device with a surround or 192 kHz mix format (none here, and changing the default
 format is a system setting), and the fallback in a live call.
 
+## PlatformAudio create apart from room connect (`rootapp/hw24-fixes`)
+
+Report from 0.9.152 (a Windows machine with 10 recording and 15 playout devices): a
+`NewPlatformAudio` had not returned after 10 s; a managed call started 11 s later connected only
+0.2 s before that create returned, and an earlier platform call's join took 17 s.
+
+Two things serialized the create with a connect:
+- `LkRuntime::instance()` builds the `PeerConnectionFactory` under the global runtime lock, and room
+  connect takes that lock first (`EngineInner::connect`). The factory created the platform ADM on the
+  worker thread (`BlockingCall` in the `PeerConnectionFactory` constructor):
+  `CreateAudioDeviceModule(kPlatformDefaultAudio)` runs `AudioDeviceWindowsCore::CoreAudioIsSupported`,
+  which builds, `Init`s and terminates a throwaway ADM, then `AdmProxy` `Init`s the real one. Each
+  `Init` is `_EnumerateEndpointDevicesAll` for both directions (webrtc-89d790b, disassembled): every
+  active, disabled and unplugged endpoint, with `GetId`, the property store, `GetState` and an
+  `IAudioEndpointVolume` activation with its range and step queries. So four full endpoint sweeps ran
+  under the lock a connect waits for. The runtime is a weak reference, so this happens again whenever
+  no room, track, source or PlatformAudio keeps one alive.
+- Whatever the worker asked of `AdmProxy` while a device operation held the device thread waited for
+  it: `RegisterAudioCallback` ran on the device thread (`RunDeviceTaskAndWait`), and
+  `StereoPlayoutIsAvailable`, `StereoRecordingIsAvailable` and `SetStereoRecording` took the device
+  mutex, which every device open and stop holds (a Windows `InitPlayout`, a 2 s `StopPlayout` join).
+  A PeerConnection's first media engine reference initializes the voice engine on the worker
+  (`adm_helpers::Init`, `RegisterAudioCallback`), so a connect waited for the device.
+
+Which step took the 10 s on that machine is not known (here, the factory takes 347 ms and the platform
+ADM 17 ms); the steps are now logged. The connect no longer waits for any of them:
+- On desktop the factory's `AdmProxy` gets an `AdmLazyPlatform`: the platform ADM is created and
+  initialized on the device thread by the first `AcquirePlatformAdm` (the first `PlatformAudio`), which
+  waits for it; the worker and the runtime lock do not. A managed call never creates it. Mobile is
+  unchanged. Created on the device thread, it is also released there (the Windows ADM uninitializes
+  the COM apartment it entered). Before it exists the proxy lists no devices, as without a platform ADM.
+- `RegisterAudioCallback` swaps the tap's transport atomically. On desktop the stereo queries answer
+  what the platform ADM said when it was attached (stereo before), and `SetStereoRecording` is kept and
+  applied before every recording open, as the playout channels are; a wish made before the platform
+  ADM existed becomes what the ADM can do (the engine always asks for what is available).
+- The FFI's `NewPlatformAudio` reads the device counts (`PlatformAudio::recording_device_count`,
+  `playout_device_count`) instead of listing every name and ID (three enumerations per device on
+  Windows, about 75 for 25 devices).
+
+Logs (warnings when slow, info otherwise; the desktop forwards warnings):
+- `AdmProxy: the platform ADM was created in <n> ms (creation <n> ms, Init and setup <n> ms)` (1 s)
+- `PlatformAudio: created in <n> ms (handle lock, runtime, platform ADM, enable, device counts, audio
+  processing <n> ms each): <r> recording / <p> playout devices` (2 s)
+- `[PLATFORM_AUDIO_FFI] PlatformAudio created in <n> ms (PlatformAudio::new, device counts, session)` (2 s)
+- `LkRuntime: PeerConnectionFactory created in <n> ms` (1 s)
+
+Tests: `root_engine_a_peer_connection_never_waits_for_a_device_open` (the device thread blocked in
+`StartPlayout` holding the device mutex; a PeerConnection's engine reference on the worker finishes at
+once) and `root_engine_the_platform_adm_is_created_with_the_first_reference_without_holding_up_a_peer_connection`
+(no creation for a managed call; with the creation held, the handle's acquire waits and a
+PeerConnection does not; one creation for later handles). With `RegisterAudioCallback`'s old
+device-thread wait put back, both fail. livekit `create_steps_log_each_steps_own_time`;
+`test_audio_device_controller_bridge` (`LK_HW_AUDIO_TESTS=1`) now acquires before it lists.
+
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
 | Commit | Change |

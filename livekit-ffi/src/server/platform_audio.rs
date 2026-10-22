@@ -14,7 +14,10 @@
 
 //! FFI bindings for PlatformAudio device management.
 
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use livekit::{PlatformAudio, PlayoutDeviceId, RecordingDeviceId};
 
@@ -46,22 +49,29 @@ pub fn platform_audio_from_handle(
     Ok(server.retrieve_handle::<FfiPlatformAudio>(handle)?.audio.clone())
 }
 
+/// A NewPlatformAudio at or above this is logged as a warning.
+const SLOW_CREATE: Duration = Duration::from_secs(2);
+
+// Runs on the caller's thread. Nothing here holds a lock a room connect
+// needs: the runtime is built without the Platform ADM, which is created on
+// the device thread by the first PlatformAudio (see livekit's
+// PlatformAudio::new, which logs its own steps).
 pub fn on_new_platform_audio(
     server: &'static FfiServer,
     _req: proto::NewPlatformAudioRequest,
 ) -> FfiResult<proto::NewPlatformAudioResponse> {
     log::info!("[PLATFORM_AUDIO_FFI] on_new_platform_audio() called");
+    let started = Instant::now();
 
     match PlatformAudio::new() {
         Ok(audio) => {
+            let created = started.elapsed();
             let handle_id = server.next_id();
-            let recording_count = audio.recording_devices().count() as i32;
-            let playout_count = audio.playout_devices().count() as i32;
-
-            log::info!(
-                "[PLATFORM_AUDIO_FFI] PlatformAudio created successfully: handle_id={}, recording_devices={}, playout_devices={}",
-                handle_id, recording_count, playout_count
-            );
+            // Counts only: listing names and IDs would enumerate the devices
+            // three times per device on Windows.
+            let recording_count = audio.recording_device_count() as i32;
+            let playout_count = audio.playout_device_count() as i32;
+            let counted = started.elapsed();
 
             let info = proto::PlatformAudioInfo {
                 recording_device_count: recording_count,
@@ -70,6 +80,21 @@ pub fn on_new_platform_audio(
 
             let rootapp = RootAudioSession::start(server, handle_id, audio.clone());
             server.store_handle(handle_id, FfiPlatformAudio { audio, rootapp });
+            let total = started.elapsed();
+            let level = if total >= SLOW_CREATE { log::Level::Warn } else { log::Level::Info };
+            log::log!(
+                level,
+                "[PLATFORM_AUDIO_FFI] PlatformAudio created in {} ms (PlatformAudio::new {} ms, \
+                 device counts {} ms, session {} ms): handle_id={}, recording_devices={}, \
+                 playout_devices={}",
+                total.as_millis(),
+                created.as_millis(),
+                counted.saturating_sub(created).as_millis(),
+                total.saturating_sub(counted).as_millis(),
+                handle_id,
+                recording_count,
+                playout_count
+            );
 
             Ok(proto::NewPlatformAudioResponse {
                 message: Some(proto::new_platform_audio_response::Message::PlatformAudio(
@@ -82,11 +107,12 @@ pub fn on_new_platform_audio(
         }
         Err(e) => {
             log::error!(
-                "[PLATFORM_AUDIO_FFI] PlatformAudio::new() failed: {}. This typically means: \
+                "[PLATFORM_AUDIO_FFI] PlatformAudio::new() failed after {} ms: {}. This typically means: \
                 (1) Android JNI not initialized (init_android not called), \
                 (2) RECORD_AUDIO permission not granted, \
                 (3) No audio devices available, or \
                 (4) Another app has exclusive audio focus.",
+                started.elapsed().as_millis(),
                 e
             );
             Ok(proto::NewPlatformAudioResponse {

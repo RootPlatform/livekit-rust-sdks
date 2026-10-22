@@ -51,6 +51,7 @@ struct AdmDeviceRender;
 struct AdmMacIo;
 struct AdmMacState;
 struct RootControlState;
+struct PlatformCreationTiming;
 #endif
 struct AudioDeviceSelection;
 struct AudioDeviceRequestOutcome;
@@ -538,7 +539,10 @@ std::unique_ptr<RootVoiceHarness> new_root_voice_harness();
 // Tests only; no audio device is opened and no PeerConnection is created.
 class RootEngineHarness {
  public:
-  RootEngineHarness();
+  // With `lazy_platform` the proxy creates its platform ADM (the fake) at
+  // the first platform reference, as the factory's does on desktop, and the
+  // creation can be held (hold_platform_creation).
+  explicit RootEngineHarness(bool lazy_platform = false);
   ~RootEngineHarness();
 
   const AudioDeviceController& controller() const;
@@ -566,6 +570,22 @@ class RootEngineHarness {
   bool platform_recording() const;
   bool synthetic_playing() const;
   rust::Vec<rust::String> take_calls() const;
+  // The platform ADM's creations so far (lazy_platform).
+  uint32_t platform_creations() const;
+  // A platform reference (no engine reference of its own) with the hold:
+  // the device thread opens playout and blocks in StartPlayout, holding the
+  // device mutex. Meanwhile a PeerConnection takes the first media engine
+  // reference on the worker, so the voice engine initializes. How long that
+  // took, ms; -1 when it had not finished within `wait_ms` (it finishes once
+  // the device is released).
+  int64_t peer_connection_while_playout_opens(uint32_t wait_ms) const;
+  // lazy_platform: a PlatformAudio handle's creation on a thread of its own
+  // while the platform ADM's creation is held, and meanwhile a
+  // PeerConnection's first media engine reference on the worker. How long
+  // the PeerConnection took, ms (-1 when not within `wait_ms`); then the
+  // creation is released.
+  PlatformCreationTiming peer_connection_while_the_platform_adm_is_created(
+      uint32_t wait_ms) const;
 
  private:
   struct Parts;
@@ -573,6 +593,7 @@ class RootEngineHarness {
 };
 
 std::unique_ptr<RootEngineHarness> new_root_engine_harness();
+std::unique_ptr<RootEngineHarness> new_root_engine_harness_with_lazy_platform();
 #endif
 
 }  // namespace livekit_ffi

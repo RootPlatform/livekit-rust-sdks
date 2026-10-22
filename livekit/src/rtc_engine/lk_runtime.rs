@@ -89,8 +89,26 @@ impl LkRuntime {
             // in RtcSession). zero_playout_delay is independent and composed
             // alongside WARP. Whether WARP actually engages is negotiated with
             // the server — it degrades to plain DTLS/SCTP if the peer opts out.
+            // Built under the runtime lock, which a room connect waits for:
+            // on desktop the platform audio device module is no longer part
+            // of it (the first PlatformAudio creates that).
             #[cfg(not(target_arch = "wasm32"))]
-            let pc_factory = PeerConnectionFactory::with_options(zero_playout_delay, true);
+            let pc_factory = {
+                let started = std::time::Instant::now();
+                let pc_factory = PeerConnectionFactory::with_options(zero_playout_delay, true);
+                let elapsed = started.elapsed();
+                let level = if elapsed >= std::time::Duration::from_secs(1) {
+                    log::Level::Warn
+                } else {
+                    log::Level::Info
+                };
+                log::log!(
+                    level,
+                    "LkRuntime: PeerConnectionFactory created in {} ms",
+                    elapsed.as_millis()
+                );
+                pc_factory
+            };
             #[cfg(target_arch = "wasm32")]
             let pc_factory = PeerConnectionFactory::default();
             let new_runtime = Arc::new(Self { pc_factory, zero_playout_delay });

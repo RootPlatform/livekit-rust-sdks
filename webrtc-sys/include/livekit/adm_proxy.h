@@ -215,6 +215,12 @@ using AdmPlayoutFallbackFactory =
     std::function<std::unique_ptr<AdmPlayoutFallback>(
         webrtc::AudioTransport* transport)>;
 
+// Creates the platform ADM (not yet initialized) when the first platform
+// reference is taken, on the device thread; null when there is none.
+struct AdmLazyPlatform {
+  std::function<webrtc::scoped_refptr<webrtc::AudioDeviceModule>()> create;
+};
+
 struct AdmRequestOutcome {
   AdmDirectionOutcome recording;
   AdmDirectionOutcome playout;
@@ -528,6 +534,17 @@ enum class AdmMonitorResult : uint8_t {
 /// InitPlayout the proxy repeats the ADM's open to report why, and plays
 /// through a shared stream of its own that the engine converts
 /// (AdmPlayoutFallback) when that opens.
+///
+/// On desktop the platform ADM is created and initialized on the device
+/// thread when the first platform reference is taken, not with the factory:
+/// the Windows ADM's creation runs two full endpoint sweeps (every active,
+/// disabled and unplugged endpoint, each with its endpoint volume activated),
+/// which took over 10 s on a machine with 25 endpoints, and the factory is
+/// built under the runtime lock a room connect waits for. A managed call
+/// never creates it. What the worker asks of the proxy (the voice engine's
+/// init, the transport, the stereo settings) never waits for the device
+/// thread or a device, so a device that is slow to create, open or stop
+/// cannot hold up a PeerConnection.
 class AdmProxy : public webrtc::AudioDeviceModule {
  public:
   AdmProxy(const webrtc::Environment& env,
@@ -539,6 +556,12 @@ class AdmProxy : public webrtc::AudioDeviceModule {
            webrtc::Thread* worker_thread,
            webrtc::scoped_refptr<RootAudioMixer> mixer,
            webrtc::scoped_refptr<webrtc::AudioDeviceModule> platform_adm);
+  // Creates the Platform ADM with `lazy` at the first AcquirePlatformAdm, on
+  // the device thread (desktop).
+  AdmProxy(const webrtc::Environment& env,
+           webrtc::Thread* worker_thread,
+           webrtc::scoped_refptr<RootAudioMixer> mixer,
+           AdmLazyPlatform lazy);
   ~AdmProxy() override;
 
   // ===========================================================================
@@ -872,6 +895,13 @@ class AdmProxy : public webrtc::AudioDeviceModule {
 #if defined(__ANDROID__)
   bool EnsurePlatformAdmCreated();
 #endif
+  // Initializes `adm` as the Platform ADM and sets it up (built-in effects
+  // off, default devices, the tap, the stereo settings); false when its Init
+  // failed.
+  bool AttachPlatformAdmLocked(
+      webrtc::scoped_refptr<webrtc::AudioDeviceModule> adm);
+  // Desktop: the lazy Platform ADM, created on the device thread once.
+  void EnsurePlatformAdm();
 
   const webrtc::Environment env_;
   webrtc::Thread* worker_thread_;
@@ -1002,6 +1032,17 @@ class AdmProxy : public webrtc::AudioDeviceModule {
   std::atomic<bool> device_track_noise_suppression_{false};
   // Desktop: libwebrtc's SetStereoPlayout, applied before every playout open.
   std::atomic<bool> stereo_playout_{true};
+  // Desktop: what the Platform ADM answered when it was attached (stereo
+  // until then), and libwebrtc's SetStereoRecording, applied before every
+  // recording open once set (a wish made before the Platform ADM existed is
+  // replaced by what the ADM can do when it is attached).
+  std::atomic<bool> stereo_playout_available_{true};
+  std::atomic<bool> stereo_recording_available_{true};
+  std::atomic<bool> stereo_recording_{false};
+  std::atomic<bool> stereo_recording_set_{false};
+  std::atomic<bool> stereo_recording_before_platform_{false};
+  // Guarded by mutex_; consumed by the first creation.
+  AdmLazyPlatform lazy_platform_;
 };
 
 }  // namespace livekit_ffi

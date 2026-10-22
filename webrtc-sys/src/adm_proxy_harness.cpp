@@ -54,6 +54,7 @@
 #include "pc/connection_context.h"
 #include "rtc_base/event.h"
 #include "rtc_base/thread.h"
+#include "rtc_base/time_utils.h"
 
 namespace livekit_ffi {
 namespace {
@@ -2533,11 +2534,61 @@ struct RootEngineHarness::Parts {
   // Worker thread only.
   std::vector<std::unique_ptr<webrtc::ConnectionContext::MediaEngineReference>>
       peer_connections;
+  // The lazy platform ADM's creations, and a creation held until released.
+  std::atomic<uint32_t> creations{0};
+  std::atomic<bool> hold_creation{false};
+  webrtc::Event creation_entered;
+  webrtc::Event creation_release;
 };
+
+namespace {
+
+// A media engine reference taken on the worker from a thread of its own, as
+// a PeerConnection's creation does; whether it was taken within `wait_ms`
+// and how long it took. The thread is joined by `Join`.
+class EngineReferenceTaker {
+ public:
+  EngineReferenceTaker(
+      webrtc::Thread* worker,
+      webrtc::scoped_refptr<webrtc::ConnectionContext> context,
+      std::vector<std::unique_ptr<
+          webrtc::ConnectionContext::MediaEngineReference>>* references)
+      : start_ms_(webrtc::TimeMillis()) {
+    thread_ = std::thread([this, worker, context, references] {
+      worker->BlockingCall([context, references] {
+        references->push_back(
+            std::make_unique<webrtc::ConnectionContext::MediaEngineReference>(
+                context));
+      });
+      taken_ms_.store(webrtc::TimeMillis() - start_ms_);
+      taken_.Set();
+    });
+  }
+  ~EngineReferenceTaker() { Join(); }
+
+  int64_t Wait(uint32_t wait_ms) {
+    return taken_.Wait(webrtc::TimeDelta::Millis(wait_ms)) ? taken_ms_.load()
+                                                           : -1;
+  }
+  void Join() {
+    if (thread_.joinable()) {
+      thread_.join();
+    }
+  }
+
+ private:
+  const int64_t start_ms_;
+  std::atomic<int64_t> taken_ms_{0};
+  webrtc::Event taken_;
+  std::thread thread_;
+};
+
+}  // namespace
 
 // Wired as PeerConnectionFactory wires it, with fakes for the platform ADM
 // and the video codecs.
-RootEngineHarness::RootEngineHarness() : parts_(std::make_unique<Parts>()) {
+RootEngineHarness::RootEngineHarness(bool lazy_platform)
+    : parts_(std::make_unique<Parts>()) {
   Parts& p = *parts_;
   p.network = webrtc::Thread::CreateWithSocketServer();
   p.network->SetName("engine-network", nullptr);
@@ -2560,8 +2611,20 @@ RootEngineHarness::RootEngineHarness() : parts_(std::make_unique<Parts>()) {
   p.capture->monitor = std::make_shared<RootAudioMonitor>();
   p.apm = CreateRootAudioProcessing(env, p.capture, p.worker.get());
   p.proxy = p.worker->BlockingCall([&] {
-    return webrtc::make_ref_counted<AdmProxy>(env, p.worker.get(), p.mixer,
-                                              p.fake);
+    if (!lazy_platform) {
+      return webrtc::make_ref_counted<AdmProxy>(env, p.worker.get(), p.mixer,
+                                                p.fake);
+    }
+    Parts* parts = &p;
+    return webrtc::make_ref_counted<AdmProxy>(
+        env, p.worker.get(), p.mixer, AdmLazyPlatform{[parts] {
+          parts->creations.fetch_add(1);
+          if (parts->hold_creation.load()) {
+            parts->creation_entered.Set();
+            parts->creation_release.Wait(webrtc::TimeDelta::Seconds(10));
+          }
+          return webrtc::scoped_refptr<webrtc::AudioDeviceModule>(parts->fake);
+        }});
   });
   p.proxy->SetDeviceFormatReaderForTest(nullptr, false);
   p.proxy->SetDeviceProbeForTest(AdmDeviceProbe{});
@@ -2749,8 +2812,63 @@ rust::Vec<rust::String> RootEngineHarness::take_calls() const {
   return calls;
 }
 
+uint32_t RootEngineHarness::platform_creations() const {
+  return parts_->creations.load();
+}
+
+int64_t RootEngineHarness::peer_connection_while_playout_opens(
+    uint32_t wait_ms) const {
+  Parts& p = *parts_;
+  p.fake->BlockNextStartPlayout();
+  p.proxy->AcquirePlatformAdm();
+  p.controller->set_adm_playout_enabled(true);
+  p.controller->set_playout_hold(true);
+  if (!p.fake->WaitStartPlayoutBlocked()) {
+    return -2;
+  }
+  EngineReferenceTaker peer_connection(p.worker.get(), p.context,
+                                       &p.peer_connections);
+  const int64_t taken_ms = peer_connection.Wait(wait_ms);
+  p.fake->ReleaseStartPlayout();
+  peer_connection.Join();
+  flush();
+  return taken_ms;
+}
+
+PlatformCreationTiming
+RootEngineHarness::peer_connection_while_the_platform_adm_is_created(
+    uint32_t wait_ms) const {
+  Parts& p = *parts_;
+  PlatformCreationTiming timing{};
+  p.hold_creation.store(true);
+  webrtc::Event acquired;
+  std::atomic<bool> result{false};
+  std::thread handle([&] {
+    result.store(acquire());
+    acquired.Set();
+  });
+  timing.creation_held =
+      p.creation_entered.Wait(webrtc::TimeDelta::Seconds(5));
+  EngineReferenceTaker peer_connection(p.worker.get(), p.context,
+                                       &p.peer_connections);
+  timing.peer_connection_ms = peer_connection.Wait(wait_ms);
+  timing.acquire_waited_for_the_creation =
+      !acquired.Wait(webrtc::TimeDelta::Zero());
+  p.hold_creation.store(false);
+  p.creation_release.Set();
+  handle.join();
+  peer_connection.Join();
+  flush();
+  timing.acquired = result.load();
+  return timing;
+}
+
 std::unique_ptr<RootEngineHarness> new_root_engine_harness() {
   return std::make_unique<RootEngineHarness>();
+}
+
+std::unique_ptr<RootEngineHarness> new_root_engine_harness_with_lazy_platform() {
+  return std::make_unique<RootEngineHarness>(true);
 }
 
 RootMonitorHarness::RootMonitorHarness()

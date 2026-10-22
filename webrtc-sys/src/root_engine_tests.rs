@@ -23,7 +23,8 @@
 use std::time::{Duration, Instant};
 
 use crate::audio_device_controller::ffi::{
-    new_root_engine_harness, RootAudioControlUpdate, RootEngineHarness,
+    new_root_engine_harness, new_root_engine_harness_with_lazy_platform, RootAudioControlUpdate,
+    RootEngineHarness,
 };
 
 const RATE: i32 = 48_000;
@@ -383,5 +384,67 @@ fn root_engine_runs_agc2_from_the_controls() {
     h.monitor(false);
     c.reset_root_audio(false);
     assert!(c.root_audio_stats().agc2_max_gain_db == 30.0, "a session start forgets the settings");
+    h.release();
+}
+
+/// A PeerConnection's voice engine init (m150: adm_helpers::Init, the APM
+/// options, RegisterAudioCallback, all on the worker) while the device thread
+/// is inside a device open that holds the device mutex (StartPlayout here; a
+/// Windows InitPlayout or a 2 s StopPlayout in the field): it never waits for
+/// the device, so a room connect is not held up by one.
+#[test]
+fn root_engine_a_peer_connection_never_waits_for_a_device_open() {
+    let h = new_root_engine_harness();
+    let taken_ms = h.peer_connection_while_playout_opens(2_000);
+    assert!(taken_ms >= 0, "the voice engine's init waited for the device open");
+    assert!(taken_ms < 1_000, "{taken_ms} ms");
+    assert!(h.platform_playing(), "the open went on once released");
+
+    // The engine works once the device is open: the call's streams play
+    // through libwebrtc's transport.
+    h.engine_playout(true);
+    let played = h.render(RATE, 2);
+    assert_eq!(played.len(), 2 * FRAME);
+    h.engine_playout(false);
+    h.close_peer_connection();
+}
+
+/// The factory's platform ADM is created at the first platform reference, on
+/// the device thread, not with the factory (whose creation a room connect
+/// waits for). A PeerConnection made while that creation takes long (the
+/// Windows ADM's two endpoint sweeps: over 10 s on a machine with 25
+/// endpoints) does not wait for it; the handle's creation does.
+#[test]
+fn root_engine_the_platform_adm_is_created_with_the_first_reference_without_holding_up_a_peer_connection(
+) {
+    let h = new_root_engine_harness_with_lazy_platform();
+    h.open_peer_connection();
+    h.engine_playout(true);
+    assert!(h.synthetic_playing(), "a managed call");
+    h.engine_playout(false);
+    h.close_peer_connection();
+    assert_eq!(h.platform_creations(), 0, "a managed call never creates the platform ADM");
+    assert_eq!(h.controller().playout_devices(), 0, "nothing to list before it exists");
+
+    let timing = h.peer_connection_while_the_platform_adm_is_created(2_000);
+    assert!(timing.creation_held, "the handle's creation reached the platform ADM's");
+    assert!(timing.peer_connection_ms >= 0, "the PeerConnection waited for the creation");
+    assert!(timing.peer_connection_ms < 1_000, "{} ms", timing.peer_connection_ms);
+    assert!(timing.acquire_waited_for_the_creation);
+    assert!(timing.acquired);
+    assert_eq!(h.platform_creations(), 1);
+    assert_eq!(h.controller().playout_devices(), 1, "listed once created");
+
+    // The platform engine works as with an eager platform ADM.
+    h.hold(true);
+    assert!(h.platform_playing());
+    h.engine_playout(true);
+    assert_eq!(h.render(RATE, 2).len(), 2 * FRAME);
+    h.engine_playout(false);
+    h.hold(false);
+    h.close_peer_connection();
+    h.release();
+    assert!(h.acquire(), "a second handle reuses it");
+    assert_eq!(h.platform_creations(), 1);
     h.release();
 }

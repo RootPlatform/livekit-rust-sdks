@@ -76,6 +76,20 @@ pub mod ffi {
         pub samples: Vec<i16>,
     }
 
+    /// A PlatformAudio handle's creation while the platform ADM's creation
+    /// was held (tests only): the creation was reached, how long a
+    /// PeerConnection's media engine reference took meanwhile (ms, -1 when
+    /// not within the wait), the handle's creation was still waiting for the
+    /// platform ADM then, and it got its reference once released.
+    #[cfg(feature = "harness")]
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct PlatformCreationTiming {
+        pub creation_held: bool,
+        pub peer_connection_ms: i64,
+        pub acquire_waited_for_the_creation: bool,
+        pub acquired: bool,
+    }
+
     /// The callbacks the harness's fake made under AudioDeviceMac's rules
     /// (tests only).
     #[cfg(feature = "harness")]
@@ -948,6 +962,24 @@ pub mod ffi {
         fn platform_recording(self: &RootEngineHarness) -> bool;
         fn synthetic_playing(self: &RootEngineHarness) -> bool;
         fn take_calls(self: &RootEngineHarness) -> Vec<String>;
+        /// The engine harness with a platform ADM created at the first
+        /// platform reference, on the device thread, as the factory's on
+        /// desktop; its creation can be held.
+        fn new_root_engine_harness_with_lazy_platform() -> UniquePtr<RootEngineHarness>;
+        fn platform_creations(self: &RootEngineHarness) -> u32;
+        /// A platform reference with the hold: the device thread opens
+        /// playout and blocks in StartPlayout holding the device mutex, while
+        /// a PeerConnection takes the first media engine reference on the
+        /// worker (the voice engine initializes). Its time, ms; -1 when not
+        /// within `wait_ms`.
+        fn peer_connection_while_playout_opens(self: &RootEngineHarness, wait_ms: u32) -> i64;
+        /// A PlatformAudio handle's creation on a thread of its own while the
+        /// platform ADM's creation is held, and a PeerConnection's first
+        /// media engine reference meanwhile.
+        fn peer_connection_while_the_platform_adm_is_created(
+            self: &RootEngineHarness,
+            wait_ms: u32,
+        ) -> PlatformCreationTiming;
     }
 
     extern "Rust" {
@@ -1149,8 +1181,21 @@ mod tests {
             return;
         }
         let _guard = TEST_MUTEX.lock().expect("test mutex poisoned");
+        let started = std::time::Instant::now();
         let factory = create_peer_connection_factory();
+        let factory_ms = started.elapsed().as_millis();
         let audio = factory.audio_device();
+        // On desktop the platform ADM exists from the first platform
+        // reference on, as PlatformAudio takes it.
+        if cfg!(not(any(target_os = "ios", target_os = "android"))) {
+            assert_eq!(audio.playout_devices(), 0, "not created with the factory");
+        }
+        let started = std::time::Instant::now();
+        assert!(audio.acquire_platform_adm());
+        eprintln!(
+            "factory {factory_ms} ms, platform ADM {} ms",
+            started.elapsed().as_millis()
+        );
 
         let recording_count = audio.recording_devices();
         let playout_count = audio.playout_devices();
@@ -1181,7 +1226,8 @@ mod tests {
         audio.set_adm_playout_enabled(initial_playout);
         assert_eq!(audio.adm_playout_enabled(), initial_playout);
 
-        assert!(audio.platform_adm_ref_count() >= 0);
-        let _ = audio.is_platform_adm_active();
+        assert!(audio.platform_adm_ref_count() >= 1);
+        assert!(audio.is_platform_adm_active());
+        audio.release_platform_adm();
     }
 }
