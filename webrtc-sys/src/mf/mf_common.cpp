@@ -27,6 +27,7 @@
 
 #include <codecapi.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -336,19 +337,51 @@ uint64_t LuidKey(const LUID& luid) {
          luid.LowPart;
 }
 
+HRESULT ResolveAdapterLuid(const LUID* luid, LUID* out) {
+  if (luid) {
+    *out = *luid;
+    return S_OK;
+  }
+  HRESULT hr = DefaultAdapterLuid(out);
+  if (FAILED(hr)) {
+    RTC_LOG(LS_WARNING) << "No default DXGI adapter: " << HResultToString(hr);
+  }
+  return hr;
+}
+
+// LK_MF_D3D11_SHARING=off, read on every acquire: each MF encoder and decoder
+// opens a device of its own and the host is refused the shared one, as before
+// the shared device. A support switch that release builds read.
+bool D3D11SharingOff() {
+  if (!EnvFlagCleared("LK_MF_D3D11_SHARING")) {
+    return false;
+  }
+  static std::atomic<bool> logged{false};
+  if (!logged.exchange(true)) {
+    RTC_LOG(LS_WARNING) << "LK_MF_D3D11_SHARING=off: every MF codec opens a "
+                           "D3D11 device of its own and the host gets none.";
+  }
+  return true;
+}
+
 }  // namespace
 
 HRESULT AcquireD3D11Device(const LUID* luid, SharedD3D11Device* out) {
   out->reset();
   LUID resolved = {};
-  if (luid) {
-    resolved = *luid;
-  } else {
-    HRESULT hr = DefaultAdapterLuid(&resolved);
+  HRESULT resolve_hr = ResolveAdapterLuid(luid, &resolved);
+  if (FAILED(resolve_hr)) {
+    return resolve_hr;
+  }
+
+  if (D3D11SharingOff()) {
+    auto bundle = std::make_shared<D3D11DeviceBundle>();
+    HRESULT hr = CreateD3D11DeviceBundle(resolved, bundle.get());
     if (FAILED(hr)) {
-      RTC_LOG(LS_WARNING) << "No default DXGI adapter: " << HResultToString(hr);
       return hr;
     }
+    *out = std::move(bundle);
+    return S_OK;
   }
 
   const uint64_t key = LuidKey(resolved);
@@ -384,6 +417,27 @@ HRESULT AcquireD3D11Device(const LUID* luid, SharedD3D11Device* out) {
   entries.push_back({key, shared});
   *out = std::move(shared);
   return S_OK;
+}
+
+void RetireD3D11Device(const LUID* luid) {
+  LUID resolved = {};
+  if (FAILED(ResolveAdapterLuid(luid, &resolved))) {
+    return;
+  }
+  const uint64_t key = LuidKey(resolved);
+  std::lock_guard<std::mutex> lock(SharedDeviceMutex());
+  std::vector<SharedDeviceEntry>& entries = SharedDevices();
+  const size_t before = entries.size();
+  entries.erase(std::remove_if(entries.begin(), entries.end(),
+                               [key](const SharedDeviceEntry& entry) {
+                                 return entry.luid == key;
+                               }),
+                entries.end());
+  if (entries.size() != before) {
+    RTC_LOG(LS_WARNING) << "Shared D3D11 device on adapter "
+                        << LuidToString(resolved)
+                        << " retired; codecs opened from now on get a new one.";
+  }
 }
 
 HRESULT AcquireD3D11DeviceForActivate(IMFActivate* activate,
@@ -424,6 +478,9 @@ HRESULT AcquireSharedD3D11DeviceForHost(const LUID* luid, ID3D11Device** out) {
   *out = nullptr;
   if (!EnsureMFStarted()) {
     return MF_E_PLATFORM_NOT_INITIALIZED;
+  }
+  if (D3D11SharingOff()) {
+    return DXGI_ERROR_UNSUPPORTED;
   }
 
   SharedD3D11Device shared;
@@ -795,3 +852,30 @@ extern "C" HRESULT lk_mf_release_host_d3d11_device(ID3D11Device* device) {
     return E_OUTOFMEMORY;
   }
 }
+
+#if defined(ROOTAPP_HARNESS)
+// mf_device.rs's tests: whether two codec acquires on the default adapter
+// share a device, and whether one after RetireD3D11Device gets a new one.
+extern "C" HRESULT lk_mf_test_codec_devices(int32_t* shared,
+                                            int32_t* new_after_retire) {
+  livekit_ffi::SharedD3D11Device first;
+  HRESULT hr = livekit_ffi::AcquireD3D11Device(nullptr, &first);
+  if (FAILED(hr)) {
+    return hr;
+  }
+  livekit_ffi::SharedD3D11Device second;
+  hr = livekit_ffi::AcquireD3D11Device(nullptr, &second);
+  if (FAILED(hr)) {
+    return hr;
+  }
+  *shared = first->device.Get() == second->device.Get();
+  livekit_ffi::RetireD3D11Device(nullptr);
+  livekit_ffi::SharedD3D11Device third;
+  hr = livekit_ffi::AcquireD3D11Device(nullptr, &third);
+  if (FAILED(hr)) {
+    return hr;
+  }
+  *new_after_retire = third->device.Get() != first->device.Get();
+  return S_OK;
+}
+#endif

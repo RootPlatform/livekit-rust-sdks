@@ -64,7 +64,8 @@ class MFH264DecoderImpl : public VideoDecoder {
   int32_t DeliverSample(IMFSample* sample, std::optional<int> qp);
   // Map(READ) of the staging copy that leaves the shared device's lock free
   // while the GPU finishes the copy: waits on a fence event when the device
-  // has ID3D11Fence (WDDM 2.0+), otherwise polls.
+  // has ID3D11Fence (WDDM 2.0+), otherwise polls. Never blocks in Map:
+  // DXGI_ERROR_WAS_STILL_DRAWING when the copy is not done in time.
   HRESULT MapStaging(D3D11_MAPPED_SUBRESOURCE* mapped);
   int32_t DeliverNV12(const uint8_t* data_y,
                       int stride_y,

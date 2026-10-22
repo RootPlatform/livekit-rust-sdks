@@ -20,11 +20,13 @@
 #include <wmcodecdsp.h>
 
 #include <memory>
+#include <thread>
 
 #include <modules/video_coding/codecs/h264/include/h264.h>
 
 #include "h264_decoder_impl.h"
 #include "mf_common.h"
+#include "mf_decode_watchdog.h"
 #include "rtc_base/logging.h"
 
 namespace webrtc {
@@ -112,7 +114,16 @@ std::unique_ptr<VideoDecoder> MFVideoDecoderFactory::Create(
     if (format.IsSameCodec(supported_format)) {
       if (format.name == "H264") {
         RTC_LOG(LS_INFO) << "Using MediaFoundation HW decoder (DXVA) for H264";
-        return std::make_unique<MFH264DecoderImpl>();
+        // A hang leaves its call holding the decoder's shared device, so
+        // encoders and the host's capture opened later get a new one. The
+        // retire runs on a thread of its own in case enumerating the adapters
+        // waits on the hung driver too.
+        return std::make_unique<MFDecodeWatchdog>(
+            std::make_unique<MFH264DecoderImpl>(), MFDecodeWatchdogLimits(),
+            &MFDecodeProcessHealth(), [] {
+              std::thread([] { livekit_ffi::RetireD3D11Device(nullptr); })
+                  .detach();
+            });
       }
     }
   }

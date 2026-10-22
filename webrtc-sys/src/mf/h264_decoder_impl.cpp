@@ -72,6 +72,14 @@ int32_t DecodeFailure(HRESULT hr) {
 constexpr int kMaxConsecutiveDecodeErrors = 30;
 constexpr int kMaxFailedKeyframes = 2;
 
+// A readback copy the GPU has not finished by then fails the frame and hands
+// the stream to the software decoder. A blocking Map would hold the shared
+// device's lock, and with it every other stream's D3D calls, for as long as
+// the GPU takes, which on a hung GPU is forever. Below the watchdog's call
+// limit (MFDecodeWatchdogLimits), so a slow readback falls back cleanly
+// instead of being abandoned.
+constexpr std::chrono::milliseconds kReadbackTimeout{500};
+
 // Test-only (webrtc-sys's mf-fault-injection feature): once
 // LK_MF_FAULT_DECODE_AFTER_FRAMES=N frames have been decoded,
 // LK_MF_FAULT_DECODE_MODE picks the failure:
@@ -193,7 +201,7 @@ HRESULT MFH264DecoderImpl::SetupD3D() {
 
 HRESULT MFH264DecoderImpl::MapStaging(D3D11_MAPPED_SUBRESOURCE* mapped) {
   const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+      std::chrono::steady_clock::now() + kReadbackTimeout;
   if (const UINT64 value = readback_fence_.Signal()) {
     readback_fence_.WaitUntil(value, deadline);
   }
@@ -201,12 +209,9 @@ HRESULT MFH264DecoderImpl::MapStaging(D3D11_MAPPED_SUBRESOURCE* mapped) {
   for (int attempt = 0;; attempt++) {
     HRESULT hr = d3d_->context->Map(staging_texture_.Get(), 0, D3D11_MAP_READ,
                                     D3D11_MAP_FLAG_DO_NOT_WAIT, mapped);
-    if (hr != DXGI_ERROR_WAS_STILL_DRAWING) {
+    if (hr != DXGI_ERROR_WAS_STILL_DRAWING ||
+        std::chrono::steady_clock::now() >= deadline) {
       return hr;
-    }
-    if (std::chrono::steady_clock::now() >= deadline) {
-      return d3d_->context->Map(staging_texture_.Get(), 0, D3D11_MAP_READ, 0,
-                                mapped);
     }
     if (attempt < 64) {
       YieldProcessor();
@@ -650,6 +655,12 @@ int32_t MFH264DecoderImpl::DeliverSample(IMFSample* sample,
                                          texture.Get(), subresource, nullptr);
     D3D11_MAPPED_SUBRESOURCE mapped = {};
     hr = MapStaging(&mapped);
+    if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
+      RTC_LOG(LS_ERROR) << "Decoder readback copy not finished after "
+                        << kReadbackTimeout.count()
+                        << " ms; decoding this stream in software.";
+      return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
+    }
     if (FAILED(hr)) {
       RTC_LOG(LS_ERROR) << "Decoder staging Map failed: "
                         << HResultToString(hr);

@@ -170,6 +170,24 @@ pub unsafe extern "C" fn livekit_ffi_d3d11_release_shared_device(
     webrtc_sys::mf_device::lk_mf_release_host_d3d11_device(device)
 }
 
+/// How often the MediaFoundation H.264 decoder watchdog gave up in this
+/// process: `hangs` counts decoder calls abandoned in the driver (the first
+/// turns MF decoding off until the process exits), `silences` streams that
+/// took frames and decoded none. Both streams go on in software. See
+/// ROOTAPP-BUILD.md.
+///
+/// # Safety
+///
+/// Each pointer must be null or valid for a `u32` write.
+#[cfg(target_os = "windows")]
+#[no_mangle]
+pub unsafe extern "C" fn livekit_ffi_mf_decode_watchdog_counts(
+    hangs: *mut u32,
+    silences: *mut u32,
+) {
+    webrtc_sys::mf_device::lk_mf_decode_watchdog_counts(hangs, silences)
+}
+
 #[cfg(target_os = "android")]
 pub mod android {
     use jni::{

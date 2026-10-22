@@ -226,11 +226,15 @@ fn main() {
                 .file("src/mf/mf_decoder_factory.cpp")
                 .file("src/mf/h264_encoder_impl.cpp")
                 .file("src/mf/h264_decoder_impl.cpp")
+                .file("src/mf/mf_decode_watchdog.cpp")
                 .flag("/DUSE_MF_VIDEO_CODEC=1")
                 .flag("/std:c++20")
                 //.flag("/wd4819")
                 //.flag("/wd4068")
                 .flag("/EHsc");
+            if harness {
+                builder.file("src/mf/mf_decode_watchdog_harness.cpp");
+            }
         }
         "linux" => {
             println!("cargo:rustc-link-lib=dylib=rt");

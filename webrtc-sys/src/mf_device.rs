@@ -35,6 +35,12 @@ extern "C" {
 
     /// Returns an HRESULT: E_INVALIDARG when `device` holds no host reference.
     pub fn lk_mf_release_host_d3d11_device(device: *mut c_void) -> i32;
+
+    /// What the MF decode watchdogs (`src/mf/mf_decode_watchdog.h`) saw in this
+    /// process: calls abandoned in the driver (each turns MF decoding off until
+    /// the process exits) and streams given up on for decoding no frame.
+    /// Either pointer may be null.
+    pub fn lk_mf_decode_watchdog_counts(hangs: *mut u32, silences: *mut u32);
 }
 
 #[cfg(test)]
@@ -45,9 +51,15 @@ mod tests {
     const E_POINTER: i32 = 0x8000_4003_u32 as i32;
     const E_INVALIDARG: i32 = 0x8007_0057_u32 as i32;
     const DXGI_ERROR_DEVICE_REMOVED: i32 = 0x887A_0005_u32 as i32;
+    const DXGI_ERROR_UNSUPPORTED: i32 = 0x887A_0004_u32 as i32;
     const D3D11_CREATE_DEVICE_PREVENT_INTERNAL_THREADING_OPTIMIZATIONS: u32 = 0x8;
     const D3D11_CREATE_DEVICE_BGRA_SUPPORT: u32 = 0x20;
     const D3D11_CREATE_DEVICE_VIDEO_SUPPORT: u32 = 0x800;
+
+    extern "C" {
+        // `src/mf/mf_common.cpp`, harness builds only.
+        fn lk_mf_test_codec_devices(shared: *mut i32, new_after_retire: *mut i32) -> i32;
+    }
 
     unsafe fn vtable_fn(object: *mut c_void, slot: usize) -> *const c_void {
         let vtable = *(object as *const *const *const c_void);
@@ -142,6 +154,21 @@ mod tests {
             assert_eq!(lk_mf_release_host_d3d11_device(first), S_OK);
             assert_eq!(lk_mf_release_host_d3d11_device(first), S_OK);
             assert_eq!(lk_mf_release_host_d3d11_device(first), E_INVALIDARG);
+
+            let (mut shared, mut new_after_retire) = (0, 0);
+            assert_eq!(lk_mf_test_codec_devices(&mut shared, &mut new_after_retire), S_OK);
+            assert_eq!(shared, 1, "codecs share one device per adapter");
+            assert_eq!(new_after_retire, 1, "a retired device is handed out again");
+
+            // The release-safe kill switch: a device per codec, none for the host.
+            std::env::set_var("LK_MF_D3D11_SHARING", "off");
+            let (hr, refused) = acquire(None);
+            let codec_hr = lk_mf_test_codec_devices(&mut shared, &mut new_after_retire);
+            std::env::remove_var("LK_MF_D3D11_SHARING");
+            assert_eq!(hr, DXGI_ERROR_UNSUPPORTED);
+            assert!(refused.is_null());
+            assert_eq!(codec_hr, S_OK);
+            assert_eq!(shared, 0, "LK_MF_D3D11_SHARING=off still shares codec devices");
         }
     }
 }

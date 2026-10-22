@@ -57,8 +57,15 @@ using SharedD3D11Device = std::shared_ptr<const D3D11DeviceBundle>;
 // each device costs the NVIDIA driver 37 worker threads. The device is
 // created without the driver's internal threading optimizations. It is
 // released when the last holder drops it, and a removed device is replaced
-// on the next call.
+// on the next call. With LK_MF_D3D11_SHARING=off every call creates a device
+// of its own.
 HRESULT AcquireD3D11Device(const LUID* luid, SharedD3D11Device* out);
+
+// Stops handing out the shared device on `luid` (the default adapter when
+// null), so the next acquire creates a new one; holders keep the old one.
+// For a device a decoder call hung on: codecs opened later would queue behind
+// it. Never calls into the retired device.
+void RetireD3D11Device(const LUID* luid);
 
 // Hardware MFTs on multi-adapter systems are bound to one adapter, recorded
 // on the activate as MFT_ENUM_ADAPTER_LUID; the device manager handed to the
@@ -72,7 +79,8 @@ HRESULT AcquireD3D11DeviceForActivate(IMFActivate* activate,
 // stays the adapter's shared device, also for codecs opened later, until
 // ReleaseSharedD3D11DeviceForHost is called with it once for every successful
 // acquire. A removed device is never handed out: the call fails with the
-// removal reason and `*out` is null.
+// removal reason and `*out` is null. DXGI_ERROR_UNSUPPORTED with
+// LK_MF_D3D11_SHARING=off.
 HRESULT AcquireSharedD3D11DeviceForHost(const LUID* luid, ID3D11Device** out);
 
 // Drops one host reference taken by AcquireSharedD3D11DeviceForHost. The
