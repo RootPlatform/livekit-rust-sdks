@@ -187,6 +187,7 @@ impl VideoSinkWrapper {
 mod tests {
     #[cxx::bridge(namespace = "livekit_ffi")]
     pub mod ffi_tests {
+        #[cfg(feature = "harness")]
         unsafe extern "C++" {
             include!("livekit/passthrough_video_encoder.h");
 

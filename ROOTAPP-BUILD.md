@@ -677,7 +677,10 @@ failure, it creates its own device as before.
 
 The publisher transport's first video track sets its start bitrate through
 `PeerConnection::SetBitrate`: 0.9 × the sum of its encodings' max bitrates, capped at 1 Mbps
-for cameras and 3 Mbps for screen shares. livekit-client leaves screen shares uncapped,
+for cameras and 3 Mbps for screen shares. Since the v0.13.1 merge a camera's cap follows the
+connection's setup time, as upstream's #1467 does for its `x-google-start-bitrate`: 1 Mbps up to
+1.5 s of setup (signal join plus ICE/DTLS), falling linearly to 300 kbps at 3.5 s and beyond. A
+screen share keeps 3 Mbps however slow the setup. livekit-client leaves screen shares uncapped,
 but Chromium writes its value only on the first H.264 payload type (42001f) while the SFU
 answers with 42e01f, so the browser really starts at libwebrtc's default. 3 Mbps turns on
 a 2K share's top layer (low layer 1.2 Mbps) at the first allocation without starting far
@@ -1325,7 +1328,7 @@ audio").
   `src/screen_audio/root_screen_audio_win.cpp` (WASAPI process loopback) on Windows,
   `root_screen_audio_mac.mm` (ScreenCaptureKit) on macOS, `root_screen_audio_linux.cpp` (PipeWire) on
   Linux, `root_screen_audio_none.cpp` elsewhere. Each backend's OS is also in `SCREEN_AUDIO_OS` in
-  `livekit-ffi/src/server/rootapp_audio.rs`.
+  `livekit-ffi/src/room_apis/server/rootapp_audio.rs`.
 - **Core** `root_screen_audio.{h,cpp}`: `RootScreenAudioCapture` attaches to a queued 48 kHz mono or
   stereo `AudioTrackSource` as its `AudioSourcePuller` (`audio_track.{h,cpp}`: the source's 10 ms task
   asks the puller for every frame and `capture_frame` refuses frames meanwhile). The pipe downmixes to
@@ -1437,7 +1440,7 @@ audio").
   with nothing linked (idle, not counted). A stream error, a disconnect or the daemon closing the
   connection is DEVICE_LOST (restart). Window and process targets capture everything but Root (the
   portal never names the window), said in the started event's description.
-- **FFI** (`livekit-ffi/src/server/rootapp_screen_audio.rs`): `RootScreenAudioStart/Stop/Stats`
+- **FFI** (`livekit-ffi/src/room_apis/server/rootapp_screen_audio.rs`): `RootScreenAudioStart/Stop/Stats`
   (requests 1012-1014), `RootScreenAudioEvent` (event 1001, polled every 20 ms from 100 ms after the
   start); an owned capture handle. Caps bit 13 SCREEN_AUDIO where an OS backend is built (Windows,
   macOS and Linux: 16383 on 64 bit). `NativeAudioSource::attach_screen_audio` (libwebrtc) keeps cxx
@@ -2625,6 +2628,63 @@ fake erases at its own level survives with AGC2 and not with the legacy engine;
 `..._frames_the_denoiser_skips_keep_the_gain`: missed and rate-bypassed frames within 0.3 dB of
 denoised ones; `..._ahead_of_the_denoiser_learns_the_room_before_the_gain`: auto sensitivity's floor
 -80 dBFS at 25 dB of gain, the gate never opens).
+
+## Upstream livekit-ffi/v0.13.1 (`rootapp/upstream-v0.13.1`)
+
+hw.23 merged with upstream's `livekit-ffi/v0.13.1` (7187f6a4, 107 commits; one Swift-only commit
+behind upstream `main` on 2026-10-21). A merge, not a rebase, so the fork's history stays as it was.
+Both sides pin `webrtc-89d790b`, so libwebrtc itself is unchanged. The FFI version is now 0.13.1;
+release tags for this line are `rootapp-ffi/v0.13.1-hw.<n>`.
+
+What the fork takes from upstream: a resume needs evidence that each PeerConnection recovered
+(#1331; `PC_RECONNECT_SETTLE_DELAY` 1 s -> 3 s) and reports its reason (#1338); a server `Leave` is
+no longer answered with a client `Leave` (#1426); teardown no longer waits on the peer or a
+half-open signal socket (#1335, #1453); `Room::close` leaves the room `Disconnected` (#1502); room,
+engine, video source and FFI room-SID leaks (#1400, #1405, #1434, #1448, #1473); non-ASCII RTC error
+headers (#1466); `add_ice_candidate` captures its state by value (#1392); reliable data replay and
+duplicates (#1449); dynacast layers re-applied after each publisher answer (#1487); the signal
+lifecycle state machine (#1402); prost 0.14 (#1447); rustls and webpki roots after the eMudhra
+intermediate CA compromise (#1518, #1546, #1549); `FfiServer::dispose` drops every FFI handle.
+#1491 (external audio send streams kept out of AudioState) and #1534 (Linux ffmpeg symbol prefix)
+are libwebrtc build changes and need a new WebRTC build; the pinned prebuilt has neither.
+
+Decisions where both sides changed the same code:
+
+- **FFI server** moved to `livekit-ffi/src/room_apis/server` (#1438, #1439; `room-apis` is the
+  default feature, `core-modules` is the other, mutually exclusive surface). The RootAudio modules
+  moved with it; the C exports, `ffi.proto`'s RootApp cases (1000+) and `rootapp_audio.proto` are
+  unchanged. Upstream added `capture.proto` (cases 89-91 and events 47-48), pre-encoded video (87-88),
+  `ENCODER_BACKEND_PRE_ENCODED` and `VIDEO_SOURCE_ENCODED`, all additive. Regenerating the desktop's
+  `Proto/*.g.cs` from this branch needs `capture.proto` in the file list (new `Capture.g.cs`); the
+  hw.23 C# keeps working against it unchanged.
+- **`PeerConnection::set_bitrate`**: both sides added it. Upstream's (#1503: `BitrateSettings` in u64,
+  saturating at `i32::MAX`, same `SetBitrate` call) replaced the fork's binding.
+- **AdmProxy**: the fork's device-thread AdmProxy is kept instead of upstream's worker-thread-affine
+  rewrite (#1212). Upstream marshals every device call onto libwebrtc's worker with a blocking hop;
+  the fork exists so that neither the worker nor an FFI caller waits for a device. From #1212 the
+  controller now holds the `RtcRuntime`, so the worker thread outlives the APM decorator and the voice
+  engine hold while Rust can reach them. Upstream's lazy platform ADM creation is not taken (the
+  fork still creates it with the factory on desktop).
+- **Device ids**: upstream's synthesized `index:<N>` GUIDs for ADMs without GUIDs (#1529, Linux) are
+  folded into the fork's lossy name handling. The desktop selects by MMDevice id, CoreAudio UID or
+  PulseAudio name through `RootAudioSelectDevices`, which this does not touch.
+- **`external_audio_source.patch`**: both sides fixed the same `AudioSendStream` bug (fork 11d0c0fc,
+  upstream #1491); upstream's patch is kept.
+- **Publisher transport**: the fork's `peer_transport.rs` is kept (start bitrate once per
+  PeerConnection through `SetBitrate` plus the probing max, released send sections, audio codec
+  pins, stereo), with #1331's connection counters and its per-candidate ICE replay ported in.
+  Upstream's `x-google-start-bitrate` munging (#1430, #1467, #1505) is not taken; #1467's setup-time
+  ramp now lowers a camera's `SetBitrate` start (see "Start bitrate"), and screen shares keep 3 Mbps
+  instead of #1505's uncapped hint.
+- **unpublish**: upstream releases the local track graph even when `remove_track` fails on a closed
+  PeerConnection (#1473); the encoder release and the released send section still follow a
+  successful `remove_track`.
+- **Test hooks**: upstream's `LIVEKIT_TEST` bridges in `video_track.rs` (#1511) are gated on the
+  `harness` feature like the fork's other test bridges.
+
+The worktree's path matters on Windows without long paths: a checkout path more than about eight
+characters longer than `C:\Users\daerc\Documents\GitHub\livekit-rust-sdks` puts a libwebrtc abseil
+header past `MAX_PATH`, and webrtc-sys fails with C1083 (`constexpr_parser.h`).
 
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
