@@ -349,13 +349,13 @@ mod tests {
 
     #[test]
     fn root_denoiser_slow_frames_latch_a_bypass() {
-        // The fake spins for 6 ms; a plain call preempted past 20 ms latches
-        // on its own, so that run is tried again.
+        // The fake spins for 12 ms, longer than the 10 ms frame; a plain call
+        // preempted past 20 ms latches on its own, so that run is tried again.
         let mut attempts = 0;
         let h = loop {
             attempts += 1;
             let h = harness();
-            let a = h.add_fake(&RootFakeFxSpec { sleep_us: 6_000, ..fake(1.0) });
+            let a = h.add_fake(&RootFakeFxSpec { sleep_us: 12_000, ..fake(1.0) });
             h.install_now(a, 48_000);
             let mut preempted = false;
             for call in 0..4 {
@@ -377,7 +377,7 @@ mod tests {
         let info = h.slot_info(false);
         assert_eq!((info.slow_frames, info.bypass), (4, SLOW), "every slow call is counted");
         assert_eq!(run(&h, 48_000, 1.0).kind, NOT_IN_USE);
-        assert_eq!(info.histogram[13..].iter().sum::<u64>(), 4, "{:?}", info.histogram);
+        assert_eq!(info.histogram[14..].iter().sum::<u64>(), 4, "{:?}", info.histogram);
 
         let b = h.add_fake(&RootFakeFxSpec { sleep_us: 25_000, ..fake(1.0) });
         h.install_now(b, 48_000);
@@ -385,11 +385,47 @@ mod tests {
         let warm_up = h.slot_info(true);
         assert_eq!(warm_up.bypass, 0, "the first call after an install is a warm-up");
         assert!(warm_up.process_max_us >= 25_000, "still measured: {}", warm_up.process_max_us);
-        assert_eq!((warm_up.slow_frames, warm_up.histogram[15]), (5, 1));
+        assert_eq!(
+            (warm_up.slow_frames, warm_up.histogram[15]),
+            (5, 2),
+            "both warm-ups (power and process: two spins each) over 20 ms"
+        );
         assert_eq!(run(&h, 48_000, 1.0).kind, RAN);
         assert_eq!(h.slot_info(false).bypass, SLOW, "one later call over 20 ms");
         assert!(h.slot_info(true).process_max_us >= 20_000);
         assert_eq!(h.slot_info(true).process_max_us, 0, "the maximum resets on read");
+    }
+
+    /// A call over 5 ms that fits in the 10 ms frame is counted slow and keeps
+    /// up: any number of them never latch the bypass (0.9.153: 11 of the 14
+    /// callers bypassed at 5 ms had no call over 9.6 ms, and 9 ended the call
+    /// with the Effects SDK off).
+    #[test]
+    fn root_denoiser_slow_calls_within_the_frame_never_latch() {
+        // The fake spins for 7 ms; a run with a call preempted past the frame
+        // is tried again.
+        for attempt in 1.. {
+            let h = harness();
+            let a = h.add_fake(&RootFakeFxSpec { sleep_us: 7_000, ..fake(1.0) });
+            h.install_now(a, 48_000);
+            // The warm-up sets the power too: two spins, over the frame.
+            assert_eq!(run(&h, 48_000, 1.0).kind, RAN);
+            h.slot_info(true);
+            let mut over_frame = false;
+            for _ in 0..10 {
+                assert_eq!(run(&h, 48_000, 1.0).kind, RAN);
+                over_frame |= h.slot_info(true).process_max_us > 10_000;
+            }
+            if over_frame {
+                assert!(attempt < 5, "every run had a call preempted past 10 ms");
+                continue;
+            }
+            let info = h.slot_info(false);
+            assert_eq!((info.slow_frames, info.bypass), (11, 0), "counted slow, not bypassed");
+            assert_eq!(info.histogram[13], 10, "{:?}", info.histogram);
+            assert_eq!(run(&h, 48_000, 1.0).kind, RAN);
+            break;
+        }
     }
 
     /// Stream restarts, device flaps and power changes in a minute never
@@ -416,7 +452,7 @@ mod tests {
             assert_eq!((info.bypass, info.slow_frames), (0, 3), "three slow flushes: counted only");
             assert!(info.process_max_us >= 50_000, "flush and process: {}", info.process_max_us);
 
-            h.set_fake_sleep_us(a, 6_000);
+            h.set_fake_sleep_us(a, 12_000);
             for power in [0.6, 0.7, 0.8] {
                 assert_eq!(h.process(48_000, &frame(48_000, 1.0), false, power, 3840).kind, RAN);
             }

@@ -185,7 +185,7 @@ RootDenoiseResult RootDenoiserSlot::ProcessAudio(const float* in,
   }
   // A (re)start, flush or power change pays one-off costs: measured and
   // counted above like any other call, but only plain calls latch.
-  if (elapsed_us > kSlowFrameUs && !restart && !power_changed) {
+  if (elapsed_us > kOverFrameUs && !restart && !power_changed) {
     slow_times_us_[slow_count_ % kSlowFramesToBypass] = end_us;
     ++slow_count_;
     bool latch = elapsed_us > kStalledFrameUs;

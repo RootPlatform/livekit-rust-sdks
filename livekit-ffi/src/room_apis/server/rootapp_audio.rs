@@ -1242,6 +1242,7 @@ impl From<RootAudioStats> for proto::RootAudioStats {
             playout_fallback: fallback.as_ref().map(|f| f.active),
             playout_fallback_opens: fallback.as_ref().map(|f| f.opens),
             playout_init_detail: fallback.map(|f| f.init_detail),
+            capture_stall_recoveries: stats.capture_stall_recoveries,
             playout_device_uid: changes.as_ref().map(|c| c.playout_uid.clone()),
             recording_device_uid: changes.as_ref().map(|c| c.recording_uid.clone()),
             same_device: changes.as_ref().map(|c| c.same_device),
@@ -1713,6 +1714,15 @@ mod tests {
             (absent.playout_fallback, absent.playout_fallback_opens, absent.playout_init_detail),
             (None, None, None)
         );
+    }
+
+    #[test]
+    fn rootapp_audio_capture_stall_recoveries_convert_and_stay_absent_without_the_guard() {
+        let stats = RootAudioStats { capture_stall_recoveries: Some(3), ..Default::default() };
+        let p: proto::RootAudioStats = stats.into();
+        assert_eq!(p.capture_stall_recoveries, Some(3));
+        let absent: proto::RootAudioStats = RootAudioStats::default().into();
+        assert_eq!(absent.capture_stall_recoveries, None);
     }
 
     #[test]

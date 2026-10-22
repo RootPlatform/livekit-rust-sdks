@@ -134,6 +134,7 @@ class RootDenoiserSlot {
  public:
   static constexpr size_t kOutputFrames = 8;
   static constexpr int64_t kSlowFrameUs = 5000;
+  static constexpr int64_t kOverFrameUs = 10000;
   static constexpr int64_t kStalledFrameUs = 20000;
   static constexpr size_t kSlowFramesToBypass = 3;
   static constexpr int64_t kSlowWindowUs = 60'000'000;
@@ -153,9 +154,12 @@ class RootDenoiserSlot {
   // `flush` asks for flush(nullptr, 0) before the next process() (kept until
   // one runs; a new pipeline needs none). `power` is applied when it changed.
   // A rate-mismatch bypass ends, with a flush, once the frames fit again.
-  // Flush, power and process are timed together (slow_frames, the maximum
-  // and the histogram); kSlowFramesToBypass plain calls over kSlowFrameUs
-  // within kSlowWindowUs, or one over kStalledFrameUs, latch kSlow. A plain
+  // Flush, power and process are timed together (the maximum and the
+  // histogram; slow_frames counts calls over kSlowFrameUs);
+  // kSlowFramesToBypass plain calls longer than the 10 ms frame
+  // (kOverFrameUs) within kSlowWindowUs, or one over kStalledFrameUs, latch
+  // kSlow. A call that fits in the frame keeps up, however slow (0.9.153: 11
+  // of the 14 callers bypassed at 5 ms had no call over 9.6 ms). A plain
   // call is one with no flush, power change or (re)start: those pay one-off
   // costs that say nothing about the SDK keeping up.
   RootDenoiseResult ProcessAudio(const float* in,

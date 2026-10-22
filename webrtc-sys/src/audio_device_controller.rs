@@ -222,6 +222,12 @@ pub mod ffi {
         pub playout_fallback_opens: u64,
         pub playout_init_detail: String,
 
+        /// Native reopens a microphone that stopped delivering capture
+        /// callbacks while it records (Windows), and how many times it did
+        /// (cumulative).
+        pub capture_stall_guard_available: bool,
+        pub capture_stall_recoveries: u64,
+
         /// The DSP chain, the denoiser slot and the APM decorator exist; the
         /// fields of the ones that do not stay at their defaults.
         pub dsp_available: bool,
@@ -705,6 +711,12 @@ pub mod ffi {
         /// playing silence (Windows). Opens real devices.
         #[cfg(windows)]
         fn wasapi_playout_fallback_run(run_ms: u32) -> String;
+        /// The real playout fallback on the default output with a transport
+        /// that never returns from its first pull (a render thread that does
+        /// not stop): each Stop's result and time, and Playing() after the
+        /// first (Windows). Opens real devices.
+        #[cfg(windows)]
+        fn wasapi_playout_fallback_stuck_stop() -> String;
         fn take_calls(self: &AdmProxyHarness) -> Vec<String>;
         fn take_playout_opened(self: &AdmProxyHarness) -> Vec<String>;
         /// The fake's channel, speaker and microphone calls and the channels of
@@ -783,6 +795,10 @@ pub mod ffi {
         /// What the diagnosis ("diagnose(default, stereo)") and the fallbacks
         /// ("Init({spk}, 2)", "Start", "Stop") were asked since the last take.
         fn take_fallback_calls(self: &AdmProxyHarness) -> Vec<String>;
+        /// While stuck, a fake fallback's Stop fails (-1) and it keeps
+        /// playing, every time it is asked, as a fallback whose render thread
+        /// never ends would if it waited for that thread again.
+        fn stick_fallback_stop(self: &AdmProxyHarness, stuck: bool);
         /// One 10 ms render callback of the playing fallback through the
         /// transport tap, from a thread of its own; frames -1 when none
         /// plays.
@@ -833,6 +849,10 @@ pub mod ffi {
         /// `poll_render_stall`.
         fn set_render_stall_guard(self: &AdmProxyHarness, stall_ms: u32, min_interval_ms: u32);
         fn poll_render_stall(self: &AdmProxyHarness);
+        /// The capture-stall guard with these limits, run only by
+        /// `poll_capture_stall`.
+        fn set_capture_stall_guard(self: &AdmProxyHarness, stall_ms: u32, min_interval_ms: u32);
+        fn poll_capture_stall(self: &AdmProxyHarness);
         fn listener_calls(self: &AdmProxyHarness) -> u32;
         fn listeners_ran_on_device_thread(self: &AdmProxyHarness) -> bool;
         fn overlapping_device_calls(self: &AdmProxyHarness) -> u32;

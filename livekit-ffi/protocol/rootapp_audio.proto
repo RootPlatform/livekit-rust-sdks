@@ -476,11 +476,11 @@ message RootAudioStats {
   // over 5 ms; denoiser_notifications the SDK's slowProcessing notifications through the native
   // handler (process-wide, cumulative). denoiser_bypass_reason: 0 none, 1 rate mismatch (until the
   // processor's rate matches the pipeline again, or a pipeline at its rate is installed), 2 output
-  // stalled (100 empty outputs in a row), 3 slow (3 calls over 5 ms within 60 s, or one over 20 ms,
-  // counting only plain calls: not the first after an install, a flush or a stream restart, nor one
-  // with a power change); 2 and 3 last until the pipeline is replaced or removed. A call's time
-  // includes the flush and power change made with it (denoiser_slow_frames, the maximum and the
-  // histogram count every call).
+  // stalled (100 empty outputs in a row), 3 slow (3 calls longer than the 10 ms frame within 60 s,
+  // or one over 20 ms; 3 calls over 5 ms up to v0.13.1-hw.1), counting only plain calls: not the
+  // first after an install, a flush or a stream restart, nor one with a power change); 2 and 3 last
+  // until the pipeline is replaced or removed. A call's time includes the flush and power change made
+  // with it (denoiser_slow_frames, the maximum and the histogram count every call).
   required bool denoiser_installed = 50;
   required uint64 denoiser_frames = 51;
   required uint64 denoiser_misses = 52;
@@ -755,6 +755,13 @@ message RootAudioStats {
   // then what the fallback did. Empty when the last open succeeded. The same text follows "device
   // init failed (n): " in a failed selection's or restart's error.
   optional string playout_init_detail = 172;
+
+  // Microphones native reopened because they delivered nothing for 1 s while recording (at most once
+  // every 5 s), counted with device_lost_reopens where those are reported. The Windows ADM's capture
+  // thread ends on an invalidated device or after 500 ms without a capture event (a device or
+  // default-device change) while Recording() stays true. Cumulative for the engine's life; present
+  // where native watches for it (Windows), absent elsewhere and from libraries that predate it.
+  optional uint64 capture_stall_recoveries = 173;
 }
 // One playout mixer source (a remote audio stream): its audio as it reached the mixer, decoded and
 // before its gain (tile volume, master volume, deafen; a muted frame counts as silence), as a sum of

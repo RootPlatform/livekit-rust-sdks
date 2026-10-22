@@ -1204,6 +1204,7 @@ struct HarnessFallbackLog {
   std::atomic<webrtc::AudioTransport*> transport{nullptr};
   std::atomic<size_t> channels{0};
   std::atomic<bool> playing{false};
+  std::atomic<bool> stop_stuck{false};
 
   void Record(std::string call) {
     webrtc::MutexLock lock(&mutex);
@@ -1238,6 +1239,9 @@ class FakePlayoutFallback : public AdmPlayoutFallback {
   }
   int32_t Stop() override {
     log_->Record("Stop");
+    if (log_->stop_stuck.load()) {
+      return -1;
+    }
     if (playing_) {
       log_->playing.store(false);
       log_->transport.store(nullptr);
@@ -1638,6 +1642,12 @@ rust::Vec<rust::String> AdmProxyHarness::take_fallback_calls() const {
   return calls;
 }
 
+void AdmProxyHarness::stick_fallback_stop(bool stuck) const {
+  if (fallback_log_) {
+    fallback_log_->stop_stuck.store(stuck);
+  }
+}
+
 AdmDeviceRender AdmProxyHarness::fallback_render() const {
   AdmDeviceRender result{};
   result.frames = -1;
@@ -1778,6 +1788,16 @@ void AdmProxyHarness::set_render_stall_guard(uint32_t stall_ms,
 
 void AdmProxyHarness::poll_render_stall() const {
   proxy_->PollRenderStallForTest();
+}
+
+void AdmProxyHarness::set_capture_stall_guard(uint32_t stall_ms,
+                                              uint32_t min_interval_ms) const {
+  proxy_->SetCaptureStallGuardForTest(true, false, static_cast<int>(stall_ms),
+                                      static_cast<int>(min_interval_ms));
+}
+
+void AdmProxyHarness::poll_capture_stall() const {
+  proxy_->PollCaptureStallForTest();
 }
 
 void AdmProxyHarness::set_default_device(bool playout, rust::Str id) const {
@@ -2196,6 +2216,98 @@ rust::String wasapi_playout_fallback_run(uint32_t run_ms) {
            std::to_string(delay_ms) + " ms, stop " + std::to_string(stopped) +
            ", after stop playing " + (fallback->Playing() ? "true" : "false") +
            "; " + fallback->Describe();
+  }));
+}
+
+namespace {
+
+// Its first pull does not return until released, as a render thread stuck in
+// a device call; the pulls after it play silence.
+class StuckTransport : public webrtc::AudioTransport {
+ public:
+  using webrtc::AudioTransport::RecordedDataIsAvailable;
+  int32_t RecordedDataIsAvailable(const void*,
+                                  size_t,
+                                  size_t,
+                                  size_t,
+                                  uint32_t,
+                                  uint32_t,
+                                  int32_t,
+                                  uint32_t,
+                                  bool,
+                                  uint32_t&) override {
+    return 0;
+  }
+  int32_t NeedMorePlayData(size_t samples_per_channel,
+                           size_t bytes_per_frame,
+                           size_t,
+                           uint32_t,
+                           void* audio_samples,
+                           size_t& samples_out,
+                           int64_t*,
+                           int64_t*) override {
+    if (!pulled_.exchange(true)) {
+      entered_.Set();
+      released_.Wait(webrtc::TimeDelta::Seconds(10));
+      left_.Set();
+    }
+    std::memset(audio_samples, 0, samples_per_channel * bytes_per_frame);
+    samples_out = samples_per_channel;
+    return 0;
+  }
+  void PullRenderData(int, int, size_t, size_t, void*, int64_t*, int64_t*)
+      override {}
+
+  webrtc::Event entered_;
+  webrtc::Event released_;
+  webrtc::Event left_;
+  std::atomic<bool> pulled_{false};
+};
+
+}  // namespace
+
+rust::String wasapi_playout_fallback_stuck_stop() {
+  return rust::String::lossy(OnMtaThread([] {
+    // The render thread given up keeps pulling it until it ends.
+    static StuckTransport transport;
+    std::unique_ptr<AdmPlayoutFallback> fallback =
+        CreateWasapiPlayoutFallback(&transport);
+    if (fallback->Init(std::string(), 2) != 0) {
+      return "Init failed: " + fallback->Describe();
+    }
+    if (fallback->Start() != 0) {
+      return "Start failed: " + fallback->Describe();
+    }
+    if (!transport.entered_.Wait(webrtc::TimeDelta::Seconds(2))) {
+      fallback->Stop();
+      return std::string("no pull");
+    }
+    using Clock = std::chrono::steady_clock;
+    auto ms_since = [](Clock::time_point start) {
+      const auto elapsed = Clock::now() - start;
+      return std::to_string(
+          std::chrono::duration_cast<std::chrono::milliseconds>(elapsed)
+              .count());
+    };
+    auto timed_stop = [&fallback, &ms_since] {
+      const Clock::time_point start = Clock::now();
+      const int32_t result = fallback->Stop();
+      return std::to_string(result) + " after " + ms_since(start) + " ms";
+    };
+    const std::string first = timed_stop();
+    const bool playing = fallback->Playing();
+    const std::string second = timed_stop();
+    const Clock::time_point start = Clock::now();
+    fallback.reset();
+    const std::string destroyed_ms = ms_since(start);
+    transport.released_.Set();
+    const bool left = transport.left_.Wait(webrtc::TimeDelta::Seconds(2));
+    // Its stream's Stop and the thread's exit after the pull.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    return "stop " + first + ", playing " + (playing ? "true" : "false") +
+           ", stop " + second + ", destroyed after " + destroyed_ms +
+           " ms, released " +
+           (left ? "true" : "false");
   }));
 }
 #endif

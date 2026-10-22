@@ -203,8 +203,10 @@ class AdmPlayoutFallback {
   // An empty `endpoint_id` opens the default console output. 0 when open.
   virtual int32_t Init(const std::string& endpoint_id, size_t channels) = 0;
   virtual int32_t Start() = 0;
-  // Stops and closes; non-zero while its thread did not stop (a later Stop
-  // waits for it again).
+  // Stops and closes. Non-zero when its thread did not stop in time: the
+  // thread is given up (it keeps its stream until it ends) and the fallback
+  // is closed all the same, so a later Stop returns 0 at once, as the
+  // Windows ADM forgets a render thread it could not join.
   virtual int32_t Stop() = 0;
   virtual bool Playing() const = 0;
   virtual uint16_t DelayMs() const = 0;
@@ -298,6 +300,10 @@ struct AdmNativeStats {
   bool playout_fallback = false;
   uint64_t playout_fallback_opens = 0;
   std::string playout_init_detail;
+  // The proxy reopens a microphone that stopped delivering (Windows), and
+  // how many times it did.
+  bool capture_stall_guard_available = false;
+  uint64_t capture_stall_recoveries = 0;
 };
 
 // Registered with the platform ADM in place of libwebrtc's AudioTransport, from
@@ -535,6 +541,13 @@ enum class AdmMonitorResult : uint8_t {
 /// through a shared stream of its own that the engine converts
 /// (AdmPlayoutFallback) when that opens.
 ///
+/// The Windows ADM's capture thread ends when its stream reports an error
+/// (the device invalidated) or signals nothing for 500 ms, which a device or
+/// default-device change can cause, and Recording() stays true: the
+/// microphone is silent until someone reopens it. The proxy reopens a
+/// recording that delivered no capture callback for 1 s (at most once every
+/// 5 s).
+///
 /// On desktop the platform ADM is created and initialized on the device
 /// thread when the first platform reference is taken, not with the factory:
 /// the Windows ADM's creation runs two full endpoint sweeps (every active,
@@ -658,6 +671,13 @@ class AdmProxy : public webrtc::AudioDeviceModule {
                                   int stall_ms,
                                   int min_interval_ms);
   void PollRenderStallForTest();
+  /// The capture-stall guard (on on Windows); without `periodic` only
+  /// PollCaptureStallForTest runs it.
+  void SetCaptureStallGuardForTest(bool enabled,
+                                   bool periodic,
+                                   int stall_ms,
+                                   int min_interval_ms);
+  void PollCaptureStallForTest();
   /// Whether enumeration serializes with device operations (Linux) and how
   /// long it waits for one in progress.
   void SetEnumerationLockForTest(bool serialize, int wait_ms);
@@ -850,6 +870,8 @@ class AdmProxy : public webrtc::AudioDeviceModule {
                                  bool default_input);
   void PollRenderStallLocked();
   void ScheduleRenderStallWatchLocked();
+  void PollCaptureStallLocked();
+  void ScheduleCaptureStallWatchLocked();
   void ResyncMonitorLocked();
   void CompleteOutcomeLocked(const DesiredState& desired,
                              AdmRequestOutcome* outcome);
@@ -980,6 +1002,19 @@ class AdmProxy : public webrtc::AudioDeviceModule {
   bool render_stall_periodic_ = false;
   int64_t render_stall_ns_ = 0;
   int64_t render_stall_interval_ns_ = 0;
+  struct CaptureStallWatch {
+    uint64_t capture = 0;
+    int64_t since_ns = 0;
+  };
+  CaptureStallWatch capture_stall_;
+  int64_t last_capture_stall_recovery_ns_ = 0;
+  bool capture_stall_guard_ = false;
+  bool capture_stall_periodic_ = false;
+  bool capture_stall_scheduled_ = false;
+  int64_t capture_stall_ns_ = 0;
+  int64_t capture_stall_interval_ns_ = 0;
+  std::atomic<bool> capture_stall_available_{false};
+  std::atomic<uint64_t> capture_stall_recoveries_{0};
   mutable webrtc::Mutex devices_mutex_;
   std::string playout_uid_;
   std::string recording_uid_;

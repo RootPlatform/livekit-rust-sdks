@@ -931,7 +931,7 @@ managed engine's `NativeAudioSource` tracks, which bypass it):
   `RootAudioSetDenoiser` or `denoiser_wanted` and installs at a speech pause (<= 3 s), removes at
   once, and hands each replaced pipeline back once (`pipelines_returned`). Bypasses: rate mismatch
   (clears itself when the rate is back), 100 empty outputs in a row, or slow frames (3 over 5 ms
-  within 60 s, or one over 20 ms). Flush, power change and `process()` are timed together into a
+  within 60 s, or one over 20 ms; 3 over 10 ms since `rootapp/mic-output-restart`). Flush, power change and `process()` are timed together into a
   16-bucket histogram and a maximum. The first call after an install or a flush is exempt from the
   single 20 ms latch (still measured, still counted toward the 3-in-60 s rule): the Effects SDK
   1.7.2 harness measured no first-call spike (2,649 calls from a fresh pipeline, maximum 516-525 us
@@ -2971,6 +2971,73 @@ and consider keeping `LK_DISABLE_MF_DECODE` on a machine whose watchdog fired.
 
 Not verified: the hang itself (no machine here reproduces it), and a Watch Stream stall through a
 LiveKit server.
+
+## The microphone after output changes, and the slow-frame bypass (`rootapp/mic-output-restart`)
+
+Reports from 0.9.153 (v0.13.1-hw.1), Sentry `mic_pipeline_dead`: 9 events from 7 Windows users in
+its first 10 hours against 2 in a week of 0.9.152. The platform microphone went silent around an
+output device change or restart until the desktop's watchdog reopened it 8-12 s later; for one user
+it never came back.
+
+What the call logs show:
+- Most stops are the system device change itself, not the proxy's restart: capture ended about
+  300 ms before the desktop's output selection (13:11, 14:29), or together with playout with no
+  request at all (13:56, 14:09). 0.9.152 has the same joint stops (03:14, 06:31). The Windows ADM
+  (`AudioDeviceWindowsCore`, webrtc-89d790b in both releases) ends its capture thread on a failed
+  WASAPI call (an invalidated device) or after 500 ms without a capture event, and `Recording()`
+  stays true, so nothing reopens it. A plain output restart on a working device leaves capture
+  running: 8 restarts through the factory's proxy on Jesse's machine, 100 capture callbacks a second
+  throughout.
+- "device request N: no completion after 5s" is not new: 0.9.152 had the same timeouts as
+  unobserved task exceptions (ROOT-DESKTOP-3PG, 6 events from 3 users); 0.9.153's desktop writes
+  them to the call log.
+- Population: 4 of the 7 users have no native-call telemetry on 0.9.152, and one (default devices
+  flapping every few seconds) sent 3 of the 9. `audio_engine_fallback` (playout that never opened,
+  the call moved to managed audio) went from 12 to 4: those machines now stay on platform audio
+  through hw.24's playout fallback.
+- What hw.24 did change: `WasapiPlayoutFallback::Stop` waited 2 s for its render thread again on
+  every call while that thread did not end, and the proxy kept a fallback whose stop failed, so every
+  later pass (a microphone restart's too) asked it again, spent 2 s, and never reopened playout. One
+  0.9.153 call shows that: after an output restart, device requests 63, 87, 217, 349 and 1065 all
+  timed out over 6 minutes and the microphone never came back (`mic_pipeline_dead_unrecovered`
+  twice; none on 0.9.152). The ADM forgets a render thread it could not join, so its failed stop is
+  retried once and playout reopens.
+
+Changes:
+- Playout fallback: a render thread that does not stop within 2 s is given up. It keeps its state
+  (its client is released when it ends) and its two events (leaked); the fallback is closed, and a
+  later `Stop` or the destructor returns at once. `AdmProxy` drops the fallback after any `Stop`, as
+  after the ADM's failed stop: no second puller in that pass, and the next one opens playout again
+  (the ADM first, then a new fallback).
+- Capture-stall guard (Windows): every 250 ms while the platform ADM records, the device thread
+  reads the tap's capture callbacks. None for 1 s (twice the ADM's 500 ms wait) reopens recording,
+  at most once every 5 s: a warning (`AdmProxy: the microphone delivered nothing for <n> ms while
+  recording; reopening it`), `RootAudioStats.capture_stall_recoveries` (173; Windows, absent
+  elsewhere and from older libraries) and a `device_lost` reopen. A stall that another thread
+  causes by holding the ADM's lock (an enumeration under a slow device change) makes the reopen wait
+  for that lock and costs one short reopen.
+- Effects SDK slow-frame bypass: 3 plain calls longer than the 10 ms frame (`kOverFrameUs`) within
+  60 s latch it (was 3 over 5 ms); one call over 20 ms still does. `denoiser_slow_frames` still
+  counts calls over 5 ms, so the desktop's "calls over 5 ms" text stays right. On 0.9.153, 14 of 57
+  SDK callers were bypassed and 9 ended the call with the SDK off; 11 of the 14 had no call over
+  9.6 ms.
+
+Tests (`cargo test -p webrtc-sys --lib --release`): `adm_proxy_gives_up_a_playout_fallback_that_does_not_stop`
+(a fake fallback whose `Stop` always fails: given up after one failed stop, the microphone restart
+after it completes and playout reopens on a new fallback), `adm_proxy_reopens_a_microphone_that_stopped_delivering`,
+`adm_proxy_capture_stall_guard_is_off_unless_the_platform_has_one`,
+`root_denoiser_slow_calls_within_the_frame_never_latch` (7 ms calls: counted slow, never bypassed);
+`root_denoiser_slow_frames_latch_a_bypass` and the warm-up test now spin 12 ms. With
+`LK_HW_AUDIO_TESTS=1`, `wasapi_playout_fallback_gives_up_a_render_thread_that_does_not_stop` runs
+the real fallback on the default output with a transport stuck in its first pull: `stop -1 after
+2002 ms, playing false, stop 0 after 0 ms, destroyed after 0 ms` (before: `stop -1 after 2003 ms,
+playing true, stop -1 after 2011 ms, destroyed after 2014 ms`). Each new test fails with its fix
+reverted. livekit `root_audio_stats_report_capture_stall_recoveries_only_where_native_watches`,
+livekit-ffi `rootapp_audio_capture_stall_recoveries_convert_and_stay_absent_without_the_guard`.
+
+Not verified: a real device change (a default switched, a headset unplugged, a Bluetooth profile
+switch), since tests here do not change system settings, and so the guard's reopen after a real ADM
+capture thread ended. With the real ADM the guard ran through 8 output restarts without a reopen.
 
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
