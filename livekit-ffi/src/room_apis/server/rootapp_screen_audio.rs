@@ -575,6 +575,7 @@ mod tests {
         assert_eq!(before.last_error_message, None);
     }
 
+    #[serial_test::parallel]
     #[test]
     fn screen_audio_handle_routes_requests_and_events() {
         let recorder = Arc::new(Recorder::default());
@@ -641,6 +642,7 @@ mod tests {
         .is_some());
     }
 
+    #[serial_test::parallel]
     #[test]
     fn screen_audio_start_refuses_unusable_sources() {
         if ROOTAPP_AUDIO_CAPS & CAP_SCREEN_AUDIO == 0 {
@@ -695,6 +697,7 @@ mod tests {
 
     // The real request path end to end; in tests every capture gets the fake
     // tone backend (new_capture), so none opens a real OS capture.
+    #[serial_test::parallel]
     #[test]
     fn screen_audio_native_capture_runs_end_to_end_with_a_fake_backend() {
         if ROOTAPP_AUDIO_CAPS & CAP_SCREEN_AUDIO == 0 {

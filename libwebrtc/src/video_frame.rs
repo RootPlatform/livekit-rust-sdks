@@ -696,7 +696,7 @@ pub mod web {
 mod tests {
     use std::{future::poll_fn, pin::Pin, time::Duration};
 
-    use livekit_runtime::Stream;
+    use tokio_stream::Stream;
     use webrtc_sys::video_frame as vf_sys;
 
     use super::{
@@ -828,7 +828,7 @@ mod tests {
             buffer,
         });
 
-        let received = livekit_runtime::timeout(Duration::from_secs(5), async {
+        let received = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let frame = poll_fn(|cx| Pin::new(&mut stream).poll_next(cx)).await.unwrap();
                 if frame.buffer.as_i420().is_some_and(|i420| data_ptr(i420) == sent) {

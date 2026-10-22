@@ -199,6 +199,7 @@ mod tests {
     use super::FfiAudioSource;
     use crate::{proto, server::FfiConfig, FFI_SERVER};
 
+    #[serial_test::parallel]
     #[test]
     fn back_to_back_captures_complete_in_submission_order() {
         let completed = Arc::new(Mutex::new(Vec::new()));
