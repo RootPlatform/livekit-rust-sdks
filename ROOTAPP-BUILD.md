@@ -3039,6 +3039,14 @@ Not verified: a real device change (a default switched, a headset unplugged, a B
 switch), since tests here do not change system settings, and so the guard's reopen after a real ADM
 capture thread ended. With the real ADM the guard ran through 8 output restarts without a reopen.
 
+## v0.13.1-hw.2 (2026-10-22)
+
+v0.13.1-hw.1 with the MF decode watchdog and stalled-stream keyframe requests (see "MF decode
+watchdog") and the microphone after output changes (see "The microphone after output changes, and
+the slow-frame bypass"). Caps 32767. Proto: `RootAudioStats.capture_stall_recoveries` (173).
+Windows also gains the `livekit_ffi_mf_decode_watchdog_counts` export and the
+`LK_MF_D3D11_SHARING=off` switch.
+
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
 | Commit | Change |
