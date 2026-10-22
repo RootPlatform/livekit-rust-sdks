@@ -97,18 +97,22 @@ pub enum AudioDeviceSelection {
 /// direction is not running, or was already running on that device) and
 /// [`ADM_RESULT_DEVICE_NOT_FOUND`] means the selected device is not present. A
 /// failed stop leaves the direction closed until the native retry a second
-/// later, so its init and start are not attempted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// later, so its init and start are not attempted. `init_detail` is why the
+/// platform ADM's init failed where native looked into it (Windows playout:
+/// the step, its HRESULT and the formats), also when the playout fallback
+/// opened the device instead; empty otherwise.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioDeviceOutcome {
     pub found: bool,
     pub attempted: bool,
     pub stop_result: i32,
     pub init_result: i32,
     pub start_result: i32,
+    pub init_detail: String,
 }
 
 /// Per direction; `None` when the request did not cover it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AudioDeviceRequestOutcome {
     pub recording: Option<AudioDeviceOutcome>,
     pub playout: Option<AudioDeviceOutcome>,
@@ -123,6 +127,7 @@ impl From<sys_adc::ffi::AudioDeviceRequestOutcome> for AudioDeviceRequestOutcome
                 stop_result: outcome.stop_result,
                 init_result: outcome.init_result,
                 start_result: outcome.start_result,
+                init_detail: outcome.init_detail,
             })
         };
         Self { recording: direction(value.recording), playout: direction(value.playout) }

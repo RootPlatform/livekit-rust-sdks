@@ -125,6 +125,9 @@ fn main() {
     if is_desktop {
         builder.file("src/desktop_capturer.cpp");
     }
+    if target_os == "windows" {
+        builder.file("src/root_wasapi_playout.cpp");
+    }
 
     // Test harnesses and test hooks (the `harness` feature, which the crates'
     // dev-dependencies turn on); release builds compile none of them.

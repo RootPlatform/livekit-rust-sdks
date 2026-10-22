@@ -2160,3 +2160,178 @@ fn adm_listener_router_routes_only_the_platform_adms_listeners() {
     h.remove_listener_from_test_thread(true);
     assert_eq!(h.core_audio_listeners(), 3, "Init's device list and default device listeners");
 }
+
+const UNSUPPORTED_MIX: &str = "Initialize 0x88890008 AUDCLNT_E_UNSUPPORTED_FORMAT, asking 8000 Hz \
+                               1 ch 16-bit PCM (no 16-bit PCM format of the ADM's list is \
+                               supported; closest 48000 Hz 8 ch 32-bit float); mix format 48000 \
+                               Hz 8 ch 32-bit float (extensible, mask 0x63F); opens with the \
+                               engine's conversion";
+
+#[test]
+fn adm_proxy_playout_falls_back_where_the_platform_adm_cannot_open_it() {
+    let h = platform(&["{spk}", "{headset}"], &["{mic}"]);
+    h.set_playout_fallback(UNSUPPORTED_MIX, true, 0);
+    h.fail_init_playout(-1);
+    h.hold(true);
+    assert_eq!(calls(&h), [default_device("Playout"), "InitPlayout".into()]);
+    assert_eq!(
+        h.take_fallback_calls(),
+        ["diagnose(default, stereo)", "Init(default, 2)", "Start"],
+        "the default output through the fallback, in libwebrtc's stereo"
+    );
+    let stats = h.stats();
+    assert!(stats.playing, "playout runs");
+    assert_eq!((stats.playout_init_result, stats.playout_start_result), (0, 0));
+    assert!(stats.playout_fallback_available && stats.playout_fallback);
+    assert_eq!(stats.playout_fallback_opens, 1);
+    assert_eq!(
+        stats.playout_init_detail,
+        format!("{UNSUPPORTED_MIX}; playing through the fallback: fake converted stream")
+    );
+
+    // The fallback's render thread pulls libwebrtc's transport through the tap.
+    h.engine_plays_mixer();
+    h.register_transport();
+    assert!(h.controller().register_root_audio_effect(1, &vec![8000i16; 4800]));
+    assert_eq!(h.controller().play_root_audio_effect(1, 0.5), 0);
+    let render = h.fallback_render();
+    assert_eq!(render.frames, 480);
+    assert!(render.samples.iter().all(|&s| (3999..=4000).contains(&s)), "the chime, both channels");
+    assert_eq!(h.stats().render_callbacks, 1, "counted as a device render");
+    h.engine_start_playout();
+    h.flush();
+    assert!(h.playing(), "libwebrtc sees its playout running");
+    assert_eq!(h.playout_delay(), 25, "the fallback's delay");
+
+    // A selection reopens on the headset, through the fallback again.
+    let outcome = select_playout(&h, "{headset}");
+    assert_eq!((outcome.stop_result, outcome.init_result, outcome.start_result), (0, 0, 0));
+    assert!(outcome.init_detail.starts_with(UNSUPPORTED_MIX), "{}", outcome.init_detail);
+    assert_eq!(calls(&h), ["SetPlayoutDevice(1)", "InitPlayout"], "the ADM is tried first");
+    assert_eq!(
+        h.take_fallback_calls(),
+        ["Stop", "diagnose({headset}, stereo)", "Init({headset}, 2)", "Start"]
+    );
+    assert_eq!(h.stats().playout_fallback_opens, 2);
+
+    // Once the ADM opens the device again, the fallback is closed for good.
+    h.fail_init_playout(0);
+    let outcome = h.restart(false, true).playout;
+    assert_eq!((outcome.stop_result, outcome.init_result, outcome.start_result), (0, 0, 0));
+    assert_eq!(outcome.init_detail, "");
+    assert_eq!(calls(&h), ["SetPlayoutDevice(1)", "InitPlayout", "StartPlayout"]);
+    assert_eq!(h.take_fallback_calls(), ["Stop"]);
+    let stats = h.stats();
+    assert!(!stats.playout_fallback && stats.playing);
+    assert_eq!(stats.playout_init_detail, "");
+    assert_eq!(h.fallback_render().frames, -1, "nothing pulls the fallback");
+}
+
+#[test]
+fn adm_proxy_playout_fallback_follows_libwebrtcs_mono_and_closes_with_the_device() {
+    let h = platform(&["{spk}"], &["{mic}"]);
+    h.set_playout_fallback(UNSUPPORTED_MIX, true, 0);
+    h.fail_init_playout(-1);
+    assert_eq!(h.engine_set_stereo_playout(false), 0);
+    h.hold(true);
+    calls(&h);
+    assert_eq!(h.take_fallback_calls(), ["diagnose(default, mono)", "Init(default, 1)", "Start"]);
+    assert_eq!(h.fallback_render().samples.len(), 480, "mono");
+
+    h.hold(false);
+    calls(&h);
+    assert_eq!(h.take_fallback_calls(), ["Stop"]);
+    assert!(!h.stats().playing && !h.stats().playout_fallback);
+
+    h.hold(true);
+    calls(&h);
+    h.take_fallback_calls();
+    h.shutdown();
+    assert_eq!(h.take_fallback_calls(), ["Stop"], "the destructor's shutdown closes it");
+}
+
+#[test]
+fn adm_proxy_playout_failure_carries_the_diagnosis_when_nothing_opens() {
+    let in_use = "Initialize 0x8889000A AUDCLNT_E_DEVICE_IN_USE, asking 48000 Hz 2 ch 16-bit PCM; \
+                  mix format 48000 Hz 2 ch 32-bit float; with the engine's conversion: \
+                  0x8889000A AUDCLNT_E_DEVICE_IN_USE";
+    let h = platform(&["{spk}"], &["{mic}"]);
+    h.set_playout_fallback(in_use, false, 0);
+    h.fail_init_playout(-1);
+    h.hold(true);
+    h.flush();
+    let outcome = select_playout(&h, "{spk}");
+    assert_eq!((outcome.init_result, outcome.start_result), (-1, ADM_RESULT_NOT_ATTEMPTED));
+    assert_eq!(outcome.init_detail, in_use);
+    assert_eq!(
+        h.take_fallback_calls(),
+        ["diagnose(default, stereo)", "diagnose({spk}, stereo)"],
+        "no fallback where a converted stream does not open either"
+    );
+    let stats = h.stats();
+    assert!(!stats.playing && !stats.playout_fallback);
+    assert_eq!((stats.playout_init_result, stats.playout_init_detail.as_str()), (-1, in_use));
+
+    // Every pass tries the closed device again; a fallback whose own open
+    // fails is reported after the diagnosis.
+    calls(&h);
+    h.set_playout_fallback(UNSUPPORTED_MIX, true, -1);
+    let outcome = h.restart(false, true).playout;
+    let failed_too = format!(
+        "{UNSUPPORTED_MIX}; the playout fallback failed too: Initialize 0x88890008 \
+         AUDCLNT_E_UNSUPPORTED_FORMAT"
+    );
+    assert_eq!((outcome.init_result, outcome.init_detail.as_str()), (-1, failed_too.as_str()));
+    assert_eq!(calls(&h), ["SetPlayoutDevice(0)", "InitPlayout"]);
+    assert_eq!(h.take_fallback_calls(), ["diagnose({spk}, stereo)", "Init({spk}, 2)"]);
+    assert_eq!(h.stats().playout_init_detail, failed_too);
+    assert_eq!(h.stats().playout_fallback_opens, 0);
+}
+
+#[test]
+fn adm_proxy_without_a_playout_fallback_reports_the_bare_failure() {
+    let h = platform(&["{spk}"], &["{mic}"]);
+    h.fail_init_playout(-1);
+    let outcome = select_playout(&h, "{spk}");
+    h.hold(true);
+    calls(&h);
+    let stats = h.stats();
+    assert!(!stats.playout_fallback_available, "the harness proxy has none unless a test sets one");
+    assert_eq!((stats.playout_init_result, stats.playout_init_detail.as_str()), (-1, ""));
+    assert_eq!(outcome.init_result, ADM_RESULT_NOT_ATTEMPTED);
+}
+
+/// The real WASAPI diagnosis and fallback on this machine's default output:
+/// a client initialized and released (the diagnosis), then the fallback's
+/// stream playing silence for 300 ms. Opens real devices.
+#[cfg(windows)]
+#[test]
+fn wasapi_playout_diagnosis_and_fallback_on_the_default_output() {
+    use crate::audio_device_controller::ffi::{
+        wasapi_playout_diagnosis, wasapi_playout_fallback_run,
+    };
+    if std::env::var_os("LK_HW_AUDIO_TESTS").is_none() {
+        eprintln!("skipped: opens the default output; set LK_HW_AUDIO_TESTS=1 to run");
+        return;
+    }
+    let diagnosis = wasapi_playout_diagnosis("", true);
+    eprintln!("diagnosis: {diagnosis}");
+    assert!(diagnosis.contains("mix format "), "{diagnosis}");
+    assert!(diagnosis.contains(", asking "), "{diagnosis}");
+    assert!(diagnosis.ends_with("opens with the engine's conversion"), "{diagnosis}");
+    let missing =
+        wasapi_playout_diagnosis("{0.0.0.00000000}.{00000000-0000-0000-0000-000000000000}", true);
+    assert!(missing.starts_with("GetDevice 0x80070490 E_NOTFOUND"), "{missing}");
+
+    let run = wasapi_playout_fallback_run(300);
+    eprintln!("fallback: {run}");
+    assert!(run.starts_with("playing true, "), "{run}");
+    assert!(run.contains(", stop 0, after stop playing false; 48000 Hz 2 ch 16-bit PCM"), "{run}");
+    let renders: u64 = run
+        .split(", ")
+        .nth(1)
+        .and_then(|part| part.strip_suffix(" renders"))
+        .and_then(|count| count.parse().ok())
+        .expect("render count");
+    assert!(renders >= 20, "about 30 renders of 10 ms in 300 ms: {run}");
+}

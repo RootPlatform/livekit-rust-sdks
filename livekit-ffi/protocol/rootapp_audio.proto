@@ -739,6 +739,22 @@ message RootAudioStats {
   // Playout that rendered nothing for 500 ms while capture went on (at most once every 5 s), reopened
   // together with a microphone on its device.
   optional uint64 render_stall_recoveries = 169;
+
+  // Playout the platform ADM could not open, where native has its own stream for it (Windows;
+  // absent elsewhere and from libraries that predate it). The Windows ADM opens playout only as
+  // 16-bit PCM at 48, 44.1, 16, 96, 32 or 8 kHz in one or two channels without the audio engine's
+  // conversion, so it fails on a device whose shared-mode mix format is anything else (a surround
+  // headset's 6 or 8 channels, 88.2 or 192 kHz). After a failed open native repeats the ADM's open
+  // to find out why and plays through a shared stream the engine converts, where that opens.
+  // Playout runs on that stream now.
+  optional bool playout_fallback = 170;
+  // Playout opens that took the fallback. Cumulative for the engine's life.
+  optional uint64 playout_fallback_opens = 171;
+  // Why the platform ADM's last playout open failed: the step (Initialize, SetEventHandle, ...), its
+  // HRESULT, the format it asked for, the device's mix format and whether a converted stream opens,
+  // then what the fallback did. Empty when the last open succeeded. The same text follows "device
+  // init failed (n): " in a failed selection's or restart's error.
+  optional string playout_init_detail = 172;
 }
 // One playout mixer source (a remote audio stream): its audio as it reached the mixer, decoded and
 // before its gain (tile volume, master volume, deafen; a muted frame counts as silence), as a sum of

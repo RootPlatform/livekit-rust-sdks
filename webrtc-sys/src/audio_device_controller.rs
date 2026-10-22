@@ -44,7 +44,7 @@ pub mod ffi {
         pub index: u16,
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct AudioDeviceOutcome {
         pub requested: bool,
         pub found: bool,
@@ -52,9 +52,13 @@ pub mod ffi {
         pub stop_result: i32,
         pub init_result: i32,
         pub start_result: i32,
+        /// Why the platform ADM's Init failed, where native looked into it
+        /// (Windows playout: the step, its HRESULT and the formats), also
+        /// when the playout fallback opened the device instead; else empty.
+        pub init_detail: String,
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct AudioDeviceRequestOutcome {
         pub recording: AudioDeviceOutcome,
         pub playout: AudioDeviceOutcome,
@@ -193,6 +197,16 @@ pub mod ffi {
         pub render_stall_reopens: u64,
         pub coupled_reopens: u64,
         pub render_stall_recoveries: u64,
+
+        /// Native has a playout fallback where the platform ADM cannot open
+        /// playout (Windows: a shared stream the audio engine converts):
+        /// playout runs on it, the opens that took it (cumulative), and why
+        /// the platform ADM's last playout Init failed (empty when it
+        /// succeeded).
+        pub playout_fallback_available: bool,
+        pub playout_fallback: bool,
+        pub playout_fallback_opens: u64,
+        pub playout_init_detail: String,
 
         /// The DSP chain, the denoiser slot and the APM decorator exist; the
         /// fields of the ones that do not stay at their defaults.
@@ -668,6 +682,15 @@ pub mod ffi {
         ) -> UniquePtr<AdmProxyHarness>;
         /// With no platform ADM (one that failed to initialize).
         fn new_adm_proxy_harness_without_platform_adm() -> UniquePtr<AdmProxyHarness>;
+        /// The real WASAPI diagnosis of a playout open (Windows), on a COM MTA
+        /// thread; " [no convert]" is appended when a converted stream does
+        /// not open. Opens real devices.
+        #[cfg(windows)]
+        fn wasapi_playout_diagnosis(endpoint_id: &str, stereo: bool) -> String;
+        /// The real playout fallback on the default output for `run_ms`,
+        /// playing silence (Windows). Opens real devices.
+        #[cfg(windows)]
+        fn wasapi_playout_fallback_run(run_ms: u32) -> String;
         fn take_calls(self: &AdmProxyHarness) -> Vec<String>;
         fn take_playout_opened(self: &AdmProxyHarness) -> Vec<String>;
         /// The fake's channel, speaker and microphone calls and the channels of
@@ -731,6 +754,25 @@ pub mod ffi {
         /// render thread makes it: AudioDeviceBuffer::RequestPlayoutData, then
         /// GetPlayoutData into the device.
         fn device_render(self: &AdmProxyHarness) -> AdmDeviceRender;
+        /// Every InitPlayout of the fake fails with `result` until it is 0
+        /// again, as the Windows ADM's does on a mix format it cannot open.
+        fn fail_init_playout(self: &AdmProxyHarness, result: i32);
+        /// The proxy gets a fake playout fallback whose Init returns
+        /// `init_result`, and a diagnosis answering `diagnosis` and
+        /// `converted_opens`.
+        fn set_playout_fallback(
+            self: &AdmProxyHarness,
+            diagnosis: &str,
+            converted_opens: bool,
+            init_result: i32,
+        );
+        /// What the diagnosis ("diagnose(default, stereo)") and the fallbacks
+        /// ("Init({spk}, 2)", "Start", "Stop") were asked since the last take.
+        fn take_fallback_calls(self: &AdmProxyHarness) -> Vec<String>;
+        /// One 10 ms render callback of the playing fallback through the
+        /// transport tap, from a thread of its own; frames -1 when none
+        /// plays.
+        fn fallback_render(self: &AdmProxyHarness) -> AdmDeviceRender;
         /// libwebrtc's transport plays the mixer from now on, as
         /// AudioTransportImpl does.
         fn engine_plays_mixer(self: &AdmProxyHarness);

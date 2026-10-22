@@ -2626,6 +2626,72 @@ fake erases at its own level survives with AGC2 and not with the legacy engine;
 denoised ones; `..._ahead_of_the_denoiser_learns_the_room_before_the_gain`: auto sensitivity's floor
 -80 dBFS at 25 dB of gain, the gate never opens).
 
+## Windows playout the ADM cannot open (`rootapp/hw24-fixes`)
+
+Reports from 0.9.152 (Windows 10 19045 and Insider build 26300): platform playout never opened on the
+system default output (`playout init/start -1/1`, "device init failed (-1)" on every restart), while
+the desktop's probe of the same device opened.
+
+The platform ADM is webrtc-89d790b's `AudioDeviceWindowsCore` (the prebuilt has no
+`CreateWindowsCoreAudioAudioDeviceModule`). Its `InitPlayout` searches 16-bit PCM at 48000, 44100,
+16000, 96000, 32000 and 8000 Hz in two then one channel (`IsFormatSupported`, shared mode), and calls
+`IAudioClient::Initialize` (shared, `AUDCLNT_STREAMFLAGS_EVENTCALLBACK`, no
+`AUTOCONVERTPCM`) with the format it found, or with the last one it tried when none matched. Without
+conversion the audio engine accepts only its own mix format's rate and channel count, so the open
+fails with `AUDCLNT_E_UNSUPPORTED_FORMAT` on a device whose mix format has more than two channels (5.1
+or 7.1, which surround gaming headsets and their virtual devices use) or another rate (88.2, 176.4 or
+192 kHz, 24 kHz). The ADM's `_TraceCOMError` line is the only place its HRESULT appears. The desktop's
+probe opens with `AutoConvertPcm | SrcDefaultQuality`, which inserts the engine's channel matrixer and
+resampler, so it opens on the same device. Nothing here is specific to build 26300.
+
+`AdmProxy` (Windows):
+- After a failed `InitPlayout` it repeats the ADM's open on the same endpoint (the selected GUID, or
+  the console default) with a client it never starts (`DiagnoseWasapiPlayout`,
+  `root_wasapi_playout.cpp`): the format search, then `Initialize`, `SetEventHandle` and
+  `GetService`. It reports the step that failed, its HRESULT, the format asked for (and the closest
+  match when none was supported), the mix format, and whether a client opens with the engine's
+  conversion. For example: `Initialize 0x88890008 AUDCLNT_E_UNSUPPORTED_FORMAT, asking 8000 Hz 1 ch
+  16-bit PCM (no 16-bit PCM format of the ADM's list is supported; closest 48000 Hz 8 ch 32-bit
+  float); mix format 48000 Hz 8 ch 32-bit float (extensible, mask 0x63F); opens with the engine's
+  conversion`.
+- Where the converted client opens, playout runs on the proxy's own stream instead
+  (`AdmPlayoutFallback`, `CreateWasapiPlayoutFallback`): shared, event driven, 48 kHz int16 in
+  libwebrtc's channel count, `AUTOCONVERTPCM | SRC_DEFAULT_QUALITY | NOPERSIST`, a 30 ms buffer
+  filled 10 ms at a time through the transport tap (render callbacks, the monitor and the guards work
+  as on the ADM) on an MMCSS "Pro Audio" thread. Its delay (padding plus stream latency) feeds
+  `PlayoutDelay`. Stops and failed starts close it; a stop that cannot join its thread within 2 s is
+  retried a second later, as the ADM's.
+- Every open tries the ADM first, so a device whose mix format changes back opens natively again.
+- The open reports success when the fallback opened. The text reaches the request outcome
+  (`AudioDeviceOutcome::init_detail`; livekit appends it to "device init failed (n): ", so a failed
+  selection or restart carries it), the log (`AdmProxy: InitPlayout failed: -1; <text>`), and
+  `RootAudioStats` 170-172:
+
+| # | Field | |
+|---|---|---|
+| 170 | `playout_fallback` | playout runs on the fallback now |
+| 171 | `playout_fallback_opens` | opens that took it, cumulative |
+| 172 | `playout_init_detail` | the last playout open's diagnosis and what the fallback did; empty when the ADM opened |
+
+The fields are present where native has a fallback (Windows), absent elsewhere and from older
+libraries; livekit: `RootAudioStats::playout_fallback` (`PlayoutFallbackStats`). No control or
+capability change (caps stay 32767). Recording has the same format search (a 4-channel microphone
+array would fail the same way) and is not covered.
+
+Tests (`cargo test -p webrtc-sys --lib --release`): `adm_proxy_playout_falls_back_where_the_platform_adm_cannot_open_it`
+(the default and a selected device through the fallback, renders through the tap, libwebrtc's view,
+the delay, back on the ADM once it opens), `adm_proxy_playout_fallback_follows_libwebrtcs_mono_and_closes_with_the_device`,
+`adm_proxy_playout_failure_carries_the_diagnosis_when_nothing_opens` (no fallback where a converted
+client does not open; a fallback that fails too), `adm_proxy_without_a_playout_fallback_reports_the_bare_failure`.
+`wasapi_playout_diagnosis_and_fallback_on_the_default_output` runs the real diagnosis and the
+fallback on the default output for 300 ms (silence) with `LK_HW_AUDIO_TESTS=1`; on Jesse's machine
+(48 kHz stereo float): the repeated open succeeds, 30 renders, 20 ms delay, a 1440 frame buffer.
+livekit `device_results_carry_why_the_init_failed`; livekit-ffi
+`rootapp_audio_playout_fallback_stats_convert_and_stay_absent_without_a_fallback`.
+
+Not verified: a device with a surround or 192 kHz mix format (none here, and changing the default
+format is a system setting), and the fallback in a live call.
+
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
 | Commit | Change |

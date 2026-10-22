@@ -41,6 +41,7 @@ namespace livekit_ffi {
 class AudioDeviceController;
 #if defined(ROOTAPP_HARNESS)
 class AdmProxyHarness;
+struct HarnessFallbackLog;
 class RootVoiceHarness;
 class RootEngineHarness;
 class RootMonitorHarness;
@@ -307,6 +308,18 @@ class AdmProxyHarness {
   // One 10 ms render callback from a device thread through the fake's
   // AudioDeviceBuffer, as the Windows ADM's render thread makes it.
   AdmDeviceRender device_render() const;
+  // Every InitPlayout of the fake fails with `result` until it is 0 again.
+  void fail_init_playout(int32_t result) const;
+  // The proxy gets a fake playout fallback (its Init returns `init_result`)
+  // and a diagnosis that answers `diagnosis` and `converted_opens`.
+  void set_playout_fallback(rust::Str diagnosis,
+                            bool converted_opens,
+                            int32_t init_result) const;
+  // What the diagnosis and the fallbacks were asked since the last take.
+  rust::Vec<rust::String> take_fallback_calls() const;
+  // One 10 ms render callback of the playing fallback from a thread of its
+  // own; frames -1 when none plays.
+  AdmDeviceRender fallback_render() const;
   // libwebrtc's transport plays the mixer from now on.
   void engine_plays_mixer() const;
   void engine_start_playout() const;
@@ -431,6 +444,7 @@ class AdmProxyHarness {
   std::shared_ptr<DeviceFormats> formats_ = std::make_shared<DeviceFormats>();
   std::shared_ptr<std::atomic<uint32_t>> foreign_calls_ =
       std::make_shared<std::atomic<uint32_t>>(0);
+  mutable std::shared_ptr<HarnessFallbackLog> fallback_log_;
 };
 
 std::unique_ptr<AdmProxyHarness> new_adm_proxy_harness(
@@ -440,6 +454,15 @@ std::unique_ptr<AdmProxyHarness> new_adm_proxy_harness_with_apm(
     rust::Slice<const rust::String> playout_guids,
     rust::Slice<const rust::String> recording_guids);
 std::unique_ptr<AdmProxyHarness> new_adm_proxy_harness_without_platform_adm();
+
+#if defined(WEBRTC_WIN)
+// The real WASAPI diagnosis of a playout open on a COM MTA thread, as the
+// device thread runs it (the client is initialized, never started).
+rust::String wasapi_playout_diagnosis(rust::Str endpoint_id, bool stereo);
+// The real playout fallback on the default output for `run_ms`, playing the
+// tap's silence; what it did.
+rust::String wasapi_playout_fallback_run(uint32_t run_ms);
+#endif
 
 class HarnessApmTransport;
 
