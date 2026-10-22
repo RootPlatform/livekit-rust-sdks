@@ -44,6 +44,18 @@ impl RemoteTrack {
             Self::Video(track) => track.get_stats().await,
         }
     }
+
+    /// Stores whether the SFU forwards the track; true when that changed.
+    pub(crate) fn set_stream_state(&self, state: StreamState) -> bool {
+        match self {
+            Self::Audio(track) => track.set_stream_state(state),
+            Self::Video(track) => track.set_stream_state(state),
+        }
+    }
+}
+
+pub(super) fn set_stream_state(inner: &TrackInner, state: StreamState) -> bool {
+    std::mem::replace(&mut inner.info.write().stream_state, state) != state
 }
 
 pub(super) async fn get_stats(inner: &Arc<TrackInner>) -> RoomResult<Vec<RtcStats>> {
@@ -78,5 +90,35 @@ impl TryFrom<Track> for RemoteTrack {
             Track::RemoteVideo(track) => Ok(Self::Video(track)),
             _ => Err("not a local track"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use libwebrtc::{
+        peer_connection_factory::native::PeerConnectionFactoryExt,
+        video_source::native::NativeVideoSource,
+    };
+
+    use super::*;
+
+    #[tokio::test]
+    async fn stream_state_follows_the_sfu_and_reports_only_changes() {
+        let factory = PeerConnectionFactory::default();
+        let source = NativeVideoSource::new(VideoResolution { width: 1280, height: 720 }, true);
+        let sid = TrackSid::try_from("TR_screenshare".to_string()).expect("track sid");
+        let track = RemoteTrack::Video(RemoteVideoTrack::new(
+            sid,
+            "screen".into(),
+            factory.create_video_track("screen", source),
+        ));
+        assert_eq!(track.stream_state(), StreamState::Active, "a subscription starts active");
+
+        assert!(track.set_stream_state(proto::StreamState::Paused.into()));
+        assert_eq!(track.stream_state(), StreamState::Paused);
+        assert!(!track.set_stream_state(StreamState::Paused), "a repeated state is no change");
+
+        assert!(track.set_stream_state(proto::StreamState::Active.into()));
+        assert_eq!(Track::from(track).stream_state(), StreamState::Active);
     }
 }

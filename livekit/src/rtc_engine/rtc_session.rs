@@ -174,6 +174,10 @@ pub enum SessionEvent {
     ConnectionQuality {
         updates: Vec<proto::ConnectionQualityInfo>,
     },
+    /// The SFU paused or resumed forwarding subscribed tracks.
+    StreamStateUpdate {
+        states: Vec<proto::StreamStateInfo>,
+    },
     RoomUpdate {
         room: proto::Room,
     },
@@ -1462,6 +1466,11 @@ impl SessionInner {
             proto::signal_response::Message::ConnectionQuality(quality) => {
                 let _ =
                     self.emitter.send(SessionEvent::ConnectionQuality { updates: quality.updates });
+            }
+            proto::signal_response::Message::StreamStateUpdate(update) => {
+                let _ = self
+                    .emitter
+                    .send(SessionEvent::StreamStateUpdate { states: update.stream_states });
             }
             proto::signal_response::Message::TrackPublished(publish_res) => {
                 let mut pending_tracks = self.pending_tracks.lock();

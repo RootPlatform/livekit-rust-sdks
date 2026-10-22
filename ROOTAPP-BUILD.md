@@ -2746,6 +2746,36 @@ PeerConnection does not; one creation for later handles). With `RegisterAudioCal
 device-thread wait put back, both fail. livekit `create_steps_log_each_steps_own_time`;
 `test_audio_device_controller_bridge` (`LK_HW_AUDIO_TESTS=1`) now acquires before it lists.
 
+## Track stream state (`rootapp/hw24-fixes`)
+
+The desktop's video health telemetry (0.9.152) puts most remote-video freezes at `no_media`: no RTP
+while the sender's connection quality is poor, for example a Watch Stream screen share with no
+inbound stream for 12 s. The SFU tells the subscriber when it stops forwarding a track
+(`SignalResponse.stream_state_update`: participant SID, track SID, `ACTIVE` or `PAUSED`), which its
+allocator does when no layer fits (this subscriber's bandwidth estimate, or a publisher that sends
+nothing usable). The Rust SDK dropped the message: `TrackInfo.stream_state` and the FFI
+`TrackInfo.stream_state` existed (upstream too) but stayed `ACTIVE`. Upstream rust-sdks (main of
+2026-10-21) still drops it; the JS SDK has `RoomEvent.TrackStreamStateChanged`.
+
+- livekit: `SessionEvent` / `EngineEvent::StreamStateUpdate`, and the room stores each state on the
+  subscribed track it names (`RemoteTrack::stream_state`) and, when it changed, sends
+  `RoomEvent::TrackStreamStateChanged { participant, publication, stream_state }`. A track starts
+  `Active`. A state for a publication whose track is not there yet (the SFU can pause a subscription
+  before the media track arrives, the never-started case) waits on the publication and is applied
+  when the track is set, reported right after `TrackSubscribed`; unsubscribing drops it (JS drops
+  such states). States for unknown participants or publications are dropped.
+- livekit-ffi: `RoomEvent.track_stream_state_changed = 1000` (`TrackStreamStateChanged`:
+  `participant_identity`, `track_sid`, `state` as the FFI `StreamState`). RootApp cases of
+  `RoomEvent` are numbered from 1000, as in `rootapp_audio.proto`, so upstream's next cases cannot
+  collide. `TrackInfo.stream_state` (track info requests) now follows the SFU too.
+
+Tests: livekit `stream_state_follows_the_sfu_and_reports_only_changes`,
+`a_stream_state_before_the_track_waits_for_it_and_an_unsubscription_drops_it`; livekit-ffi
+`track_stream_state_changed_is_a_room_event_of_its_own` (the case's field number on the wire). The
+path from the signal client to the room event is not covered by a test here: that needs a LiveKit
+server (an e2e test could pause a track with `SimulateScenario { subscriber_bandwidth }`, which the
+Rust SDK does not send yet).
+
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
 | Commit | Change |

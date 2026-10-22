@@ -17,6 +17,15 @@ use livekit_protocol::*;
 use crate::{participant, room::ChatMessage as RoomChatMessage, track, DataPacketKind};
 
 // Conversions
+impl From<StreamState> for track::StreamState {
+    fn from(value: StreamState) -> Self {
+        match value {
+            StreamState::Active => Self::Active,
+            StreamState::Paused => Self::Paused,
+        }
+    }
+}
+
 impl From<ConnectionQuality> for participant::ConnectionQuality {
     fn from(value: ConnectionQuality) -> Self {
         match value {
