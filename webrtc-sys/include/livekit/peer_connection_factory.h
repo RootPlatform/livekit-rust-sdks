@@ -86,6 +86,10 @@ class PeerConnectionFactory {
   rust::String field_trial(rust::Str key) const;
 
  private:
+  // Declaration order matters: rtc_runtime_ must be declared before
+  // adm_proxy_/audio_device_ so it is destroyed last. Releasing the proxy
+  // does a BlockingCall onto the runtime's worker thread, which must still
+  // be running at that point.
   std::shared_ptr<RtcRuntime> rtc_runtime_;
   webrtc::scoped_refptr<RootAudioMixer> audio_mixer_;
   std::shared_ptr<RootCaptureState> capture_state_;

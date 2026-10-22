@@ -57,6 +57,8 @@ class PeerConnection : webrtc::PeerConnectionObserver {
 
   void set_configuration(RtcConfiguration config) const;
 
+  void set_bitrate(BitrateSettings settings) const;
+
   void create_offer(
       RtcOfferAnswerOptions options,
       rust::Box<PeerContext> ctx,
@@ -100,8 +102,6 @@ class PeerConnection : webrtc::PeerConnectionObserver {
       rust::Fn<void(rust::Box<PeerContext>, rust::String)> on_stats) const;
 
   void restart_ice() const;
-
-  void set_bitrate(int32_t min_bps, int32_t start_bps, int32_t max_bps) const;
 
   std::shared_ptr<RtpTransceiver> add_transceiver(
       std::shared_ptr<MediaStreamTrack> track,

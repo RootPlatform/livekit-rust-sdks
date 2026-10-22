@@ -291,7 +291,8 @@ PeerConnectionFactory::PeerConnectionFactory(
   }
 #endif
   audio_device_ = std::make_shared<AudioDeviceController>(
-      adm_proxy_, audio_mixer_, apm_, capture_state_, engine_hold_);
+      rtc_runtime_, adm_proxy_, audio_mixer_, apm_, capture_state_,
+      engine_hold_);
 
   if (peer_factory_.get() == nullptr) {
     RTC_LOG_ERR(LS_ERROR) << "Failed to create PeerConnectionFactory";

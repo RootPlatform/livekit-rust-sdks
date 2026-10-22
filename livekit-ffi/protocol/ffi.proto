@@ -19,6 +19,7 @@ package livekit.proto;
 import "audio_frame.proto";
 import "data_stream.proto";
 import "data_track.proto";
+import "capture.proto";
 // import "handle.proto";
 import "e2ee.proto";
 import "room.proto";
@@ -171,6 +172,10 @@ message FfiRequest {
     DefineSchemaRequest define_schema = 85;
     GetSchemaRequest get_schema = 86;
 
+    // Pre-encoded video
+    CaptureEncodedVideoFrameRequest capture_encoded_video_frame = 87;
+    TakeEncodedVideoSourceFeedbackRequest take_encoded_video_source_feedback = 88;
+
     // Reconnection / chaos testing
     SimulateScenarioRequest simulate_scenario = 76;
 
@@ -202,7 +207,12 @@ message FfiRequest {
     RootScreenAudioStopRequest root_screen_audio_stop = 1013;
     RootScreenAudioStatsRequest root_screen_audio_stats = 1014;
 
-    // NEXT_ID: 87
+    // Capture sources (livekit-capture; requires the `capture` feature)
+    NewCaptureSourceRequest new_capture_source = 91;
+    StartCaptureRequest start_capture = 89;
+    StopCaptureRequest stop_capture = 90;
+
+    // NEXT_ID: 92
   }
 }
 
@@ -317,6 +327,10 @@ message FfiResponse {
     DefineSchemaResponse define_schema = 85;
     GetSchemaResponse get_schema = 86;
 
+    // Pre-encoded video
+    CaptureEncodedVideoFrameResponse capture_encoded_video_frame = 87;
+    TakeEncodedVideoSourceFeedbackResponse take_encoded_video_source_feedback = 88;
+
     // Reconnection / chaos testing
     SimulateScenarioResponse simulate_scenario = 75;
 
@@ -348,7 +362,12 @@ message FfiResponse {
     RootScreenAudioStopResponse root_screen_audio_stop = 1013;
     RootScreenAudioStatsResponse root_screen_audio_stats = 1014;
 
-    // NEXT_ID: 87
+    // Capture sources (livekit-capture; requires the `capture` feature)
+    NewCaptureSourceResponse new_capture_source = 91;
+    StartCaptureResponse start_capture = 89;
+    StopCaptureResponse stop_capture = 90;
+
+    // NEXT_ID: 92
   }
 }
 
@@ -421,7 +440,11 @@ message FfiEvent {
     RootAudioEvent root_audio = 1000;
     RootScreenAudioEvent root_screen_audio = 1001;
 
-    // NEXT_ID: 47
+    // Capture sources (livekit-capture; requires the `capture` feature)
+    NewCaptureSourceCallback new_capture_source = 47;
+    CaptureSourceEvent capture_source_event = 48;
+
+    // NEXT_ID: 49
   }
 }
 

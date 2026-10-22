@@ -69,13 +69,17 @@ namespace livekit_ffi {
 AdmDeviceSelection ToAdmSelection(const AudioDeviceSelection& selection);
 AudioDeviceRequestOutcome ToRequestOutcome(const AdmRequestOutcome& outcome);
 
+class RtcRuntime;
+
 class AudioDeviceController {
  public:
-  explicit AudioDeviceController(webrtc::scoped_refptr<AdmProxy> adm_proxy);
+  AudioDeviceController(std::shared_ptr<RtcRuntime> rtc_runtime,
+                        webrtc::scoped_refptr<AdmProxy> adm_proxy);
   // The native audio engine's pieces; any of them may be null (mobile, tests).
   // `engine_hold` keeps libwebrtc's voice engine initialized while a platform
   // reference is held.
   AudioDeviceController(
+      std::shared_ptr<RtcRuntime> rtc_runtime,
       webrtc::scoped_refptr<AdmProxy> adm_proxy,
       webrtc::scoped_refptr<RootAudioMixer> mixer,
       webrtc::scoped_refptr<RootApmDecorator> apm,
@@ -186,6 +190,11 @@ class AudioDeviceController {
   bool is_platform_adm_active() const;
 
  private:
+  // The APM decorator and the voice engine hold post to the runtime's worker
+  // thread, so the runtime (and its threads) stays alive as long as Rust can
+  // reach the controller. Declaration order matters: rtc_runtime_ must be
+  // declared before the members that use its threads so it is destroyed last.
+  std::shared_ptr<RtcRuntime> rtc_runtime_;
   webrtc::scoped_refptr<AdmProxy> adm_proxy_;
   webrtc::scoped_refptr<RootAudioMixer> mixer_;
   webrtc::scoped_refptr<RootApmDecorator> apm_;

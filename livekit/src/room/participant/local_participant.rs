@@ -35,7 +35,6 @@ use crate::{
     e2ee::EncryptionType,
     options::{self, compute_video_encodings, video_layers_from_encodings, TrackPublishOptions},
     prelude::*,
-    room::rpc::{RpcError, RpcErrorCode, RpcInvocationData},
     rtc_engine::lk_runtime::LkRuntime,
     rtc_engine::{EngineError, EngineResult, RtcEngine},
     ChatMessage, DataPacket, RoomSession, SipDTMF, Transcription,
@@ -47,11 +46,11 @@ use libwebrtc::{
     rtp_parameters::RtpEncodingParameters,
     video_source::RtcVideoSource,
 };
-use livekit_api::signal_client::SignalError;
 use livekit_protocol as proto;
-use livekit_runtime::timeout;
+use livekit_signaling::SignalError;
 use parking_lot::{Mutex, RwLock};
 use proto::request_response::Reason;
+use tokio::time::timeout;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -678,16 +677,24 @@ impl LocalParticipant {
         let publication = self.remove_publication(sid);
         if let Some(TrackPublication::Local(publication)) = publication {
             let track = publication.track().unwrap();
-            let transceiver = track.transceiver().unwrap();
-            let sender = transceiver.sender();
+            let remove_result = {
+                let transceiver = track.transceiver().unwrap();
+                let sender = transceiver.sender();
+                let result = self.inner.rtc_engine.remove_track(sender.clone());
+                if result.is_ok() {
+                    if matches!(track, LocalTrack::Video(_)) {
+                        sender.release_video_encoder();
+                    }
+                    if let Some(mid) = transceiver.mid() {
+                        self.inner.rtc_engine.release_send_section(mid);
+                    }
+                }
+                result
+            };
 
-            self.inner.rtc_engine.remove_track(sender.clone())?;
-            if matches!(track, LocalTrack::Video(_)) {
-                sender.release_video_encoder();
-            }
-            if let Some(mid) = transceiver.mid() {
-                self.inner.rtc_engine.release_send_section(mid);
-            }
+            // The peer connection may already be closed after a server-initiated
+            // disconnect. Always release the local publication/track graph even
+            // when removing its sender is no longer possible.
             track.set_transceiver(None);
 
             if let Some(local_track_unpublished) =
@@ -697,7 +704,11 @@ impl LocalParticipant {
             }
 
             publication.set_track(None);
-            self.inner.rtc_engine.publisher_negotiation_needed();
+            if remove_result.is_ok() {
+                self.inner.rtc_engine.publisher_negotiation_needed();
+            }
+
+            remove_result?;
 
             Ok(publication)
         } else {
@@ -928,7 +939,7 @@ impl LocalParticipant {
         let session = self.session().ok_or_else(|| {
             RpcError::built_in(RpcErrorCode::SendFailed, Some("Not connected".to_string()))
         })?;
-        let transport = crate::room::rpc::SessionTransport(session.clone());
+        let transport = crate::room::rpc_transport::SessionTransport(session.clone());
         session.rpc_client.perform_rpc(data, &transport).await
     }
 

@@ -82,6 +82,15 @@ pub mod ffi {
         use_obsolete_sctp_sdp: bool,
     }
 
+    pub struct BitrateSettings {
+        pub has_min_bitrate_bps: bool,
+        pub min_bitrate_bps: i32,
+        pub has_start_bitrate_bps: bool,
+        pub start_bitrate_bps: i32,
+        pub has_max_bitrate_bps: bool,
+        pub max_bitrate_bps: i32,
+    }
+
     pub struct IceServer {
         pub urls: Vec<String>,
         pub username: String,
@@ -136,6 +145,7 @@ pub mod ffi {
         type PeerConnection;
 
         fn set_configuration(self: &PeerConnection, config: RtcConfiguration) -> Result<()>;
+        fn set_bitrate(self: &PeerConnection, settings: BitrateSettings) -> Result<()>;
 
         fn create_offer(
             self: &PeerConnection,
@@ -199,13 +209,6 @@ pub mod ffi {
             on_complete: fn(ctx: Box<PeerContext>, error: RtcError),
         );
         fn restart_ice(self: &PeerConnection);
-        // PeerConnectionInterface::SetBitrate; a negative value leaves that bound unset.
-        fn set_bitrate(
-            self: &PeerConnection,
-            min_bps: i32,
-            start_bps: i32,
-            max_bps: i32,
-        ) -> Result<()>;
         fn current_local_description(self: &PeerConnection) -> UniquePtr<SessionDescription>;
         fn current_remote_description(self: &PeerConnection) -> UniquePtr<SessionDescription>;
         fn connection_state(self: &PeerConnection) -> PeerConnectionState;

@@ -15,7 +15,11 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt::{Debug, Formatter},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
+    time::Duration,
 };
 
 use libwebrtc::{peer_connection::BitrateSettings, prelude::*};
@@ -53,6 +57,9 @@ struct BitratePreferences {
     start_applied: bool,
     // Sum of the encodings' max bitrates of each published video track, by track id.
     video_max_bps: HashMap<String, u64>,
+    // How long this peer connection took to set up, set once the initial connect succeeds.
+    // `compute_start_bitrate_kbps` lowers a camera's start for slow connections.
+    connection_setup_time: Option<Duration>,
 }
 
 impl BitratePreferences {
@@ -74,11 +81,11 @@ impl BitratePreferences {
         let start_kbps = if self.start_applied {
             None
         } else {
-            PeerTransport::compute_start_bitrate_kbps(max_bps, screen)
+            PeerTransport::compute_start_bitrate_kbps(max_bps, screen, self.connection_setup_time)
         };
         self.start_applied |= start_kbps.is_some();
         BitrateSettings {
-            start_bitrate_bps: start_kbps.map(|kbps| kbps as i32 * 1000),
+            start_bitrate_bps: start_kbps.map(|kbps| u64::from(kbps) * 1000),
             max_bitrate_bps: Some(self.max_bitrate_bps()),
             ..Default::default()
         }
@@ -97,10 +104,10 @@ impl BitratePreferences {
     /// static, and a 15 Mbps top layer then needs ~15 s of AIMD increase once it moves. Twice
     /// the published video's max bitrates matches the ceiling libwebrtc puts on probes once
     /// that video is allocated (twice the max allocated bitrate).
-    fn max_bitrate_bps(&self) -> i32 {
+    fn max_bitrate_bps(&self) -> u64 {
         let max = self.video_max_bps.values().fold(0u64, |sum, bps| sum.saturating_add(*bps));
         let max = max.saturating_mul(2);
-        max.clamp(Self::DEFAULT_MAX_PROBE_BPS, i32::MAX as u64) as i32
+        max.clamp(Self::DEFAULT_MAX_PROBE_BPS, i32::MAX as u64)
     }
 }
 
@@ -111,6 +118,12 @@ pub struct PeerTransport {
     inner: Arc<AsyncMutex<TransportInner>>,
     bitrate: Mutex<BitratePreferences>,
     released_send_mids: Mutex<HashSet<String>>,
+
+    /// Counts entries into `Connected`; see [`Self::note_connection_state`].
+    connected_generation: AtomicU32,
+
+    /// Counts exits from `Connected`; see [`Self::note_connection_state`].
+    disconnect_generation: AtomicU32,
 }
 
 impl Debug for PeerTransport {
@@ -142,6 +155,8 @@ impl PeerTransport {
             })),
             bitrate: Mutex::new(BitratePreferences::default()),
             released_send_mids: Mutex::new(HashSet::new()),
+            connected_generation: AtomicU32::new(0),
+            disconnect_generation: AtomicU32::new(0),
         }
     }
 
@@ -159,6 +174,31 @@ impl PeerTransport {
 
     pub fn is_connected(&self) -> bool {
         self.peer_connection.connection_state() == PeerConnectionState::Connected
+    }
+
+    pub fn connected_generation(&self) -> u32 {
+        self.connected_generation.load(Ordering::Acquire)
+    }
+
+    pub fn disconnect_generation(&self) -> u32 {
+        self.disconnect_generation.load(Ordering::Acquire)
+    }
+
+    /// Record a connection-state transition, so a later observer can tell what the transport
+    /// has *done* rather than only what it currently reports.
+    ///
+    /// Both counters exist because `PeerConnectionState` is a level, and a level cannot
+    /// distinguish a transport that recovered from one whose far end vanished: ICE keeps
+    /// reporting `Connected` until its receiving timeout, and only reaches `Failed` after
+    /// consent expiry tens of seconds later. Comparing these against a snapshot taken before
+    /// a resume gives that history. Called for every `RtcEvent::ConnectionChange`, so a
+    /// transport that drops and returns between two polls is still visible as having dropped.
+    pub fn note_connection_state(&self, state: PeerConnectionState) {
+        if state == PeerConnectionState::Connected {
+            self.connected_generation.fetch_add(1, Ordering::AcqRel);
+        } else {
+            self.disconnect_generation.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     pub fn peer_connection(&self) -> PeerConnection {
@@ -212,8 +252,23 @@ impl PeerTransport {
         };
         self.peer_connection.set_remote_description(remote_description).await?;
 
+        // Apply every queued candidate, even if one fails. A candidate can be rejected on its
+        // own merits — a malformed or stale line from the server — and that must not abort the
+        // replay: `drain`'s `Drop` clears the whole range however far iteration got, so an early
+        // return discards the untried candidates instead of leaving them queued. It would also
+        // skip the `restarting_ice` reset below, leaving the transport queuing every future
+        // candidate forever. The remote description is already applied at this point, so there
+        // is nothing to unwind — the failure is per-candidate and the rest still stand.
         for ic in inner.pending_candidates.drain(..) {
-            self.peer_connection.add_ice_candidate(ic).await?;
+            let candidate = ic.to_string();
+            if let Err(err) = self.peer_connection.add_ice_candidate(ic).await {
+                log::warn!(
+                    "{:?}: failed to add pending ice candidate {}: {:?}",
+                    self.signal_target,
+                    candidate,
+                    err
+                );
+            }
         }
 
         inner.restarting_ice = false;
@@ -308,6 +363,12 @@ impl PeerTransport {
         self.apply_bitrate(settings);
     }
 
+    /// Record how long this peer connection took to set up. Called once, after the initial
+    /// connect succeeds; resumes and ICE restarts keep the estimator and never call this.
+    pub fn set_connection_setup_time(&self, setup: Duration) {
+        self.bitrate.lock().connection_setup_time = Some(setup);
+    }
+
     pub fn remove_video_track(&self, track_id: &str) {
         if let Some(settings) = self.bitrate.lock().on_video_track_removed(track_id) {
             self.apply_bitrate(settings);
@@ -336,20 +397,55 @@ impl PeerTransport {
     /// without starting far above a typical uplink.
     const MAX_SCREEN_START_BITRATE_KBPS: u32 = 3000;
 
+    /// Minimum start bitrate (kbps): libwebrtc's own default starting estimate. A target below
+    /// this gets no start bitrate, since seeding above the real capacity costs more than the
+    /// ramp it saves, and a slow connection's camera is seeded no higher than this.
+    const MIN_TARGET_BITRATE_KBPS: u32 = 300;
+
+    /// Connection setup times bounding a camera's ramp in [`Self::compute_start_bitrate_kbps`]
+    /// (upstream #1467): at or below the first the start is capped at
+    /// [`Self::MAX_START_BITRATE_KBPS`], at or above the second at
+    /// [`Self::MIN_TARGET_BITRATE_KBPS`]. Measured upstream on shaped links (CLT-3380): healthy
+    /// links set up in under 860 ms, a 1 Mbps link with 150 ms RTT took 1.1–1.7 s, a 500 kbps
+    /// link ~2.3 s at the median, and a 300 kbps link never under 3 s.
+    const SETUP_TIME_FOR_MAX_BITRATE: Duration = Duration::from_millis(1500);
+    const SETUP_TIME_FOR_MIN_BITRATE: Duration = Duration::from_millis(3500);
+
     /// Compute the start bitrate of a video track.
     ///
-    /// Returns min(90% of target, 1 Mbps), or 3 Mbps for screen shares. Returns None if no
+    /// Returns min(90% of target, cap). A camera's cap is 1 Mbps, ramping linearly down to
+    /// 300 kbps as the connection's setup time goes from 1.5 s to 3.5 s (setup time grows with
+    /// round-trip time and loss, which also mark the links where a 1 Mbps start overshoots;
+    /// without one the cap stays at 1 Mbps). A screen share's cap is 3 Mbps whatever the setup
+    /// time, since its content needs the bitrate at once to stay legible. Returns None if no
     /// target bitrate is set or if the target is too low.
-    fn compute_start_bitrate_kbps(target_bps: Option<u64>, screen: bool) -> Option<u32> {
+    fn compute_start_bitrate_kbps(
+        target_bps: Option<u64>,
+        screen: bool,
+        setup_time: Option<Duration>,
+    ) -> Option<u32> {
         let target_bps = target_bps?;
         let target_kbps = u32::try_from(target_bps / 1000).unwrap_or(u32::MAX);
 
-        if target_kbps < 300 {
+        if target_kbps < Self::MIN_TARGET_BITRATE_KBPS {
             return None;
         }
 
-        let cap =
-            if screen { Self::MAX_SCREEN_START_BITRATE_KBPS } else { Self::MAX_START_BITRATE_KBPS };
+        let cap = if screen {
+            Self::MAX_SCREEN_START_BITRATE_KBPS
+        } else {
+            match setup_time {
+                None => Self::MAX_START_BITRATE_KBPS,
+                Some(setup) => {
+                    let fast = Self::SETUP_TIME_FOR_MAX_BITRATE.as_secs_f64();
+                    let slow = Self::SETUP_TIME_FOR_MIN_BITRATE.as_secs_f64();
+                    let ramp = ((setup.as_secs_f64() - fast) / (slow - fast)).clamp(0.0, 1.0);
+                    let range =
+                        (Self::MAX_START_BITRATE_KBPS - Self::MIN_TARGET_BITRATE_KBPS) as f64;
+                    (Self::MAX_START_BITRATE_KBPS as f64 - ramp * range).round() as u32
+                }
+            }
+        };
         let start_kbps = (target_kbps as f64 * 0.9).round() as u32;
         Some(start_kbps.min(target_kbps).min(cap))
     }
@@ -849,7 +945,10 @@ impl PeerTransport {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
+    use std::{
+        collections::{HashMap, HashSet},
+        time::Duration,
+    };
 
     use libwebrtc::peer_connection::BitrateSettings;
 
@@ -1045,20 +1144,118 @@ a=fmtp:111 minptime=10;useinbandfec=1\r\n";
 
     #[test]
     fn camera_start_bitrate_is_capped_at_one_mbps() {
-        assert_eq!(PeerTransport::compute_start_bitrate_kbps(Some(15_610_000), false), Some(1000));
-        assert_eq!(PeerTransport::compute_start_bitrate_kbps(Some(800_000), false), Some(720));
-        assert_eq!(PeerTransport::compute_start_bitrate_kbps(Some(299_000), false), None);
-        assert_eq!(PeerTransport::compute_start_bitrate_kbps(None, false), None);
+        let start = |bps| PeerTransport::compute_start_bitrate_kbps(bps, false, None);
+        assert_eq!(start(Some(15_610_000)), Some(1000));
+        assert_eq!(start(Some(800_000)), Some(720));
+        assert_eq!(start(Some(299_000)), None);
+        assert_eq!(start(None), None);
     }
 
     #[test]
     fn screen_share_start_bitrate_is_capped_at_three_mbps() {
-        assert_eq!(PeerTransport::compute_start_bitrate_kbps(Some(16_200_000), true), Some(3000));
-        assert_eq!(PeerTransport::compute_start_bitrate_kbps(Some(2_900_000), true), Some(2610));
-        assert_eq!(PeerTransport::compute_start_bitrate_kbps(Some(299_000), true), None);
+        let start = |bps| PeerTransport::compute_start_bitrate_kbps(bps, true, None);
+        assert_eq!(start(Some(16_200_000)), Some(3000));
+        assert_eq!(start(Some(2_900_000)), Some(2610));
+        assert_eq!(start(Some(299_000)), None);
     }
 
-    fn settings(start: Option<i32>, max: i32) -> BitrateSettings {
+    #[test]
+    fn camera_start_bitrate_ramps_down_with_connection_setup_time() {
+        // A 3 Mbps camera target, so only the cap moves.
+        let camera = |ms| {
+            PeerTransport::compute_start_bitrate_kbps(
+                Some(3_000_000),
+                false,
+                Some(Duration::from_millis(ms)),
+            )
+        };
+        assert_eq!(camera(0), Some(1000), "instant setup keeps the ceiling");
+        assert_eq!(camera(1500), Some(1000), "the fast anchor keeps the ceiling");
+        assert_eq!(camera(1724), Some(922), "a slow 1 Mbps link barely moves");
+        assert_eq!(camera(2500), Some(650), "midpoint of the ramp");
+        assert_eq!(camera(3500), Some(300), "the slow anchor reaches the floor");
+        assert_eq!(camera(18_131), Some(300), "anything slower stays at the floor");
+        assert_eq!(
+            PeerTransport::compute_start_bitrate_kbps(
+                Some(500_000),
+                false,
+                Some(Duration::from_millis(2500))
+            ),
+            Some(450),
+            "90% of the target still wins when it is lower than the cap"
+        );
+    }
+
+    #[test]
+    fn slow_connection_setup_leaves_the_screen_share_start_at_its_cap() {
+        let screen = |ms| {
+            PeerTransport::compute_start_bitrate_kbps(
+                Some(16_200_000),
+                true,
+                Some(Duration::from_millis(ms)),
+            )
+        };
+        assert_eq!(screen(1273), Some(3000));
+        assert_eq!(screen(2500), Some(3000));
+        assert_eq!(screen(4061), Some(3000));
+    }
+
+    #[test]
+    fn the_connection_setup_time_lowers_only_the_first_camera_start() {
+        let mut prefs = BitratePreferences {
+            connection_setup_time: Some(Duration::from_millis(3500)),
+            ..Default::default()
+        };
+        assert_eq!(
+            prefs.on_video_track("camera".into(), Some(4_110_000), false),
+            settings(Some(300_000), 8_220_000)
+        );
+        assert_eq!(
+            prefs.on_video_track("screen".into(), Some(16_200_000), true),
+            settings(None, 40_620_000)
+        );
+    }
+
+    /// The two counters are the whole basis on which a resume decides a transport recovered,
+    /// so each transition must land on exactly one of them, and a transport that drops and
+    /// returns must leave both marks rather than looking untouched.
+    #[test]
+    fn connection_state_transitions_are_counted_separately() {
+        use libwebrtc::prelude::*;
+        use livekit_protocol as proto;
+
+        let factory = PeerConnectionFactory::default();
+        let mut config = RtcConfiguration::default();
+        config.continual_gathering_policy = ContinualGatheringPolicy::GatherOnce;
+        config.ice_transport_type = IceTransportsType::All;
+        let pc = factory.create_peer_connection(config).unwrap();
+
+        let transport = PeerTransport::new(
+            pc,
+            proto::SignalTarget::Subscriber,
+            /* single_pc_mode= */ false,
+        );
+        let counters = || (transport.connected_generation(), transport.disconnect_generation());
+
+        assert_eq!(counters(), (0, 0));
+
+        transport.note_connection_state(PeerConnectionState::Connecting);
+        assert_eq!(counters(), (0, 1));
+
+        transport.note_connection_state(PeerConnectionState::Connected);
+        assert_eq!(counters(), (1, 1));
+
+        // Dropping and returning must move both counters: a resume needs to see that it broke
+        // *and* that it came back, and a poll sampling only the current state sees neither.
+        transport.note_connection_state(PeerConnectionState::Disconnected);
+        transport.note_connection_state(PeerConnectionState::Connected);
+        assert_eq!(counters(), (2, 2));
+
+        transport.note_connection_state(PeerConnectionState::Failed);
+        assert_eq!(counters(), (2, 3));
+    }
+
+    fn settings(start: Option<u64>, max: u64) -> BitrateSettings {
         BitrateSettings {
             start_bitrate_bps: start,
             max_bitrate_bps: Some(max),
@@ -1099,7 +1296,7 @@ a=fmtp:111 minptime=10;useinbandfec=1\r\n";
         assert_eq!(prefs.on_video_track_removed("camera"), Some(settings(None, 5_000_000)));
 
         prefs.on_video_track("huge".into(), Some(u64::MAX / 2), true);
-        assert_eq!(prefs.max_bitrate_bps(), i32::MAX);
+        assert_eq!(prefs.max_bitrate_bps(), i32::MAX as u64);
     }
 
     #[test]

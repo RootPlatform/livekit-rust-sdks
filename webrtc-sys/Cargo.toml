@@ -1,6 +1,6 @@
 [package]
 name = "webrtc-sys"
-version = "0.3.43"
+version = "0.3.50"
 edition.workspace = true
 homepage = "https://livekit.io"
 license.workspace = true
@@ -11,6 +11,11 @@ repository.workspace = true
 default = []
 harness = []
 mf-fault-injection = []
+
+# How CI checks this crate's features, read by
+# `.github/workflows/feature-combinations-curated.yml` via `cargo metadata`.
+[package.metadata.feature-combinations]
+mode = "powerset"
 
 [dependencies]
 cxx = "1.0"
@@ -31,6 +36,5 @@ pkg-config = "0.3.22"
 pkg-config = "0.3.22"
 
 [dev-dependencies]
-env_logger = { workspace = true }
 rustfft = "6"
 webrtc-sys = { path = ".", features = ["harness", "mf-fault-injection"] }

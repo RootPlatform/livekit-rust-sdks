@@ -1302,8 +1302,8 @@ AdmProxyHarness::AdmProxyHarness(
                                    ? "default|" + opened.name
                                    : opened.guid + "|" + opened.name);
       });
-  controller_ = std::make_unique<AudioDeviceController>(proxy_, mixer_, apm_,
-                                                        capture_);
+  controller_ = std::make_unique<AudioDeviceController>(nullptr, proxy_, mixer_,
+                                                        apm_, capture_);
 }
 
 rust::Vec<rust::String> AdmProxyHarness::take_playout_opened() const {
@@ -2113,8 +2113,8 @@ RootVoiceHarness::RootVoiceHarness()
   proxy_->SetDeviceProbeForTest(AdmDeviceProbe{});
   proxy_->SetRenderStallGuardForTest(false, false, 0, 0);
   proxy_->SetCaptureState(capture_);
-  controller_ = std::make_unique<AudioDeviceController>(proxy_, mixer_, apm_,
-                                                        capture_);
+  controller_ = std::make_unique<AudioDeviceController>(nullptr, proxy_, mixer_,
+                                                        apm_, capture_);
   proxy_->AcquirePlatformAdm();
   proxy_->set_recording_enabled(true);
   proxy_->set_playout_enabled(true);
@@ -2397,7 +2397,7 @@ RootEngineHarness::RootEngineHarness() : parts_(std::make_unique<Parts>()) {
   });
   p.hold = std::make_shared<RootVoiceEngineHold>(p.worker.get(), p.context);
   p.controller = std::make_unique<AudioDeviceController>(
-      p.proxy, p.mixer, p.apm, p.capture, p.hold);
+      nullptr, p.proxy, p.mixer, p.apm, p.capture, p.hold);
 }
 
 RootEngineHarness::~RootEngineHarness() {
