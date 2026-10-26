@@ -3096,6 +3096,11 @@ call-end field `cqVideoRenderQueueDrops`. Expect 0 with this build, and `not_del
 Test: `cargo test -p libwebrtc --lib native::peer_connection` (`prerenderer_smoothing_stays_off`:
 off on a new connection, and still off after `set_configuration` with the same configuration).
 
+## v0.13.1-hw.3 (2026-10-26)
+
+v0.13.1-hw.2 with prerenderer smoothing off (see "No prerenderer smoothing"). Caps 32767, no proto
+changes.
+
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
 | Commit | Change |
