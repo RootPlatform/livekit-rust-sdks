@@ -3047,6 +3047,55 @@ the slow-frame bypass"). Caps 32767. Proto: `RootAudioStats.capture_stall_recove
 Windows also gains the `livekit_ffi_mf_decode_watchdog_counts` export and the
 `LK_MF_D3D11_SHARING=off` switch.
 
+## No prerenderer smoothing (`rootapp/no-prerenderer-smoothing`)
+
+`to_native_rtc_configuration` (`webrtc-sys/src/peer_connection.cpp`) turns off libwebrtc's
+prerenderer smoothing (`RTCConfiguration::set_prerenderer_smoothing(false)`) for every peer
+connection, so `VideoReceiveStream2` hands decoded frames straight to the track's sinks instead of
+an `IncomingVideoStream`.
+
+Why, from desktop 0.9.153-155's "Native video freeze" events with verdict `not_delivered`
+(ROOT-DESKTOP-3T3, 34 events, 25 users, 2026-10-26):
+
+- Frames kept decoding (`frames_decoded` +42 to +95 over the 2 s window), yet the host's feed got
+  no callback at all: neither received nor dropped. The FFI stream task forwards every frame its
+  sink gets, so the frames stopped between the decoder and the sink.
+- The freezes ended by themselves within about 10 s. Calls whose only freeze was `not_delivered`
+  had longest freezes of 6.2-8.9 s.
+- In 20 of 34 windows more frames were decoded than received (a backlog flushed), and
+  `frames_dropped` was 0 in 33.
+- 32 of 34 were screen shares, 29 pinned to the high layer, and 87% with the app in the background
+  (about 60% for `no_media` freezes): mostly people watching a stream while they play.
+
+That is `VideoRenderFrames`, which the smoothing puts in that gap. It holds each frame until its
+render time (released at render time minus the render delay) and drops a frame whose render time is
+earlier than the last one queued ("Frame scheduled out of order"). It also drops frames more than
+500 ms late while others wait ("Too old frame") and more than 10 s ahead ("Frame too long into the
+future"). One frame whose render time jumps a few seconds ahead, from a late decode
+(`VCMTiming::UpdateCurrentDelay` raises the delay at once) or an RTP timestamp outlier, is held
+until then, and every frame decoded after it is dropped. Those drops only feed the
+`WebRTC.Video.DroppedFrames.RenderQueue` histogram and an RTC_LOG warning, never getStats. Behaviour
+read from the m125 sources; the prebuilt's `video_render_frames.h` (`last_render_time_ms_`,
+`frames_dropped_`) is unchanged. The setting defaults to on (`MediaConfig::Video`,
+`VideoReceiveStreamInterface::Config`), and nothing in the fork set it before.
+
+Without it, decoding is still scheduled by render time (`FrameDecodeTiming` waits at most
+`max_wait_for_frame` per frame), so normal pacing and lip sync barely change: frames reach the sink
+a render delay (10 ms) earlier. A late or out-of-order frame now shows up at once and the next one
+replaces it; the desktop host keeps only the newest frame and draws at display rate. Not yet
+checked in a live call.
+
+The value is part of `MediaConfig`'s equality, and `SetConfiguration` refuses changes to fields it
+cannot modify ("Modifying the configuration in an unsupported way", as with `enable_sctp_snap`),
+so create and `set_configuration` both take it from the same conversion.
+
+Desktop side: `RenderQueueDropCounter` (desktop branch `claude/peaceful-lovelace-70fb31`) counts
+those three warnings into the freeze events (`video.render_queue`, `render_queue_*`) and the
+call-end field `cqVideoRenderQueueDrops`. Expect 0 with this build, and `not_delivered` gone.
+
+Test: `cargo test -p libwebrtc --lib native::peer_connection` (`prerenderer_smoothing_stays_off`:
+off on a new connection, and still off after `set_configuration` with the same configuration).
+
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
 | Commit | Change |

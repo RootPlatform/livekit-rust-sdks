@@ -57,6 +57,8 @@ class PeerConnection : webrtc::PeerConnectionObserver {
 
   void set_configuration(RtcConfiguration config) const;
 
+  bool prerenderer_smoothing() const;
+
   void set_bitrate(BitrateSettings settings) const;
 
   void create_offer(

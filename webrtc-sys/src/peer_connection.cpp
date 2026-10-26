@@ -58,6 +58,14 @@ webrtc::PeerConnectionInterface::RTCConfiguration to_native_rtc_configuration(
   rtc_config.enable_sctp_snap = config.enable_sctp_snap;
   rtc_config.media_config.video.periodic_alr_bandwidth_probing =
       config.periodic_alr_bandwidth_probing;
+  // Decoded frames go straight to the sinks. Prerenderer smoothing
+  // (IncomingVideoStream) holds each one until its render time, up to 10 s
+  // ahead, and drops every later frame that would render before it, so one
+  // frame with a far render time freezes the video while decoding goes on.
+  // Decoding is already scheduled by render time, and RootApp's host keeps
+  // only the newest frame. Part of MediaConfig's equality, so
+  // set_configuration passes the same value as creation.
+  rtc_config.set_prerenderer_smoothing(false);
 
   return rtc_config;
 }
@@ -112,6 +120,10 @@ void PeerConnection::set_configuration(RtcConfiguration config) const {
   if (!result.ok()) {
     throw std::runtime_error(serialize_error(to_error(result)));
   }
+}
+
+bool PeerConnection::prerenderer_smoothing() const {
+  return peer_connection_->GetConfiguration().prerenderer_smoothing();
 }
 
 void PeerConnection::set_bitrate(BitrateSettings settings) const {

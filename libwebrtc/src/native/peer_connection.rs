@@ -210,6 +210,11 @@ impl PeerConnection {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn prerenderer_smoothing(&self) -> bool {
+        self.sys_handle.prerenderer_smoothing()
+    }
+
     pub fn set_bitrate(&self, settings: BitrateSettings) -> Result<(), RtcError> {
         self.sys_handle
             .set_bitrate(settings.into())
@@ -648,6 +653,21 @@ mod tests {
         peer_connection_factory::{PeerConnectionFactory, RtcConfiguration},
         RtcErrorType,
     };
+
+    #[tokio::test]
+    async fn prerenderer_smoothing_stays_off() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let factory = PeerConnectionFactory::default();
+        let pc = factory.create_peer_connection(RtcConfiguration::default()).unwrap();
+        assert!(!pc.handle.prerenderer_smoothing());
+
+        pc.set_configuration(RtcConfiguration::default())
+            .expect("the same configuration again is not an unsupported modification");
+        assert!(!pc.handle.prerenderer_smoothing());
+
+        pc.close();
+    }
 
     #[tokio::test]
     async fn set_bitrate() {

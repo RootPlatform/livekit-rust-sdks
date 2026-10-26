@@ -145,6 +145,7 @@ pub mod ffi {
         type PeerConnection;
 
         fn set_configuration(self: &PeerConnection, config: RtcConfiguration) -> Result<()>;
+        fn prerenderer_smoothing(self: &PeerConnection) -> bool;
         fn set_bitrate(self: &PeerConnection, settings: BitrateSettings) -> Result<()>;
 
         fn create_offer(
