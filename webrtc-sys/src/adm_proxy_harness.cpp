@@ -3042,4 +3042,16 @@ bool adm_name_matches_for_test(rust::Slice<const uint8_t> device,
              }) == 0;
 }
 
+AdmCaptureLoss adm_capture_loss_for_test(rust::Slice<const int64_t> times_us,
+                                         size_t frames,
+                                         uint32_t rate) {
+  AdmCaptureLossMeter meter;
+  uint64_t max_lag_us = 0;
+  for (int64_t time_us : times_us) {
+    meter.Observe(time_us * 1000, frames, rate);
+    max_lag_us = std::max(max_lag_us, meter.TakeMaxLagUs());
+  }
+  return AdmCaptureLoss{max_lag_us, meter.lost_us(), meter.loss_events()};
+}
+
 }  // namespace livekit_ffi

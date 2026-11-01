@@ -78,6 +78,7 @@ pub mod ffi {
         pub installs: u64,
         pub frames_until_first_output: i32,
         pub process_max_us: u64,
+        pub lateness_max_us: u64,
         pub histogram: Vec<u64>,
     }
 
@@ -347,59 +348,158 @@ mod tests {
         assert_eq!(h.slot_info(false).bypass, RATE_MISMATCH, "output capacity under 8 frames");
     }
 
+    /// 11 ms calls back to back fall 1 ms further behind the frame each: the
+    /// backlog passes the 15 ms budget on the 16th plain call.
     #[test]
-    fn root_denoiser_slow_frames_latch_a_bypass() {
-        // The fake spins for 12 ms, longer than the 10 ms frame; a plain call
-        // preempted past 20 ms latches on its own, so that run is tried again.
+    fn root_denoiser_a_sustained_overrun_latches_a_bypass() {
+        // A call preempted for a few ms brings the latch forward, so that run
+        // is tried again.
         let mut attempts = 0;
-        let h = loop {
+        let (h, calls) = loop {
             attempts += 1;
             let h = harness();
-            let a = h.add_fake(&RootFakeFxSpec { sleep_us: 12_000, ..fake(1.0) });
+            let a = h.add_fake(&RootFakeFxSpec { sleep_us: 11_000, ..fake(1.0) });
             h.install_now(a, 48_000);
+            assert_eq!(run(&h, 48_000, 1.0).kind, RAN);
+            h.slot_info(true);
             let mut preempted = false;
-            for call in 0..4 {
+            let mut lateness = Vec::new();
+            while h.slot_info(false).bypass == 0 && lateness.len() < 30 {
                 assert_eq!(run(&h, 48_000, 1.0).kind, RAN);
-                let info = h.slot_info(true);
-                preempted = call > 0 && info.process_max_us > 20_000;
-                if preempted {
-                    break;
-                }
-                if call < 3 {
-                    assert_eq!(info.bypass, 0, "a warm-up and two slow calls are not enough");
-                }
+                let step = h.slot_info(true);
+                preempted |= step.process_max_us > 13_000;
+                lateness.push(step.lateness_max_us);
             }
             if !preempted {
-                break h;
+                break (h, lateness);
             }
-            assert!(attempts < 5, "every run had a call preempted past 20 ms");
+            assert!(attempts < 5, "every run had a call preempted past 13 ms");
         };
+        let count = calls.len() as u64;
+        assert!((13..=16).contains(&count), "latched after {count} plain calls of 11 ms: {calls:?}");
+        assert!(calls.windows(2).all(|w| w[1] > w[0]), "the backlog grows with every call: {calls:?}");
+        assert!(calls[calls.len() - 2] <= 15_000 && calls[calls.len() - 1] > 15_000, "{calls:?}");
         let info = h.slot_info(false);
-        assert_eq!((info.slow_frames, info.bypass), (4, SLOW), "every slow call is counted");
+        assert_eq!(info.bypass, SLOW);
+        assert_eq!(info.slow_frames, count + 1, "every slow call is counted, the warm-up too");
+        assert_eq!((info.histogram[14], info.histogram[15]), (count, 1), "{:?}", info.histogram);
         assert_eq!(run(&h, 48_000, 1.0).kind, NOT_IN_USE);
-        assert_eq!(info.histogram[14..].iter().sum::<u64>(), 4, "{:?}", info.histogram);
+        assert_eq!(h.slot_info(true).lateness_max_us, 0, "the maximum resets on read");
 
-        let b = h.add_fake(&RootFakeFxSpec { sleep_us: 25_000, ..fake(1.0) });
+        let b = h.add_fake(&fake(1.0));
         h.install_now(b, 48_000);
         assert_eq!(run(&h, 48_000, 1.0).kind, RAN);
-        let warm_up = h.slot_info(true);
-        assert_eq!(warm_up.bypass, 0, "the first call after an install is a warm-up");
-        assert!(warm_up.process_max_us >= 25_000, "still measured: {}", warm_up.process_max_us);
-        assert_eq!(
-            (warm_up.slow_frames, warm_up.histogram[15]),
-            (5, 2),
-            "both warm-ups (power and process: two spins each) over 20 ms"
-        );
         assert_eq!(run(&h, 48_000, 1.0).kind, RAN);
-        assert_eq!(h.slot_info(false).bypass, SLOW, "one later call over 20 ms");
-        assert!(h.slot_info(true).process_max_us >= 20_000);
-        assert_eq!(h.slot_info(true).process_max_us, 0, "the maximum resets on read");
+        let fresh = h.slot_info(true);
+        assert_eq!((fresh.bypass, fresh.lateness_max_us), (0, 0), "a new pipeline starts with no backlog");
     }
 
-    /// A call over 5 ms that fits in the 10 ms frame is counted slow and keeps
-    /// up: any number of them never latch the bypass (0.9.153: 11 of the 14
-    /// callers bypassed at 5 ms had no call over 9.6 ms, and 9 ended the call
-    /// with the Effects SDK off).
+    /// One call that overruns the frame by more than the budget (a 30 ms
+    /// call: 20 ms behind) latches on its own, unless it is a warm-up.
+    #[test]
+    fn root_denoiser_one_stalled_call_latches_a_bypass() {
+        let h = harness();
+        let a = h.add_fake(&RootFakeFxSpec { sleep_us: 30_000, ..fake(1.0) });
+        h.install_now(a, 48_000);
+        assert_eq!(run(&h, 48_000, 1.0).kind, RAN);
+        let warm_up = h.slot_info(true);
+        assert_eq!((warm_up.bypass, warm_up.lateness_max_us), (0, 0), "the first call after an install is a warm-up");
+        assert!(warm_up.process_max_us >= 60_000, "still measured: {}", warm_up.process_max_us);
+        assert_eq!(
+            (warm_up.slow_frames, warm_up.histogram[15]),
+            (1, 1),
+            "power and process together: one call over 20 ms"
+        );
+        assert_eq!(run(&h, 48_000, 1.0).kind, RAN);
+        let info = h.slot_info(true);
+        assert_eq!(info.bypass, SLOW, "one plain call of 30 ms");
+        assert!(info.lateness_max_us >= 20_000, "{}", info.lateness_max_us);
+        assert_eq!(run(&h, 48_000, 1.0).kind, NOT_IN_USE);
+    }
+
+    /// Calls of 12-15 ms between calls that fit in the frame (the capture
+    /// thread catches up from the device's buffer) never latch, nor do two
+    /// 13 ms calls in a row (0.9.159: 46 of 66 fallbacks had no call over
+    /// 20 ms, and slow spells ran at 5-11 ms a call).
+    #[test]
+    fn root_denoiser_isolated_overruns_never_latch() {
+        // Two 13 ms calls preempted to 18 ms each would pass the budget, so a
+        // run with a call over 16.5 ms is tried again.
+        for attempt in 1.. {
+            let h = harness();
+            let a = h.add_fake(&fake(1.0));
+            h.install_now(a, 48_000);
+            assert_eq!(run(&h, 48_000, 1.0).kind, RAN);
+            h.slot_info(true);
+            let mut ran = true;
+            for round in 0..12u32 {
+                let spins: &[u32] = if round % 2 == 0 { &[12_000 + round / 2 * 600] } else { &[13_000, 13_000] };
+                for &spin in spins {
+                    h.set_fake_sleep_us(a, spin);
+                    ran &= run(&h, 48_000, 1.0).kind == RAN;
+                }
+                h.set_fake_sleep_us(a, 0);
+                for _ in 0..2 {
+                    ran &= run(&h, 48_000, 1.0).kind == RAN;
+                }
+            }
+            let info = h.slot_info(false);
+            if info.process_max_us > 16_500 {
+                assert!(attempt < 5, "every run had a call preempted past 16.5 ms");
+                continue;
+            }
+            assert!(ran, "{info:?}");
+            assert_eq!(info.bypass, 0, "isolated overruns of the frame are caught up");
+            assert!((5_000..15_000).contains(&info.lateness_max_us), "{}", info.lateness_max_us);
+            assert_eq!(info.slow_frames, 6 + 6 * 2, "{info:?}");
+            assert_eq!(run(&h, 48_000, 1.0).kind, RAN);
+            break;
+        }
+    }
+
+    /// Calls that fit in the frame build no backlog, but leave the rest of
+    /// the capture thread little of it: 100 plain calls (about 1 s) averaging
+    /// over 9.5 ms latch, 8.5 ms never does.
+    #[test]
+    fn root_denoiser_a_saturated_second_latches_a_bypass() {
+        // Preemption raises the average and can build a backlog, so a run
+        // whose backlog reached 10 ms is tried again.
+        for attempt in 1.. {
+            let h = harness();
+            let a = h.add_fake(&RootFakeFxSpec { sleep_us: 8_500, ..fake(1.0) });
+            h.install_now(a, 48_000);
+            assert_eq!(run(&h, 48_000, 1.0).kind, RAN);
+            h.slot_info(true);
+            let kept_up = (0..150).all(|_| run(&h, 48_000, 1.0).kind == RAN);
+            let calm = h.slot_info(true);
+            if calm.process_max_us > 15_000 {
+                assert!(attempt < 5, "every run had a call preempted far past the frame");
+                continue;
+            }
+            assert!(kept_up, "8.5 ms calls keep up: {calm:?}");
+            h.set_fake_sleep_us(a, 9_900);
+            let mut calls = 0;
+            while h.slot_info(false).bypass == 0 && calls < 150 {
+                assert_eq!(run(&h, 48_000, 1.0).kind, RAN);
+                calls += 1;
+            }
+            let info = h.slot_info(true);
+            if info.lateness_max_us >= 10_000 {
+                assert!(attempt < 5, "every run had a call preempted far past the frame");
+                continue;
+            }
+            assert_eq!(calm.bypass, 0);
+            assert!(calm.lateness_max_us < 7_000, "{}", calm.lateness_max_us);
+            assert_eq!(info.bypass, SLOW, "with no backlog to speak of: {}", info.lateness_max_us);
+            assert!((40..=100).contains(&calls), "latched after {calls} calls of 9.9 ms");
+            break;
+        }
+    }
+
+    /// A call over 5 ms that fits in the 10 ms frame with room to spare is
+    /// counted slow and keeps up: any number of them never latch the bypass
+    /// (0.9.153: 11 of the 14 callers bypassed at 5 ms had no call over
+    /// 9.6 ms, and 9 ended the call with the Effects SDK off).
     #[test]
     fn root_denoiser_slow_calls_within_the_frame_never_latch() {
         // The fake spins for 7 ms; a run with a call preempted past the frame
@@ -432,11 +532,12 @@ mod tests {
     /// bypass a denoiser that keeps up with plain frames.
     #[test]
     fn root_denoiser_warm_ups_flushes_and_power_changes_never_count_toward_the_slow_latch() {
-        // A plain call preempted past 20 ms latches on its own, so that run is
-        // tried again.
+        // A plain call preempted past 13 ms moves the backlog, so that run is
+        // tried again. Each plain call gives the backlog after it.
         let plain = |h: &RootDenoiserHarness| {
-            assert_eq!(h.process(48_000, &frame(48_000, 1.0), false, 0.8, 3840).kind, RAN);
-            h.slot_info(true).process_max_us <= 20_000
+            let ran = h.process(48_000, &frame(48_000, 1.0), false, 0.8, 3840).kind == RAN;
+            let info = h.slot_info(true);
+            (ran && info.process_max_us <= 13_000).then_some(info.lateness_max_us)
         };
         for attempt in 1.. {
             let h = harness();
@@ -458,13 +559,16 @@ mod tests {
             }
             let info = h.slot_info(true);
             assert_eq!((info.bypass, info.slow_frames), (0, 6), "power changes neither");
-            if !(plain(&h) && plain(&h)) {
-                assert!(attempt < 5, "every run had a plain call preempted past 20 ms");
+            assert_eq!(info.lateness_max_us, 0, "no backlog from any of them");
+            let (Some(_), Some(backlog)) = (plain(&h), plain(&h)) else {
+                assert!(attempt < 5, "every run had a plain call preempted past 13 ms");
                 continue;
-            }
-            assert_eq!(h.slot_info(false).bypass, 0, "two plain slow calls");
-            plain(&h);
-            assert_eq!(h.slot_info(false).bypass, SLOW, "the third plain one latches");
+            };
+            assert_eq!(h.slot_info(false).bypass, 0, "two plain 12 ms calls");
+            assert!((4_000..6_000).contains(&backlog), "{backlog}");
+            h.set_fake_sleep_us(a, 30_000);
+            assert_eq!(h.process(48_000, &frame(48_000, 1.0), false, 0.8, 3840).kind, RAN);
+            assert_eq!(h.slot_info(false).bypass, SLOW, "a plain 30 ms call latches");
             break;
         }
     }

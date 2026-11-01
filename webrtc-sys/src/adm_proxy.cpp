@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <thread>
 #include <utility>
@@ -449,6 +450,75 @@ std::string AdmDeviceString(const char* buffer, size_t size) {
 }
 
 // =============================================================================
+// AdmCaptureLossMeter
+// =============================================================================
+
+void AdmCaptureLossMeter::Start(int64_t now_ns, uint32_t sample_rate) {
+  rate_ = sample_rate;
+  anchor_ns_ = now_ns;
+  delivered_ns_ = 0;
+  floor_ns_ = 0;
+  window_end_ns_ = now_ns + kWindowNs;
+  window_min_ns_ = 0;
+  pending_ = false;
+}
+
+void AdmCaptureLossMeter::Observe(int64_t now_ns,
+                                  size_t frames,
+                                  uint32_t sample_rate) {
+  if (sample_rate == 0) {
+    return;
+  }
+  if (reset_.exchange(false, std::memory_order_relaxed) ||
+      sample_rate != rate_ || now_ns < last_ns_ ||
+      now_ns - last_ns_ >= kResetGapNs) {
+    Start(now_ns, sample_rate);
+  }
+  last_ns_ = now_ns;
+  const int64_t lag = now_ns - anchor_ns_ - delivered_ns_;
+  delivered_ns_ += static_cast<int64_t>(frames) * 1'000'000'000 / sample_rate;
+  floor_ns_ = std::min(floor_ns_, lag);
+  window_min_ns_ = std::min(window_min_ns_, lag);
+  UpdateMax(max_lag_ns_, static_cast<uint64_t>(lag - floor_ns_));
+  if (now_ns < window_end_ns_) {
+    return;
+  }
+  const int64_t settled = window_min_ns_;
+  window_min_ns_ = std::numeric_limits<int64_t>::max();
+  window_end_ns_ = now_ns + kWindowNs;
+  if (settled - floor_ns_ <= kToleranceNs) {
+    floor_ns_ = settled;
+    pending_ = false;
+    return;
+  }
+  if (pending_) {
+    const int64_t confirmed = std::min(settled, pending_min_ns_);
+    lost_ns_.fetch_add(static_cast<uint64_t>(confirmed - floor_ns_),
+                       std::memory_order_relaxed);
+    loss_events_.fetch_add(1, std::memory_order_relaxed);
+    floor_ns_ = confirmed;
+  }
+  pending_ = settled - floor_ns_ > kToleranceNs;
+  pending_min_ns_ = settled;
+}
+
+void AdmCaptureLossMeter::Reset() {
+  reset_.store(true, std::memory_order_relaxed);
+}
+
+uint64_t AdmCaptureLossMeter::lost_us() const {
+  return lost_ns_.load(std::memory_order_relaxed) / 1000;
+}
+
+uint64_t AdmCaptureLossMeter::loss_events() const {
+  return loss_events_.load(std::memory_order_relaxed);
+}
+
+uint64_t AdmCaptureLossMeter::TakeMaxLagUs() {
+  return max_lag_ns_.exchange(0, std::memory_order_relaxed) / 1000;
+}
+
+// =============================================================================
 // AdmTransportTap
 // =============================================================================
 
@@ -464,10 +534,10 @@ void AdmTransportTap::set_mono_capture(bool mono) {
   mono_capture_.store(mono, std::memory_order_relaxed);
 }
 
-void AdmTransportTap::Count(Direction& direction,
-                            size_t frames,
-                            uint32_t sample_rate,
-                            uint32_t delay_ms) {
+int64_t AdmTransportTap::Count(Direction& direction,
+                               size_t frames,
+                               uint32_t sample_rate,
+                               uint32_t delay_ms) {
   const int64_t now = NowNs();
   direction.last_ns.store(now, std::memory_order_relaxed);
   const int64_t previous =
@@ -482,6 +552,7 @@ void AdmTransportTap::Count(Direction& direction,
     AddTo(direction.duration_s, seconds);
     AddTo(direction.delay_s, static_cast<double>(frames) * delay_ms / 1000.0);
   }
+  return now;
 }
 
 int32_t AdmTransportTap::RecordedDataIsAvailable(
@@ -519,8 +590,10 @@ int32_t AdmTransportTap::RecordedDataIsAvailable(
     return 0;
   }
   const uint32_t playout_delay = playout_delay_ms_.load(std::memory_order_relaxed);
-  Count(capture_, samples_per_channel, sample_rate,
-        total_delay_ms > playout_delay ? total_delay_ms - playout_delay : 0);
+  const int64_t now = Count(
+      capture_, samples_per_channel, sample_rate,
+      total_delay_ms > playout_delay ? total_delay_ms - playout_delay : 0);
+  capture_loss_.Observe(now, samples_per_channel, sample_rate);
   capture_rate_.store(sample_rate, std::memory_order_relaxed);
   capture_channels_.store(static_cast<uint32_t>(channels),
                           std::memory_order_relaxed);
@@ -660,6 +733,7 @@ void AdmTransportTap::PullRenderData(int bits_per_sample,
 
 void AdmTransportTap::ResetCaptureClock() {
   capture_.previous_ns.store(0, std::memory_order_relaxed);
+  capture_loss_.Reset();
 }
 
 void AdmTransportTap::ResetRenderClock() {
@@ -710,6 +784,9 @@ AdmTapStats AdmTransportTap::Read() {
                                  ? total_delay - stats.playout_delay_ms
                                  : 0;
   stats.overlapping_callbacks = overlapping_.load(std::memory_order_relaxed);
+  stats.capture_max_lag_us = capture_loss_.TakeMaxLagUs();
+  stats.capture_lost_us = capture_loss_.lost_us();
+  stats.capture_loss_events = capture_loss_.loss_events();
   return stats;
 }
 

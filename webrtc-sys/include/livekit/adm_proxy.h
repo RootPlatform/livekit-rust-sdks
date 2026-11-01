@@ -244,6 +244,57 @@ struct AdmTapStats {
   uint32_t playout_delay_ms = 0;
   uint32_t recording_delay_ms = 0;
   uint64_t overlapping_callbacks = 0;
+  uint64_t capture_max_lag_us = 0;
+  uint64_t capture_lost_us = 0;
+  uint64_t capture_loss_events = 0;
+};
+
+// Capture audio the device produced that never reached the tap, from the
+// callbacks' audio against the wall clock: lag = time since the clock started
+// less the audio delivered before this callback. A capture thread that runs
+// late catches up from the device's buffer, and its lag comes back down to
+// where it settled; audio the buffer dropped leaves it that much higher for
+// good. Each window (kWindowNs) settles at its lowest lag. A rise of more than
+// kToleranceNs over the settled lag (clock drift and jitter stay under it)
+// counts as lost once the next window confirms it, by the smaller of the two
+// rises; a backlog that drains within the two windows counts nothing. max lag
+// is the highest lag over the settled one since the last TakeMaxLagUs. The
+// clock starts over at the first callback, a reset, a rate change or a gap of
+// kResetGapNs or more (a device that stopped, not a late thread: the stall
+// guard's time). Single writer (the capture callback); the counters are read
+// from any thread.
+class AdmCaptureLossMeter {
+ public:
+  static constexpr int64_t kWindowNs = 1'000'000'000;
+  static constexpr int64_t kToleranceNs = 5'000'000;
+  static constexpr int64_t kResetGapNs = 1'000'000'000;
+
+  void Observe(int64_t now_ns, size_t frames, uint32_t sample_rate);
+  // The next Observe starts the clock over. Any thread.
+  void Reset();
+
+  uint64_t lost_us() const;
+  uint64_t loss_events() const;
+  uint64_t TakeMaxLagUs();
+
+ private:
+  void Start(int64_t now_ns, uint32_t sample_rate);
+
+  std::atomic<bool> reset_{true};
+  // Capture callback only.
+  uint32_t rate_ = 0;
+  int64_t anchor_ns_ = 0;
+  int64_t last_ns_ = 0;
+  int64_t delivered_ns_ = 0;
+  int64_t floor_ns_ = 0;
+  int64_t window_end_ns_ = 0;
+  int64_t window_min_ns_ = 0;
+  bool pending_ = false;
+  int64_t pending_min_ns_ = 0;
+
+  std::atomic<uint64_t> lost_ns_{0};
+  std::atomic<uint64_t> loss_events_{0};
+  std::atomic<uint64_t> max_lag_ns_{0};
 };
 
 struct AdmNativeStats {
@@ -407,10 +458,11 @@ class AdmTransportTap : public webrtc::AudioTransport {
     std::atomic<double> delay_s{0.0};
   };
 
-  static void Count(Direction& direction,
-                    size_t frames,
-                    uint32_t sample_rate,
-                    uint32_t delay_ms);
+  // Returns the callback's time.
+  static int64_t Count(Direction& direction,
+                       size_t frames,
+                       uint32_t sample_rate,
+                       uint32_t delay_ms);
   int32_t Render(bool count,
                  size_t samples_per_channel,
                  size_t bytes_per_frame,
@@ -435,6 +487,7 @@ class AdmTransportTap : public webrtc::AudioTransport {
   std::atomic<uint32_t> capture_total_delay_ms_{0};
   std::atomic<uint16_t> playout_delay_ms_{0};
   std::atomic<bool> mono_capture_{true};
+  AdmCaptureLossMeter capture_loss_;
   // Capture thread only (inside the capture guard).
   std::array<int16_t, webrtc::AudioFrame::kMaxDataSizeSamples> mono_{};
 };

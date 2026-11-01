@@ -1243,6 +1243,10 @@ impl From<RootAudioStats> for proto::RootAudioStats {
             playout_fallback_opens: fallback.as_ref().map(|f| f.opens),
             playout_init_detail: fallback.map(|f| f.init_detail),
             capture_stall_recoveries: stats.capture_stall_recoveries,
+            denoiser_lateness_max_us: stats.denoiser_lateness_max_us,
+            capture_max_lag_us: Some(stats.capture_max_lag_us),
+            capture_lost_us: Some(stats.capture_lost_us),
+            capture_loss_events: Some(stats.capture_loss_events),
             playout_device_uid: changes.as_ref().map(|c| c.playout_uid.clone()),
             recording_device_uid: changes.as_ref().map(|c| c.recording_uid.clone()),
             same_device: changes.as_ref().map(|c| c.same_device),
@@ -1723,6 +1727,25 @@ mod tests {
         assert_eq!(p.capture_stall_recoveries, Some(3));
         let absent: proto::RootAudioStats = RootAudioStats::default().into();
         assert_eq!(absent.capture_stall_recoveries, None);
+    }
+
+    #[test]
+    fn rootapp_audio_capture_loss_and_denoiser_lateness_convert() {
+        let stats = RootAudioStats {
+            capture_max_lag_us: 31_000,
+            capture_lost_us: 20_000,
+            capture_loss_events: 1,
+            denoiser_lateness_max_us: Some(4_000),
+            ..Default::default()
+        };
+        let p: proto::RootAudioStats = stats.into();
+        assert_eq!(
+            (p.capture_max_lag_us, p.capture_lost_us, p.capture_loss_events),
+            (Some(31_000), Some(20_000), Some(1))
+        );
+        assert_eq!(p.denoiser_lateness_max_us, Some(4_000));
+        let none: proto::RootAudioStats = RootAudioStats::default().into();
+        assert_eq!((none.capture_lost_us, none.denoiser_lateness_max_us), (Some(0), None));
     }
 
     #[test]

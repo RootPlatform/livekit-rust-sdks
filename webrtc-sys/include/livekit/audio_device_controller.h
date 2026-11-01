@@ -48,6 +48,7 @@ class RootMonitorHarness;
 struct RootMonitorStats;
 struct RootVoiceFakeCounts;
 struct AdmDeviceRender;
+struct AdmCaptureLoss;
 struct AdmMacIo;
 struct AdmMacState;
 struct RootControlState;
@@ -215,6 +216,11 @@ int32_t resolve_audio_device_index_for_test(
 // bytes as in the ADM's buffer (unterminated when it fills it).
 bool adm_name_matches_for_test(rust::Slice<const uint8_t> device,
                                rust::Str wanted);
+// An AdmCaptureLossMeter fed one callback of `frames` at `rate` at each of
+// `times_us`.
+AdmCaptureLoss adm_capture_loss_for_test(rust::Slice<const int64_t> times_us,
+                                         size_t frames,
+                                         uint32_t rate);
 
 // A RootAudioMonitor driven as its capture and render threads would (tests).
 class RootMonitorHarness {

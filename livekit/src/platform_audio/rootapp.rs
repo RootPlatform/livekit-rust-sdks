@@ -1006,6 +1006,9 @@ pub struct RootAudioStats {
     /// Frames processed while the fallback was decided on but WebRTC NS was
     /// not applied yet.
     pub ns_fallback_pending_frames: Option<u64>,
+    /// The slot's lateness backlog (each plain call's time over the 10 ms
+    /// frame, less what calls left of it) at most since the previous read.
+    pub denoiser_lateness_max_us: Option<u64>,
 
     // APM policy (APM decorator).
     pub apm_policy_applies: Option<u64>,
@@ -1049,6 +1052,13 @@ pub struct RootAudioStats {
     // recording (cumulative); `None` where native does not watch for that
     // (it does on Windows).
     pub capture_stall_recoveries: Option<u64>,
+
+    // Capture audio lost while callbacks kept coming: how far the delivered
+    // audio fell behind the wall clock over its settled lag at most since
+    // the previous read, the audio lost and the losses (cumulative).
+    pub capture_max_lag_us: u64,
+    pub capture_lost_us: u64,
+    pub capture_loss_events: u64,
 }
 
 impl Default for RootAudioStats {
@@ -1162,6 +1172,7 @@ impl Default for RootAudioStats {
             denoiser_frames_until_first_output: None,
             webrtc_ns_fallback: None,
             ns_fallback_pending_frames: None,
+            denoiser_lateness_max_us: None,
             apm_policy_applies: None,
             apm_policy_deferred: None,
             apm_policy_forced: None,
@@ -1181,6 +1192,9 @@ impl Default for RootAudioStats {
             device_changes: None,
             playout_fallback: None,
             capture_stall_recoveries: None,
+            capture_max_lag_us: 0,
+            capture_lost_us: 0,
+            capture_loss_events: 0,
         }
     }
 }
@@ -1247,6 +1261,10 @@ impl RootAudioStats {
             capture_stall_recoveries: native
                 .capture_stall_guard_available
                 .then_some(native.capture_stall_recoveries),
+            capture_max_lag_us: native.capture_max_lag_us,
+            capture_lost_us: native.capture_lost_us,
+            capture_loss_events: native.capture_loss_events,
+            denoiser_lateness_max_us: denoiser.then_some(native.denoiser_lateness_max_us),
             monitor_active: monitor.then_some(native.monitor_active),
             monitor_frames: monitor.then_some(native.monitor_frames),
             monitor_dropped_frames: monitor.then_some(native.monitor_dropped_frames),
@@ -2168,6 +2186,30 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(without.capture_stall_recoveries, None);
+    }
+
+    #[test]
+    fn root_audio_stats_report_capture_loss_everywhere_and_denoiser_lateness_with_a_slot() {
+        let native = NativeAudioStats {
+            capture_max_lag_us: 31_000,
+            capture_lost_us: 20_000,
+            capture_loss_events: 1,
+            denoiser_available: true,
+            denoiser_lateness_max_us: 4_000,
+            ..Default::default()
+        };
+        let stats = RootAudioStats::from_native(native);
+        assert_eq!(
+            (stats.capture_max_lag_us, stats.capture_lost_us, stats.capture_loss_events),
+            (31_000, 20_000, 1)
+        );
+        assert_eq!(stats.denoiser_lateness_max_us, Some(4_000));
+        let without = RootAudioStats::from_native(NativeAudioStats {
+            capture_lost_us: 20_000,
+            denoiser_lateness_max_us: 4_000,
+            ..Default::default()
+        });
+        assert_eq!((without.capture_lost_us, without.denoiser_lateness_max_us), (20_000, None));
     }
 
     #[test]

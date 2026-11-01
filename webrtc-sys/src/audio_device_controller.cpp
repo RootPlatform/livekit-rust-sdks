@@ -446,6 +446,9 @@ RootAudioNativeStats AudioDeviceController::root_audio_stats() const {
   stats.playout_init_detail = rust::String::lossy(native.playout_init_detail);
   stats.capture_stall_guard_available = native.capture_stall_guard_available;
   stats.capture_stall_recoveries = native.capture_stall_recoveries;
+  stats.capture_max_lag_us = native.tap.capture_max_lag_us;
+  stats.capture_lost_us = native.tap.capture_lost_us;
+  stats.capture_loss_events = native.tap.capture_loss_events;
 
   const double nan = std::numeric_limits<double>::quiet_NaN();
   stats.erl_db = nan;
@@ -553,6 +556,7 @@ RootAudioNativeStats AudioDeviceController::root_audio_stats() const {
     stats.denoiser_misses = slot.misses;
     stats.denoiser_empty_outputs = slot.empty_outputs;
     stats.denoiser_process_max_us = slot.process_max_us;
+    stats.denoiser_lateness_max_us = slot.lateness_max_us;
     stats.denoiser_slow_frames = slot.slow_frames;
     stats.denoiser_bypass_reason = static_cast<uint32_t>(slot.bypass);
     stats.denoiser_notifications = notifications.slow;

@@ -23,8 +23,9 @@ use cxx::UniquePtr;
 
 use crate::audio_device_controller::{
     ffi::{
-        new_adm_proxy_harness, new_adm_proxy_harness_with_apm,
-        new_adm_proxy_harness_without_platform_adm, AdmProxyHarness, AudioDeviceOutcome,
+        adm_capture_loss_for_test, new_adm_proxy_harness, new_adm_proxy_harness_with_apm,
+        new_adm_proxy_harness_without_platform_adm, AdmCaptureLoss, AdmProxyHarness,
+        AudioDeviceOutcome,
         AudioDeviceSelection, AudioDeviceSelectionKind, RootAudioControlUpdate,
         RootDenoiserCompletionItem, RootDenoiserReturnedItem, RootDenoiserStateInfo,
     },
@@ -676,6 +677,106 @@ fn adm_proxy_answers_overlapping_device_callbacks_with_silence() {
     assert_eq!(stats.overlapping_callbacks, 2);
     assert_eq!(stats.render_callbacks, 2);
     assert_eq!(stats.capture_callbacks, 1);
+}
+
+/// Capture callbacks (µs) of a thread reading a device's 10 ms frames (frame
+/// k ready at k x 10 ms, or `frame_us` apart) from a buffer of `buffer_ms`:
+/// each callback takes `cost_us(k)`, and a frame the thread reaches more than
+/// the buffer later was dropped (no callback).
+fn capture_thread(
+    frames: i64,
+    frame_us: i64,
+    buffer_ms: i64,
+    cost_us: impl Fn(i64) -> i64,
+) -> Vec<i64> {
+    let mut times = Vec::new();
+    let mut free_at = 0;
+    for k in 0..frames {
+        let ready = k * frame_us;
+        let at = ready.max(free_at);
+        if at - ready > buffer_ms * 1000 {
+            continue;
+        }
+        times.push(at);
+        free_at = at + cost_us(k);
+    }
+    times
+}
+
+fn capture_loss(times: &[i64]) -> AdmCaptureLoss {
+    adm_capture_loss_for_test(times, 480, 48_000)
+}
+
+#[test]
+fn adm_proxy_capture_loss_counts_nothing_for_late_callbacks_the_buffer_caught_up() {
+    let on_time = capture_thread(500, 10_000, 1000, |k| 100 + (k * 7919 % 21) * 100);
+    assert_eq!(capture_loss(&on_time), AdmCaptureLoss { max_lag_us: 0, lost_us: 0, loss_events: 0 });
+
+    let jitter: Vec<i64> = (0..500).map(|k| k * 10_000 + (k * 7919 % 21) * 100).collect();
+    let jittered = capture_loss(&jitter);
+    assert_eq!((jittered.lost_us, jittered.loss_events), (0, 0));
+    assert!(jittered.max_lag_us <= 2_000, "{jittered:?}");
+
+    let stalls = |k| match k {
+        150 => 15_000,
+        300 => 25_000,
+        450 => 40_000,
+        _ => 100,
+    };
+    let late = capture_loss(&capture_thread(700, 10_000, 1000, stalls));
+    assert_eq!((late.lost_us, late.loss_events), (0, 0), "{late:?}");
+    assert!((29_000..=31_000).contains(&late.max_lag_us), "a 40 ms call: 30 ms behind: {late:?}");
+}
+
+#[test]
+fn adm_proxy_capture_loss_counts_the_frames_a_full_buffer_dropped() {
+    let stall = |k| if k == 150 { 45_000 } else { 100 };
+    let times = capture_thread(500, 10_000, 20, stall);
+    let dropped = 500 - times.len() as u64;
+    assert_eq!(dropped, 2, "a 45 ms call over a 20 ms buffer");
+    let loss = capture_loss(&times);
+    assert_eq!(loss.loss_events, 1, "{loss:?}");
+    assert!(loss.lost_us.abs_diff(dropped * 10_000) <= 200, "{loss:?}");
+    assert!(loss.max_lag_us >= 35_000, "{loss:?}");
+
+    let twice = capture_thread(800, 10_000, 20, |k| if k == 150 || k == 500 { 45_000 } else { 100 });
+    let loss = capture_loss(&twice);
+    assert_eq!(loss.loss_events, 2, "{loss:?}");
+    assert!(loss.lost_us.abs_diff(40_000) <= 400, "{loss:?}");
+
+    let unconfirmed = capture_thread(200, 10_000, 20, |k| if k == 150 { 45_000 } else { 100 });
+    assert_eq!(capture_loss(&unconfirmed).loss_events, 0, "a loss waits for the next window to confirm it");
+}
+
+#[test]
+fn adm_proxy_capture_loss_absorbs_clock_drift_and_slow_backlogs() {
+    for frame_us in [10_005, 9_995] {
+        let loss = capture_loss(&capture_thread(2000, frame_us, 1000, |_| 100));
+        assert_eq!((loss.lost_us, loss.loss_events), (0, 0), "{frame_us} µs frames: {loss:?}");
+    }
+
+    let draining = |k| match k {
+        100 => 30_000,
+        101..=220 => 9_900,
+        _ => 100,
+    };
+    let loss = capture_loss(&capture_thread(600, 10_000, 1000, draining));
+    assert_eq!((loss.lost_us, loss.loss_events), (0, 0), "a backlog that drains over 1.2 s: {loss:?}");
+    assert!(loss.max_lag_us >= 19_000, "{loss:?}");
+}
+
+#[test]
+fn adm_proxy_capture_loss_starts_over_after_a_device_gap() {
+    let mut times: Vec<i64> = (0..300).map(|k| k * 10_000).collect();
+    times.extend((450..800).map(|k| k * 10_000));
+    let loss = capture_loss(&times);
+    assert_eq!(loss, AdmCaptureLoss { max_lag_us: 0, lost_us: 0, loss_events: 0 }, "a 1.5 s gap is a stopped device");
+
+    let mut short: Vec<i64> = (0..300).map(|k| k * 10_000).collect();
+    short.extend((330..800).map(|k| k * 10_000));
+    let loss = capture_loss(&short);
+    assert_eq!(loss.loss_events, 1, "{loss:?}");
+    assert!(loss.lost_us.abs_diff(300_000) <= 1_000, "a 0.3 s gap is audio lost: {loss:?}");
 }
 
 #[test]

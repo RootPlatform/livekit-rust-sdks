@@ -90,6 +90,15 @@ pub mod ffi {
         pub acquired: bool,
     }
 
+    /// What an `AdmCaptureLossMeter` counted (tests only).
+    #[cfg(feature = "harness")]
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct AdmCaptureLoss {
+        pub max_lag_us: u64,
+        pub lost_us: u64,
+        pub loss_events: u64,
+    }
+
     /// The callbacks the harness's fake made under AudioDeviceMac's rules
     /// (tests only).
     #[cfg(feature = "harness")]
@@ -228,6 +237,15 @@ pub mod ffi {
         pub capture_stall_guard_available: bool,
         pub capture_stall_recoveries: u64,
 
+        /// Capture audio the device produced that never reached libwebrtc
+        /// while callbacks kept coming (`AdmCaptureLossMeter`): how far the
+        /// delivered audio fell behind the wall clock over its settled lag
+        /// at most since the last read (reset on read), the audio lost
+        /// (cumulative) and the losses counted (cumulative).
+        pub capture_max_lag_us: u64,
+        pub capture_lost_us: u64,
+        pub capture_loss_events: u64,
+
         /// The DSP chain, the denoiser slot and the APM decorator exist; the
         /// fields of the ones that do not stay at their defaults.
         pub dsp_available: bool,
@@ -298,6 +316,9 @@ pub mod ffi {
         pub denoiser_misses: u64,
         pub denoiser_empty_outputs: u64,
         pub denoiser_process_max_us: u64,
+        /// The slot's lateness backlog at most since the last read (reset
+        /// on read).
+        pub denoiser_lateness_max_us: u64,
         pub denoiser_slow_frames: u64,
         pub denoiser_bypass_reason: u32,
         pub denoiser_notifications: u64,
@@ -677,6 +698,9 @@ pub mod ffi {
         /// A selection by `wanted` against one device the ADM names with
         /// these raw bytes.
         fn adm_name_matches_for_test(device: &[u8], wanted: &str) -> bool;
+        /// A capture loss meter fed one callback of `frames` at `rate` at
+        /// each of `times_us`.
+        fn adm_capture_loss_for_test(times_us: &[i64], frames: usize, rate: u32) -> AdmCaptureLoss;
 
         /// A RootAudioMonitor driven as its capture and render threads would.
         fn new_root_monitor_harness() -> UniquePtr<RootMonitorHarness>;

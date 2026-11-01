@@ -144,7 +144,10 @@ RootDenoiseResult RootDenoiserSlot::ProcessAudio(const float* in,
     applied_power_ = std::numeric_limits<float>::quiet_NaN();
     first_output_seen_ = false;
     calls_before_output_ = 0;
-    slow_count_ = 0;
+    lateness_us_ = 0;
+    recent_us_.fill(0);
+    recent_sum_us_ = 0;
+    plain_calls_ = 0;
   }
   // Everything the SDK does on this frame is timed: flush, power and process.
   const int64_t start_us = NowUs();
@@ -185,16 +188,22 @@ RootDenoiseResult RootDenoiserSlot::ProcessAudio(const float* in,
   }
   // A (re)start, flush or power change pays one-off costs: measured and
   // counted above like any other call, but only plain calls latch.
-  if (elapsed_us > kOverFrameUs && !restart && !power_changed) {
-    slow_times_us_[slow_count_ % kSlowFramesToBypass] = end_us;
-    ++slow_count_;
-    bool latch = elapsed_us > kStalledFrameUs;
-    if (slow_count_ >= kSlowFramesToBypass &&
-        end_us - slow_times_us_[slow_count_ % kSlowFramesToBypass] <=
-            kSlowWindowUs) {
-      latch = true;
+  if (!restart && !power_changed) {
+    lateness_us_ = std::max<int64_t>(0, lateness_us_ + elapsed_us - kFrameUs);
+    const uint64_t lateness = static_cast<uint64_t>(lateness_us_);
+    uint64_t max = lateness_max_us_.load(std::memory_order_relaxed);
+    while (lateness > max && !lateness_max_us_.compare_exchange_weak(
+                                 max, lateness, std::memory_order_relaxed)) {
     }
-    if (latch) {
+    int64_t& oldest = recent_us_[plain_calls_ % kAverageCalls];
+    recent_sum_us_ += elapsed_us - oldest;
+    oldest = elapsed_us;
+    ++plain_calls_;
+    const bool behind = lateness_us_ > kLatenessBudgetUs;
+    const bool saturated =
+        plain_calls_ >= kAverageCalls &&
+        recent_sum_us_ > kAverageLimitUs * static_cast<int64_t>(kAverageCalls);
+    if (behind || saturated) {
       bypass_.store(static_cast<uint32_t>(RootDenoiserBypass::kSlow),
                     std::memory_order_relaxed);
     }
@@ -342,6 +351,9 @@ RootDenoiserSlotStats RootDenoiserSlot::ReadStats(bool take_max) {
   stats.process_max_us =
       take_max ? process_max_us_.exchange(0, std::memory_order_relaxed)
                : process_max_us_.load(std::memory_order_relaxed);
+  stats.lateness_max_us =
+      take_max ? lateness_max_us_.exchange(0, std::memory_order_relaxed)
+               : lateness_max_us_.load(std::memory_order_relaxed);
   for (size_t i = 0; i < kHistogramBuckets; ++i) {
     stats.histogram[i] = histogram_[i].load(std::memory_order_relaxed);
   }
@@ -1239,6 +1251,7 @@ RootDenoiserSlotInfo RootDenoiserHarness::slot_info(bool take_max) const {
   info.installs = stats.installs;
   info.frames_until_first_output = stats.frames_until_first_output;
   info.process_max_us = stats.process_max_us;
+  info.lateness_max_us = stats.lateness_max_us;
   for (uint64_t count : stats.histogram) {
     info.histogram.push_back(count);
   }

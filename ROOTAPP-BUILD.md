@@ -3101,6 +3101,69 @@ off on a new connection, and still off after `set_configuration` with the same c
 v0.13.1-hw.2 with prerenderer smoothing off (see "No prerenderer smoothing"). Caps 32767, no proto
 changes.
 
+## The slow-frame bypass follows the capture deadline (`rootapp/denoiser-lateness-budget`)
+
+From hw.3 (desktop 0.9.159), Sentry `AudioEffectFailed` with `native_slow_frames` and `slow_processing`:
+66 fallbacks from 40 users in a day, about 11% of native users. The fallback is safe (native's WebRTC NS
+covers at once) but lets more background noise through until the SDK's 1-30 min cooldown ends.
+
+- About 46 of the 66 never logged a call over 20 ms. During slow spells most calls took 5-11 ms (one
+  spell: 37 of 42 calls over 5 ms, the slowest 11.2 ms).
+- The rule latched on 3 plain calls over the 10 ms frame within 60 s. That is stricter than the real
+  deadline: the capture device keeps filling its buffer while the capture thread runs late (the Windows
+  ADM's shared-mode WASAPI endpoint buffer, about 20 ms over the frame), and the thread catches up from it
+  on the next frames. A 12 ms call loses nothing.
+
+`RootDenoiserSlot` now runs a lateness backlog over plain calls instead: each adds its time over the
+10 ms frame (`kFrameUs`) and takes off what it left of it, never below 0. `kSlow` latches when the backlog
+passes `kLatenessBudgetUs` (15 ms: one call of 25 ms or more on its own, or 11 ms calls back to back after
+16), or when the last `kAverageCalls` (100, about 1 s) plain calls averaged over `kAverageLimitUs` (9.5 ms:
+such calls build no backlog but leave the APM and the rest of the capture thread too little of the frame).
+The average is a ring of the last 100 plain calls' times with a running sum, reset with the backlog on each
+new pipeline. Restarts, flushes and power changes stay exempt (timed and counted, kept out of both). The
+backlog's maximum since the last read is `RootAudioStats.denoiser_lateness_max_us` (174).
+`denoiser_slow_frames` still counts calls over 5 ms. `kStalledFrameUs`, `kSlowFramesToBypass` and
+`kSlowWindowUs` are gone.
+
+The ADM proxy's transport tap measures whether audio was really lost (`AdmCaptureLossMeter`, every
+platform): lag = time since the clock started less the audio the capture callbacks delivered before this
+one. A late thread catching up from the device's buffer comes back down to its settled lag; audio the
+buffer dropped leaves the lag that much higher for good. Each 1 s window settles at its lowest lag (the
+settled lag also follows any lower lag at once); a rise of more than 5 ms (`kToleranceNs`; clock drift of
+even 0.1% is 1 ms a window) counts as lost once the next window confirms it, by the smaller of the two
+rises, so a backlog that drains within about 2 s counts nothing. A recording (re)start
+(`ResetCaptureClock`), a rate change or a gap of 1 s or more (a stopped device; the capture-stall guard's
+business) starts the clock over and counts nothing. `RootAudioStats.capture_max_lag_us` (175, reset on
+read) is how far the delivered audio fell behind its settled lag; `capture_lost_us` (176) and
+`capture_loss_events` (177) are cumulative. It runs inside the tap's capture guard on the capture thread:
+plain members, three atomics, no locks or allocation.
+
+The point of the meter is the tuning below; a separate-thread denoiser that adds 10 ms for everyone is
+only worth it if spikes over 20 ms turn out common and do lose audio. What the desktop sends and what to
+tune against it: RootApp.Client.Desktop `docs/native-platform-audio.md`, "Slow frames: the lateness budget".
+
+Tests (`cargo test -p webrtc-sys --lib --release`; the slot's fake spins):
+`root_denoiser_isolated_overruns_never_latch` (12-15 ms calls and pairs of 13 ms calls between calls that
+fit: no bypass, backlog 6 ms at most), `root_denoiser_a_sustained_overrun_latches_a_bypass` (11 ms calls:
+the backlog grows 1 ms a call and latches on the 13th-16th), `root_denoiser_one_stalled_call_latches_a_bypass`
+(a 30 ms plain call latches alone; the 60 ms warm-up does not), `root_denoiser_a_saturated_second_latches_a_bypass`
+(150 calls of 8.5 ms never latch; 9.9 ms ones latch on the average with no backlog, after about 72),
+`root_denoiser_warm_ups_flushes_and_power_changes_never_count_toward_the_slow_latch` (now: no backlog from
+them, two plain 12 ms calls make 4 ms, a plain 30 ms call latches). Capture loss over simulated capture
+threads (frame k ready at k x 10 ms, a buffer of n ms, a cost per callback):
+`adm_proxy_capture_loss_counts_nothing_for_late_callbacks_the_buffer_caught_up` (on time, jittered by up
+to 2 ms, and 15/25/40 ms calls with a large buffer: nothing lost, 30 ms lag),
+`adm_proxy_capture_loss_counts_the_frames_a_full_buffer_dropped` (a 45 ms call over a 20 ms buffer drops 2
+frames: 20 ms lost in 1 loss; two such: 40 ms in 2; one the run ends before confirming: none),
+`adm_proxy_capture_loss_absorbs_clock_drift_and_slow_backlogs` (±0.05% device clocks over 20 s; a 30 ms
+backlog draining over 1.2 s), `adm_proxy_capture_loss_starts_over_after_a_device_gap` (1.5 s: nothing;
+0.3 s: 300 ms lost). livekit `root_audio_stats_report_capture_loss_everywhere_and_denoiser_lateness_with_a_slot`,
+livekit-ffi `rootapp_audio_capture_loss_and_denoiser_lateness_convert`.
+
+Not verified: a live call. The 20 ms slack is the expected WASAPI shared-mode buffer, not measured; the
+capture loss meter is there to measure it. macOS and Linux builds (the changes are portable C++ and Rust,
+no new files or dependencies).
+
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
 | Commit | Change |

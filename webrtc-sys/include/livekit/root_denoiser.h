@@ -121,6 +121,7 @@ struct RootDenoiserSlotStats {
   uint64_t installs = 0;
   int32_t frames_until_first_output = -1;
   uint64_t process_max_us = 0;
+  uint64_t lateness_max_us = 0;
   std::array<uint64_t, 16> histogram{};
 };
 
@@ -134,10 +135,10 @@ class RootDenoiserSlot {
  public:
   static constexpr size_t kOutputFrames = 8;
   static constexpr int64_t kSlowFrameUs = 5000;
-  static constexpr int64_t kOverFrameUs = 10000;
-  static constexpr int64_t kStalledFrameUs = 20000;
-  static constexpr size_t kSlowFramesToBypass = 3;
-  static constexpr int64_t kSlowWindowUs = 60'000'000;
+  static constexpr int64_t kFrameUs = 10000;
+  static constexpr int64_t kLatenessBudgetUs = 15000;
+  static constexpr size_t kAverageCalls = 100;
+  static constexpr int64_t kAverageLimitUs = 9500;
   static constexpr int kControlTimeoutMs = 200;
   static constexpr size_t kHistogramBuckets = 16;
   static constexpr std::array<int64_t, kHistogramBuckets - 1>
@@ -155,13 +156,18 @@ class RootDenoiserSlot {
   // one runs; a new pipeline needs none). `power` is applied when it changed.
   // A rate-mismatch bypass ends, with a flush, once the frames fit again.
   // Flush, power and process are timed together (the maximum and the
-  // histogram; slow_frames counts calls over kSlowFrameUs);
-  // kSlowFramesToBypass plain calls longer than the 10 ms frame
-  // (kOverFrameUs) within kSlowWindowUs, or one over kStalledFrameUs, latch
-  // kSlow. A call that fits in the frame keeps up, however slow (0.9.153: 11
-  // of the 14 callers bypassed at 5 ms had no call over 9.6 ms). A plain
+  // histogram; slow_frames counts calls over kSlowFrameUs). Plain calls run
+  // a lateness backlog: each adds its time over the 10 ms frame (kFrameUs)
+  // and takes off what it left of it, never below 0, as the capture thread
+  // catches up from the device's buffer after a call that overran. kSlow
+  // latches when the backlog passes kLatenessBudgetUs, or when the last
+  // kAverageCalls plain calls (about 1 s) averaged over kAverageLimitUs,
+  // which leaves the rest of the capture thread too little of the frame.
+  // Isolated calls of 12-15 ms never latch (0.9.159: 46 of 66 fallbacks had
+  // no call over 20 ms, and most slow spells ran at 5-11 ms a call). A plain
   // call is one with no flush, power change or (re)start: those pay one-off
-  // costs that say nothing about the SDK keeping up.
+  // costs that say nothing about the SDK keeping up. The backlog's maximum
+  // since the last ReadStats(true) is lateness_max_us.
   RootDenoiseResult ProcessAudio(const float* in,
                                  size_t frames,
                                  int sample_rate,
@@ -187,7 +193,7 @@ class RootDenoiserSlot {
   bool installed() const;
   uint32_t rate() const;
   RootDenoiserBypass bypass() const;
-  // `take_max` resets process_max_us.
+  // `take_max` resets process_max_us and lateness_max_us.
   RootDenoiserSlotStats ReadStats(bool take_max);
 
 #if defined(ROOTAPP_HARNESS)
@@ -228,8 +234,10 @@ class RootDenoiserSlot {
   int32_t calls_before_output_ = 0;
   RootDenoiserBypass pending_bypass_ = RootDenoiserBypass::kNone;
   uint64_t pending_bypass_generation_ = 0;
-  std::array<int64_t, kSlowFramesToBypass> slow_times_us_{};
-  size_t slow_count_ = 0;
+  int64_t lateness_us_ = 0;
+  std::array<int64_t, kAverageCalls> recent_us_{};
+  int64_t recent_sum_us_ = 0;
+  size_t plain_calls_ = 0;
 
   std::atomic<uint64_t> frames_{0};
   std::atomic<uint64_t> misses_{0};
@@ -239,6 +247,7 @@ class RootDenoiserSlot {
   std::atomic<uint64_t> installs_{0};
   std::atomic<int32_t> frames_until_first_output_{-1};
   std::atomic<uint64_t> process_max_us_{0};
+  std::atomic<uint64_t> lateness_max_us_{0};
   std::array<std::atomic<uint64_t>, kHistogramBuckets> histogram_{};
 };
 

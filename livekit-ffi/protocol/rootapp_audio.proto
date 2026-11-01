@@ -476,9 +476,10 @@ message RootAudioStats {
   // over 5 ms; denoiser_notifications the SDK's slowProcessing notifications through the native
   // handler (process-wide, cumulative). denoiser_bypass_reason: 0 none, 1 rate mismatch (until the
   // processor's rate matches the pipeline again, or a pipeline at its rate is installed), 2 output
-  // stalled (100 empty outputs in a row), 3 slow (3 calls longer than the 10 ms frame within 60 s,
-  // or one over 20 ms; 3 calls over 5 ms up to v0.13.1-hw.1), counting only plain calls: not the
-  // first after an install, a flush or a stream restart, nor one with a power change); 2 and 3 last
+  // stalled (100 empty outputs in a row), 3 slow (the lateness backlog, denoiser_lateness_max_us, past
+  // 15 ms, or the last 100 calls averaging over 9.5 ms; 3 calls longer than the 10 ms frame within 60 s
+  // or one over 20 ms up to v0.13.1-hw.3, 3 calls over 5 ms up to v0.13.1-hw.1), counting only plain
+  // calls: not the first after an install, a flush or a stream restart, nor one with a power change); 2 and 3 last
   // until the pipeline is replaced or removed. A call's time includes the flush and power change made
   // with it (denoiser_slow_frames, the maximum and the histogram count every call).
   required bool denoiser_installed = 50;
@@ -762,6 +763,24 @@ message RootAudioStats {
   // default-device change) while Recording() stays true. Cumulative for the engine's life; present
   // where native watches for it (Windows), absent elsewhere and from libraries that predate it.
   optional uint64 capture_stall_recoveries = 173;
+
+  // The Effects SDK slot's lateness backlog at most since the previous read (capability DENOISER; absent
+  // without it and from libraries that predate it): each plain process() call adds its time over the
+  // 10 ms frame and takes off what it left of it, never below 0, as the capture thread catches up from
+  // the device's buffer. Bypass reason 3 (slow) latches when it passes 15 ms, or when the last 100 plain
+  // calls averaged over 9.5 ms (up to v0.13.1-hw.3: 3 calls over 10 ms within 60 s, or one over 20 ms).
+  optional uint64 denoiser_lateness_max_us = 174;
+  // Capture audio the device produced that never reached libwebrtc while callbacks kept coming (absent
+  // from libraries that predate it): the callbacks' audio against the wall clock. capture_max_lag_us is
+  // how far the delivered audio fell behind its settled lag at most since the previous read (a late
+  // capture thread catching up from the device's buffer, or audio the buffer dropped); a rise of the
+  // settled lag (its lowest point over 1 s) of more than 5 ms that the next second confirms is lost
+  // audio: capture_lost_us (cumulative) over capture_loss_events (cumulative). Clock drift stays under
+  // the 5 ms; a gap of 1 s or more (a stopped device) and a device (re)start start the clock over and
+  // count nothing.
+  optional uint64 capture_max_lag_us = 175;
+  optional uint64 capture_lost_us = 176;
+  optional uint64 capture_loss_events = 177;
 }
 // One playout mixer source (a remote audio stream): its audio as it reached the mixer, decoded and
 // before its gain (tile volume, master volume, deafen; a muted frame counts as silence), as a sum of
