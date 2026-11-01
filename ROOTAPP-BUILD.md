@@ -3164,6 +3164,13 @@ Not verified: a live call. The 20 ms slack is the expected WASAPI shared-mode bu
 capture loss meter is there to measure it. macOS and Linux builds (the changes are portable C++ and Rust,
 no new files or dependencies).
 
+## v0.13.1-hw.4 (2026-11-01)
+
+v0.13.1-hw.3 with the slow-frame bypass on a lateness budget and the capture loss meter (see "The
+slow-frame bypass follows the capture deadline"). Caps 32767. Proto: `RootAudioStats`
+`denoiser_lateness_max_us` (174), `capture_max_lag_us` (175), `capture_lost_us` (176),
+`capture_loss_events` (177).
+
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
 | Commit | Change |
