@@ -23,8 +23,10 @@ use cxx::UniquePtr;
 
 use crate::audio_device_controller::{
     ffi::{
-        adm_capture_loss_for_test, new_adm_proxy_harness, new_adm_proxy_harness_with_apm,
-        new_adm_proxy_harness_without_platform_adm, AdmCaptureLoss, AdmProxyHarness,
+        adm_capture_loss_attribution_for_test, adm_capture_loss_for_test,
+        new_adm_proxy_harness, new_adm_proxy_harness_with_apm,
+        new_adm_proxy_harness_without_platform_adm, AdmCaptureLoss, AdmCaptureLossAttribution,
+        AdmProxyHarness,
         AudioDeviceOutcome,
         AudioDeviceSelection, AudioDeviceSelectionKind, RootAudioControlUpdate,
         RootDenoiserCompletionItem, RootDenoiserReturnedItem, RootDenoiserStateInfo,
@@ -705,6 +707,90 @@ fn capture_thread(
 
 fn capture_loss(times: &[i64]) -> AdmCaptureLoss {
     adm_capture_loss_for_test(times, 480, 48_000)
+}
+
+/// As `capture_thread`, with each callback's processing time.
+fn timed_capture_thread(
+    frames: i64,
+    frame_us: i64,
+    buffer_ms: i64,
+    cost_us: impl Fn(i64) -> i64,
+) -> (Vec<i64>, Vec<i64>) {
+    let mut times = Vec::new();
+    let mut busy = Vec::new();
+    let mut free_at = 0;
+    for k in 0..frames {
+        let ready = k * frame_us;
+        let at = ready.max(free_at);
+        if at - ready > buffer_ms * 1000 {
+            continue;
+        }
+        let cost = cost_us(k);
+        times.push(at);
+        busy.push(cost);
+        free_at = at + cost;
+    }
+    (times, busy)
+}
+
+fn attributed(times: &[i64], busy: &[i64], render_gaps: &[i64]) -> AdmCaptureLossAttribution {
+    adm_capture_loss_attribution_for_test(times, busy, render_gaps, 480, 48_000)
+}
+
+#[test]
+fn adm_proxy_capture_loss_counts_no_latency_step_under_8_ms() {
+    let step = |ms: i64| -> Vec<i64> {
+        (0..800).map(|k| k * 10_000 + if k >= 300 { ms * 1000 } else { 0 }).collect()
+    };
+    let small = capture_loss(&step(7));
+    assert_eq!((small.lost_us, small.loss_events), (0, 0), "a 7 ms step of the device's latency: {small:?}");
+    let again = capture_loss(&[step(7), (800..1600).map(|k| k * 10_000 + 14_000).collect()].concat());
+    assert_eq!((again.lost_us, again.loss_events), (0, 0), "nor a second one: {again:?}");
+    let large = capture_loss(&step(12));
+    assert_eq!(large.loss_events, 1, "12 ms looks like a dropped period: {large:?}");
+    assert!(large.lost_us.abs_diff(12_000) <= 200, "{large:?}");
+}
+
+#[test]
+fn adm_proxy_capture_loss_puts_what_our_processing_caused_on_busy() {
+    let (times, busy) = timed_capture_thread(500, 10_000, 20, |k| if k == 150 { 45_000 } else { 100 });
+    let render = vec![10_000; times.len()];
+    let loss = attributed(&times, &busy, &render);
+    assert_eq!(loss.loss_events, 1, "{loss:?}");
+    assert!(loss.lost_us.abs_diff(20_000) <= 200, "{loss:?}");
+    assert_eq!((loss.lost_busy_us, loss.busy_loss_events, loss.busy_losses_counted), (loss.lost_us, 1, 1));
+    assert_eq!(loss.lost_coupled_us, 0);
+    assert!(loss.busy_max_us >= 45_000, "{loss:?}");
+
+    let (times, busy) =
+        timed_capture_thread(800, 10_000, 20, |k| if (100..500).contains(&k) { 12_000 } else { 100 });
+    let overload = attributed(&times, &busy, &[]);
+    assert!(overload.loss_events >= 2, "12 ms a frame for 4 s drops audio every second: {overload:?}");
+    assert!(overload.lost_us >= 500_000, "{overload:?}");
+    assert_eq!(overload.lost_busy_us, overload.lost_us, "all of it ours: {overload:?}");
+    assert_eq!(overload.busy_losses_counted, overload.loss_events);
+}
+
+#[test]
+fn adm_proxy_capture_loss_puts_a_device_gap_outside_our_processing_and_sees_playout_stall_with_it() {
+    let mut times: Vec<i64> = (0..300).map(|k| k * 10_000).collect();
+    times.extend((330..800).map(|k| k * 10_000));
+    let busy = vec![100; times.len()];
+    let render = vec![10_000; times.len()];
+    let device = attributed(&times, &busy, &render);
+    assert_eq!(device.loss_events, 1, "{device:?}");
+    assert!(device.lost_us.abs_diff(300_000) <= 1_000, "{device:?}");
+    assert_eq!((device.lost_busy_us, device.busy_losses_counted, device.lost_coupled_us), (0, 0, 0), "{device:?}");
+    assert!(device.idle_max_us >= 300_000, "{device:?}");
+    assert!(device.busy_max_us < 1_000, "{device:?}");
+
+    let mut stalled = render.clone();
+    stalled[300] = 310_000;
+    let coupled = attributed(&times, &busy, &stalled);
+    assert_eq!((coupled.lost_busy_us, coupled.lost_coupled_us), (0, coupled.lost_us), "{coupled:?}");
+
+    let unseen = attributed(&times, &busy, &[]);
+    assert_eq!(unseen.lost_coupled_us, 0, "no render, no stall to see: {unseen:?}");
 }
 
 #[test]

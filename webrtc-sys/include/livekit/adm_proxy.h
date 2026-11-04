@@ -247,6 +247,11 @@ struct AdmTapStats {
   uint64_t capture_max_lag_us = 0;
   uint64_t capture_lost_us = 0;
   uint64_t capture_loss_events = 0;
+  uint64_t capture_lost_busy_us = 0;
+  uint64_t capture_busy_loss_events = 0;
+  uint64_t capture_lost_coupled_us = 0;
+  uint64_t capture_busy_max_us = 0;
+  uint64_t capture_idle_max_us = 0;
 };
 
 // Capture audio the device produced that never reached the tap, from the
@@ -261,26 +266,60 @@ struct AdmTapStats {
 // is the highest lag over the settled one since the last TakeMaxLagUs. The
 // clock starts over at the first callback, a reset, a rate change or a gap of
 // kResetGapNs or more (a device that stopped, not a late thread: the stall
-// guard's time). Single writer (the capture callback); the counters are read
-// from any thread.
+// guard's time). A confirmed rise under kMinLossNs moves the settled lag and
+// counts nothing: the device's own latency stepping up (wireless headsets,
+// virtual devices), not audio lost, which goes in whole device periods (10 ms
+// in WASAPI shared mode). Single writer (the capture callback); the counters
+// are read from any thread.
+//
+// Where a loss came from: Finish, after the callback's processing returned,
+// times it (busy: libwebrtc's chain after the tap, the APM, the capture
+// processor and the denoiser); the time from one Finish to the next Observe
+// is idle (the platform ADM's loop, a device that delivered nothing, the OS).
+// A confirmed loss is busy when the busy time over the frames' duration in
+// the windows that saw it (the one before the rise, the rise and the one that
+// confirmed it) is at least half of it: the thread was late because our
+// processing ran over the frame. Any other loss is outside our processing,
+// and coupled when playout stalled too in those windows (a render gap of
+// kCoupledRenderGapNs or more, ended or still open at a window's end, while
+// render callbacks were coming: the device, the audio engine or a lock both
+// directions take). Each busy loss bumps the counter set_busy_losses gave.
 class AdmCaptureLossMeter {
  public:
   static constexpr int64_t kWindowNs = 1'000'000'000;
   static constexpr int64_t kToleranceNs = 5'000'000;
+  static constexpr int64_t kMinLossNs = 8'000'000;
   static constexpr int64_t kResetGapNs = 1'000'000'000;
+  static constexpr int64_t kCoupledRenderGapNs = 50'000'000;
+  static constexpr size_t kAttributionWindows = 3;
 
   void Observe(int64_t now_ns, size_t frames, uint32_t sample_rate);
+  // After the callback Observe saw returned from its processing.
+  void Finish(int64_t now_ns);
+  // Render thread: a render callback at `now_ns`, `gap_ns` after the one
+  // before it (0 for the first). ResetRender: render stopped or restarts.
+  void NoteRender(int64_t now_ns, int64_t gap_ns);
+  void ResetRender();
   // The next Observe starts the clock over. Any thread.
   void Reset();
+  // Bumped once per busy loss; may be null. Set before any device opens.
+  void set_busy_losses(std::atomic<uint64_t>* counter);
 
   uint64_t lost_us() const;
   uint64_t loss_events() const;
+  uint64_t lost_busy_us() const;
+  uint64_t busy_loss_events() const;
+  uint64_t lost_coupled_us() const;
   uint64_t TakeMaxLagUs();
+  uint64_t TakeBusyMaxUs();
+  uint64_t TakeIdleMaxUs();
 
  private:
   void Start(int64_t now_ns, uint32_t sample_rate);
+  void CountLoss(int64_t loss_ns);
 
   std::atomic<bool> reset_{true};
+  std::atomic<std::atomic<uint64_t>*> busy_losses_{nullptr};
   // Capture callback only.
   uint32_t rate_ = 0;
   int64_t anchor_ns_ = 0;
@@ -291,10 +330,27 @@ class AdmCaptureLossMeter {
   int64_t window_min_ns_ = 0;
   bool pending_ = false;
   int64_t pending_min_ns_ = 0;
+  bool observed_ = false;
+  bool exited_ = false;
+  int64_t entry_ns_ = 0;
+  int64_t frame_ns_ = 0;
+  int64_t exit_ns_ = 0;
+  // Busy time over the frames' duration and the longest render gap, per
+  // window: [0] the current one, then the ones before it.
+  std::array<int64_t, kAttributionWindows> window_busy_over_ns_{};
+  std::array<int64_t, kAttributionWindows> window_render_gap_ns_{};
 
+  std::atomic<uint64_t> render_gap_ns_{0};
+  std::atomic<int64_t> render_last_ns_{0};
+  std::atomic<bool> render_seen_{false};
   std::atomic<uint64_t> lost_ns_{0};
   std::atomic<uint64_t> loss_events_{0};
+  std::atomic<uint64_t> lost_busy_ns_{0};
+  std::atomic<uint64_t> busy_loss_events_{0};
+  std::atomic<uint64_t> lost_coupled_ns_{0};
   std::atomic<uint64_t> max_lag_ns_{0};
+  std::atomic<uint64_t> busy_max_ns_{0};
+  std::atomic<uint64_t> idle_max_ns_{0};
 };
 
 struct AdmNativeStats {
@@ -377,6 +433,9 @@ class AdmTransportTap : public webrtc::AudioTransport {
   void set_transport(webrtc::AudioTransport* transport);
   // Set once, before any device opens; may be null.
   void set_monitor(RootAudioMonitor* monitor);
+  // The capture state's busy capture loss counter (AdmCaptureLossMeter); set
+  // once, before any device opens; may be null.
+  void set_busy_capture_losses(std::atomic<uint64_t>* counter);
   // While libwebrtc records for no send stream (the mic test, the app's own
   // start) the device's channels reach libwebrtc averaged to one, as a mono
   // send stream's RemixAndResample averages them, so the APM and the capture
@@ -458,11 +517,13 @@ class AdmTransportTap : public webrtc::AudioTransport {
     std::atomic<double> delay_s{0.0};
   };
 
-  // Returns the callback's time.
+  // Returns the callback's time; `gap_ns`, when given, receives the time since
+  // the previous callback (0 for the first one after a reset).
   static int64_t Count(Direction& direction,
                        size_t frames,
                        uint32_t sample_rate,
-                       uint32_t delay_ms);
+                       uint32_t delay_ms,
+                       int64_t* gap_ns = nullptr);
   int32_t Render(bool count,
                  size_t samples_per_channel,
                  size_t bytes_per_frame,

@@ -268,6 +268,28 @@ void RootDenoiserSlot::LatchBypass(RootDenoiserBypass reason) {
   pending_bypass_generation_ = seen_generation_;
 }
 
+bool RootDenoiserSlot::LatchForCaptureLoss() {
+  uint32_t expected = kFree;
+  if (!owner_.compare_exchange_strong(expected, kAudio,
+                                      std::memory_order_acquire,
+                                      std::memory_order_relaxed)) {
+    return false;
+  }
+  const bool running = pipeline_ && generation_ == seen_generation_ &&
+                       bypass_.load(std::memory_order_relaxed) == 0;
+  const bool settled = plain_calls_ >= kCaptureLossSettledCalls;
+  const bool share =
+      recent_sum_us_ >=
+      kCaptureLossShareUs * static_cast<int64_t>(kAverageCalls);
+  if (running && settled && share) {
+    bypass_.store(static_cast<uint32_t>(RootDenoiserBypass::kCaptureLoss),
+                  std::memory_order_relaxed);
+    capture_loss_bypasses_.fetch_add(1, std::memory_order_relaxed);
+  }
+  owner_.store(kFree, std::memory_order_release);
+  return true;
+}
+
 bool RootDenoiserSlot::AcquireControl(int timeout_ms) {
   const auto deadline = std::chrono::steady_clock::now() +
                         std::chrono::milliseconds(std::max(0, timeout_ms));
@@ -354,6 +376,8 @@ RootDenoiserSlotStats RootDenoiserSlot::ReadStats(bool take_max) {
   stats.lateness_max_us =
       take_max ? lateness_max_us_.exchange(0, std::memory_order_relaxed)
                : lateness_max_us_.load(std::memory_order_relaxed);
+  stats.capture_loss_bypasses =
+      capture_loss_bypasses_.load(std::memory_order_relaxed);
   for (size_t i = 0; i < kHistogramBuckets; ++i) {
     stats.histogram[i] = histogram_[i].load(std::memory_order_relaxed);
   }
@@ -424,7 +448,8 @@ std::optional<bool> RootNsFallback::Update(int64_t now_ms,
     }
     const bool died =
         installed && (bypass == RootDenoiserBypass::kOutputStalled ||
-                      bypass == RootDenoiserBypass::kSlow);
+                      bypass == RootDenoiserBypass::kSlow ||
+                      bypass == RootDenoiserBypass::kCaptureLoss);
     on = on_ || died ||
          (inactive_since_ms_.has_value() &&
           now_ms - *inactive_since_ms_ >= grace_ms_);
@@ -1236,6 +1261,10 @@ void RootDenoiserHarness::latch_bypass(uint32_t reason) const {
   state_->slot->LatchBypass(static_cast<RootDenoiserBypass>(reason));
 }
 
+bool RootDenoiserHarness::latch_for_capture_loss() const {
+  return state_->slot->LatchForCaptureLoss();
+}
+
 RootDenoiserSlotInfo RootDenoiserHarness::slot_info(bool take_max) const {
   const RootDenoiserSlotStats stats = state_->slot->ReadStats(take_max);
   RootDenoiserSlotInfo info{};
@@ -1252,6 +1281,7 @@ RootDenoiserSlotInfo RootDenoiserHarness::slot_info(bool take_max) const {
   info.frames_until_first_output = stats.frames_until_first_output;
   info.process_max_us = stats.process_max_us;
   info.lateness_max_us = stats.lateness_max_us;
+  info.capture_loss_bypasses = stats.capture_loss_bypasses;
   for (uint64_t count : stats.histogram) {
     info.histogram.push_back(count);
   }

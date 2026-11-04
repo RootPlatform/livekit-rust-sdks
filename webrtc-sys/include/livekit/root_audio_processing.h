@@ -293,6 +293,11 @@ struct RootCaptureState {
   // (re)start (bumped before each StartRecording).
   std::atomic<uint64_t> dsp_reset_seq{0};
   std::atomic<uint64_t> stream_epoch{0};
+  // Bumped by the ADM tap's capture loss meter for each confirmed loss our
+  // processing caused (the callbacks ran over the frame); the processor asks
+  // the denoiser slot to bypass a pipeline that runs and takes a share of the
+  // frame (RootDenoiserSlot::LatchForCaptureLoss).
+  std::atomic<uint64_t> busy_capture_losses{0};
   // What the APM decorator has applied, and what the denoiser control decided
   // for its WebRTC NS fallback (applied a little later, by the decorator).
   std::atomic<bool> webrtc_ns_applied{false};
@@ -504,6 +509,7 @@ class RootCaptureProcessor : public webrtc::CustomProcessing {
   uint64_t seen_reset_seq_ = 0;
   uint64_t seen_stream_epoch_ = 0;
   uint64_t seen_gain_reset_seq_ = 0;
+  uint64_t seen_busy_capture_losses_ = 0;
   bool stalled_ = false;
   // The pipeline was not fed while the denoiser was not wanted: flush it
   // before it runs again.
@@ -1021,6 +1027,7 @@ class RootProcessorHarness {
   void set_webrtc_ns_applied(bool applied) const;
   void set_ns_fallback_decided(bool on) const;
   void bump_stream_epoch() const;
+  void bump_busy_capture_losses() const;
   void gain_reset(float db) const;
   void set_gain_engine(uint32_t engine) const;
   void set_agc2_tuning(RootAgc2Tuning tuning) const;
@@ -1045,6 +1052,7 @@ class RootProcessorHarness {
   // Holds the slot as the audio thread would mid-process (the next frame
   // misses).
   bool hold_denoiser_slot(bool hold) const;
+  void set_fake_denoiser_sleep_us(uint32_t sleep_us) const;
   // Stores the speaking flag as the audio thread publishes it on a frame now.
   void set_published_speaking(bool speaking) const;
   void clear_stale_speaking() const;

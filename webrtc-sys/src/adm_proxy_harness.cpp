@@ -3054,4 +3054,37 @@ AdmCaptureLoss adm_capture_loss_for_test(rust::Slice<const int64_t> times_us,
   return AdmCaptureLoss{max_lag_us, meter.lost_us(), meter.loss_events()};
 }
 
+AdmCaptureLossAttribution adm_capture_loss_attribution_for_test(
+    rust::Slice<const int64_t> times_us,
+    rust::Slice<const int64_t> busy_us,
+    rust::Slice<const int64_t> render_gaps_us,
+    size_t frames,
+    uint32_t rate) {
+  AdmCaptureLossMeter meter;
+  std::atomic<uint64_t> busy_losses{0};
+  meter.set_busy_losses(&busy_losses);
+  uint64_t busy_max_us = 0;
+  uint64_t idle_max_us = 0;
+  for (size_t i = 0; i < times_us.size(); ++i) {
+    const int64_t at = times_us[i] * 1000;
+    if (i < render_gaps_us.size() && render_gaps_us[i] > 0) {
+      meter.NoteRender(at, render_gaps_us[i] * 1000);
+    }
+    meter.Observe(at, frames, rate);
+    meter.Finish(at + (i < busy_us.size() ? busy_us[i] : 0) * 1000);
+    busy_max_us = std::max(busy_max_us, meter.TakeBusyMaxUs());
+    idle_max_us = std::max(idle_max_us, meter.TakeIdleMaxUs());
+  }
+  AdmCaptureLossAttribution result{};
+  result.lost_us = meter.lost_us();
+  result.loss_events = meter.loss_events();
+  result.lost_busy_us = meter.lost_busy_us();
+  result.busy_loss_events = meter.busy_loss_events();
+  result.lost_coupled_us = meter.lost_coupled_us();
+  result.busy_losses_counted = busy_losses.load();
+  result.busy_max_us = busy_max_us;
+  result.idle_max_us = idle_max_us;
+  return result;
+}
+
 }  // namespace livekit_ffi

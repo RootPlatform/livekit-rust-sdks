@@ -479,8 +479,11 @@ message RootAudioStats {
   // stalled (100 empty outputs in a row), 3 slow (the lateness backlog, denoiser_lateness_max_us, past
   // 15 ms, or the last 100 calls averaging over 9.5 ms; 3 calls longer than the 10 ms frame within 60 s
   // or one over 20 ms up to v0.13.1-hw.3, 3 calls over 5 ms up to v0.13.1-hw.1), counting only plain
-  // calls: not the first after an install, a flush or a stream restart, nor one with a power change); 2 and 3 last
-  // until the pipeline is replaced or removed. A call's time includes the flush and power change made
+  // calls: not the first after an install, a flush or a stream restart, nor one with a power change),
+  // 4 capture loss (from v0.13.1-hw.5: the capture loss meter confirmed a loss our processing caused,
+  // capture_lost_busy_us, while this pipeline had run 500 plain calls since its start and its last 100
+  // averaged 2 ms or more; denoiser_capture_loss_bypasses counts them); 2, 3 and 4 last until the
+  // pipeline is replaced or removed. A call's time includes the flush and power change made
   // with it (denoiser_slow_frames, the maximum and the histogram count every call).
   required bool denoiser_installed = 50;
   required uint64 denoiser_frames = 51;
@@ -781,6 +784,26 @@ message RootAudioStats {
   optional uint64 capture_max_lag_us = 175;
   optional uint64 capture_lost_us = 176;
   optional uint64 capture_loss_events = 177;
+  // Where the lost capture audio came from (absent from libraries that predate it, v0.13.1-hw.5 on).
+  // From v0.13.1-hw.5 a confirmed rise under 8 ms is the device's latency stepping up, not a loss (a
+  // drop is a whole device period), and counts in none of 176-180. Each callback is timed from the tap
+  // to the return of its processing (busy: libwebrtc's chain, the APM, the capture processor, the
+  // denoiser); the time from one callback's return to the next is idle (the platform ADM's loop, a
+  // device that delivered nothing, the OS). A loss is busy when the busy time over the frames' duration
+  // in the three seconds that saw it is at least half of it: capture_lost_busy_us over
+  // capture_busy_loss_events (cumulative). Any other loss is outside our processing, and
+  // capture_lost_coupled_us (cumulative) when playout stalled too in those seconds (a render gap of
+  // 50 ms or more while render ran: the device, the audio engine, or a lock both directions take).
+  // capture_busy_max_us is the longest callback and capture_idle_max_us the longest time between
+  // callbacks outside our processing, each since the previous read.
+  optional uint64 capture_lost_busy_us = 178;
+  optional uint64 capture_busy_loss_events = 179;
+  optional uint64 capture_lost_coupled_us = 180;
+  optional uint64 capture_busy_max_us = 181;
+  optional uint64 capture_idle_max_us = 182;
+  // Pipelines the denoiser slot bypassed for lost capture audio (bypass reason 4), cumulative
+  // (capability DENOISER; absent without it and from libraries that predate it).
+  optional uint64 denoiser_capture_loss_bypasses = 183;
 }
 // One playout mixer source (a remote audio stream): its audio as it reached the mixer, decoded and
 // before its gain (tile volume, master volume, deafen; a muted frame counts as silence), as a sum of

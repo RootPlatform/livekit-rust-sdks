@@ -1247,6 +1247,12 @@ impl From<RootAudioStats> for proto::RootAudioStats {
             capture_max_lag_us: Some(stats.capture_max_lag_us),
             capture_lost_us: Some(stats.capture_lost_us),
             capture_loss_events: Some(stats.capture_loss_events),
+            capture_lost_busy_us: Some(stats.capture_lost_busy_us),
+            capture_busy_loss_events: Some(stats.capture_busy_loss_events),
+            capture_lost_coupled_us: Some(stats.capture_lost_coupled_us),
+            capture_busy_max_us: Some(stats.capture_busy_max_us),
+            capture_idle_max_us: Some(stats.capture_idle_max_us),
+            denoiser_capture_loss_bypasses: stats.denoiser_capture_loss_bypasses,
             playout_device_uid: changes.as_ref().map(|c| c.playout_uid.clone()),
             recording_device_uid: changes.as_ref().map(|c| c.recording_uid.clone()),
             same_device: changes.as_ref().map(|c| c.same_device),
@@ -1746,6 +1752,33 @@ mod tests {
         assert_eq!(p.denoiser_lateness_max_us, Some(4_000));
         let none: proto::RootAudioStats = RootAudioStats::default().into();
         assert_eq!((none.capture_lost_us, none.denoiser_lateness_max_us), (Some(0), None));
+    }
+
+    #[test]
+    fn rootapp_audio_capture_loss_attribution_and_its_bypasses_convert() {
+        let stats = RootAudioStats {
+            capture_lost_busy_us: 30_000,
+            capture_busy_loss_events: 2,
+            capture_lost_coupled_us: 12_000,
+            capture_busy_max_us: 41_000,
+            capture_idle_max_us: 320_000,
+            denoiser_capture_loss_bypasses: Some(1),
+            ..Default::default()
+        };
+        let p: proto::RootAudioStats = stats.into();
+        assert_eq!(
+            (
+                p.capture_lost_busy_us,
+                p.capture_busy_loss_events,
+                p.capture_lost_coupled_us,
+                p.capture_busy_max_us,
+                p.capture_idle_max_us
+            ),
+            (Some(30_000), Some(2), Some(12_000), Some(41_000), Some(320_000))
+        );
+        assert_eq!(p.denoiser_capture_loss_bypasses, Some(1));
+        let none: proto::RootAudioStats = RootAudioStats::default().into();
+        assert_eq!((none.capture_lost_busy_us, none.denoiser_capture_loss_bypasses), (Some(0), None));
     }
 
     #[test]

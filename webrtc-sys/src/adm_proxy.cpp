@@ -461,11 +461,16 @@ void AdmCaptureLossMeter::Start(int64_t now_ns, uint32_t sample_rate) {
   window_end_ns_ = now_ns + kWindowNs;
   window_min_ns_ = 0;
   pending_ = false;
+  exited_ = false;
+  window_busy_over_ns_.fill(0);
+  window_render_gap_ns_.fill(0);
+  render_gap_ns_.store(0, std::memory_order_relaxed);
 }
 
 void AdmCaptureLossMeter::Observe(int64_t now_ns,
                                   size_t frames,
                                   uint32_t sample_rate) {
+  observed_ = false;
   if (sample_rate == 0) {
     return;
   }
@@ -475,8 +480,14 @@ void AdmCaptureLossMeter::Observe(int64_t now_ns,
     Start(now_ns, sample_rate);
   }
   last_ns_ = now_ns;
+  if (exited_ && now_ns > exit_ns_) {
+    UpdateMax(idle_max_ns_, static_cast<uint64_t>(now_ns - exit_ns_));
+  }
+  observed_ = true;
+  entry_ns_ = now_ns;
+  frame_ns_ = static_cast<int64_t>(frames) * 1'000'000'000 / sample_rate;
   const int64_t lag = now_ns - anchor_ns_ - delivered_ns_;
-  delivered_ns_ += static_cast<int64_t>(frames) * 1'000'000'000 / sample_rate;
+  delivered_ns_ += frame_ns_;
   floor_ns_ = std::min(floor_ns_, lag);
   window_min_ns_ = std::min(window_min_ns_, lag);
   UpdateMax(max_lag_ns_, static_cast<uint64_t>(lag - floor_ns_));
@@ -486,24 +497,94 @@ void AdmCaptureLossMeter::Observe(int64_t now_ns,
   const int64_t settled = window_min_ns_;
   window_min_ns_ = std::numeric_limits<int64_t>::max();
   window_end_ns_ = now_ns + kWindowNs;
+  int64_t render_gap = static_cast<int64_t>(
+      render_gap_ns_.exchange(0, std::memory_order_relaxed));
+  if (render_seen_.load(std::memory_order_acquire)) {
+    const int64_t last = render_last_ns_.load(std::memory_order_relaxed);
+    if (now_ns > last) {
+      render_gap = std::max(render_gap, now_ns - last);
+    }
+  }
+  window_render_gap_ns_[0] = std::max(window_render_gap_ns_[0], render_gap);
   if (settled - floor_ns_ <= kToleranceNs) {
     floor_ns_ = settled;
     pending_ = false;
+  } else {
+    if (pending_) {
+      const int64_t confirmed = std::min(settled, pending_min_ns_);
+      CountLoss(confirmed - floor_ns_);
+      floor_ns_ = confirmed;
+    }
+    pending_ = settled - floor_ns_ > kToleranceNs;
+    pending_min_ns_ = settled;
+  }
+  for (size_t i = kAttributionWindows - 1; i > 0; --i) {
+    window_busy_over_ns_[i] = window_busy_over_ns_[i - 1];
+    window_render_gap_ns_[i] = window_render_gap_ns_[i - 1];
+  }
+  window_busy_over_ns_[0] = 0;
+  window_render_gap_ns_[0] = 0;
+}
+
+void AdmCaptureLossMeter::Finish(int64_t now_ns) {
+  if (!observed_) {
     return;
   }
-  if (pending_) {
-    const int64_t confirmed = std::min(settled, pending_min_ns_);
-    lost_ns_.fetch_add(static_cast<uint64_t>(confirmed - floor_ns_),
-                       std::memory_order_relaxed);
-    loss_events_.fetch_add(1, std::memory_order_relaxed);
-    floor_ns_ = confirmed;
+  observed_ = false;
+  const int64_t busy = now_ns - entry_ns_;
+  if (busy > 0) {
+    UpdateMax(busy_max_ns_, static_cast<uint64_t>(busy));
   }
-  pending_ = settled - floor_ns_ > kToleranceNs;
-  pending_min_ns_ = settled;
+  if (busy > frame_ns_) {
+    window_busy_over_ns_[0] += busy - frame_ns_;
+  }
+  exited_ = true;
+  exit_ns_ = now_ns;
+}
+
+void AdmCaptureLossMeter::CountLoss(int64_t loss_ns) {
+  if (loss_ns < kMinLossNs) {
+    return;
+  }
+  int64_t busy_over = 0;
+  int64_t render_gap = 0;
+  for (size_t i = 0; i < kAttributionWindows; ++i) {
+    busy_over += window_busy_over_ns_[i];
+    render_gap = std::max(render_gap, window_render_gap_ns_[i]);
+  }
+  const uint64_t loss = static_cast<uint64_t>(loss_ns);
+  lost_ns_.fetch_add(loss, std::memory_order_relaxed);
+  loss_events_.fetch_add(1, std::memory_order_relaxed);
+  if (2 * busy_over >= loss_ns) {
+    lost_busy_ns_.fetch_add(loss, std::memory_order_relaxed);
+    busy_loss_events_.fetch_add(1, std::memory_order_relaxed);
+    if (std::atomic<uint64_t>* counter =
+            busy_losses_.load(std::memory_order_acquire)) {
+      counter->fetch_add(1, std::memory_order_release);
+    }
+  } else if (render_gap >= kCoupledRenderGapNs) {
+    lost_coupled_ns_.fetch_add(loss, std::memory_order_relaxed);
+  }
+}
+
+void AdmCaptureLossMeter::NoteRender(int64_t now_ns, int64_t gap_ns) {
+  if (gap_ns > 0) {
+    UpdateMax(render_gap_ns_, static_cast<uint64_t>(gap_ns));
+  }
+  render_last_ns_.store(now_ns, std::memory_order_relaxed);
+  render_seen_.store(true, std::memory_order_release);
+}
+
+void AdmCaptureLossMeter::ResetRender() {
+  render_seen_.store(false, std::memory_order_release);
 }
 
 void AdmCaptureLossMeter::Reset() {
   reset_.store(true, std::memory_order_relaxed);
+}
+
+void AdmCaptureLossMeter::set_busy_losses(std::atomic<uint64_t>* counter) {
+  busy_losses_.store(counter, std::memory_order_release);
 }
 
 uint64_t AdmCaptureLossMeter::lost_us() const {
@@ -514,8 +595,28 @@ uint64_t AdmCaptureLossMeter::loss_events() const {
   return loss_events_.load(std::memory_order_relaxed);
 }
 
+uint64_t AdmCaptureLossMeter::lost_busy_us() const {
+  return lost_busy_ns_.load(std::memory_order_relaxed) / 1000;
+}
+
+uint64_t AdmCaptureLossMeter::busy_loss_events() const {
+  return busy_loss_events_.load(std::memory_order_relaxed);
+}
+
+uint64_t AdmCaptureLossMeter::lost_coupled_us() const {
+  return lost_coupled_ns_.load(std::memory_order_relaxed) / 1000;
+}
+
 uint64_t AdmCaptureLossMeter::TakeMaxLagUs() {
   return max_lag_ns_.exchange(0, std::memory_order_relaxed) / 1000;
+}
+
+uint64_t AdmCaptureLossMeter::TakeBusyMaxUs() {
+  return busy_max_ns_.exchange(0, std::memory_order_relaxed) / 1000;
+}
+
+uint64_t AdmCaptureLossMeter::TakeIdleMaxUs() {
+  return idle_max_ns_.exchange(0, std::memory_order_relaxed) / 1000;
 }
 
 // =============================================================================
@@ -534,16 +635,25 @@ void AdmTransportTap::set_mono_capture(bool mono) {
   mono_capture_.store(mono, std::memory_order_relaxed);
 }
 
+void AdmTransportTap::set_busy_capture_losses(std::atomic<uint64_t>* counter) {
+  capture_loss_.set_busy_losses(counter);
+}
+
 int64_t AdmTransportTap::Count(Direction& direction,
                                size_t frames,
                                uint32_t sample_rate,
-                               uint32_t delay_ms) {
+                               uint32_t delay_ms,
+                               int64_t* gap_ns) {
   const int64_t now = NowNs();
   direction.last_ns.store(now, std::memory_order_relaxed);
   const int64_t previous =
       direction.previous_ns.exchange(now, std::memory_order_relaxed);
-  if (previous > 0 && now > previous) {
-    UpdateMax(direction.max_gap_ns, static_cast<uint64_t>(now - previous));
+  const int64_t gap = previous > 0 && now > previous ? now - previous : 0;
+  if (gap > 0) {
+    UpdateMax(direction.max_gap_ns, static_cast<uint64_t>(gap));
+  }
+  if (gap_ns) {
+    *gap_ns = gap;
   }
   direction.callbacks.fetch_add(1, std::memory_order_relaxed);
   direction.frames.fetch_add(frames, std::memory_order_relaxed);
@@ -642,6 +752,7 @@ int32_t AdmTransportTap::RecordedDataIsAvailable(
         sample_rate, total_delay_ms, clock_drift, current_mic_level,
         key_pressed, new_mic_level, estimated_capture_time_ns);
   }
+  capture_loss_.Finish(NowNs());
   capture_busy_.store(false, std::memory_order_release);
   return result;
 }
@@ -689,8 +800,11 @@ int32_t AdmTransportTap::Render(bool count,
     return 0;
   }
   if (count) {
-    Count(render_, samples_per_channel, sample_rate,
-          playout_delay_ms_.load(std::memory_order_relaxed));
+    int64_t gap = 0;
+    const int64_t now =
+        Count(render_, samples_per_channel, sample_rate,
+              playout_delay_ms_.load(std::memory_order_relaxed), &gap);
+    capture_loss_.NoteRender(now, gap);
   }
 
   webrtc::AudioTransport* transport =
@@ -738,6 +852,7 @@ void AdmTransportTap::ResetCaptureClock() {
 
 void AdmTransportTap::ResetRenderClock() {
   render_.previous_ns.store(0, std::memory_order_relaxed);
+  capture_loss_.ResetRender();
 }
 
 uint64_t AdmTransportTap::capture_callbacks() const {
@@ -787,6 +902,11 @@ AdmTapStats AdmTransportTap::Read() {
   stats.capture_max_lag_us = capture_loss_.TakeMaxLagUs();
   stats.capture_lost_us = capture_loss_.lost_us();
   stats.capture_loss_events = capture_loss_.loss_events();
+  stats.capture_lost_busy_us = capture_loss_.lost_busy_us();
+  stats.capture_busy_loss_events = capture_loss_.busy_loss_events();
+  stats.capture_lost_coupled_us = capture_loss_.lost_coupled_us();
+  stats.capture_busy_max_us = capture_loss_.TakeBusyMaxUs();
+  stats.capture_idle_max_us = capture_loss_.TakeIdleMaxUs();
   return stats;
 }
 
@@ -1349,6 +1469,10 @@ bool AdmProxy::StopDeviceLocked(bool playout, AdmDirectionOutcome* outcome) {
     capture_state_->ClearSpeaking();
   }
   if (result == 0) {
+    if (playout) {
+      // A stopped output is no render stall for the capture loss meter.
+      tap_.ResetRenderClock();
+    }
     ForgetFormatLocked(playout);
     ForgetOpenedLocked(playout);
 #if !LK_ADM_MOBILE
@@ -2535,6 +2659,8 @@ void AdmProxy::SetCaptureState(
       capture_state_ ? capture_state_->monitor.get() : nullptr;
   monitor_.store(monitor, std::memory_order_release);
   tap_.set_monitor(monitor);
+  tap_.set_busy_capture_losses(
+      capture_state_ ? &capture_state_->busy_capture_losses : nullptr);
 }
 
 #if defined(ROOTAPP_HARNESS)

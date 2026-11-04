@@ -1009,6 +1009,10 @@ pub struct RootAudioStats {
     /// The slot's lateness backlog (each plain call's time over the 10 ms
     /// frame, less what calls left of it) at most since the previous read.
     pub denoiser_lateness_max_us: Option<u64>,
+    /// Pipelines the slot bypassed for lost capture audio (bypass reason 4:
+    /// a capture loss our processing caused while the pipeline ran),
+    /// cumulative.
+    pub denoiser_capture_loss_bypasses: Option<u64>,
 
     // APM policy (APM decorator).
     pub apm_policy_applies: Option<u64>,
@@ -1059,6 +1063,16 @@ pub struct RootAudioStats {
     pub capture_max_lag_us: u64,
     pub capture_lost_us: u64,
     pub capture_loss_events: u64,
+    // Where it came from (cumulative): the audio and losses our processing
+    // caused (the callbacks ran over the frame), and the audio lost outside
+    // it while playout stalled too. The longest callback (our processing)
+    // and the longest time between callbacks outside it, since the previous
+    // read.
+    pub capture_lost_busy_us: u64,
+    pub capture_busy_loss_events: u64,
+    pub capture_lost_coupled_us: u64,
+    pub capture_busy_max_us: u64,
+    pub capture_idle_max_us: u64,
 }
 
 impl Default for RootAudioStats {
@@ -1173,6 +1187,7 @@ impl Default for RootAudioStats {
             webrtc_ns_fallback: None,
             ns_fallback_pending_frames: None,
             denoiser_lateness_max_us: None,
+            denoiser_capture_loss_bypasses: None,
             apm_policy_applies: None,
             apm_policy_deferred: None,
             apm_policy_forced: None,
@@ -1195,6 +1210,11 @@ impl Default for RootAudioStats {
             capture_max_lag_us: 0,
             capture_lost_us: 0,
             capture_loss_events: 0,
+            capture_lost_busy_us: 0,
+            capture_busy_loss_events: 0,
+            capture_lost_coupled_us: 0,
+            capture_busy_max_us: 0,
+            capture_idle_max_us: 0,
         }
     }
 }
@@ -1264,7 +1284,14 @@ impl RootAudioStats {
             capture_max_lag_us: native.capture_max_lag_us,
             capture_lost_us: native.capture_lost_us,
             capture_loss_events: native.capture_loss_events,
+            capture_lost_busy_us: native.capture_lost_busy_us,
+            capture_busy_loss_events: native.capture_busy_loss_events,
+            capture_lost_coupled_us: native.capture_lost_coupled_us,
+            capture_busy_max_us: native.capture_busy_max_us,
+            capture_idle_max_us: native.capture_idle_max_us,
             denoiser_lateness_max_us: denoiser.then_some(native.denoiser_lateness_max_us),
+            denoiser_capture_loss_bypasses: denoiser
+                .then_some(native.denoiser_capture_loss_bypasses),
             monitor_active: monitor.then_some(native.monitor_active),
             monitor_frames: monitor.then_some(native.monitor_frames),
             monitor_dropped_frames: monitor.then_some(native.monitor_dropped_frames),
@@ -2210,6 +2237,43 @@ mod tests {
             ..Default::default()
         });
         assert_eq!((without.capture_lost_us, without.denoiser_lateness_max_us), (20_000, None));
+    }
+
+    #[test]
+    fn root_audio_stats_say_where_capture_loss_came_from_and_count_its_bypasses_with_a_slot() {
+        let native = NativeAudioStats {
+            capture_lost_us: 50_000,
+            capture_loss_events: 3,
+            capture_lost_busy_us: 30_000,
+            capture_busy_loss_events: 2,
+            capture_lost_coupled_us: 12_000,
+            capture_busy_max_us: 41_000,
+            capture_idle_max_us: 320_000,
+            denoiser_available: true,
+            denoiser_capture_loss_bypasses: 1,
+            ..Default::default()
+        };
+        let stats = RootAudioStats::from_native(native);
+        assert_eq!(
+            (
+                stats.capture_lost_busy_us,
+                stats.capture_busy_loss_events,
+                stats.capture_lost_coupled_us,
+                stats.capture_busy_max_us,
+                stats.capture_idle_max_us
+            ),
+            (30_000, 2, 12_000, 41_000, 320_000)
+        );
+        assert_eq!(stats.denoiser_capture_loss_bypasses, Some(1));
+        let without = RootAudioStats::from_native(NativeAudioStats {
+            capture_lost_busy_us: 30_000,
+            denoiser_capture_loss_bypasses: 1,
+            ..Default::default()
+        });
+        assert_eq!(
+            (without.capture_lost_busy_us, without.denoiser_capture_loss_bypasses),
+            (30_000, None)
+        );
     }
 
     #[test]

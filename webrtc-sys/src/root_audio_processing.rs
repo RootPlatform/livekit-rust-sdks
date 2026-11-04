@@ -425,6 +425,8 @@ pub mod ffi {
         fn set_ns_fallback_decided(self: &RootProcessorHarness, on: bool);
         /// As AdmProxy does before each StartRecording.
         fn bump_stream_epoch(self: &RootProcessorHarness);
+        /// As the ADM tap's capture loss meter does for a busy loss.
+        fn bump_busy_capture_losses(self: &RootProcessorHarness);
         /// As the controller does: payload, then the sequence number (and AGC2
         /// starts over from it).
         fn gain_reset(self: &RootProcessorHarness, db: f32);
@@ -457,6 +459,8 @@ pub mod ffi {
         fn fake_denoiser(self: &RootProcessorHarness) -> RootFakeDenoiserProbe;
         /// Holds the slot as the audio thread would mid-process.
         fn hold_denoiser_slot(self: &RootProcessorHarness, hold: bool) -> bool;
+        /// Each process() call of the last fake installed spins this long.
+        fn set_fake_denoiser_sleep_us(self: &RootProcessorHarness, sleep_us: u32);
         /// Stores the speaking flag as the processor publishes it, as of a
         /// frame now.
         fn set_published_speaking(self: &RootProcessorHarness, speaking: bool);
@@ -1271,6 +1275,46 @@ mod processor_tests {
         assert!(silent(&run(&h, 48000, 1, 1000.0)), "a new stream holds again");
         let fake = h.fake_denoiser();
         assert_eq!((fake.flush_calls, fake.power_sets, fake.last_power), (1, 2, 0.8));
+    }
+
+    #[test]
+    fn root_capture_processor_bypasses_a_denoiser_that_runs_when_capture_loses_audio_to_our_processing() {
+        let h = pass_through(48000, 1);
+        h.set_denoiser_wanted(true);
+        assert!(h.install_fake_denoiser(48000, 1.0, 0, 0, 0, 0));
+        h.set_fake_denoiser_sleep_us(2_500);
+        for _ in 0..200 {
+            run(&h, 48000, 1, 1000.0);
+        }
+        h.bump_busy_capture_losses();
+        run(&h, 48000, 1, 1000.0);
+        assert_eq!(h.fake_denoiser().bypass, 0, "200 calls since its install: its warm-up could have caused it");
+        for _ in 0..400 {
+            run(&h, 48000, 1, 1000.0);
+        }
+        assert_eq!(h.fake_denoiser().bypass, 0, "a loss already judged is not judged again");
+
+        h.set_denoiser_wanted(false);
+        h.bump_busy_capture_losses();
+        run(&h, 48000, 1, 1000.0);
+        h.set_denoiser_wanted(true);
+        run(&h, 48000, 1, 1000.0);
+        assert_eq!(h.fake_denoiser().bypass, 0, "a loss while the denoiser did not run is passed over");
+
+        assert!(h.hold_denoiser_slot(true));
+        h.bump_busy_capture_losses();
+        run(&h, 48000, 1, 1000.0);
+        assert!(h.hold_denoiser_slot(false));
+        assert_eq!(h.fake_denoiser().bypass, 0, "missed: the denoiser did not run");
+        run(&h, 48000, 1, 1000.0);
+        assert_eq!(h.fake_denoiser().bypass, 0);
+
+        h.bump_busy_capture_losses();
+        let calls = h.fake_denoiser().process_calls;
+        run(&h, 48000, 1, 1000.0);
+        assert_eq!(h.fake_denoiser().bypass, 4, "settled and 2.5 ms a call: bypassed for capture loss");
+        run(&h, 48000, 1, 1000.0);
+        assert_eq!(h.fake_denoiser().process_calls, calls + 1, "bypassed from the next frame on");
     }
 
     #[test]

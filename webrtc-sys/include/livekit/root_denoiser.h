@@ -101,6 +101,10 @@ enum class RootDenoiserBypass : uint32_t {
   kRateMismatch = 1,
   kOutputStalled = 2,
   kSlow = 3,
+  // The capture loss meter confirmed audio the device's buffer dropped
+  // because the capture callbacks ran over the frame, while this pipeline ran
+  // and took a share of it (RootDenoiserSlot::LatchForCaptureLoss).
+  kCaptureLoss = 4,
 };
 struct RootDenoiseResult {
   RootDenoiseKind kind = RootDenoiseKind::kNotInUse;
@@ -122,6 +126,7 @@ struct RootDenoiserSlotStats {
   int32_t frames_until_first_output = -1;
   uint64_t process_max_us = 0;
   uint64_t lateness_max_us = 0;
+  uint64_t capture_loss_bypasses = 0;
   std::array<uint64_t, 16> histogram{};
 };
 
@@ -139,6 +144,8 @@ class RootDenoiserSlot {
   static constexpr int64_t kLatenessBudgetUs = 15000;
   static constexpr size_t kAverageCalls = 100;
   static constexpr int64_t kAverageLimitUs = 9500;
+  static constexpr size_t kCaptureLossSettledCalls = 500;
+  static constexpr int64_t kCaptureLossShareUs = 2000;
   static constexpr int kControlTimeoutMs = 200;
   static constexpr size_t kHistogramBuckets = 16;
   static constexpr std::array<int64_t, kHistogramBuckets - 1>
@@ -178,6 +185,16 @@ class RootDenoiserSlot {
   // Audio thread: bypass the pipeline that last ran from the next frame on
   // (ignored when it was replaced meanwhile).
   void LatchBypass(RootDenoiserBypass reason);
+  // Audio thread: the capture loss meter confirmed a loss our processing
+  // caused. The pipeline that runs is bypassed (kCaptureLoss) when it has run
+  // kCaptureLossSettledCalls plain calls since its (re)start (a loss its
+  // warm-up caused is confirmed within about 3 s, never this late) and its
+  // last kAverageCalls plain calls averaged kCaptureLossShareUs or more
+  // (giving that back can bring the callback under the frame; a denoiser
+  // that takes little of it is not what ran over). Returns false, deciding
+  // nothing, while the control side holds the slot (the caller asks again on
+  // the next frame).
+  bool LatchForCaptureLoss();
 
   // Control side (never the audio thread). Each takes the slot with 1 ms
   // sleeps for up to `timeout_ms` and returns false, changing nothing, when
@@ -248,12 +265,13 @@ class RootDenoiserSlot {
   std::atomic<int32_t> frames_until_first_output_{-1};
   std::atomic<uint64_t> process_max_us_{0};
   std::atomic<uint64_t> lateness_max_us_{0};
+  std::atomic<uint64_t> capture_loss_bypasses_{0};
   std::array<std::atomic<uint64_t>, kHistogramBuckets> histogram_{};
 };
 
 // Native WebRTC NS covering a denoiser that is wanted but not running: on at
-// once when the installed pipeline was bypassed for a stalled output or slow
-// frames, on after `grace_ms` of frames when none runs for another reason
+// once when the installed pipeline was bypassed for a stalled output, slow
+// frames or lost capture audio, on after `grace_ms` of frames when none runs for another reason
 // (missing, removed, bypassed for its rate); off once it runs again or is not
 // wanted. The grace only counts while frames flow (processed_frames moved in
 // the last kFlowingMs) and no install is on its way (`arriving`: a request
@@ -574,6 +592,7 @@ class RootDenoiserHarness {
                                float power,
                                size_t out_capacity) const;
   void latch_bypass(uint32_t reason) const;
+  bool latch_for_capture_loss() const;
   RootDenoiserSlotInfo slot_info(bool take_max) const;
 
   // A thread calling ProcessAudio back to back on a tone at `rate`, and

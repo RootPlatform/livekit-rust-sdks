@@ -67,7 +67,8 @@ pub mod ffi {
     pub struct RootDenoiserSlotInfo {
         pub installed: bool,
         pub rate: u32,
-        /// 0 none, 1 rate mismatch, 2 output stalled, 3 slow.
+        /// 0 none, 1 rate mismatch, 2 output stalled, 3 slow, 4 capture
+        /// loss.
         pub bypass: u32,
         pub generation: u64,
         pub frames: u64,
@@ -79,6 +80,7 @@ pub mod ffi {
         pub frames_until_first_output: i32,
         pub process_max_us: u64,
         pub lateness_max_us: u64,
+        pub capture_loss_bypasses: u64,
         pub histogram: Vec<u64>,
     }
 
@@ -151,6 +153,9 @@ pub mod ffi {
             out_capacity: usize,
         ) -> RootDenoiseTestFrame;
         fn latch_bypass(self: &RootDenoiserHarness, reason: u32);
+        /// The capture processor's call after a busy capture loss; false while
+        /// the slot is held.
+        fn latch_for_capture_loss(self: &RootDenoiserHarness) -> bool;
         fn slot_info(self: &RootDenoiserHarness, take_max: bool) -> RootDenoiserSlotInfo;
         /// A thread running frames back to back, latching an output stall
         /// after every `latch_every`-th one (0 never).
@@ -460,6 +465,40 @@ mod tests {
     /// Calls that fit in the frame build no backlog, but leave the rest of
     /// the capture thread little of it: 100 plain calls (about 1 s) averaging
     /// over 9.5 ms latch, 8.5 ms never does.
+    #[test]
+    fn root_denoiser_a_capture_loss_bypasses_a_settled_pipeline_that_takes_a_share_of_the_frame() {
+        const CAPTURE_LOSS: u32 = 4;
+        let h = harness();
+        let a = h.add_fake(&RootFakeFxSpec { sleep_us: 3_000, ..fake(1.0) });
+        h.install_now(a, 48_000);
+        assert_eq!(run(&h, 48_000, 1.0).kind, RAN, "the start: not a plain call");
+        for _ in 0..499 {
+            assert_eq!(run(&h, 48_000, 1.0).kind, RAN);
+        }
+        assert!(h.latch_for_capture_loss());
+        let early = h.slot_info(false);
+        assert_eq!((early.bypass, early.capture_loss_bypasses), (0, 0), "499 plain calls: not settled");
+        assert_eq!(run(&h, 48_000, 1.0).kind, RAN);
+        assert!(h.latch_for_capture_loss());
+        let info = h.slot_info(false);
+        assert_eq!((info.bypass, info.capture_loss_bypasses), (CAPTURE_LOSS, 1));
+        assert_eq!(run(&h, 48_000, 1.0).kind, NOT_IN_USE, "bypassed from the next frame on");
+        assert!(h.latch_for_capture_loss());
+        assert_eq!(h.slot_info(false).capture_loss_bypasses, 1, "a bypassed pipeline is not counted again");
+
+        let b = h.add_fake(&fake(1.0));
+        h.install_now(b, 48_000);
+        for _ in 0..600 {
+            assert_eq!(run(&h, 48_000, 1.0).kind, RAN);
+        }
+        assert!(h.latch_for_capture_loss());
+        assert_eq!(h.slot_info(false).bypass, 0, "a pipeline that takes little of the frame is not what ran over");
+
+        assert!(h.hold_slot(true));
+        assert!(!h.latch_for_capture_loss(), "the slot is held: nothing decided");
+        assert!(h.hold_slot(false));
+    }
+
     #[test]
     fn root_denoiser_a_saturated_second_latches_a_bypass() {
         // Preemption raises the average and can build a backlog, so a run

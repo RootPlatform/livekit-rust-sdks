@@ -99,6 +99,21 @@ pub mod ffi {
         pub loss_events: u64,
     }
 
+    /// Where an `AdmCaptureLossMeter` put what it counted (tests only).
+    #[cfg(feature = "harness")]
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct AdmCaptureLossAttribution {
+        pub lost_us: u64,
+        pub loss_events: u64,
+        pub lost_busy_us: u64,
+        pub busy_loss_events: u64,
+        pub lost_coupled_us: u64,
+        /// What the counter set_busy_losses gave received.
+        pub busy_losses_counted: u64,
+        pub busy_max_us: u64,
+        pub idle_max_us: u64,
+    }
+
     /// The callbacks the harness's fake made under AudioDeviceMac's rules
     /// (tests only).
     #[cfg(feature = "harness")]
@@ -245,6 +260,16 @@ pub mod ffi {
         pub capture_max_lag_us: u64,
         pub capture_lost_us: u64,
         pub capture_loss_events: u64,
+        /// Where the losses came from (cumulative): the audio and losses
+        /// our processing caused (the callbacks ran over the frame), and
+        /// the audio lost outside it while playout stalled too. The longest
+        /// callback (our processing) and the longest time between callbacks
+        /// outside it, since the last read (reset on read).
+        pub capture_lost_busy_us: u64,
+        pub capture_busy_loss_events: u64,
+        pub capture_lost_coupled_us: u64,
+        pub capture_busy_max_us: u64,
+        pub capture_idle_max_us: u64,
 
         /// The DSP chain, the denoiser slot and the APM decorator exist; the
         /// fields of the ones that do not stay at their defaults.
@@ -319,6 +344,9 @@ pub mod ffi {
         /// The slot's lateness backlog at most since the last read (reset
         /// on read).
         pub denoiser_lateness_max_us: u64,
+        /// Pipelines the slot bypassed for lost capture audio (bypass
+        /// reason 4, cumulative).
+        pub denoiser_capture_loss_bypasses: u64,
         pub denoiser_slow_frames: u64,
         pub denoiser_bypass_reason: u32,
         pub denoiser_notifications: u64,
@@ -701,6 +729,17 @@ pub mod ffi {
         /// A capture loss meter fed one callback of `frames` at `rate` at
         /// each of `times_us`.
         fn adm_capture_loss_for_test(times_us: &[i64], frames: usize, rate: u32) -> AdmCaptureLoss;
+        /// The same, with each callback's processing time (`busy_us`, its
+        /// return that long after `times_us`) and a render callback just
+        /// before it `render_gaps_us` after the previous one (0: none; an
+        /// empty slice: no render at all).
+        fn adm_capture_loss_attribution_for_test(
+            times_us: &[i64],
+            busy_us: &[i64],
+            render_gaps_us: &[i64],
+            frames: usize,
+            rate: u32,
+        ) -> AdmCaptureLossAttribution;
 
         /// A RootAudioMonitor driven as its capture and render threads would.
         fn new_root_monitor_harness() -> UniquePtr<RootMonitorHarness>;

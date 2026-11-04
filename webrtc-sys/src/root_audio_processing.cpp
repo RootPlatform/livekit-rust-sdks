@@ -463,6 +463,8 @@ RootCaptureProcessor::RootCaptureProcessor(
   if (!state_->agc2) {
     state_->agc2 = std::make_shared<RootAgc2>(webrtc::CreateEnvironment());
   }
+  seen_busy_capture_losses_ =
+      state_->busy_capture_losses.load(std::memory_order_acquire);
 }
 
 RootCaptureProcessor::~RootCaptureProcessor() = default;
@@ -622,6 +624,15 @@ void RootCaptureProcessor::Process(webrtc::AudioBuffer* audio) {
     slot->LatchBypass(RootDenoiserBypass::kOutputStalled);
   }
   stalled_ = outputs.denoiser_stalled;
+  // A busy capture loss while the pipeline runs: the slot decides whether it
+  // took enough of the frame to be bypassed. Losses seen while it did not run
+  // are passed over.
+  const uint64_t busy_losses = state.busy_capture_losses.load(kAcquire);
+  if (busy_losses != seen_busy_capture_losses_ &&
+      (denoised.kind != RootDenoiseKind::kRan ||
+       slot->LatchForCaptureLoss())) {
+    seen_busy_capture_losses_ = busy_losses;
+  }
 
   for (size_t c = 1; c < channels; ++c) {
     std::copy(samples, samples + frames, data[c]);
@@ -1985,6 +1996,10 @@ void RootProcessorHarness::bump_stream_epoch() const {
   state_->stream_epoch.fetch_add(1, std::memory_order_release);
 }
 
+void RootProcessorHarness::bump_busy_capture_losses() const {
+  state_->busy_capture_losses.fetch_add(1, std::memory_order_release);
+}
+
 void RootProcessorHarness::gain_reset(float db) const {
   if (std::isfinite(db)) {
     state_->agc2->Reset(db);
@@ -2172,6 +2187,12 @@ RootFakeDenoiserProbe RootProcessorHarness::fake_denoiser() const {
 
 bool RootProcessorHarness::hold_denoiser_slot(bool hold) const {
   return state_->denoiser_slot->HoldForTest(hold);
+}
+
+void RootProcessorHarness::set_fake_denoiser_sleep_us(uint32_t sleep_us) const {
+  if (!fakes_.empty()) {
+    fakes_.back()->set_sleep_us(sleep_us);
+  }
 }
 
 void RootProcessorHarness::set_published_speaking(bool speaking) const {

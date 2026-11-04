@@ -3171,6 +3171,55 @@ slow-frame bypass follows the capture deadline"). Caps 32767. Proto: `RootAudioS
 `denoiser_lateness_max_us` (174), `capture_max_lag_us` (175), `capture_lost_us` (176),
 `capture_loss_events` (177).
 
+## Where capture loss comes from (`rootapp/capture-loss-attribution`)
+
+From `rootapp-ffi/v0.13.1-hw.4` (4b6cc2f7). 0.9.160 (hw.4) reported capture loss on 172 of 451 native
+calls: 518 s over 1.55M s of Windows call time, five users holding 79% of it, none on macOS. Most of it
+came from calls whose Effects SDK ran slow on most calls but never past its own 15 ms backlog (the whole
+capture callback ran over the frame and the WASAPI buffer overflowed steadily); the rest from stalls of
+the whole audio stack (playout stalled for seconds with capture) and rare 100-470 ms gaps. A third of the
+calls counted only latency steps of 5-8 ms.
+
+`AdmCaptureLossMeter`:
+- A confirmed rise under `kMinLossNs` (8 ms) moves the settled lag and counts nothing: a drop is a whole
+  device period (10 ms in WASAPI shared mode, at least about 8 ms with drift), so smaller rises are the
+  device's latency stepping up.
+- `Finish` after the transport returns times each callback (busy); the time from one `Finish` to the next
+  `Observe` is idle (both maxima reset on read). The render thread notes each render callback and its gap
+  (`NoteRender`; `ResetRender` on a playout start or stop). The last three windows (the one before the
+  rise, the rise and the one that confirms it) keep the busy time over the frames' duration and the
+  longest render gap, ended or still open at a window's end. A confirmed loss is busy when that busy time
+  is at least half of it; otherwise coupled when a render gap reached `kCoupledRenderGapNs` (50 ms) while
+  render ran. Each busy loss bumps `RootCaptureState::busy_capture_losses` (set by
+  `AdmProxy::SetCaptureState`). Still no locks or allocation on either thread.
+
+The denoiser slot: `RootCaptureProcessor` passes each move of that counter to
+`RootDenoiserSlot::LatchForCaptureLoss` on a frame the pipeline ran (other frames pass it over), which
+bypasses it with reason 4 (`kCaptureLoss`) when it ran `kCaptureLossSettledCalls` (500) plain calls since
+its start (a loss its warm-up caused is confirmed within about 3 s) and its last 100 plain calls averaged
+`kCaptureLossShareUs` (2 ms) or more. While the control side holds the slot it decides nothing and the
+next frame asks again. `RootNsFallback` turns WebRTC NS on at once for 4 as for 2 and 3.
+
+Proto `RootAudioStats` (all optional): 178 `capture_lost_busy_us`, 179 `capture_busy_loss_events`, 180
+`capture_lost_coupled_us` (cumulative), 181 `capture_busy_max_us`, 182 `capture_idle_max_us` (reset on
+read), 183 `denoiser_capture_loss_bypasses` (cumulative, capability DENOISER); `denoiser_bypass_reason`
+documents 4. livekit `RootAudioStats` carries them (the bypass count with the denoiser).
+
+Tests (`cargo test -p webrtc-sys --lib --release`, 422 pass): `adm_proxy_capture_loss_counts_no_latency_step_under_8_ms`
+(7 ms steps, twice: nothing; 12 ms: one loss), `adm_proxy_capture_loss_puts_what_our_processing_caused_on_busy`
+(a 45 ms callback over a 20 ms buffer: 20 ms, all busy, the counter bumped once; 12 ms callbacks for 4 s:
+every loss busy), `adm_proxy_capture_loss_puts_a_device_gap_outside_our_processing_and_sees_playout_stall_with_it`
+(a 0.3 s device gap: outside, idle max over 300 ms; coupled with a 310 ms render gap; not without render),
+`root_denoiser_a_capture_loss_bypasses_a_settled_pipeline_that_takes_a_share_of_the_frame` (3 ms calls: not
+at 499 plain calls, bypassed at 500 and counted once; a light pipeline never; a held slot decides nothing),
+`root_capture_processor_bypasses_a_denoiser_that_runs_when_capture_loses_audio_to_our_processing` (too early,
+judged once, passed over while not wanted or missed, then bypassed); the earlier capture loss tests
+unchanged. livekit `root_audio_stats_say_where_capture_loss_came_from_and_count_its_bypasses_with_a_slot`
+(11 pass), livekit-ffi `rootapp_audio_capture_loss_attribution_and_its_bypasses_convert` (43 pass).
+
+Not verified: a live call, macOS and Linux builds (portable C++ and Rust, no new files or dependencies),
+and the 50 ms coupling threshold against real render stalls.
+
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
 | Commit | Change |
