@@ -3220,6 +3220,14 @@ unchanged. livekit `root_audio_stats_say_where_capture_loss_came_from_and_count_
 Not verified: a live call, macOS and Linux builds (portable C++ and Rust, no new files or dependencies),
 and the 50 ms coupling threshold against real render stalls.
 
+## v0.13.1-hw.5 (2026-11-04)
+
+v0.13.1-hw.4 with the capture loss meter's 8 ms minimum, its busy/outside/coupled attribution and the
+denoiser bypass for lost capture audio (bypass reason 4; see "Where capture loss comes from"). Caps
+32767. Proto: `RootAudioStats` `capture_lost_busy_us` (178), `capture_busy_loss_events` (179),
+`capture_lost_coupled_us` (180), `capture_busy_max_us` (181), `capture_idle_max_us` (182),
+`denoiser_capture_loss_bypasses` (183).
+
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
 | Commit | Change |
