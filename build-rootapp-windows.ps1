@@ -243,12 +243,12 @@ foreach ($target in $Targets) {
     }
     try {
         if ($CompileOnly) {
-            cargo rustc --release -p livekit-ffi --target $target --crate-type staticlib
+            cargo rustc --release -p livekit-ffi --target $target --no-default-features --features native-tls --crate-type staticlib
             if ($LASTEXITCODE -ne 0) { throw "cargo rustc failed for $target" }
             Write-Host "compiled -> target\$target\release\livekit_ffi.lib (not linked)"
             continue
         }
-        cargo build --release -p livekit-ffi --target $target
+        cargo build --release -p livekit-ffi --target $target --no-default-features --features native-tls
         if ($LASTEXITCODE -ne 0) { throw "cargo build failed for $target" }
     }
     finally {

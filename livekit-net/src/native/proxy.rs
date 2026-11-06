@@ -196,9 +196,24 @@ pub(super) async fn connect_ws(
                     MaybeTlsStream::Rustls(tls_stream)
                 }
 
-                #[cfg(not(feature = "rustls-tls-native-roots"))]
+                // native-tls builds (RootApp's Windows libraries) wrap the tunnel with the
+                // platform's TLS and certificate checks
+                #[cfg(all(feature = "native-tls", not(feature = "rustls-tls-native-roots")))]
                 {
-                    // For non-rustls-tls-native-roots builds, don't support proxy for WSS
+                    let (ws_stream, _) = tokio_tungstenite::client_async_tls_with_config(
+                        request,
+                        proxy_stream,
+                        None,
+                        None,
+                    )
+                    .await
+                    .map_err(map_ws_err)?;
+                    return Ok(ws_stream);
+                }
+
+                #[cfg(not(any(feature = "native-tls", feature = "rustls-tls-native-roots")))]
+                {
+                    // Builds without a TLS backend for the tunnel don't support proxy for WSS
                     return Err(TransportError::Connection(
                         "WSS over proxy requires rustls-tls-native-roots feature".into(),
                     ));

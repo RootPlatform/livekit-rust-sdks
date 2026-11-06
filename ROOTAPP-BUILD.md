@@ -257,6 +257,14 @@ Both targets link the CRT statically (`+crt-static` in `.cargo/config.toml`) and
 therefore loads on Windows N/KN without the Media Feature Pack and falls back to software codecs
 there.
 
+Both targets build with `--no-default-features --features native-tls`, so the signal connection and
+the HTTP calls use SChannel and Windows' own certificate chain checks, the same as Chromium. The
+default `rustls-tls-native-roots` only trusts the roots already in the machine's ROOT store when the
+library starts. Windows fetches missing roots on demand, so on some Windows 10 PCs the store lacked
+the root of the call server's chain: every join failed with `invalid peer certificate:
+UnknownIssuer` while browser calls connected (desktop 0.9.161, ROOT-DESKTOP-3S0). `wss` through an
+`HTTPS_PROXY` uses SChannel too.
+
 ### libyuv SIMD on win-x64
 
 libyuv only compiles its x86 SSSE3/AVX2 row functions for GCC-style compilers, so a
