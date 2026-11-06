@@ -3236,6 +3236,12 @@ denoiser bypass for lost capture audio (bypass reason 4; see "Where capture loss
 `capture_lost_coupled_us` (180), `capture_busy_max_us` (181), `capture_idle_max_us` (182),
 `denoiser_capture_loss_bypasses` (183).
 
+## v0.13.1-hw.6 (2026-11-05)
+
+v0.13.1-hw.5 with Windows TLS through SChannel: both Windows targets build livekit-ffi with
+`--no-default-features --features native-tls`, and `wss` through `HTTPS_PROXY` works on native-tls
+builds (see "Windows"). macOS and Linux unchanged. Caps 32767. Proto unchanged.
+
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
 | Commit | Change |
