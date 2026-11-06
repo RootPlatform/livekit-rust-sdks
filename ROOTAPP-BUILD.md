@@ -970,14 +970,17 @@ Limits and what is not verified:
 - The golden vectors match bit for bit on Windows x64; other math libraries may need
   `ROOTAPP_DSP_GOLDEN_LOOSE=1`.
 
-Known limit (libwebrtc prebuilt): `external_audio_source.patch` as built into the pinned prebuilt
-never clears `sending_` in `Stop()`, and `StoreEncoderProperties` still registers a sending external
-stream with AudioState when its send codec changes (format, payload type or RED). That stream would
-then get the mic's audio, and after unpublish AudioState would keep a pointer to the deleted
-stream. The patch in this repo fixes both, but only a libwebrtc built from it has the fix. Until
-then: a published audio track's codec options (RED, DTX, stereo) never change in place (they are
-fixed at publish; stereo munging is keyed to the track id in every offer), and `RtpSender` refuses
-`set_track` and inactive encodings on audio senders (unpublish and republish instead).
+Known limit (libwebrtc prebuilt, up to v0.13.1-hw.6): `external_audio_source.patch` as built into
+`webrtc-89d790b` never clears `sending_` in `Stop()`, and `StoreEncoderProperties` still registers a
+sending external stream with AudioState when its send codec changes (format, payload type or RED).
+That stream would then get the mic's audio, and after unpublish AudioState would keep a pointer to
+the deleted stream. The patch in this repo fixes both, but only a libwebrtc built from it has the
+fix. Until then: a published audio track's codec options (RED, DTX, stereo) never change in place
+(they are fixed at publish; stereo munging is keyed to the track id in every offer), and `RtpSender`
+refuses `set_track` and inactive encodings on audio senders (unpublish and republish instead).
+`webrtc-a545de4` (v0.13.4-hw.7 on) is the first prebuilt built from the fixed patch (see "Upstream
+main at livekit-ffi v0.13.4"). Both workarounds, and the send codec pin below, stay until a live
+test without them shows they are no longer needed.
 
 The server's answers change codecs too: LiveKit 1.13.7 with a single peer connection answers a new
 stereo screen-audio section `minptime=10;stereo=1;useinbandfec=1` and every later negotiation (the
@@ -3241,6 +3244,100 @@ denoiser bypass for lost capture audio (bypass reason 4; see "Where capture loss
 v0.13.1-hw.5 with Windows TLS through SChannel: both Windows targets build livekit-ffi with
 `--no-default-features --features native-tls`, and `wss` through `HTTPS_PROXY` works on native-tls
 builds (see "Windows"). macOS and Linux unchanged. Caps 32767. Proto unchanged.
+
+## Upstream main at livekit-ffi v0.13.4 (`rootapp/upstream-0.13.4`)
+
+v0.13.1-hw.6 merged with upstream `main` at ab3711a7: the 35 commits after `livekit-ffi/v0.13.1`,
+through `livekit-ffi/v0.13.4`. A merge again, not a rebase. The FFI version is now 0.13.4; release
+tags for this line are `rootapp-ffi/v0.13.4-hw.<n>`, starting at hw.7.
+
+**libwebrtc `webrtc-89d790b` -> `webrtc-a545de4`** (#1562). a545de4 is webrtc-sdk `m150_release`
+with a refreshed `ssl_roots.h` that drops `AAA Certificate Services`, the root that cross-signs the
+eMudhra intermediates whose keys leaked on 2026-10-20. TURN/TLS checks certificates against those
+compiled-in roots and falls back to the OS store when they find no path. a545de4 also has frame
+cryptor `key_size` (default 128, as before), `AddTransceiver` returning `INVALID_STATE` on a
+closed PeerConnection, and Apple and Android changes. Its upstream tag is rust-sdks 524123ee, so it
+is the first prebuilt built with #1491's `external_audio_source.patch` (the "Known limit" in
+"Native call audio") and #1534's prefixed ffmpeg symbols on Linux; #1494 makes a WebRTC build fail
+when a patch does not apply. `webrtc-sys/libwebrtc` on this branch is identical to 524123ee's.
+The win-x64 prebuilt's `webrtc.ninja` defines and `args.gn` are unchanged. Its headers differ only in
+`frame_crypto_transformer.h` (`key_size`), `ssl_certificate.h` (a virtual `VerifyChain(chain,
+hostname)` overload), `audio_engine_device.h` (the AVAudioEngine ADM, which the fork does not use),
+`peer_connection_interface.h` (a comment), `ssl_roots.h` and ObjC/Android headers. webrtc-sys
+subclasses none of those classes, and `frame_cryptor.cpp` default-constructs `KeyProviderOptions`.
+The m150 notes above (`AudioDeviceMac`'s listeners, `AudioDeviceWindowsCore`'s formats, the
+prerenderer) still describe a545de4.
+
+What the fork takes from upstream:
+
+- **Reconnect backoff** (#1457): after the n-th failed attempt the engine waits `min(7 s, 300 ms x
+  n^2)` plus up to 1 s of jitter, so ten attempts take at least about 44 s instead of 13 s or less
+  (full jitter), and no new attempt starts after 60 s. The room stays `Reconnecting` that long before
+  it reports `Disconnected`.
+- **Signaling teardown** (#1568, #1589): a requested close or restart no longer emits a spurious
+  `SignalEvent::Close`; a join or reconnect response that fails or times out closes its WebSocket;
+  each `RtcSession` gets its own cancellation token, cancelled in `close` after the `Leave`, so a
+  resume racing the close stops and closes the transport it opened.
+- **Publisher senders detached before close** (#1570): `SessionInner::close` removes every
+  publisher sender before closing the PeerConnection, so a server-ended session no longer leaves the
+  local tracks (and their native sources) attached to dead senders. `RtpSender::track()` returns
+  `None` for a detached sender instead of dereferencing null. The fork's `remove_track` also drops the
+  track from the start-bitrate preferences.
+- **Transcriptions** (#1600): a received transcription with an invalid track sid is dropped. Before,
+  `unwrap()` panicked, and with `panic = "abort"` any participant could end every native client in
+  the call with one crafted packet.
+- **Single PC offers** (#1610): `OfferOptions::offer_to_receive_*` are `Option<bool>`, and single PC
+  offers leave them unset, so receive-only transceivers stay `recvonly` without SDP munging. The
+  `inactive -> recvonly` munge is gone. It also rewrote released send sections ("Unpublish and the
+  publisher SDP"); those now stay `inactive` in every later offer, which LiveKit server sees for the
+  first time.
+- **Negotiated data channels** (#1527): the client advertises protocol 18 (was 17). In single PC
+  mode the early publisher PeerConnection creates `_reliable`, `_lossy` and `_data_track` as
+  negotiated channels with SCTP ids 100-102. When the server's `ServerInfo.protocol` is below 18 the
+  engine closes them and opens in-band channels on the same SCTP section. The desktop leaves
+  `single_peer_connection` at its default (true), so every Root call takes one of the two paths.
+- **Linux encoders**: NVENC and Jetson no longer return an error for a frame they already delivered
+  (#1551). The simulcast adapter popped that frame's RTP timestamp twice, and the empty-deque
+  `pop_back` aborted the process when dynacast paused a layer or a track was unpublished mid-encode.
+  VAAPI destroys each frame's parameter buffers after `vaEndPicture` (#1524); before, they leaked in
+  the driver, about 43 MiB per minute for one 640x480 track on Mesa.
+- **Codec selection** (#1451): pass-through codecs are advertised whether or not a real encoder
+  exists, and a raw video publish settles on a codec `VideoEncoderFactory::BackendCodecs(Auto)`
+  can produce, falling back to VP8 with a warning. Every desktop target produces H.264 (OpenH264 is
+  in every prebuilt), so the desktop's H.264 publishes are unchanged. Codec preferences still hold
+  only the requested codec, as before; when no capability matches, they now list the producible
+  codecs instead of nothing.
+- **Encoder wrapper** (#1607): `EncodedFrameGuardEncoder` became `VideoEncoderWrapper`, which also
+  sits in the encoded-image callback path to restore presentation timestamps, and calls `Release()`
+  from its destructor. The MF encoder delivers on the encoder queue and its `Release()` is idempotent
+  and stops the drain task first, so neither change reaches it.
+- **FFI proto**: `capture.proto` replaces `CaptureSourceEvent` (event 48, now reserved) with
+  `JoinCaptureRequest` (92) / `JoinCaptureCallback` (event 49) and adds `CaptureErrorKind`;
+  `RoomDataStreamOptions.use_legacy_client_implementation` is deprecated and ignored (#1575). The
+  data stream changes (#1558) are in the core-modules (UniFFI) surface; the room-apis data stream
+  messages are unchanged.
+- **Dependencies**: rustls 0.23.46 (#1588) fixes Brotli certificate decompression, which the fork
+  does not enable (rustls has no brotli dependency in `Cargo.lock`); Windows builds have no rustls at
+  all. zip 9.0.5 (#1624) is a build dependency of `webrtc-sys-build`, which unpacks the prebuilt.
+
+Conflicts, all textual: the test imports in `livekit/src/room/options.rs` (both sides' helpers);
+`create_initial_offer`'s comment in `peer_transport.rs` (upstream's first sentence, without its
+`x-google-start-bitrate` paragraph, since the fork never took that munging); forward declarations
+in `peer_connection_factory.h`; includes in `video_encoder_factory.cpp`.
+
+Not taken here: the MF H.264 encoder (`ProcessEncodedFrame`) still returns
+`WEBRTC_VIDEO_CODEC_ERROR` when `OnEncodedImage` fails after delivering, the pattern #1551 removed
+from NVENC. On Windows the prebuilt uses MSVC's STL without hardening, so the adapter's empty
+`pop_back` would be undefined behaviour rather than an abort.
+
+Checked on Windows x64: `build-rootapp-windows.ps1 -Targets x86_64-pc-windows-msvc` (the DLL has
+`download_ffi.sh`'s probe strings and no rustls), and `cargo test --lib --release` for webrtc-sys
+(422 pass, 4 ignored), libwebrtc (42), livekit (123) and livekit-ffi (100, 1 ignored). Not checked
+here: win-arm64, macOS and Linux builds, the e2e tests against a LiveKit server, and a live call:
+single PC joins with protocol 18 (negotiated or in-band data channels, which carry the desktop's
+speaking state), released send sections offered `inactive`, the reconnect schedule against the
+desktop's network hold, screen audio with the send codec pin on a545de4, TURN/TLS, and Linux NVENC
+and VAAPI.
 
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
