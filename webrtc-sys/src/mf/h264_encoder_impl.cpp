@@ -2006,11 +2006,14 @@ int32_t MFH264EncoderImpl::ProcessEncodedFrame(std::vector<uint8_t>& packet) {
   codec_info.codecSpecific.H264.packetization_mode =
       H264PacketizationMode::NonInterleaved;
 
+  // The frame has already been delivered, so a failed send (a simulcast layer
+  // paused by dynacast, a track unpublished mid-encode) is not an encode
+  // error: SimulcastEncoderAdapter would drop an RTP timestamp its callback
+  // already consumed, and Encode() would give up the frame it was submitting.
   const auto result =
       encoded_image_callback_->OnEncodedImage(encoded_image_, &codec_info);
   if (result.error != EncodedImageCallback::Result::OK) {
-    RTC_LOG(LS_ERROR) << "OnEncodedImage failed " << result.error;
-    return WEBRTC_VIDEO_CODEC_ERROR;
+    RTC_LOG(LS_WARNING) << "OnEncodedImage failed " << result.error;
   }
   return WEBRTC_VIDEO_CODEC_OK;
 }

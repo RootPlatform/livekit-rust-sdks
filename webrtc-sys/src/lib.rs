@@ -46,6 +46,8 @@ pub mod root_echo_model;
 mod adm_proxy_tests;
 #[cfg(all(test, target_os = "windows"))]
 mod mf_decode_watchdog_tests;
+#[cfg(all(test, target_os = "windows"))]
+mod mf_encoder_tests;
 #[cfg(all(test, not(any(target_os = "ios", target_os = "android"))))]
 mod root_echo_metrics;
 #[cfg(all(test, not(any(target_os = "ios", target_os = "android"))))]

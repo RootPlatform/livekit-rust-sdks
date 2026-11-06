@@ -234,6 +234,7 @@ fn main() {
                 .flag("/EHsc");
             if harness {
                 builder.file("src/mf/mf_decode_watchdog_harness.cpp");
+                builder.file("src/mf/mf_encoder_harness.cpp");
             }
         }
         "linux" => {

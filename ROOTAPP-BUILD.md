@@ -3325,14 +3325,25 @@ Conflicts, all textual: the test imports in `livekit/src/room/options.rs` (both 
 `x-google-start-bitrate` paragraph, since the fork never took that munging); forward declarations
 in `peer_connection_factory.h`; includes in `video_encoder_factory.cpp`.
 
-Not taken here: the MF H.264 encoder (`ProcessEncodedFrame`) still returns
-`WEBRTC_VIDEO_CODEC_ERROR` when `OnEncodedImage` fails after delivering, the pattern #1551 removed
-from NVENC. On Windows the prebuilt uses MSVC's STL without hardening, so the adapter's empty
-`pop_back` would be undefined behaviour rather than an abort.
+The MF H.264 encoder had #1551's pattern too: `ProcessEncodedFrame` returned
+`WEBRTC_VIDEO_CODEC_ERROR` when `OnEncodedImage` failed after delivering, and `Encode()` passed it
+on. It now logs a warning and returns OK, as NVENC does. A delivered frame refused before
+`ProcessInput` (an earlier frame collected while waiting for an input slot) cost the frame being
+submitted. A refused frame collected after it (sync MFTs, the soft wait without an encoder queue,
+the wait at 4 frames in flight) could be the one `Encode()` had just submitted, and the adapter then
+popped a timestamp its callback had already consumed. On Windows the prebuilt uses MSVC's STL
+without hardening, so that empty `pop_back` is undefined behaviour rather than an abort. Output
+collected by the drain task was not affected; it ignores everything but a hardware failure. Test
+(`harness`, real GPU, skips without an MF H.264 encoder): `cargo test -p webrtc-sys --lib --release
+mf_encoder` drives the real encoder without a task queue, with a sink that refuses the first 10
+frames as `RtpVideoSender` refuses a stopped layer's. Every `Encode()` returns OK or `NO_OUTPUT`,
+and the encoder keeps delivering afterwards.
 
 Checked on Windows x64: `build-rootapp-windows.ps1 -Targets x86_64-pc-windows-msvc` (the DLL has
 `download_ffi.sh`'s probe strings and no rustls), and `cargo test --lib --release` for webrtc-sys
-(422 pass, 4 ignored), libwebrtc (42), livekit (123) and livekit-ffi (100, 1 ignored). Not checked
+(423 pass with the MF test, 4 ignored), libwebrtc (42), livekit (123) and livekit-ffi (100, 1
+ignored). The MF test fails without the MF change (frames 0-9 each return `ERROR` from their own
+`Encode()`) and passes with it, on this machine's GPU. Not checked
 here: win-arm64, macOS and Linux builds, the e2e tests against a LiveKit server, and a live call:
 single PC joins with protocol 18 (negotiated or in-band data channels, which carry the desktop's
 speaking state), released send sections offered `inactive`, the reconnect schedule against the
