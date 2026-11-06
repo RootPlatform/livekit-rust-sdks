@@ -3350,6 +3350,20 @@ speaking state), released send sections offered `inactive`, the reconnect schedu
 desktop's network hold, screen audio with the send codec pin on a545de4, TURN/TLS, and Linux NVENC
 and VAAPI.
 
+## v0.13.4-hw.7 (2026-11-05)
+
+v0.13.1-hw.6 with upstream `main` through `livekit-ffi/v0.13.4` (see "Upstream main at livekit-ffi
+v0.13.4"). It brings libwebrtc `webrtc-a545de4`, which drops the roots behind the compromised eMudhra
+intermediates and is the first prebuilt built with the fixed `external_audio_source.patch`.
+Upstream also brings livekit-client's reconnect backoff, signaling teardown fixes, publisher senders
+detached before close, no abort on a transcription with an invalid track sid, protocol 18 with
+negotiated data channels in single PC mode, single PC offers without `offer_to_receive`, and the
+Linux NVENC abort and VAAPI leak fixes. The MF H.264 encoder no longer reports a refused delivered
+frame as an encode error. Caps 32767. Proto: `capture.proto`'s `JoinCaptureRequest` (92) and
+`JoinCaptureCallback` (event 49) replace `CaptureSourceEvent` (event 48, now reserved), and
+`CaptureError` gains `kind`; `RoomDataStreamOptions.use_legacy_client_implementation` is deprecated
+and ignored. Released without a live call test (see the end of the section above).
+
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
 | Commit | Change |
