@@ -105,9 +105,10 @@ Per RID, the script:
 
 1. Builds with Apple clang (`xcrun --find clang`, which overrides `CC`/`CXX`):
    `MACOSX_DEPLOYMENT_TARGET=11.0` (arm64) or `10.15` (x86_64), then
-   `cargo build --release -p livekit-ffi --target <triple>`. That means default features
-   (`rustls-tls-native-roots`) and the workspace release profile (`opt-level="z"`, LTO, one codegen
-   unit, `panic=abort`, `strip="symbols"`), the same as upstream's macOS jobs. `.cargo/config.toml`
+   `cargo build --release -p livekit-ffi --features rustls-tls-webpki-roots --target <triple>`. That
+   means the default `rustls-tls-native-roots` plus bundled roots (see "TLS roots") and the workspace
+   release profile (`opt-level="z"`, LTO, one codegen unit, `panic=abort`, `strip="symbols"`), as in
+   upstream's macOS jobs. `.cargo/config.toml`
    adds `-ObjC`. The script ignores `RUSTFLAGS`, because setting it would drop that flag.
 2. Sets the install name to `@rpath/liblivekit_ffi.dylib` and signs the dylib ad hoc, since any edit
    voids the linker signature. Upstream leaves rustc's absolute build path as the id. .NET loads the
@@ -257,13 +258,8 @@ Both targets link the CRT statically (`+crt-static` in `.cargo/config.toml`) and
 therefore loads on Windows N/KN without the Media Feature Pack and falls back to software codecs
 there.
 
-Both targets build with `--no-default-features --features native-tls`, so the signal connection and
-the HTTP calls use SChannel and Windows' own certificate chain checks, the same as Chromium. The
-default `rustls-tls-native-roots` only trusts the roots already in the machine's ROOT store when the
-library starts. Windows fetches missing roots on demand, so on some Windows 10 PCs the store lacked
-the root of the call server's chain: every join failed with `invalid peer certificate:
-UnknownIssuer` while browser calls connected (desktop 0.9.161, ROOT-DESKTOP-3S0). `wss` through an
-`HTTPS_PROXY` uses SChannel too.
+TLS is rustls with the Windows store's roots plus Mozilla's (see "TLS roots"). hw.6 and hw.7 used
+SChannel instead.
 
 ### libyuv SIMD on win-x64
 
@@ -367,6 +363,40 @@ every host acquire):
 | `LK_MF_FAULT_DECODE_AFTER_FRAMES=N` | Decoder fault after N frames. |
 | `LK_MF_FAULT_DECODE_MODE=unlisted\|renegotiate` | Decoder fault kind. The default is `DXGI_ERROR_DEVICE_REMOVED`, `unlisted` is `E_FAIL`, and `renegotiate` is `MF_E_TRANSFORM_STREAM_CHANGE`. |
 | `LK_MF_FAULT_HOST_DEVICE_REMOVED=1` | `livekit_ffi_d3d11_acquire_shared_device` reports the shared device as removed, so the host falls back to a device of its own. |
+
+## TLS roots
+
+Every build script adds `--features rustls-tls-webpki-roots` to livekit-ffi's default
+`rustls-tls-native-roots`. The signal WebSocket (tokio-tungstenite), the HTTP calls (reqwest) and
+`wss` through an `HTTPS_PROXY` (`livekit-net/src/native/proxy.rs`) then trust both:
+
+- the system's roots, read by `rustls-native-certs` when the connection's TLS settings are built: the
+  Windows ROOT store, the macOS keychain or the Linux CA bundle (`SSL_CERT_FILE` / `SSL_CERT_DIR`
+  replace them when set). Antivirus and corporate roots installed on the machine keep working;
+- Mozilla's roots, compiled in from `webpki-roots` (1.0.10 at hw.8), the way Chromium carries its own
+  root store.
+
+Why: LiveKit Cloud (`*.livekit.cloud`) serves `ZeroSSL RSA DV SSL CA 2`, issued by `Sectigo Public
+Server Authentication Root R46`, which it sends cross-signed by `USERTrust RSA Certification
+Authority`. Windows installs most roots only when CryptoAPI first needs one, so a PC whose store
+held neither failed every join with `invalid peer certificate: UnknownIssuer` while browser calls,
+on Chromium's own store, connected (desktop 0.9.161, ROOT-DESKTOP-3S0). hw.6 and hw.7 built Windows
+with `native-tls` (SChannel), which fetches a missing root, but SChannel still fails where Windows'
+automatic root update is turned off, and the desktop is retiring the browser call engine it fell
+back to.
+
+The cost: the compiled-in list only changes with a new FFI build, so a root that Mozilla removes (as
+after the eMudhra compromise) stays trusted until the next release. Update `webpki-roots` in
+`Cargo.lock` when releasing. TURN/TLS is not affected: libwebrtc checks it against its own
+`ssl_roots.h` first, then the OS store.
+
+Checked on Windows x64 with a probe that calls `livekit_net::testing::native_ws_client`, directly
+and through a local CONNECT proxy, with `SSL_CERT_FILE` holding only ISRG Root X1 and a stand-in
+local root (BadSSL's). With `rustls-tls-native-roots` alone, `wss://<project>.livekit.cloud/rtc`
+fails with `UnknownIssuer` both ways, as in 3S0. With both features it reaches the server (HTTP 401
+without a token) both ways. The local root's site still connects, and expired or untrusted chains
+are still rejected. The win-x64 DLL has rustls, the root names and the store reader
+(`CertOpenStore`), and no SChannel TLS (`InitializeSecurityContextW`).
 
 ## Handing a build to the desktop repo
 

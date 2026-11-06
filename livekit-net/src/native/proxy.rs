@@ -160,6 +160,8 @@ pub(super) async fn connect_ws(
 
                     // Load native root certificates
                     let mut root_store = rustls::RootCertStore::empty();
+                    #[cfg(feature = "rustls-tls-webpki-roots")]
+                    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
                     let cert_result = rustls_native_certs::load_native_certs();
                     if !cert_result.errors.is_empty() {
                         log::warn!(
@@ -167,7 +169,7 @@ pub(super) async fn connect_ws(
                             cert_result.errors
                         );
                     }
-                    if cert_result.certs.is_empty() {
+                    if cert_result.certs.is_empty() && root_store.is_empty() {
                         return Err(TransportError::Connection(format!(
                             "Could not load any native root certificates: {:?}",
                             cert_result.errors

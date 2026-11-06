@@ -370,7 +370,7 @@ rk_finish_checks
 
 if [ "$CHECK_ONLY" = 1 ]; then
   rk_log "plan (--check: nothing was built or installed)"
-  rk_info "cargo build --release -p livekit-ffi --target $TARGET"
+  rk_info "cargo build --release -p livekit-ffi --features rustls-tls-webpki-roots --target $TARGET"
   rk_info "  -> $DIST/$RID/native/liblivekit_ffi.so + build-info.json"
   if [ "$ZIP" = 1 ]; then rk_info "  -> $DIST/$(rk_asset "$RID") + $DIST/SHA256SUMS"; fi
   rk_info "hardware video: $HW_DESC"
@@ -382,7 +382,7 @@ fi
 mkdir -p "$DIST"
 DIST="$(cd "$DIST" && pwd)"
 
-rk_log "cargo build --release -p livekit-ffi --target $TARGET"
+rk_log "cargo build --release -p livekit-ffi --features rustls-tls-webpki-roots --target $TARGET"
 # webrtc-sys/build.rs detects CUDA and libva but does not rerun when they change, so a
 # cached build would keep the old codec set. Clean it whenever the configuration differs.
 hw_config="rid=$RID nvidia=$NVIDIA vaapi=$VAAPI cuda_home=$CUDA_HOME cxx=$CXX"
@@ -400,7 +400,7 @@ if [ -z "${BINDGEN_EXTRA_CLANG_ARGS:-}" ] && resource_dir="$("$CC" -print-resour
   export BINDGEN_EXTRA_CLANG_ARGS="-resource-dir=$resource_dir"
   rk_info "bindgen: -resource-dir=$resource_dir"
 fi
-cargo build --release -p livekit-ffi --target "$TARGET"
+cargo build --release -p livekit-ffi --features rustls-tls-webpki-roots --target "$TARGET"
 printf '%s\n' "$hw_config" > "$stamp"
 
 so="$TARGET_DIR/$TARGET/release/liblivekit_ffi.so"

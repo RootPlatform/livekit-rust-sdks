@@ -192,7 +192,7 @@ rk_finish_checks
 if [ "$CHECK_ONLY" = 1 ]; then
   rk_log "plan (--check: nothing was built)"
   for rid in $RIDS; do
-    rk_info "$rid: MACOSX_DEPLOYMENT_TARGET=$(deployment_target_of "$rid") cargo build --release -p livekit-ffi --target $(triple_of "$rid")"
+    rk_info "$rid: MACOSX_DEPLOYMENT_TARGET=$(deployment_target_of "$rid") cargo build --release -p livekit-ffi --features rustls-tls-webpki-roots --target $(triple_of "$rid")"
     rk_info "  -> $DIST/$rid/native/liblivekit_ffi.dylib (install name @rpath/liblivekit_ffi.dylib, ad-hoc signed) + build-info.json"
     if [ "$ZIP" = 1 ]; then rk_info "  -> $DIST/$(rk_asset "$rid") + $DIST/SHA256SUMS"; fi
   done
@@ -281,8 +281,8 @@ build_rid() {
   local rid="$1" triple dt src work f out
   triple="$(triple_of "$rid")"
   dt="$(deployment_target_of "$rid")"
-  rk_log "$rid: cargo build --release -p livekit-ffi --target $triple (MACOSX_DEPLOYMENT_TARGET=$dt)"
-  MACOSX_DEPLOYMENT_TARGET="$dt" cargo build --release -p livekit-ffi --target "$triple"
+  rk_log "$rid: cargo build --release -p livekit-ffi --features rustls-tls-webpki-roots --target $triple (MACOSX_DEPLOYMENT_TARGET=$dt)"
+  MACOSX_DEPLOYMENT_TARGET="$dt" cargo build --release -p livekit-ffi --features rustls-tls-webpki-roots --target "$triple"
 
   src="$TARGET_DIR/$triple/release/liblivekit_ffi.dylib"
   [ -f "$src" ] || rk_die "$src was not produced"

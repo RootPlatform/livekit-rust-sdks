@@ -3954,6 +3954,7 @@ dependencies = [
  "tokio-tungstenite",
  "uniffi",
  "url",
+ "webpki-roots 1.0.10",
 ]
 
 [[package]]
