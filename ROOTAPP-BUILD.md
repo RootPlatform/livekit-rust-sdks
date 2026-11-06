@@ -373,7 +373,7 @@ Every build script adds `--features rustls-tls-webpki-roots` to livekit-ffi's de
 - the system's roots, read by `rustls-native-certs` when the connection's TLS settings are built: the
   Windows ROOT store, the macOS keychain or the Linux CA bundle (`SSL_CERT_FILE` / `SSL_CERT_DIR`
   replace them when set). Antivirus and corporate roots installed on the machine keep working;
-- Mozilla's roots, compiled in from `webpki-roots` (1.0.10 at hw.8), the way Chromium carries its own
+- Mozilla's roots, compiled in from `webpki-roots` (1.0.11 at hw.8), the way Chromium carries its own
   root store.
 
 Why: LiveKit Cloud (`*.livekit.cloud`) serves `ZeroSSL RSA DV SSL CA 2`, issued by `Sectigo Public
