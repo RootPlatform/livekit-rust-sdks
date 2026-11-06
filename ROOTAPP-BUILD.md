@@ -3394,6 +3394,13 @@ frame as an encode error. Caps 32767. Proto: `capture.proto`'s `JoinCaptureReque
 `CaptureError` gains `kind`; `RoomDataStreamOptions.use_legacy_client_implementation` is deprecated
 and ignored. Released without a live call test (see the end of the section above).
 
+## v0.13.4-hw.8 (2026-11-06)
+
+v0.13.4-hw.7 with bundled TLS roots on every platform (see "TLS roots"). Windows is back on rustls,
+now trusting Mozilla's roots next to the Windows store's, so the call server's chain verifies
+whether or not Windows has installed its root. macOS and Linux get the same list. Caps 32767. Proto
+unchanged.
+
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
 | Commit | Change |
