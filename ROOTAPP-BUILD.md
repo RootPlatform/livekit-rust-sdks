@@ -3401,6 +3401,29 @@ now trusting Mozilla's roots next to the Windows store's, so the call server's c
 whether or not Windows has installed its root. macOS and Linux get the same list. Caps 32767. Proto
 unchanged.
 
+## v0.13.4-hw.9 (2026-11-07)
+
+v0.13.4-hw.8 plus two crash fixes (`rootapp/codec-exceptions`). Caps 32767. Proto unchanged.
+
+- NVDEC (Linux): NVIDIA's sample `NvDecoder` reports every cuvid and CUDA failure by throwing,
+  including from the parser callbacks that run inside libnvcuvid, and nothing caught it, so
+  `std::terminate` aborted the app as soon as a remote H.264 camera or share reached a machine with
+  a usable NVIDIA GPU (desktop Sentry ROOT-DESKTOP-3JX, symbol-less SIGABRT). The callbacks now keep
+  the first exception and fail, `NvDecoder::Decode` rethrows it after `cuvidParseVideoData` returns,
+  and the H.264 and H.265 decoders catch it in `Configure` and `Decode`. H.264 then returns
+  `WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE`, so `VideoDecoderFactory::WithSoftwareFallback` moves the
+  stream to FFmpeg; H.265 has no software decoder and returns an error.
+- NVDEC: each packet is parsed once, flagged `CUVID_PKT_ENDOFPICTURE`, so the picture comes out in
+  the same call. The old loop fed the same packet again until a frame came out, which duplicated
+  pictures and could spin forever on a packet that never produces one. A packet with no picture
+  returns `WEBRTC_VIDEO_CODEC_OK` without a frame.
+- NVENC needed nothing: construction, `CreateEncoder`, `EncodeFrame` and `SetRates` already catch
+  `NVENCException`, and teardown makes no throwing calls.
+- livekit-ffi: when the client never sends `ReadyForRoomEventRequest` (15 s), the room is closed and
+  its handle dropped as before, but no Panic event follows. The desktop binding answered that event
+  with `Environment.Exit` (ROOT-DESKTOP-3NB); a late ready request now fails as an invalid handle.
+- `LK_DISABLE_NVDEC` (upstream) still turns NVDEC off; it was the workaround on hw.8 and earlier.
+
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
 | Commit | Change |
