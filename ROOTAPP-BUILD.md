@@ -492,8 +492,8 @@ Measured on run 42347317979:
 
 | RID | Debug file (zipped) | Line tables |
 |---|---|---|
-| win-x64 | PDB 80 MB (20 MB) | 740 of 3,201 modules: Rust, and 87 webrtc-sys objects (`mf_*`, D3D11, H.264) |
-| win-arm64 | PDB 76 MB (18 MB) | 661 of 3,012 modules |
+| win-x64 | PDB 80 MB (20 MB) | 740 of 3,201 modules: Rust, and all 86 webrtc-sys C++ objects (`mf_*`, D3D11, H.264) |
+| win-arm64 | PDB 76 MB (18 MB) | 661 of 3,012 modules, the 86 webrtc-sys objects among them |
 | linux-x64 | `.debug` 27 MB (15 MB) | 247 Rust and 145 C/C++ units, 96 of them webrtc-sys `src/` (NVIDIA, VAAPI) |
 | linux-arm64 | `.debug` 28 MB (14 MB) | 224 Rust and 128 C/C++ units, 73 webrtc-sys |
 | osx-arm64 | dSYM 250 MB (65 MB) | 170 Rust and 2,104 C/C++/ObjC units, 2,027 of them libwebrtc |
