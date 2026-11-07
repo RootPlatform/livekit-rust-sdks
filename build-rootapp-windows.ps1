@@ -212,25 +212,31 @@ function Write-PdbReport([string]$Pdb) {
     $obj = $null
     $modules = 0
     $withLines = 0
-    $rlibObjects = 0
+    $own = 0
     $webrtcSys = @()
+    $bundled = 0
+    $bundledWithLines = 0
     foreach ($line in (& $pdbutil dump --modules $Pdb 2>$null)) {
         if ($line -match 'Mod \d+ \| `(.*)`:') { $module = $Matches[1]; $obj = $null; $modules++; continue }
         if ($line -match 'Obj: `(.*)`:') { $obj = $Matches[1]; continue }
         if ($module -and $line -match '# files: (\d+)') {
-            $inRlib = $obj -match 'webrtc[-_]sys'
-            if ($inRlib) { $rlibObjects++ }
-            if ([int]$Matches[1] -gt 0) {
-                $withLines++
-                if ($inRlib) { $webrtcSys += Split-Path $module -Leaf }
+            $files = [int]$Matches[1]
+            if ($files -gt 0) { $withLines++ }
+            # webrtc-sys's own objects keep their build\webrtc-sys-<hash>\out path as the module
+            # name; libwebrtc's come from webrtc.lib, which rustc bundles into the same rlib.
+            if ($module -match '[\\/]webrtc-sys-[0-9a-f]+[\\/]out[\\/]') {
+                $own++
+                if ($files -gt 0) { $webrtcSys += Split-Path $module -Leaf }
+            }
+            elseif ($obj -match 'webrtc[-_]sys') {
+                $bundled++
+                if ($files -gt 0) { $bundledWithLines++ }
             }
             $module = $null
         }
     }
     $examples = ($webrtcSys | Where-Object { $_ -match 'mf_|d3d11|h264' } | Select-Object -First 3) -join ', '
-    # rustc bundles webrtc-sys's own objects and libwebrtc's webrtc.lib into the webrtc_sys rlib; only
-    # webrtc-sys's (and its cxx bridges') have line tables.
-    Write-Host "PDB modules: $modules, $withLines with line tables. webrtc_sys rlib: $rlibObjects objects, $($webrtcSys.Count) with line tables (webrtc-sys's C++, e.g. $examples; libwebrtc's have none)"
+    Write-Host "PDB modules: $modules, $withLines with line tables. webrtc-sys C++: $own objects, $($webrtcSys.Count) with line tables (e.g. $examples). Other objects in the webrtc_sys rlib (libwebrtc): $bundled, $bundledWithLines with line tables"
 }
 
 function Write-BuildInfo([string]$Dest, [string]$Rid, [string]$Target, [string]$DebugFile, [string]$DebugId) {
