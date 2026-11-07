@@ -63,9 +63,15 @@ bool NvidiaH265DecoderImpl::Configure(const Settings& settings) {
   int maxWidth = 4096;
   int maxHeight = 4096;
 
-  decoder_ = std::make_unique<NvDecoder>(
-      cu_context_, false, cudaVideoCodec_HEVC, true, false, nullptr, nullptr,
-      false, maxWidth, maxHeight);
+  try {
+    decoder_ = std::make_unique<NvDecoder>(
+        cu_context_, false, cudaVideoCodec_HEVC, true, false, nullptr, nullptr,
+        false, maxWidth, maxHeight);
+  } catch (const std::exception& e) {
+    RTC_LOG(LS_ERROR) << "NVDEC H265 initialization failed: " << e.what();
+    decoder_.reset();
+    return false;
+  }
   return true;
 }
 
@@ -102,14 +108,24 @@ int32_t NvidiaH265DecoderImpl::Decode(const EncodedImage& input_image,
     return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
   }
 
+  if (!decoder_) {
+    return WEBRTC_VIDEO_CODEC_UNINITIALIZED;
+  }
+
   int nFrameReturned = 0;
-  do {
+  try {
     nFrameReturned = decoder_->Decode(
         input_image.data(), static_cast<int>(input_image.size()),
-        CUVID_PKT_TIMESTAMP, input_image.RtpTimestamp());
-  } while (nFrameReturned == 0);
+        CUVID_PKT_ENDOFPICTURE, input_image.RtpTimestamp());
+  } catch (const std::exception& e) {
+    RTC_LOG(LS_ERROR) << "NVDEC H265 decode failed: " << e.what();
+    return WEBRTC_VIDEO_CODEC_ERROR;
+  }
 
   is_configured_decoder_ = true;
+  if (nFrameReturned == 0) {
+    return WEBRTC_VIDEO_CODEC_OK;
+  }
 
   if (decoder_->GetOutputFormat() != cudaVideoSurfaceFormat_NV12) {
     RTC_LOG(LS_ERROR) << "not supported output format: "

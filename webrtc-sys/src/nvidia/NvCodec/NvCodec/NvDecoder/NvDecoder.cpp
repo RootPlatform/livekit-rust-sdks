@@ -798,7 +798,15 @@ int NvDecoder::Decode(const uint8_t *pData, int nSize, int nFlags, int64_t nTime
     if (!pData || nSize == 0) {
         packet.flags |= CUVID_PKT_ENDOFSTREAM;
     }
-    NVDEC_API_CALL(cuvidParseVideoData(m_hParser, &packet));
+    m_callbackException = nullptr;
+    CUresult parseResult = cuvidParseVideoData(m_hParser, &packet);
+    if (m_callbackException)
+    {
+        std::exception_ptr callbackException = m_callbackException;
+        m_callbackException = nullptr;
+        std::rethrow_exception(callbackException);
+    }
+    NVDEC_API_CALL(parseResult);
 
     return m_nDecodedFrame;
 }

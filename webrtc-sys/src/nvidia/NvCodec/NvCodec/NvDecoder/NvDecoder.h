@@ -13,6 +13,7 @@
 
 #include <assert.h>
 #include <stdint.h>
+#include <exception>
 #include <mutex>
 #include <vector>
 #include <string>
@@ -252,17 +253,37 @@ private:
     /**
     *   @brief  Callback function to be registered for getting a callback when decoding of sequence starts
     */
-    static int CUDAAPI HandleVideoSequenceProc(void *pUserData, CUVIDEOFORMAT *pVideoFormat) { return ((NvDecoder *)pUserData)->HandleVideoSequence(pVideoFormat); }
+    // The parser calls these from inside libnvcuvid, so an exception must not unwind through it: keep the first one and fail the callback, and Decode() rethrows it.
+    template <typename Fn>
+    static int GuardCallback(void *pUserData, Fn fn)
+    {
+        NvDecoder *decoder = (NvDecoder *)pUserData;
+        if (decoder->m_callbackException)
+        {
+            return 0;
+        }
+        try
+        {
+            return fn(decoder);
+        }
+        catch (...)
+        {
+            decoder->m_callbackException = std::current_exception();
+            return 0;
+        }
+    }
+
+    static int CUDAAPI HandleVideoSequenceProc(void *pUserData, CUVIDEOFORMAT *pVideoFormat) { return GuardCallback(pUserData, [&](NvDecoder *d) { return d->HandleVideoSequence(pVideoFormat); }); }
 
     /**
     *   @brief  Callback function to be registered for getting a callback when a decoded frame is ready to be decoded
     */
-    static int CUDAAPI HandlePictureDecodeProc(void *pUserData, CUVIDPICPARAMS *pPicParams) { return ((NvDecoder *)pUserData)->HandlePictureDecode(pPicParams); }
+    static int CUDAAPI HandlePictureDecodeProc(void *pUserData, CUVIDPICPARAMS *pPicParams) { return GuardCallback(pUserData, [&](NvDecoder *d) { return d->HandlePictureDecode(pPicParams); }); }
 
     /**
     *   @brief  Callback function to be registered for getting a callback when a decoded frame is available for display
     */
-    static int CUDAAPI HandlePictureDisplayProc(void *pUserData, CUVIDPARSERDISPINFO *pDispInfo) { return ((NvDecoder *)pUserData)->HandlePictureDisplay(pDispInfo); }
+    static int CUDAAPI HandlePictureDisplayProc(void *pUserData, CUVIDPARSERDISPINFO *pDispInfo) { return GuardCallback(pUserData, [&](NvDecoder *d) { return d->HandlePictureDisplay(pDispInfo); }); }
 
     /**
     *   @brief  Callback function to be registered for getting a callback to get operating point when AV1 SVC sequence header start.
@@ -272,7 +293,7 @@ private:
     /**
     *   @brief  Callback function to be registered for getting a callback when all the unregistered user SEI Messages are parsed for a frame.
     */
-    static int CUDAAPI HandleSEIMessagesProc(void *pUserData, CUVIDSEIMESSAGEINFO *pSEIMessageInfo) { return ((NvDecoder *)pUserData)->GetSEIMessage(pSEIMessageInfo); } 
+    static int CUDAAPI HandleSEIMessagesProc(void *pUserData, CUVIDSEIMESSAGEINFO *pSEIMessageInfo) { return GuardCallback(pUserData, [&](NvDecoder *d) { return d->GetSEIMessage(pSEIMessageInfo); }); }
 
     /**
     *   @brief  This function gets called when a sequence is ready to be decoded. The function also gets called
@@ -331,6 +352,7 @@ private:
     // timestamps of decoded frames
     std::vector<int64_t> m_vTimestamp;
     int m_nDecodedFrame = 0, m_nDecodedFrameReturned = 0;
+    std::exception_ptr m_callbackException;
     int m_nDecodePicCnt = 0, m_nPicNumInDecodeOrder[MAX_FRM_CNT];
     CUVIDSEIMESSAGEINFO *m_pCurrSEIMessage = NULL;
     CUVIDSEIMESSAGEINFO m_SEIMessagesDisplayOrder[MAX_FRM_CNT];

@@ -70,9 +70,15 @@ bool NvidiaH264DecoderImpl::Configure(const Settings& settings) {
   int maxHeight = 4096;
 
   // bUseDeviceFrame: allocate in memory or cuda device memory
-  decoder_ = std::make_unique<NvDecoder>(
-      cu_context_, false, cudaVideoCodec_H264, true, false, nullptr, nullptr,
-      false, maxWidth, maxHeight);
+  try {
+    decoder_ = std::make_unique<NvDecoder>(
+        cu_context_, false, cudaVideoCodec_H264, true, false, nullptr, nullptr,
+        false, maxWidth, maxHeight);
+  } catch (const std::exception& e) {
+    RTC_LOG(LS_ERROR) << "NVDEC H264 initialization failed: " << e.what();
+    decoder_.reset();
+    return false;
+  }
   return true;
 }
 
@@ -108,27 +114,37 @@ int32_t NvidiaH264DecoderImpl::Decode(const EncodedImage& input_image,
     RTC_LOG(LS_ERROR) << "decode failed on input image is null";
     return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
   }
+  if (!decoder_) {
+    return WEBRTC_VIDEO_CODEC_UNINITIALIZED;
+  }
 
   h264_bitstream_parser_.ParseBitstream(input_image);
   std::optional<int> qp = h264_bitstream_parser_.GetLastSliceQp();
   std::optional<SpsParser::SpsState> sps = h264_bitstream_parser_.sps();
 
-  if (is_configured_decoder_) {
-    if (!sps ||
-        sps.value().width != static_cast<uint32_t>(decoder_->GetWidth()) ||
-        sps.value().height != static_cast<uint32_t>(decoder_->GetHeight())) {
-      decoder_->setReconfigParams(nullptr, nullptr);
-    }
-  }
-
   int nFrameReturnd = 0;
-  do {
+  try {
+    if (is_configured_decoder_) {
+      if (!sps ||
+          sps.value().width != static_cast<uint32_t>(decoder_->GetWidth()) ||
+          sps.value().height != static_cast<uint32_t>(decoder_->GetHeight())) {
+        decoder_->setReconfigParams(nullptr, nullptr);
+      }
+    }
+
     nFrameReturnd = decoder_->Decode(
         input_image.data(), static_cast<int>(input_image.size()),
-        CUVID_PKT_TIMESTAMP, input_image.RtpTimestamp());
-  } while (nFrameReturnd == 0);
+        CUVID_PKT_ENDOFPICTURE, input_image.RtpTimestamp());
+  } catch (const std::exception& e) {
+    RTC_LOG(LS_ERROR) << "NVDEC H264 decode failed, falling back to software: "
+                      << e.what();
+    return WEBRTC_VIDEO_CODEC_FALLBACK_SOFTWARE;
+  }
 
   is_configured_decoder_ = true;
+  if (nFrameReturnd == 0) {
+    return WEBRTC_VIDEO_CODEC_OK;
+  }
 
   // todo: support other output format
   // Chromium's H264 Encoder is output on NV12, so currently only NV12 is

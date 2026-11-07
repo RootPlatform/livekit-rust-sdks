@@ -278,7 +278,6 @@ impl FfiRoom {
                         drop(handle);
                         ffi_room.close(server, DisconnectReason::ConnectionTimeout).await;
                         server.drop_handle(handle_id);
-                        server.send_panic(Box::new(FfiError::InvalidRequest(msg.into())));
                         return;
                     }
 
