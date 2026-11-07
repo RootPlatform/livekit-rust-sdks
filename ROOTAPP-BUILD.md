@@ -26,9 +26,14 @@ All three scripts write the same layout (default `rootapp-dist/` in the repo roo
 rootapp-dist/
   <rid>/native/<library>          the library the desktop installs
   <rid>/native/build-info.json    provenance, informational
+  <rid>/debug/<debug file>        livekit_ffi.pdb, liblivekit_ffi.so.debug or liblivekit_ffi.dylib.dSYM
   ffi-<os>-<arch>.zip             only with --zip (-Zip on Windows)
-  SHA256SUMS                      "<sha256>  <asset>" for every zip written so far
+  SHA256SUMS                      "<sha256>  <asset>" for every ffi zip written so far
+  symbols-<os>-<arch>.zip         the debug file, only with --zip (-Zip)
+  SHA256SUMS-symbols              "<sha256>  <asset>" for every symbols zip written so far
 ```
+
+See [Debug files and Sentry](#debug-files-and-sentry) for the debug files.
 
 The zips use upstream's release asset names and layout (`.github/workflows/ffi-builds.yml`):
 `ffi-windows-x86_64.zip`, `ffi-windows-arm64.zip`, `ffi-macos-x86_64.zip`, `ffi-macos-arm64.zip`,
@@ -48,6 +53,8 @@ The zips use upstream's release asset names and layout (`.github/workflows/ffi-b
 | `buildHost` | `uname -srm`, or the Windows version |
 | `minimumOs` | `macOS 11.0`, `glibc 2.35`, `Windows 10` |
 | `hardwareVideo` | `VideoToolbox`, `NVENC/NVDEC, VAAPI`, `MediaFoundation H.264`, `none (software codecs)` |
+| `debugFile` | `livekit_ffi.pdb`, `liblivekit_ffi.so.debug`, `liblivekit_ffi.dylib.dSYM` |
+| `debugId` | the id Sentry shows for the library's image, e.g. `c4b644e6-659a-46fa-9769-ef5c223d9924-1` |
 
 ## Getting the fork onto a Mac or Linux machine
 
@@ -108,8 +115,10 @@ Per RID, the script:
    `cargo build --release -p livekit-ffi --features rustls-tls-webpki-roots --target <triple>`. That
    means the default `rustls-tls-native-roots` plus bundled roots (see "TLS roots") and the workspace
    release profile (`opt-level="z"`, LTO, one codegen unit, `panic=abort`, `strip="symbols"`), as in
-   upstream's macOS jobs. `.cargo/config.toml`
-   adds `-ObjC`. The script ignores `RUSTFLAGS`, because setting it would drop that flag.
+   upstream's macOS jobs. Line tables and the dSYM come from target rustflags and CFLAGS given on
+   top, not from the profile (see "Debug files and Sentry").
+   `.cargo/config.toml` adds `-ObjC`. The script ignores `RUSTFLAGS`, because setting it would drop
+   that flag.
 2. Sets the install name to `@rpath/liblivekit_ffi.dylib` and signs the dylib ad hoc, since any edit
    voids the linker signature. Upstream leaves rustc's absolute build path as the id. .NET loads the
    dylib by path, so nothing depends on the id.
@@ -117,10 +126,11 @@ Per RID, the script:
    architecture, `otool -l` minos must equal the deployment target, and the id must be `@rpath/...`.
    `otool -L` must list only `/usr/lib` and `/System/Library` entries, which catches Homebrew
    libraries that slip in. The dylib must export `_livekit_ffi_initialize`, contain the desktop's
-   probe strings `livekit_ffi_initialize` and `VTDecompressionSession`, and pass
-   `codesign --verify --strict`.
-4. Installs `rootapp-dist/<rid>/native/liblivekit_ffi.dylib` and `build-info.json`, and the zip with
-   `--zip`.
+   probe strings `livekit_ffi_initialize` and `VTDecompressionSession`, pass
+   `codesign --verify --strict`, and hold no debug map (stab) entries. The dSYM must have the
+   dylib's UUID, a `__debug_line` section, and Rust and C/C++ compile units.
+4. Installs `rootapp-dist/<rid>/native/liblivekit_ffi.dylib`, `build-info.json` and
+   `rootapp-dist/<rid>/debug/liblivekit_ffi.dylib.dSYM`, and with `--zip` the two zips.
 
 The desktop's Mac publish signs the app bundle, which replaces the ad hoc signature.
 
@@ -206,6 +216,9 @@ The script fails unless the built `.so` passes all of these:
   `Invalid mix of IDR and non-IDR slices`. With NVIDIA: `NVIDIA H264 Decoder`/`Encoder`,
   `libcuda.so.1`, `libnvcuvid.so.1` and `libnvidia-encode.so.1`. With VAAPI: `VAAPI H264 Encoder`,
   `libva.so.2` and `libva-drm.so.2`.
+- The `.so` has a GNU build-id and `.gnu_debuglink`, and no `.debug_*`, `.symtab` or `.strtab` left.
+  `liblivekit_ffi.so.debug` has the same build-id, `.debug_info`, `.debug_line`, `.symtab`, and Rust
+  and C/C++ compile units (see "Debug files and Sentry").
 
 `LK_DISABLE_NVDEC` (any value) turns NVDEC off at runtime.
 
@@ -251,7 +264,11 @@ setup-protoc binary. `webrtc-sys` downloads the target's libwebrtc prebuilt on t
 .\build-rootapp-windows.ps1 -Zip                              # also write ffi-windows-*.zip and SHA256SUMS
 ```
 
-Each built DLL lands in `rootapp-dist\<rid>\native\` with a `build-info.json`.
+Each built DLL lands in `rootapp-dist\<rid>\native\` with a `build-info.json`, and its
+`livekit_ffi.pdb` in `rootapp-dist\<rid>\debug\` (`-CompileOnly` writes neither and builds without
+debug info). The script fails unless the DLL's CodeView record names `livekit_ffi.pdb` without a
+directory. With `llvm-pdbutil.exe` next to libclang (CI's LLVM has it) it also prints how many PDB
+modules have line tables.
 
 Both targets link the CRT statically (`+crt-static` in `.cargo/config.toml`) and delay-load
 `mfplat.dll` (`/DELAYLOAD:mfplat.dll` plus `delayimp.lib`, set in `livekit-ffi/build.rs`). The DLL
@@ -424,6 +441,153 @@ the hashes.
 
 A `rootapp-dist` can move between machines (USB, scp). Its layout is the same everywhere.
 
+## Debug files and Sentry
+
+Every build writes the library's debug file next to it, so a crash inside `livekit_ffi` symbolicates
+in Sentry. Through hw.9 nothing was kept, and ROOT-DESKTOP-3JX (Linux SIGABRT) and 4C5 (the AMD
+D3D11 `CopyResource` access violation) showed only `<unknown>` frames in the library.
+
+| RID | Debug file | Sentry matches it to the library by |
+|---|---|---|
+| win-x64, win-arm64 | `livekit_ffi.pdb` | the DLL's CodeView record (PDB GUID and age) |
+| osx-arm64, osx-x64 | `liblivekit_ffi.dylib.dSYM` | `LC_UUID` |
+| linux-x64, linux-arm64 | `liblivekit_ffi.so.debug` | the GNU build-id: 20 bytes on x64, 8 on arm64 (lld) |
+
+Sentry's debug id is that identifier; for ELF it is the first 16 bytes of the build-id read as a
+little-endian GUID, zero-padded. `build-info.json` records it as `debugId`, so an image in a Sentry
+event leads back to its build: `grep -l <debug id> build-info-*.json`.
+
+### How the scripts build them
+
+The cargo profile stays exactly as in `Cargo.toml` (`opt-level = "z"`, fat LTO, one codegen unit,
+`panic = "abort"`, `strip = "symbols"`, `debug = false`). Cargo hashes the profile into every
+crate's `-C metadata`, so changing any profile setting, even only `strip`, renames symbols and
+reshuffles the code: a linux-x64 build with only `strip = "none"` changed the length of 58
+functions against hw.9. Instead the scripts pass:
+
+- Rust: `--config "target.<triple>.rustflags=['-Cdebuginfo=line-tables-only', ...]"`. Cargo
+  appends these to `.cargo/config.toml`'s target flags (`-ObjC`, `-fuse-ld=lld`, `+crt-static`) and
+  leaves `-C metadata` alone. Linux and Windows add `-Cstrip=none`, macOS `-Csplit-debuginfo=packed`.
+  The win-arm64 clang-cl fallback appends them to its `CARGO_ENCODED_RUSTFLAGS` instead, which
+  would otherwise override them.
+- C and C++ compiled by cc-rs: `CFLAGS_<triple>` and `CXXFLAGS_<triple>` get `-g1 -gdwarf-4`
+  (Linux), `-g1` (macOS) or `-Z7` (Windows), after cc-rs's own flags. The profile's `DEBUG` stays
+  off, so cc-rs adds no `-g` and no `-fno-omit-frame-pointer` of its own. On win-arm64 ring compiles
+  its C and assembly with GNU-style clang, which rejects `-Z7`, so there only C++ gets it.
+
+Per platform:
+
+- Windows: rustc links with `/DEBUG` and `/PDBALTPATH:%_PDB%` whatever `strip` says (hw.9's DLLs
+  already name `livekit_ffi.pdb` in their CodeView record; that PDB stayed in
+  `target\<triple>\release\deps` and was thrown away). The script takes `deps\livekit_ffi.pdb`.
+- Linux: linked unstripped, then split with objcopy: `--only-keep-debug
+  --compress-debug-sections=zlib` for the debug file, `--strip-all --add-gnu-debuglink` for the
+  shipped `.so`, which gains a `.gnu_debuglink` section (file name and CRC32).
+- macOS: rustc runs dsymutil on the linked dylib, then strips it as before. The script takes
+  `deps/liblivekit_ffi.dylib.dSYM`.
+
+### What the debug files hold
+
+Measured on run 42347317979:
+
+| RID | Debug file (zipped) | Line tables |
+|---|---|---|
+| win-x64 | PDB 80 MB (20 MB) | 740 of 3,201 modules: Rust, and 87 webrtc-sys objects (`mf_*`, D3D11, H.264) |
+| win-arm64 | PDB 76 MB (18 MB) | 661 of 3,012 modules |
+| linux-x64 | `.debug` 27 MB (15 MB) | 247 Rust and 145 C/C++ units, 96 of them webrtc-sys `src/` (NVIDIA, VAAPI) |
+| linux-arm64 | `.debug` 28 MB (14 MB) | 224 Rust and 128 C/C++ units, 73 webrtc-sys |
+| osx-arm64 | dSYM 250 MB (65 MB) | 170 Rust and 2,104 C/C++/ObjC units, 2,027 of them libwebrtc |
+| osx-x64 | dSYM 260 MB (67 MB) | 179 Rust and 2,101 C/C++/ObjC units, 2,015 libwebrtc |
+
+- Rust: function names, files, lines and inlined frames.
+- webrtc-sys's C++ (`src/mf`, the D3D11 sharing, `src/nvidia`, VAAPI), the cxx bridges, libyuv and
+  soxr (ring too, except on win-arm64): names and lines.
+- libwebrtc, the prebuilt `webrtc-<sha>` archive. macOS: names and lines, because
+  `build_macos.sh` leaves `symbol_level` at its default. Windows and Linux are built with
+  `symbol_level=0`, so no lines. The Linux debug file carries libwebrtc's full symbol table, static
+  functions included, so its frames still get function names. A PDB has only libwebrtc's public
+  symbols, so on Windows a frame in an internal-linkage function shows the nearest public name.
+  Lines there need a libwebrtc built with `symbol_level=1` (`LK_CUSTOM_WEBRTC`).
+
+### What changes in the shipped library
+
+The zips' layout, the stripping and the optimisation settings are as before, and the symbols zips
+are not in `SHA256SUMS`; the desktop never downloads them. The library's sha256 changes anyway: the
+PDB GUID is new on every link, and the build-id and `LC_UUID` hash an output that now has debug
+info. The desktop pins whatever a release publishes, as before.
+
+The machine code is not quite bit-for-bit what the same sources give without debug info: rustc and
+LLVM make a few different inlining and outlining decisions when they emit line tables. The CI
+builds are otherwise reproducible (two runs of hw.9's sources gave identical `.so` files; runs 3
+and 4 of this branch gave identical `.so` and `.dylib` files and identical Windows `.text`), so
+the difference is measurable. Branch build vs hw.9 release, same sources, functions counted from
+`.eh_frame`, `.pdata` or `LC_FUNCTION_STARTS`:
+
+| RID | Functions | Functions whose length changed | `.text` |
+|---|---|---|---|
+| linux-x64 | 69,292 (same) | 2 | +16 bytes |
+| osx-x64 | 81,894 (same) | 0 | same size |
+| win-x64 | 43,643 (+1) | about 2 | +3,344 bytes of 23.0 MB |
+| win-arm64 | 40,881 (−4) | about 4 | +192 bytes |
+| linux-arm64 | 84,111 (+1) | about 24 | +8 bytes |
+| osx-arm64 | 87,545 (−345) | about 2,000 | +31,304 bytes of 15.6 MB (0.2%) |
+
+Everything else is the same code at shifted addresses. osx-arm64 changes most, most likely because
+the AArch64 machine outliner (on at `opt-level = "z"`) outlines less once debug info is on; that is
+an inference from the counts, not something checked. None of it changes what the code does. A
+release with debug files still gets the usual live test.
+
+### Upload to Sentry
+
+The workflow's Debug files job runs on every run. With sentry-cli 3.8.2 it checks that each library
+and its debug file have the same debug id, that the debug file has `debug` and `symtab`
+information, and that `build-info.json` has the same id. If any check fails, the release does not
+go out. For a tagged run, or a manual run with `sentry_upload` checked, it then uploads each
+library and its debug file to Sentry with `--require-all` on the expected ids. Sentry takes unwind
+information from the library and names and lines from the debug file. An upload failure only warns:
+the release still goes out, and the files can be uploaded again later from it.
+
+Settings in RootPlatform/livekit-rust-sdks, under Settings > Secrets and variables > Actions:
+
+- Secret `SENTRY_AUTH_TOKEN`: a Sentry organization token for root-jl (Sentry: Settings > Developer
+  Settings > Organization Tokens; its `org:ci` scope covers debug file uploads), or the same token
+  RootApp.Client.Desktop's publish workflows use. A GitHub organization secret shared by both
+  repositories also works. Without it the job warns and uploads nothing.
+- Optional variables `SENTRY_ORG` and `SENTRY_PROJECT`, which default to `root-jl` and `root-desktop`.
+
+To test the token without a release, run the workflow with an empty tag and `sentry_upload` checked.
+The debug files of such a run match libraries that never ship, so uploading them does no harm.
+
+The upload happens here rather than in the desktop's publish workflows because debug files belong
+to an FFI build, not to a desktop release. They are uploaded once, by the job that has them, before
+any desktop build can ship the library. Every desktop publish (Windows, Mac and Linux, staging and
+production) would otherwise download and upload the same few hundred MB again. The desktop's
+publish workflows also stay unchanged.
+
+To upload a release's files by hand (a release built before the token was set, or files Sentry
+dropped after a long time unused):
+
+```bash
+gh release download <tag> -R RootPlatform/livekit-rust-sdks -p 'ffi-*.zip' -p 'symbols-*.zip' -D ffi-debug
+sentry-cli debug-files upload --org root-jl --project root-desktop ffi-debug
+```
+
+sentry-cli looks inside the zips. Rebuilding the commit is no substitute: Windows gets a new PDB
+GUID on every link, and Linux and macOS only reproduce the same ids while the runner images and
+toolchains stay the same.
+
+Releases up to hw.9 have no debug files, so their crashes (3JX and 4C5 among them) stay
+unsymbolicated. Crashes in a release built with this change symbolicate once its files are in
+Sentry.
+
+### Local debugging
+
+- Windows (Visual Studio, WinDbg): add `rootapp-dist\<rid>\debug` to the symbol path, or put
+  `livekit_ffi.pdb` next to the DLL.
+- Linux (gdb, perf): put `liblivekit_ffi.so.debug` next to the `.so` (`.gnu_debuglink` names it), or
+  under `/usr/lib/debug/.build-id/<first two hex digits>/<rest>.debug`.
+- macOS (lldb): put the dSYM next to the dylib, or `target symbols add <dSYM>`.
+
 ## Release mode (needs Jesse's approval)
 
 Nothing here has been done. Creating the repo, pushing and tagging are Jesse's calls.
@@ -444,9 +608,11 @@ Nothing here has been done. Creating the repo, pushing and tagging are Jesse's c
    `SHA256SUMS` only lists the zips that run built. It also refuses a tag that already points to another
    commit, or a draft release that targets one, because the release would then hold binaries that don't
    match its tag.
-5. The release gets the six zips, `SHA256SUMS` and `build-info-<rid>.json`. The release job checks
-   that each zip has the library, `livekit_ffi.h` and `LICENSE.md` at its root, and that `file` reports
-   the asset's architecture. The job summary lists the lines for the desktop's checksum file.
+5. The release gets the six zips, `SHA256SUMS`, `build-info-<rid>.json`, the six `symbols-*.zip`
+   and `SHA256SUMS-symbols`. The release job checks that each zip has the library, `livekit_ffi.h` and
+   `LICENSE.md` at its root, and that `file` reports the asset's architecture. The job summary lists
+   the lines for the desktop's checksum file. The Debug files job runs before it (see "Debug files
+   and Sentry"); a debug file that does not match its library stops the release.
 6. In RootApp.Client.Desktop:
    - Add the summary's `<sha256>  rootapp/<asset>` lines to `external/LivekitRtc/ffi-checksums.sha256`.
    - In `ffi-sources.conf`, set `ROOTAPP_FFI_TAG`, `ROOTAPP_FFI_REPO=<org>/<repo>`, and
@@ -455,8 +621,9 @@ Nothing here has been done. Creating the repo, pushing and tagging are Jesse's c
      The Linux container also needs `gh`.
    - Optionally set `ROOTAPP_FFI_SOURCE: rootapp` so a missing fork asset fails the build.
 
-The workflow needs no secrets beyond `GITHUB_TOKEN`. It only creates releases from a job with
-`contents: write`, and it does nothing in a repository owned by `livekit`. Its jobs:
+A release needs no secrets beyond `GITHUB_TOKEN`. The optional `SENTRY_AUTH_TOKEN` secret only adds
+the Sentry upload. The workflow only creates releases from a job with `contents: write`, and it does
+nothing in a repository owned by `livekit`. Its jobs:
 
 | Job | Runner | How |
 |---|---|---|
@@ -464,6 +631,8 @@ The workflow needs no secrets beyond `GITHUB_TOKEN`. It only creates releases fr
 | osx-arm64, osx-x64 | `macos-latest` | `build-rootapp-macos.sh --rid <rid> --zip` |
 | linux-x64 | `ubuntu-24.04` + container `ubuntu:22.04` | installs `nvidia-cuda-dev` (picking a `libnvidia-compute` provider), then `build-rootapp-linux.sh --rid linux-x64 --zip` |
 | linux-arm64 | `ubuntu-24.04-arm` + container `ubuntu:22.04` | `build-rootapp-linux.sh --rid linux-arm64 --zip` |
+| Debug files | `ubuntu-latest` | sentry-cli 3.8.2 (sha256-pinned): checks every library against its debug file; uploads both to Sentry for a tag or `sentry_upload` |
+| Release | `ubuntu-latest` | after the Debug files job; attaches the assets to the release (tag only) |
 
 The Ubuntu 22.04 container pins the glibc floor at 2.35, the desktop's floor, whatever the runner
 image is.

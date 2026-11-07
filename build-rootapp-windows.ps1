@@ -212,26 +212,25 @@ function Write-PdbReport([string]$Pdb) {
     $obj = $null
     $modules = 0
     $withLines = 0
+    $rlibObjects = 0
     $webrtcSys = @()
-    $libwebrtc = 0
-    $libwebrtcWithLines = 0
     foreach ($line in (& $pdbutil dump --modules $Pdb 2>$null)) {
         if ($line -match 'Mod \d+ \| `(.*)`:') { $module = $Matches[1]; $obj = $null; $modules++; continue }
         if ($line -match 'Obj: `(.*)`:') { $obj = $Matches[1]; continue }
         if ($module -and $line -match '# files: (\d+)') {
-            $files = [int]$Matches[1]
-            $isLibwebrtc = $obj -match '[\\/]webrtc\.lib$'
-            if ($isLibwebrtc) { $libwebrtc++ }
-            if ($files -gt 0) {
+            $inRlib = $obj -match 'webrtc[-_]sys'
+            if ($inRlib) { $rlibObjects++ }
+            if ([int]$Matches[1] -gt 0) {
                 $withLines++
-                if ($isLibwebrtc) { $libwebrtcWithLines++ }
-                if ($obj -match 'webrtc[-_]sys') { $webrtcSys += Split-Path $module -Leaf }
+                if ($inRlib) { $webrtcSys += Split-Path $module -Leaf }
             }
             $module = $null
         }
     }
     $examples = ($webrtcSys | Where-Object { $_ -match 'mf_|d3d11|h264' } | Select-Object -First 3) -join ', '
-    Write-Host "PDB modules: $modules, $withLines with line tables; webrtc-sys objects with line tables: $($webrtcSys.Count) (e.g. $examples); libwebrtc (webrtc.lib): $libwebrtc objects, $libwebrtcWithLines with line tables"
+    # rustc bundles webrtc-sys's own objects and libwebrtc's webrtc.lib into the webrtc_sys rlib; only
+    # webrtc-sys's (and its cxx bridges') have line tables.
+    Write-Host "PDB modules: $modules, $withLines with line tables. webrtc_sys rlib: $rlibObjects objects, $($webrtcSys.Count) with line tables (webrtc-sys's C++, e.g. $examples; libwebrtc's have none)"
 }
 
 function Write-BuildInfo([string]$Dest, [string]$Rid, [string]$Target, [string]$DebugFile, [string]$DebugId) {
