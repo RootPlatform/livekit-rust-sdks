@@ -80,11 +80,29 @@ rk_elf_debug_id() {
   printf '%s-%s-%s-%s-%s\n' "${b:6:2}${b:4:2}${b:2:2}${b:0:2}" "${b:10:2}${b:8:2}" "${b:14:2}${b:12:2}" "${b:16:4}" "${b:20:12}"
 }
 
-# The release profile's debug settings for builds that write debug files. They only add line tables
-# and a separate debug file; opt-level, LTO, codegen units and panic stay as in Cargo.toml.
-rk_debug_profile_env() {
-  export CARGO_PROFILE_RELEASE_DEBUG=line-tables-only
-  rk_info "debug info: CARGO_PROFILE_RELEASE_DEBUG=line-tables-only (written to a separate debug file)"
+# Debug info goes in through target rustflags and C/C++ flags, never through the cargo profile:
+# cargo hashes profile settings into every crate's -C metadata, which renames symbols and reorders
+# the generated code even when nothing else changes. Rustflags given with --config are appended to
+# .cargo/config.toml's (-ObjC, -fuse-ld=lld, +crt-static) and leave -C metadata alone.
+#
+# rk_debug_config <triple> [rustc flag]...: the --config value for cargo build.
+rk_debug_config() {
+  local triple="$1" flags="'-Cdebuginfo=line-tables-only'" f
+  shift
+  for f in "$@"; do flags="$flags,'$f'"; done
+  printf 'target.%s.rustflags=[%s]' "$triple" "$flags"
+}
+
+# rk_debug_cflags <triple> <flags>: appends <flags> to CFLAGS_<triple> and CXXFLAGS_<triple>, which
+# cc-rs puts after its own flags. With the profile's debug off, cc-rs adds no -g (and no
+# -fno-omit-frame-pointer) itself.
+rk_debug_cflags() {
+  local t v
+  t="$(printf '%s' "$1" | tr -- '-' '_')"
+  for v in CFLAGS CXXFLAGS; do
+    eval "export ${v}_$t=\"\${${v}_$t:+\$${v}_$t }$2\""
+  done
+  rk_info "C/C++ debug info: CFLAGS_$t / CXXFLAGS_$t += $2"
 }
 
 rk_rust_version() {

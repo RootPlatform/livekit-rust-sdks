@@ -194,7 +194,7 @@ rk_finish_checks
 if [ "$CHECK_ONLY" = 1 ]; then
   rk_log "plan (--check: nothing was built)"
   for rid in $RIDS; do
-    rk_info "$rid: MACOSX_DEPLOYMENT_TARGET=$(deployment_target_of "$rid") CARGO_PROFILE_RELEASE_DEBUG=line-tables-only CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO=packed cargo build --release -p livekit-ffi --features rustls-tls-webpki-roots --target $(triple_of "$rid")"
+    rk_info "$rid: MACOSX_DEPLOYMENT_TARGET=$(deployment_target_of "$rid") cargo build --release -p livekit-ffi --features rustls-tls-webpki-roots --target $(triple_of "$rid") --config \"$(rk_debug_config "$(triple_of "$rid")" -Csplit-debuginfo=packed)\" (C/C++: -g1)"
     rk_info "  -> $DIST/$rid/native/liblivekit_ffi.dylib (install name @rpath/liblivekit_ffi.dylib, ad-hoc signed) + build-info.json"
     rk_info "  -> $DIST/$rid/debug/liblivekit_ffi.dylib.dSYM (rustc's dsymutil run)"
     if [ "$ZIP" = 1 ]; then rk_info "  -> $DIST/$(rk_asset "$rid") + $DIST/SHA256SUMS, $DIST/$(rk_symbols_asset "$rid") + $DIST/SHA256SUMS-symbols"; fi
@@ -207,12 +207,9 @@ mkdir -p "$DIST"
 DIST="$(cd "$DIST" && pwd)"
 TARGET_DIR="$(rk_target_dir)"
 
-rk_log "debug info"
-rk_debug_profile_env
-# rustc runs dsymutil on the linked dylib (before it strips it, strip = "symbols" as before), which
-# collects the line tables and the full symbol table from the object files into a .dSYM.
-export CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO=packed
-rk_info "dSYM: CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO=packed"
+# Line tables with -Csplit-debuginfo=packed: rustc runs dsymutil on the linked dylib, which collects
+# the line tables and the full symbol table from the object files into a .dSYM, and then strips the
+# dylib (strip = "symbols" as before). See rk_debug_config.
 
 verify_dylib() {
   local rid="$1" f="$2" arch dt archs minos id bad probe stabs fail=0
@@ -333,17 +330,21 @@ verify_dsym() {
 }
 
 build_rid() {
-  local rid="$1" triple dt src dsym work f out debug_id
+  local rid="$1" triple dt src dsym work f out debug_id debug_config
   triple="$(triple_of "$rid")"
   dt="$(deployment_target_of "$rid")"
-  rk_log "$rid: cargo build --release -p livekit-ffi --features rustls-tls-webpki-roots --target $triple (MACOSX_DEPLOYMENT_TARGET=$dt)"
-  MACOSX_DEPLOYMENT_TARGET="$dt" cargo build --release -p livekit-ffi --features rustls-tls-webpki-roots --target "$triple"
+  debug_config="$(rk_debug_config "$triple" -Csplit-debuginfo=packed)"
+  rk_log "$rid: cargo build --release -p livekit-ffi --features rustls-tls-webpki-roots --target $triple --config \"$debug_config\" (MACOSX_DEPLOYMENT_TARGET=$dt)"
+  rk_debug_cflags "$triple" "-g1"
+  MACOSX_DEPLOYMENT_TARGET="$dt" cargo build --release -p livekit-ffi --features rustls-tls-webpki-roots --target "$triple" --config "$debug_config"
 
   src="$TARGET_DIR/$triple/release/liblivekit_ffi.dylib"
   [ -f "$src" ] || rk_die "$src was not produced"
-  [ -d "$src.dSYM" ] || rk_die "$src.dSYM was not produced"
-  # cargo may uplift the dSYM as a symlink; use the bundle itself.
-  dsym="$(cd "$src.dSYM" && pwd -P)"
+  # rustc writes the dSYM next to the dylib it links, in deps/. The profile has no debug info, so
+  # cargo does not copy it up.
+  dsym="$TARGET_DIR/$triple/release/deps/liblivekit_ffi.dylib.dSYM"
+  [ -d "$dsym" ] || rk_die "$dsym was not produced"
+  dsym="$(cd "$dsym" && pwd -P)"
   work="$TARGET_DIR/rootapp-dist-work/$rid"
   rm -rf "$work"
   mkdir -p "$work"

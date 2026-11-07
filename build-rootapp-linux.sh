@@ -377,7 +377,7 @@ rk_finish_checks
 
 if [ "$CHECK_ONLY" = 1 ]; then
   rk_log "plan (--check: nothing was built or installed)"
-  rk_info "CARGO_PROFILE_RELEASE_DEBUG=line-tables-only CARGO_PROFILE_RELEASE_STRIP=none cargo build --release -p livekit-ffi --features rustls-tls-webpki-roots --target $TARGET"
+  rk_info "cargo build --release -p livekit-ffi --features rustls-tls-webpki-roots --target $TARGET --config \"$(rk_debug_config "$TARGET" -Cstrip=none)\" (C/C++: -g1 -gdwarf-4)"
   rk_info "  -> $DIST/$RID/native/liblivekit_ffi.so (stripped by $OBJCOPY) + build-info.json"
   rk_info "  -> $DIST/$RID/debug/liblivekit_ffi.so.debug (objcopy --only-keep-debug)"
   if [ "$ZIP" = 1 ]; then rk_info "  -> $DIST/$(rk_asset "$RID") + $DIST/SHA256SUMS, $DIST/$(rk_symbols_asset "$RID") + $DIST/SHA256SUMS-symbols"; fi
@@ -408,20 +408,13 @@ if [ -z "${BINDGEN_EXTRA_CLANG_ARGS:-}" ] && resource_dir="$("$CC" -print-resour
   export BINDGEN_EXTRA_CLANG_ARGS="-resource-dir=$resource_dir"
   rk_info "bindgen: -resource-dir=$resource_dir"
 fi
-rk_debug_profile_env
-# Link unstripped and split afterwards: the debug file keeps the line tables and the full symbol
-# table, and the shipped library is stripped the way strip = "symbols" (the linker's --strip-all)
-# left it.
-export CARGO_PROFILE_RELEASE_STRIP=none
-# With debug info on, cc-rs adds -fno-omit-frame-pointer to every C/C++ unit. clang keeps frame
-# pointers on aarch64 Linux anyway but omits them on x86_64 at -O, so restore that default and the
-# C/C++ code stays what a build without debug info compiles.
-if [ "$TARGET" = x86_64-unknown-linux-gnu ]; then
-  export CFLAGS_x86_64_unknown_linux_gnu="${CFLAGS_x86_64_unknown_linux_gnu:+$CFLAGS_x86_64_unknown_linux_gnu }-fomit-frame-pointer"
-  export CXXFLAGS_x86_64_unknown_linux_gnu="${CXXFLAGS_x86_64_unknown_linux_gnu:+$CXXFLAGS_x86_64_unknown_linux_gnu }-fomit-frame-pointer"
-  rk_info "C/C++: -fomit-frame-pointer (clang's x86_64 default, which cc-rs overrides when debug info is on)"
-fi
-cargo build --release -p livekit-ffi --features rustls-tls-webpki-roots --target "$TARGET"
+# Line tables, linked unstripped (-Cstrip=none overrides the profile's strip = "symbols") and split
+# afterwards: the debug file keeps the line tables and the full symbol table, and the shipped
+# library is stripped as the linker's --strip-all left it. See rk_debug_config.
+debug_config="$(rk_debug_config "$TARGET" -Cstrip=none)"
+rk_info "rust debug info: --config \"$debug_config\""
+rk_debug_cflags "$TARGET" "-g1 -gdwarf-4"
+cargo build --release -p livekit-ffi --features rustls-tls-webpki-roots --target "$TARGET" --config "$debug_config"
 printf '%s\n' "$hw_config" > "$stamp"
 
 built="$TARGET_DIR/$TARGET/release/liblivekit_ffi.so"

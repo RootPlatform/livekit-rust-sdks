@@ -329,13 +329,26 @@ foreach ($target in $Targets) {
         if (-not (Test-Path $clangCl)) { throw "$clangCl not found; yuv-sys needs clang-cl for libyuv's SSSE3/AVX2 rows" }
         $targetEnv['LK_YUV_CC'] = $clangCl
     }
+    $debugArgs = @()
     if (-not $CompileOnly) {
-        # Line tables for Rust, and /Z7 for the C/C++ that cc-rs compiles. strip = "none" makes
-        # rustc link with /DEBUG and /PDBALTPATH:%_PDB% instead of /DEBUG:NONE, so the linker
-        # writes livekit_ffi.pdb and the DLL names it (file name only) in a CodeView record.
-        # /OPT:REF,ICF stays explicit, so the code is what a build without the PDB links.
-        $targetEnv['CARGO_PROFILE_RELEASE_DEBUG'] = 'line-tables-only'
-        $targetEnv['CARGO_PROFILE_RELEASE_STRIP'] = 'none'
+        # Line tables for Rust and -Z7 for the C/C++ that cc-rs compiles, given as target rustflags
+        # and CFLAGS rather than through the cargo profile: cargo hashes profile settings into
+        # every crate's -C metadata, which renames symbols and reorders the generated code.
+        # rustc links with /DEBUG and /PDBALTPATH:%_PDB% either way (hw.9's DLLs already name
+        # livekit_ffi.pdb); -Cstrip=none only keeps it from stripping anything out of the PDB.
+        $rustDebug = @('-Cdebuginfo=line-tables-only', '-Cstrip=none')
+        $cTarget = $target -replace '-', '_'
+        foreach ($name in "CFLAGS_$cTarget", "CXXFLAGS_$cTarget") {
+            $current = if ($targetEnv.Contains($name)) { $targetEnv[$name] } else { [Environment]::GetEnvironmentVariable($name) }
+            $targetEnv[$name] = (@($current, '-Z7') | Where-Object { $_ }) -join ' '
+        }
+        if ($targetEnv.Contains('CARGO_ENCODED_RUSTFLAGS')) {
+            $targetEnv['CARGO_ENCODED_RUSTFLAGS'] = (@($targetEnv['CARGO_ENCODED_RUSTFLAGS']) + $rustDebug) -join [char]0x1f
+        }
+        else {
+            $debugArgs = @('--config', "target.$target.rustflags=[$(($rustDebug | ForEach-Object { "'$_'" }) -join ',')]")
+        }
+        Write-Host "debug info: $($rustDebug -join ' ') $($debugArgs -join ' '); C/C++ -Z7"
     }
     foreach ($name in $targetEnv.Keys) {
         $saved[$name] = [Environment]::GetEnvironmentVariable($name)
@@ -348,7 +361,7 @@ foreach ($target in $Targets) {
             Write-Host "compiled -> target\$target\release\livekit_ffi.lib (not linked)"
             continue
         }
-        cargo build --release -p livekit-ffi --target $target --features rustls-tls-webpki-roots
+        cargo build --release -p livekit-ffi --target $target --features rustls-tls-webpki-roots @debugArgs
         if ($LASTEXITCODE -ne 0) { throw "cargo build failed for $target" }
     }
     finally {
@@ -359,7 +372,9 @@ foreach ($target in $Targets) {
     }
     $rid = $rids[$target]
     $dll = Join-Path $PSScriptRoot "target\$target\release\livekit_ffi.dll"
-    $pdb = Join-Path $PSScriptRoot "target\$target\release\livekit_ffi.pdb"
+    # The linker writes the PDB next to the DLL it links, in deps\. The profile has no debug info,
+    # so cargo does not copy it up.
+    $pdb = Join-Path $PSScriptRoot "target\$target\release\deps\livekit_ffi.pdb"
     if (-not (Test-Path $pdb)) { throw "$pdb was not produced; the link did not run with /DEBUG" }
     $reference = Get-PdbReference $dll
     if (-not $reference) { throw "$dll has no CodeView (RSDS) record, so Sentry cannot match it to $pdb" }
