@@ -323,7 +323,8 @@ verify_dsym() {
   rust_cus="$(printf '%s\n' "$cu_names" | grep -c '\.rs' || true)"
   cxx_cus="$(printf '%s\n' "$cu_names" | grep -cE '\.(c|cc|cpp|cxx|m|mm)$' || true)"
   rk_info "compile units with line tables: $rust_cus Rust, $cxx_cus C/C++/Objective-C"
-  rk_info "webrtc-sys units, e.g.: $(printf '%s\n' "$cu_names" | grep -E '(^|/)src/[^/]+\.(cpp|mm)$' | head -n 3 | tr '\n' ' ')"
+  rk_info "  webrtc-sys src/: $(printf '%s\n' "$cu_names" | grep -c '^src/' || true), e.g. $(printf '%s\n' "$cu_names" | grep -E '^src/' | grep -E 'objc|video|audio' | head -n 3 | tr '\n' ' ')"
+  rk_info "  libwebrtc prebuilt: $(printf '%s\n' "$cu_names" | grep -c '^\.\./' || true)"
   if [ "$rust_cus" = 0 ] || [ "$cxx_cus" = 0 ]; then
     rk_info "the dSYM is missing Rust or C/C++ line tables"
     fail=1

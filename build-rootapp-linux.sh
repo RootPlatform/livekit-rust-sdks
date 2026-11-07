@@ -479,8 +479,9 @@ rk_info "debug file symbols: $(readelf -s -W "$debug" | awk '$4 == "FUNC" { n++ 
 cu_names="$(readelf --debug-dump=info --dwarf-depth=1 "$debug" 2>/dev/null | awk '/DW_TAG_compile_unit/ { cu = 1; next } cu && /DW_AT_name/ { sub(/.*: /, ""); print; cu = 0 }')"
 rust_cus="$(printf '%s\n' "$cu_names" | grep -c '\.rs' || true)"
 cxx_cus="$(printf '%s\n' "$cu_names" | grep -cE '\.(c|cc|cpp|cxx)$' || true)"
-rk_info "compile units with line tables: $rust_cus Rust, $cxx_cus C/C++ (libwebrtc's prebuilt has none: symbol_level=0)"
-rk_info "webrtc-sys C/C++ units: $(printf '%s\n' "$cu_names" | grep -cE '(^|/)src/.*\.(cc|cpp)$' || true), e.g. $(printf '%s\n' "$cu_names" | grep -E '(^|/)src/(nvidia|vaapi)/' | head -n 3 | tr '\n' ' ')"
+rk_info "compile units with line tables: $rust_cus Rust, $cxx_cus C/C++"
+rk_info "  webrtc-sys src/: $(printf '%s\n' "$cu_names" | grep -c '^src/' || true), e.g. $(printf '%s\n' "$cu_names" | grep -E '^src/' | grep -E 'nvidia|vaapi|video' | head -n 3 | tr '\n' ' ')"
+rk_info "  libwebrtc prebuilt: $(printf '%s\n' "$cu_names" | grep -c '^\.\./' || true) (built with symbol_level=0)"
 if [ "$rust_cus" = 0 ] || [ "$cxx_cus" = 0 ]; then
   rk_info "the debug file is missing Rust or C/C++ line tables"
   fail=1
