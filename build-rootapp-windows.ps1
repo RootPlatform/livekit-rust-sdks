@@ -160,7 +160,72 @@ function Get-GitValue([string[]]$GitArgs) {
     return $value
 }
 
-function Write-BuildInfo([string]$Dest, [string]$Rid, [string]$Target) {
+function Get-PdbReference([string]$Path) {
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    $pe = [BitConverter]::ToInt32($bytes, 0x3c)
+    if ([BitConverter]::ToUInt32($bytes, $pe) -ne 0x4550) { throw "$Path is not a PE file" }
+    $sectionCount = [BitConverter]::ToUInt16($bytes, $pe + 6)
+    $optionalHeaderSize = [BitConverter]::ToUInt16($bytes, $pe + 20)
+    $optional = $pe + 24
+    $dataDirectories = if ([BitConverter]::ToUInt16($bytes, $optional) -eq 0x20b) { $optional + 112 } else { $optional + 96 }
+    $debugRva = [BitConverter]::ToUInt32($bytes, $dataDirectories + 6 * 8)
+    $debugSize = [BitConverter]::ToUInt32($bytes, $dataDirectories + 6 * 8 + 4)
+    if ($debugRva -eq 0) { return $null }
+    $debugOffset = $null
+    for ($i = 0; $i -lt $sectionCount; $i++) {
+        $section = $optional + $optionalHeaderSize + 40 * $i
+        $virtualSize = [BitConverter]::ToUInt32($bytes, $section + 8)
+        $virtualAddress = [BitConverter]::ToUInt32($bytes, $section + 12)
+        $rawSize = [BitConverter]::ToUInt32($bytes, $section + 16)
+        $rawPointer = [BitConverter]::ToUInt32($bytes, $section + 20)
+        if ($debugRva -ge $virtualAddress -and $debugRva -lt $virtualAddress + [Math]::Max($virtualSize, $rawSize)) {
+            $debugOffset = $rawPointer + ($debugRva - $virtualAddress)
+            break
+        }
+    }
+    if ($null -eq $debugOffset) { return $null }
+    for ($entry = $debugOffset; $entry -lt $debugOffset + $debugSize; $entry += 28) {
+        if ([BitConverter]::ToUInt32($bytes, $entry + 12) -ne 2) { continue }
+        $cv = [BitConverter]::ToUInt32($bytes, $entry + 24)
+        if ([Text.Encoding]::ASCII.GetString($bytes, $cv, 4) -ne 'RSDS') { continue }
+        $guid = [Guid]::new([byte[]]$bytes[($cv + 4)..($cv + 19)])
+        $age = [BitConverter]::ToUInt32($bytes, $cv + 20)
+        $end = [Array]::IndexOf($bytes, [byte]0, $cv + 24)
+        return [pscustomobject]@{
+            Guid = $guid
+            Age = $age
+            Path = [Text.Encoding]::UTF8.GetString($bytes, $cv + 24, $end - $cv - 24)
+            DebugId = "$guid-$('{0:x}' -f $age)"
+        }
+    }
+    return $null
+}
+
+function Write-PdbReport([string]$Pdb) {
+    $pdbutil = Join-Path $llvmBin 'llvm-pdbutil.exe'
+    if (-not (Test-Path $pdbutil)) {
+        Write-Host "llvm-pdbutil.exe not in $llvmBin; skipping the module report"
+        return
+    }
+    $ErrorActionPreference = 'Continue'
+    $obj = $null
+    $modules = 0
+    $withLines = 0
+    $webrtcSys = @()
+    foreach ($line in (& $pdbutil dump --modules $Pdb 2>$null)) {
+        if ($line -match 'Obj: `(.*)`:') { $obj = $Matches[1]; $modules++; continue }
+        if ($obj -and $line -match '# files: (\d+)') {
+            if ([int]$Matches[1] -gt 0) {
+                $withLines++
+                if ($obj -match '[\\/]webrtc-sys-[0-9a-f]+[\\/]') { $webrtcSys += Split-Path $obj -Leaf }
+            }
+            $obj = $null
+        }
+    }
+    Write-Host "PDB modules: $modules, $withLines with line tables; webrtc-sys C++ objects with line tables: $($webrtcSys.Count) (e.g. $(($webrtcSys | Where-Object { $_ -match 'mf|d3d11|h264' } | Select-Object -First 3) -join ', '))"
+}
+
+function Write-BuildInfo([string]$Dest, [string]$Rid, [string]$Target, [string]$DebugFile, [string]$DebugId) {
     $commit = Get-GitValue @('rev-parse', 'HEAD')
     $branch = Get-GitValue @('rev-parse', '--abbrev-ref', 'HEAD')
     $dirty = [bool]($commit -and (Get-GitValue @('status', '--porcelain', '--untracked-files=no')))
@@ -180,6 +245,8 @@ function Write-BuildInfo([string]$Dest, [string]$Rid, [string]$Target) {
         buildHost = "Windows $([Environment]::OSVersion.Version) $env:PROCESSOR_ARCHITECTURE"
         minimumOs = 'Windows 10'
         hardwareVideo = 'MediaFoundation H.264'
+        debugFile = $DebugFile
+        debugId = $DebugId
     }
     $json = ($info | ConvertTo-Json) -replace "`r`n", "`n"
     [IO.File]::WriteAllText((Join-Path $Dest 'build-info.json'), "$json`n", $utf8)
@@ -208,17 +275,33 @@ function New-FfiZip([string]$Rid, [string]$Dll) {
     finally {
         Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
     }
-    $sha = (Get-FileHash -Algorithm SHA256 $zipPath).Hash.ToLowerInvariant()
-    $sums = Join-Path $OutDir 'SHA256SUMS'
+    $sha = Add-Sum -Sums (Join-Path $OutDir 'SHA256SUMS') -Path $zipPath
+    Write-Host "zip -> $zipPath"
+    Write-Host "sha256: $sha (recorded in $OutDir\SHA256SUMS)"
+    Write-Host "desktop ffi-checksums.sha256 line: $sha  rootapp/$asset"
+}
+
+function Add-Sum([string]$Sums, [string]$Path) {
+    $asset = Split-Path $Path -Leaf
+    $sha = (Get-FileHash -Algorithm SHA256 $Path).Hash.ToLowerInvariant()
     $lines = @()
-    if (Test-Path $sums) {
-        $lines = @([IO.File]::ReadAllLines($sums) | Where-Object { $_ -and (($_ -split '\s+', 2)[1] -ne $asset) })
+    if (Test-Path $Sums) {
+        $lines = @([IO.File]::ReadAllLines($Sums) | Where-Object { $_ -and (($_ -split '\s+', 2)[1] -ne $asset) })
     }
     $lines += "$sha  $asset"
-    [IO.File]::WriteAllText($sums, (($lines -join "`n") + "`n"), $utf8)
-    Write-Host "zip -> $zipPath"
-    Write-Host "sha256: $sha (recorded in $sums)"
-    Write-Host "desktop ffi-checksums.sha256 line: $sha  rootapp/$asset"
+    [IO.File]::WriteAllText($Sums, (($lines -join "`n") + "`n"), $utf8)
+    return $sha
+}
+
+# symbols-windows-<arch>.zip holds the PDB; SHA256SUMS keeps listing only the ffi-*.zip files the
+# desktop pins.
+function New-SymbolsZip([string]$Rid, [string]$Pdb) {
+    $zipPath = Join-Path $OutDir ($assets[$Rid] -replace '^ffi-', 'symbols-')
+    if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+    Compress-Archive -Path $Pdb -DestinationPath $zipPath
+    $sha = Add-Sum -Sums (Join-Path $OutDir 'SHA256SUMS-symbols') -Path $zipPath
+    Write-Host "debug files zip -> $zipPath"
+    Write-Host "sha256: $sha (recorded in $OutDir\SHA256SUMS-symbols)"
 }
 
 foreach ($target in $Targets) {
@@ -236,6 +319,14 @@ foreach ($target in $Targets) {
         $clangCl = Join-Path $llvmBin 'clang-cl.exe'
         if (-not (Test-Path $clangCl)) { throw "$clangCl not found; yuv-sys needs clang-cl for libyuv's SSSE3/AVX2 rows" }
         $targetEnv['LK_YUV_CC'] = $clangCl
+    }
+    if (-not $CompileOnly) {
+        # Line tables for Rust, and /Z7 for the C/C++ that cc-rs compiles. strip = "none" makes
+        # rustc link with /DEBUG and /PDBALTPATH:%_PDB% instead of /DEBUG:NONE, so the linker
+        # writes livekit_ffi.pdb and the DLL names it (file name only) in a CodeView record.
+        # /OPT:REF,ICF stays explicit, so the code is what a build without the PDB links.
+        $targetEnv['CARGO_PROFILE_RELEASE_DEBUG'] = 'line-tables-only'
+        $targetEnv['CARGO_PROFILE_RELEASE_STRIP'] = 'none'
     }
     foreach ($name in $targetEnv.Keys) {
         $saved[$name] = [Environment]::GetEnvironmentVariable($name)
@@ -258,10 +349,23 @@ foreach ($target in $Targets) {
         }
     }
     $rid = $rids[$target]
+    $dll = Join-Path $PSScriptRoot "target\$target\release\livekit_ffi.dll"
+    $pdb = Join-Path $PSScriptRoot "target\$target\release\livekit_ffi.pdb"
+    if (-not (Test-Path $pdb)) { throw "$pdb was not produced; the link did not run with /DEBUG" }
+    $reference = Get-PdbReference $dll
+    if (-not $reference) { throw "$dll has no CodeView (RSDS) record, so Sentry cannot match it to $pdb" }
+    if ($reference.Path -ne 'livekit_ffi.pdb') { throw "$dll names its PDB '$($reference.Path)', expected livekit_ffi.pdb (rustc's /PDBALTPATH:%_PDB%)" }
+    Write-Host "PDB: livekit_ffi.pdb, $((Get-Item $pdb).Length) bytes; Sentry debug id $($reference.DebugId)"
+    Write-PdbReport $pdb
     $dest = Join-Path $OutDir "$rid\native"
-    New-Item -ItemType Directory -Force $dest | Out-Null
-    Copy-Item "target\$target\release\livekit_ffi.dll" $dest -Force
-    Write-Host "copied -> $dest\livekit_ffi.dll"
-    Write-BuildInfo -Dest $dest -Rid $rid -Target $target
-    if ($Zip) { New-FfiZip -Rid $rid -Dll (Join-Path $dest 'livekit_ffi.dll') }
+    $debugDest = Join-Path $OutDir "$rid\debug"
+    New-Item -ItemType Directory -Force $dest, $debugDest | Out-Null
+    Copy-Item $dll $dest -Force
+    Copy-Item $pdb $debugDest -Force
+    Write-Host "copied -> $dest\livekit_ffi.dll, $debugDest\livekit_ffi.pdb"
+    Write-BuildInfo -Dest $dest -Rid $rid -Target $target -DebugFile 'livekit_ffi.pdb' -DebugId $reference.DebugId
+    if ($Zip) {
+        New-FfiZip -Rid $rid -Dll (Join-Path $dest 'livekit_ffi.dll')
+        New-SymbolsZip -Rid $rid -Pdb (Join-Path $debugDest 'livekit_ffi.pdb')
+    }
 }

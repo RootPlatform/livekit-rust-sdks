@@ -2,14 +2,16 @@
 #
 # Builds livekit-ffi for macOS on a Mac (Apple silicon or Intel; either host builds both
 # architectures) and installs rootapp-dist/osx-arm64/native/liblivekit_ffi.dylib and
-# rootapp-dist/osx-x64/native/liblivekit_ffi.dylib, each next to a build-info.json.
+# rootapp-dist/osx-x64/native/liblivekit_ffi.dylib, each next to a build-info.json, with the
+# matching rootapp-dist/<rid>/debug/liblivekit_ffi.dylib.dSYM.
 # Mirrors the macOS jobs of .github/workflows/ffi-builds.yml: default features, release profile,
 # MACOSX_DEPLOYMENT_TARGET 11.0 (arm64) and 10.15 (x86_64). See ROOTAPP-BUILD.md.
 #
 # Usage: ./build-rootapp-macos.sh [--rid osx-arm64|osx-x64|all]... [--zip] [--out DIR] [--check]
 #   --rid    RIDs to build, repeated or comma-separated (default: all)
 #   --zip    also write <out>/ffi-macos-<arch>.zip in the upstream release layout and
-#            record its sha256 in <out>/SHA256SUMS
+#            record its sha256 in <out>/SHA256SUMS, plus <out>/symbols-macos-<arch>.zip
+#            (the dSYM) recorded in <out>/SHA256SUMS-symbols
 #   --out    output directory (default: $ROOTAPP_DIST_DIR, else rootapp-dist next to this script)
 #   --check  check prerequisites and print the plan; builds and installs nothing
 #
@@ -167,7 +169,7 @@ else
 fi
 
 rk_log "tools"
-rk_need_tools git curl unzip shasum file lipo otool nm codesign install_name_tool
+rk_need_tools git curl unzip shasum file lipo otool nm codesign install_name_tool dsymutil dwarfdump
 if [ "$ZIP" = 1 ]; then rk_need_tools zip; fi
 rk_info "cmake/ninja: not needed (nothing in the livekit-ffi dependency graph uses CMake)"
 
@@ -192,9 +194,10 @@ rk_finish_checks
 if [ "$CHECK_ONLY" = 1 ]; then
   rk_log "plan (--check: nothing was built)"
   for rid in $RIDS; do
-    rk_info "$rid: MACOSX_DEPLOYMENT_TARGET=$(deployment_target_of "$rid") cargo build --release -p livekit-ffi --features rustls-tls-webpki-roots --target $(triple_of "$rid")"
+    rk_info "$rid: MACOSX_DEPLOYMENT_TARGET=$(deployment_target_of "$rid") CARGO_PROFILE_RELEASE_DEBUG=line-tables-only CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO=packed cargo build --release -p livekit-ffi --features rustls-tls-webpki-roots --target $(triple_of "$rid")"
     rk_info "  -> $DIST/$rid/native/liblivekit_ffi.dylib (install name @rpath/liblivekit_ffi.dylib, ad-hoc signed) + build-info.json"
-    if [ "$ZIP" = 1 ]; then rk_info "  -> $DIST/$(rk_asset "$rid") + $DIST/SHA256SUMS"; fi
+    rk_info "  -> $DIST/$rid/debug/liblivekit_ffi.dylib.dSYM (rustc's dsymutil run)"
+    if [ "$ZIP" = 1 ]; then rk_info "  -> $DIST/$(rk_asset "$rid") + $DIST/SHA256SUMS, $DIST/$(rk_symbols_asset "$rid") + $DIST/SHA256SUMS-symbols"; fi
   done
   rk_info "the first build of each target downloads its libwebrtc prebuilt (a few hundred MB) from github.com/livekit/rust-sdks releases"
   exit 0
@@ -204,8 +207,15 @@ mkdir -p "$DIST"
 DIST="$(cd "$DIST" && pwd)"
 TARGET_DIR="$(rk_target_dir)"
 
+rk_log "debug info"
+rk_debug_profile_env
+# rustc runs dsymutil on the linked dylib (before it strips it, strip = "symbols" as before), which
+# collects the line tables and the full symbol table from the object files into a .dSYM.
+export CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO=packed
+rk_info "dSYM: CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO=packed"
+
 verify_dylib() {
-  local rid="$1" f="$2" arch dt archs minos id bad probe fail=0
+  local rid="$1" f="$2" arch dt archs minos id bad probe stabs fail=0
   arch="$(lipo_arch_of "$rid")"
   dt="$(deployment_target_of "$rid")"
   rk_log "$rid: checks"
@@ -274,11 +284,55 @@ verify_dylib() {
     fail=1
   fi
 
+  stabs="$(nm -ap "$f" 2>/dev/null | awk '$2 == "-" { n++ } END { print n + 0 }')"
+  if [ "$stabs" = 0 ]; then
+    rk_info "debug map: none left in the shipped dylib"
+  else
+    rk_info "debug map: $stabs stab entries left in the shipped dylib (strip = \"symbols\" should remove them)"
+    fail=1
+  fi
+
   [ "$fail" = 0 ] || rk_die "$f failed the checks above"
 }
 
+uuid_of() {
+  dwarfdump --uuid "$1" 2>/dev/null | awk 'NR == 1 { print $2 }'
+}
+
+verify_dsym() {
+  local rid="$1" f="$2" dsym="$3" dwarf uuid duuid cu_names rust_cus cxx_cus fail=0
+  rk_log "$rid: dSYM"
+  dwarf="$dsym/Contents/Resources/DWARF/liblivekit_ffi.dylib"
+  [ -f "$dwarf" ] || rk_die "$dwarf is missing; rustc did not run dsymutil"
+  uuid="$(uuid_of "$f")"
+  duuid="$(uuid_of "$dwarf")"
+  if [ -n "$uuid" ] && [ "$uuid" = "$duuid" ]; then
+    rk_info "UUID: $uuid (the dSYM matches)"
+  else
+    rk_info "UUID: dylib '$uuid', dSYM '$duuid'"
+    fail=1
+  fi
+  if otool -l "$dwarf" | grep -q 'sectname __debug_line'; then
+    rk_info "line tables: $(wc -c < "$dwarf" | tr -d ' ') bytes of DWARF"
+  else
+    rk_info "the dSYM has no __debug_line section"
+    fail=1
+  fi
+  rk_info "dSYM symbols: $(nm "$dwarf" 2>/dev/null | wc -l | tr -d ' ')"
+  cu_names="$(dwarfdump --debug-info --recurse-depth=0 "$dwarf" 2>/dev/null | awk '/DW_TAG_compile_unit/ { cu = 1; next } cu && /DW_AT_name/ { sub(/.*DW_AT_name[^(]*\("/, ""); sub(/"\)$/, ""); print; cu = 0 }')"
+  rust_cus="$(printf '%s\n' "$cu_names" | grep -c '\.rs' || true)"
+  cxx_cus="$(printf '%s\n' "$cu_names" | grep -cE '\.(c|cc|cpp|cxx|m|mm)$' || true)"
+  rk_info "compile units with line tables: $rust_cus Rust, $cxx_cus C/C++/Objective-C"
+  rk_info "webrtc-sys units, e.g.: $(printf '%s\n' "$cu_names" | grep -E '(^|/)src/[^/]+\.(cpp|mm)$' | head -n 3 | tr '\n' ' ')"
+  if [ "$rust_cus" = 0 ] || [ "$cxx_cus" = 0 ]; then
+    rk_info "the dSYM is missing Rust or C/C++ line tables"
+    fail=1
+  fi
+  [ "$fail" = 0 ] || rk_die "$dsym failed the checks above"
+}
+
 build_rid() {
-  local rid="$1" triple dt src work f out
+  local rid="$1" triple dt src dsym work f out debug_id
   triple="$(triple_of "$rid")"
   dt="$(deployment_target_of "$rid")"
   rk_log "$rid: cargo build --release -p livekit-ffi --features rustls-tls-webpki-roots --target $triple (MACOSX_DEPLOYMENT_TARGET=$dt)"
@@ -286,6 +340,9 @@ build_rid() {
 
   src="$TARGET_DIR/$triple/release/liblivekit_ffi.dylib"
   [ -f "$src" ] || rk_die "$src was not produced"
+  [ -d "$src.dSYM" ] || rk_die "$src.dSYM was not produced"
+  # cargo may uplift the dSYM as a symlink; use the bundle itself.
+  dsym="$(cd "$src.dSYM" && pwd -P)"
   work="$TARGET_DIR/rootapp-dist-work/$rid"
   rm -rf "$work"
   mkdir -p "$work"
@@ -300,10 +357,14 @@ build_rid() {
   codesign --force --sign - "$f"
 
   verify_dylib "$rid" "$f"
+  verify_dsym "$rid" "$f" "$dsym"
+  debug_id="$(uuid_of "$f" | tr 'A-F' 'a-f')"
   rk_install_lib "$f" "$DIST/$rid/native"
-  rk_write_build_info "$DIST/$rid/native" "$rid" "$triple" liblivekit_ffi.dylib "macOS $dt" "VideoToolbox"
+  rk_install_debug "$dsym" "$DIST/$rid/debug"
+  rk_write_build_info "$DIST/$rid/native" "$rid" "$triple" liblivekit_ffi.dylib "macOS $dt" "VideoToolbox" liblivekit_ffi.dylib.dSYM "$debug_id"
   if [ "$ZIP" = 1 ]; then
     rk_package "$rid" "$DIST/$rid/native/liblivekit_ffi.dylib"
+    rk_package_symbols "$rid" "$DIST/$rid/debug" liblivekit_ffi.dylib.dSYM
   fi
 }
 
@@ -314,6 +375,7 @@ done
 rk_log "done"
 for rid in $RIDS; do
   rk_info "$DIST/$rid/native/liblivekit_ffi.dylib"
+  rk_info "$DIST/$rid/debug/liblivekit_ffi.dylib.dSYM"
 done
 # shellcheck disable=SC2086
 rk_handoff_hint $RIDS

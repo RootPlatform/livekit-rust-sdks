@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # Builds livekit-ffi for Linux natively (no Docker) and installs
-# rootapp-dist/<rid>/native/liblivekit_ffi.so next to a build-info.json.
+# rootapp-dist/<rid>/native/liblivekit_ffi.so next to a build-info.json, and its debug file
+# rootapp-dist/<rid>/debug/liblivekit_ffi.so.debug (matched by GNU build-id).
 #   linux-x64    on an x86_64 host, with NVIDIA NVENC/NVDEC and VAAPI (both required by default).
 #   linux-arm64  on an aarch64 host, or cross-compiled from x86_64 (setup in ROOTAPP-BUILD.md).
 #                Software video like the official build; ARM64_NVIDIA=1 adds NVENC/NVDEC.
@@ -11,7 +12,8 @@
 # Usage: ./build-rootapp-linux.sh [--rid linux-x64|linux-arm64] [--zip] [--out DIR] [--no-apt] [--check]
 #   --rid     RID to build (default: the host's)
 #   --zip     also write <out>/ffi-linux-<arch>.zip in the upstream release layout and
-#             record its sha256 in <out>/SHA256SUMS
+#             record its sha256 in <out>/SHA256SUMS, plus <out>/symbols-linux-<arch>.zip
+#             (the debug file) recorded in <out>/SHA256SUMS-symbols
 #   --out     output directory (default: $ROOTAPP_DIST_DIR, else rootapp-dist next to this script)
 #   --no-apt  do not apt-get install the build dependencies (same as SKIP_APT=1)
 #   --check   check prerequisites and print the plan; builds and installs nothing
@@ -26,7 +28,8 @@
 #   MAX_GLIBC=2.35     fail when the result needs a newer glibc; "none" skips the check
 #   CROSS_PKGCONFIG_DIR  cross builds: arm64 .pc files (default /usr/lib/aarch64-linux-gnu/pkgconfig)
 #   PROTOC, PROTOC_VERSION (25.2), LLVM_VERSION (21.1.8), LLVM_ROOT (/opt/llvm-$LLVM_VERSION),
-#   CC/CXX (a clang 21+; skips the LLVM download), LIBCLANG_PATH, SKIP_APT=1
+#   CC/CXX (a clang 21+; skips the LLVM download), LIBCLANG_PATH, SKIP_APT=1,
+#   OBJCOPY (splits the debug file; default objcopy, aarch64-linux-gnu-objcopy for a cross build)
 
 set -euo pipefail
 
@@ -198,6 +201,10 @@ need_tool unzip unzip
 need_tool xz xz-utils
 need_tool file file
 need_tool readelf binutils
+if [ -z "${OBJCOPY:-}" ]; then
+  if [ "$CROSS" = 1 ]; then OBJCOPY=aarch64-linux-gnu-objcopy; else OBJCOPY=objcopy; fi
+fi
+if [ "$CROSS" = 1 ]; then need_tool "$OBJCOPY" binutils-aarch64-linux-gnu; else need_tool "$OBJCOPY" binutils; fi
 need_tool sha256sum coreutils
 if [ "$ZIP" = 1 ]; then need_tool zip zip; fi
 if [ "$RID" = linux-arm64 ]; then need_tool ld.lld lld; fi
@@ -370,9 +377,10 @@ rk_finish_checks
 
 if [ "$CHECK_ONLY" = 1 ]; then
   rk_log "plan (--check: nothing was built or installed)"
-  rk_info "cargo build --release -p livekit-ffi --features rustls-tls-webpki-roots --target $TARGET"
-  rk_info "  -> $DIST/$RID/native/liblivekit_ffi.so + build-info.json"
-  if [ "$ZIP" = 1 ]; then rk_info "  -> $DIST/$(rk_asset "$RID") + $DIST/SHA256SUMS"; fi
+  rk_info "CARGO_PROFILE_RELEASE_DEBUG=line-tables-only CARGO_PROFILE_RELEASE_STRIP=none cargo build --release -p livekit-ffi --features rustls-tls-webpki-roots --target $TARGET"
+  rk_info "  -> $DIST/$RID/native/liblivekit_ffi.so (stripped by $OBJCOPY) + build-info.json"
+  rk_info "  -> $DIST/$RID/debug/liblivekit_ffi.so.debug (objcopy --only-keep-debug)"
+  if [ "$ZIP" = 1 ]; then rk_info "  -> $DIST/$(rk_asset "$RID") + $DIST/SHA256SUMS, $DIST/$(rk_symbols_asset "$RID") + $DIST/SHA256SUMS-symbols"; fi
   rk_info "hardware video: $HW_DESC"
   rk_info "glibc: the result needs this host's glibc (${host_glibc:-unknown}) at most; checked against MAX_GLIBC=$MAX_GLIBC"
   rk_info "the first build downloads the libwebrtc prebuilt (a few hundred MB) from github.com/livekit/rust-sdks releases"
@@ -400,14 +408,83 @@ if [ -z "${BINDGEN_EXTRA_CLANG_ARGS:-}" ] && resource_dir="$("$CC" -print-resour
   export BINDGEN_EXTRA_CLANG_ARGS="-resource-dir=$resource_dir"
   rk_info "bindgen: -resource-dir=$resource_dir"
 fi
+rk_debug_profile_env
+# Link unstripped and split afterwards: the debug file keeps the line tables and the full symbol
+# table, and the shipped library is stripped the way strip = "symbols" (the linker's --strip-all)
+# left it.
+export CARGO_PROFILE_RELEASE_STRIP=none
+# With debug info on, cc-rs adds -fno-omit-frame-pointer to every C/C++ unit. clang keeps frame
+# pointers on aarch64 Linux anyway but omits them on x86_64 at -O, so restore that default and the
+# C/C++ code stays what a build without debug info compiles.
+if [ "$TARGET" = x86_64-unknown-linux-gnu ]; then
+  export CFLAGS_x86_64_unknown_linux_gnu="${CFLAGS_x86_64_unknown_linux_gnu:+$CFLAGS_x86_64_unknown_linux_gnu }-fomit-frame-pointer"
+  export CXXFLAGS_x86_64_unknown_linux_gnu="${CXXFLAGS_x86_64_unknown_linux_gnu:+$CXXFLAGS_x86_64_unknown_linux_gnu }-fomit-frame-pointer"
+  rk_info "C/C++: -fomit-frame-pointer (clang's x86_64 default, which cc-rs overrides when debug info is on)"
+fi
 cargo build --release -p livekit-ffi --features rustls-tls-webpki-roots --target "$TARGET"
 printf '%s\n' "$hw_config" > "$stamp"
 
-so="$TARGET_DIR/$TARGET/release/liblivekit_ffi.so"
-[ -f "$so" ] || rk_die "$so was not produced"
+built="$TARGET_DIR/$TARGET/release/liblivekit_ffi.so"
+[ -f "$built" ] || rk_die "$built was not produced"
+
+rk_log "debug file"
+work="$TARGET_DIR/rootapp-dist-work/$RID"
+rm -rf "$work"
+mkdir -p "$work"
+so="$work/liblivekit_ffi.so"
+debug="$work/liblivekit_ffi.so.debug"
+"$OBJCOPY" --only-keep-debug --compress-debug-sections=zlib "$built" "$debug"
+"$OBJCOPY" --strip-all --add-gnu-debuglink="$debug" "$built" "$so"
+rk_info "$debug: $(wc -c < "$debug" | tr -d ' ') bytes; stripped library: $(wc -c < "$so" | tr -d ' ') bytes"
 
 rk_log "checks"
 fail=0
+section_names() {
+  readelf -S -W "$1" | sed -n 's/^ *\[ *[0-9]*\] \([^ ]\{1,\}\) .*/\1/p'
+}
+build_id_of() {
+  readelf -n "$1" 2>/dev/null | awk '/Build ID:/ && id == "" { id = $3 } END { print id }'
+}
+so_sections="$(section_names "$so")"
+debug_sections="$(section_names "$debug")"
+
+BUILD_ID="$(build_id_of "$so")"
+DEBUG_ID=""
+if [ -z "$BUILD_ID" ]; then
+  rk_info "no GNU build-id note; Sentry matches a Linux library to its debug file by build-id"
+  fail=1
+elif [ "$(build_id_of "$debug")" != "$BUILD_ID" ]; then
+  rk_info "the debug file's build-id ($(build_id_of "$debug")) is not the library's ($BUILD_ID)"
+  fail=1
+else
+  DEBUG_ID="$(rk_elf_debug_id "$BUILD_ID")"
+  rk_info "build-id: $BUILD_ID (Sentry debug id $DEBUG_ID)"
+fi
+leftover="$(printf '%s\n' "$so_sections" | grep -E '^\.(z?debug_|symtab$|strtab$)' | tr '\n' ' ' || true)"
+if [ -n "$leftover" ]; then
+  rk_info "the shipped library still has: $leftover"
+  fail=1
+fi
+if ! printf '%s\n' "$so_sections" | grep -qx '\.gnu_debuglink'; then
+  rk_info "the shipped library has no .gnu_debuglink"
+  fail=1
+fi
+for s in .debug_info .debug_line .symtab; do
+  if ! printf '%s\n' "$debug_sections" | grep -qxF -- "$s"; then
+    rk_info "the debug file has no $s"
+    fail=1
+  fi
+done
+rk_info "debug file symbols: $(readelf -s -W "$debug" | awk '$4 == "FUNC" { n++ } END { print n + 0 }') functions"
+cu_names="$(readelf --debug-dump=info --dwarf-depth=1 "$debug" 2>/dev/null | awk '/DW_TAG_compile_unit/ { cu = 1; next } cu && /DW_AT_name/ { sub(/.*: /, ""); print; cu = 0 }')"
+rust_cus="$(printf '%s\n' "$cu_names" | grep -c '\.rs' || true)"
+cxx_cus="$(printf '%s\n' "$cu_names" | grep -cE '\.(c|cc|cpp|cxx)$' || true)"
+rk_info "compile units with line tables: $rust_cus Rust, $cxx_cus C/C++ (libwebrtc's prebuilt has none: symbol_level=0)"
+rk_info "webrtc-sys C/C++ units: $(printf '%s\n' "$cu_names" | grep -cE '(^|/)src/.*\.(cc|cpp)$' || true), e.g. $(printf '%s\n' "$cu_names" | grep -E '(^|/)src/(nvidia|vaapi)/' | head -n 3 | tr '\n' ' ')"
+if [ "$rust_cus" = 0 ] || [ "$cxx_cus" = 0 ]; then
+  rk_info "the debug file is missing Rust or C/C++ line tables"
+  fail=1
+fi
 check_probe() {
   if grep -aqF -- "$1" "$so"; then
     rk_info "capability string: $1"
@@ -489,11 +566,14 @@ fi
 
 dest="$DIST/$RID/native"
 rk_install_lib "$so" "$dest"
-rk_write_build_info "$dest" "$RID" "$TARGET" liblivekit_ffi.so "glibc $GLIBC_FLOOR" "$HW_DESC"
+rk_install_debug "$debug" "$DIST/$RID/debug"
+rk_write_build_info "$dest" "$RID" "$TARGET" liblivekit_ffi.so "glibc $GLIBC_FLOOR" "$HW_DESC" liblivekit_ffi.so.debug "$DEBUG_ID"
 if [ "$ZIP" = 1 ]; then
   rk_package "$RID" "$dest/liblivekit_ffi.so"
+  rk_package_symbols "$RID" "$DIST/$RID/debug" liblivekit_ffi.so.debug
 fi
 
 rk_log "done"
 rk_info "$dest/liblivekit_ffi.so (needs glibc $GLIBC_FLOOR+, hardware video: $HW_DESC)"
+rk_info "$DIST/$RID/debug/liblivekit_ffi.so.debug (Sentry debug id $DEBUG_ID)"
 rk_handoff_hint "$RID"

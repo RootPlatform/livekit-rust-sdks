@@ -1,6 +1,9 @@
 # RootApp fork: builds livekit-ffi for the six desktop RIDs with the build-rootapp-* scripts, zips each
 # under the upstream asset name (ffi-<os>-<arch>.zip) and attaches the zips, SHA256SUMS and
-# build-info-<rid>.json to a GitHub release. Needs only GITHUB_TOKEN. See ROOTAPP-BUILD.md.
+# build-info-<rid>.json to a GitHub release, with the debug files (symbols-<os>-<arch>.zip and
+# SHA256SUMS-symbols). The Debug files job checks that each debug file matches its library and,
+# for a release, uploads both to Sentry when the SENTRY_AUTH_TOKEN secret is set. Releases need
+# only GITHUB_TOKEN. See ROOTAPP-BUILD.md.
 
 name: RootApp FFI
 
@@ -19,6 +22,11 @@ on:
         default: "win-x64 win-arm64 osx-arm64 osx-x64 linux-x64 linux-arm64"
       publish:
         description: "Publish the release; otherwise it stays a draft"
+        required: false
+        type: boolean
+        default: false
+      sentry_upload:
+        description: "Upload the debug files to Sentry even without a tag (releases always upload)"
         required: false
         type: boolean
         default: false
@@ -188,6 +196,7 @@ jobs:
           name: rootapp-ffi-${{ matrix.rid }}
           path: |
             rootapp-dist/ffi-*.zip
+            rootapp-dist/symbols-*.zip
             rootapp-dist/*/native/build-info.json
           if-no-files-found: error
 
@@ -233,6 +242,7 @@ jobs:
           name: rootapp-ffi-${{ matrix.rid }}
           path: |
             rootapp-dist/ffi-*.zip
+            rootapp-dist/symbols-*.zip
             rootapp-dist/*/native/build-info.json
           if-no-files-found: error
 
@@ -307,12 +317,136 @@ jobs:
           name: rootapp-ffi-${{ matrix.rid }}
           path: |
             rootapp-dist/ffi-*.zip
+            rootapp-dist/symbols-*.zip
             rootapp-dist/*/native/build-info.json
           if-no-files-found: error
 
+  # Every run: sentry-cli must read the same debug id from each library and its debug file, and the
+  # debug file must carry line and symbol information. A release (or sentry_upload) then uploads
+  # both to Sentry, keyed by that id; without the SENTRY_AUTH_TOKEN secret it only warns.
+  symbols:
+    name: Debug files
+    needs: [plan, build-windows, build-macos, build-linux]
+    if: >-
+      always() && needs.plan.result == 'success' &&
+      !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
+    runs-on: ubuntu-latest
+    env:
+      SENTRY_CLI_VERSION: "3.8.2"
+      SENTRY_CLI_SHA256: c958865f9d4000183509ea21b1f04925d5390de6d8d87386b9e69f2b305070c3
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: rootapp-ffi-*
+          merge-multiple: true
+          path: dist
+
+      - name: Install sentry-cli
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="$RUNNER_TEMP/sentry-cli-bin"
+          mkdir -p "$bin"
+          curl --fail --location --silent --show-error -o "$bin/sentry-cli" \
+            "https://github.com/getsentry/sentry-cli/releases/download/$SENTRY_CLI_VERSION/sentry-cli-Linux-x86_64"
+          echo "$SENTRY_CLI_SHA256  $bin/sentry-cli" | sha256sum -c -
+          chmod +x "$bin/sentry-cli"
+          echo "$bin" >> "$GITHUB_PATH"
+          "$bin/sentry-cli" --version
+
+      - name: Check that each debug file matches its library
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          zips=(dist/ffi-*.zip)
+          [ "${#zips[@]}" -gt 0 ] || { echo "::error::no ffi-*.zip artifacts"; exit 1; }
+          rm -rf symbols
+          mkdir -p symbols
+          : > "$RUNNER_TEMP/debug-ids"
+          {
+            echo "### Debug files"
+            echo
+            echo "| RID | Sentry debug id | Library | Debug file | Debug file size |"
+            echo "|---|---|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          fail=0
+          for path in "${zips[@]}"; do
+            z="$(basename "$path")"
+            sym="symbols-${z#ffi-}"
+            case "$z" in
+              ffi-windows-x86_64.zip) rid=win-x64 ;;
+              ffi-windows-arm64.zip) rid=win-arm64 ;;
+              ffi-macos-x86_64.zip) rid=osx-x64 ;;
+              ffi-macos-arm64.zip) rid=osx-arm64 ;;
+              ffi-linux-x86_64.zip) rid=linux-x64 ;;
+              ffi-linux-arm64.zip) rid=linux-arm64 ;;
+              *) echo "::error::unexpected asset $z"; exit 1 ;;
+            esac
+            case "$rid" in
+              win-*) lib=livekit_ffi.dll; dbg=livekit_ffi.pdb; file=livekit_ffi.pdb ;;
+              osx-*) lib=liblivekit_ffi.dylib; dbg=liblivekit_ffi.dylib.dSYM; file=liblivekit_ffi.dylib.dSYM/Contents/Resources/DWARF/liblivekit_ffi.dylib ;;
+              linux-*) lib=liblivekit_ffi.so; dbg=liblivekit_ffi.so.debug; file=liblivekit_ffi.so.debug ;;
+            esac
+            [ -f "dist/$sym" ] || { echo "::error::$z has no $sym next to it"; exit 1; }
+            dir="symbols/$rid"
+            mkdir -p "$dir"
+            unzip -q -o "$path" "$lib" -d "$dir"
+            unzip -q -o "dist/$sym" -d "$dir"
+            [ -f "$dir/$file" ] || { echo "::error::$sym has no $file"; exit 1; }
+            lib_json="$(sentry-cli debug-files check --json "$dir/$lib")"
+            dbg_json="$(sentry-cli debug-files check --json "$dir/$file")"
+            lib_id="$(jq -r '.variants[0].debug_id // ""' <<< "$lib_json")"
+            lib_features="$(jq -r '.features // ""' <<< "$lib_json")"
+            dbg_id="$(jq -r '.variants[0].debug_id // ""' <<< "$dbg_json")"
+            dbg_features="$(jq -r '.features // ""' <<< "$dbg_json")"
+            info_id="$(jq -r '.debugId // ""' "dist/$rid/native/build-info.json")"
+            echo "$rid: $lib $lib_id ($lib_features); $dbg $dbg_id ($dbg_features); build-info.json $info_id"
+            if [ -z "$lib_id" ] || [ "$lib_id" != "$dbg_id" ]; then
+              echo "::error::$rid: $dbg ($dbg_id) does not match $lib ($lib_id)"
+              fail=1
+            fi
+            if [ "$info_id" != "$lib_id" ]; then
+              echo "::error::$rid: build-info.json has debugId '$info_id', sentry-cli reads $lib_id from $lib"
+              fail=1
+            fi
+            for feature in debug symtab; do
+              case ", $dbg_features," in
+                *", $feature,"*) ;;
+                *) echo "::error::$rid: $dbg has no $feature information ($dbg_features)"; fail=1 ;;
+              esac
+            done
+            echo "$lib_id" >> "$RUNNER_TEMP/debug-ids"
+            echo "| $rid | \`$lib_id\` | $lib_features | $dbg_features | $(du -sh "$dir/$dbg" | cut -f1) |" >> "$GITHUB_STEP_SUMMARY"
+          done
+          [ "$fail" = 0 ]
+
+      # The library goes up too: Sentry reads unwind information from it (.pdata, .eh_frame,
+      # __unwind_info) and names and lines from the debug file.
+      - name: Upload to Sentry
+        if: needs.plan.outputs.tag != '' || inputs.sentry_upload
+        continue-on-error: true
+        shell: bash
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: ${{ vars.SENTRY_ORG || 'root-jl' }}
+          SENTRY_PROJECT: ${{ vars.SENTRY_PROJECT || 'root-desktop' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SENTRY_AUTH_TOKEN:-}" ]; then
+            echo "::warning::the SENTRY_AUTH_TOKEN secret is not set, so the debug files were not uploaded to Sentry (see ROOTAPP-BUILD.md, Debug files and Sentry)"
+            exit 0
+          fi
+          ids=()
+          while read -r id; do ids+=(--id "$id"); done < "$RUNNER_TEMP/debug-ids"
+          sentry-cli debug-files upload --org "$SENTRY_ORG" --project "$SENTRY_PROJECT" \
+            --no-zips --wait-for 900 --require-all "${ids[@]}" symbols
+          echo "Uploaded to Sentry $SENTRY_ORG/$SENTRY_PROJECT: $(tr '\n' ' ' < "$RUNNER_TEMP/debug-ids")" >> "$GITHUB_STEP_SUMMARY"
+
   release:
     name: Release
-    needs: [plan, build-windows, build-macos, build-linux]
+    needs: [plan, build-windows, build-macos, build-linux, symbols]
     if: >-
       always() && needs.plan.result == 'success' && needs.plan.outputs.tag != '' &&
       !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
@@ -362,11 +496,20 @@ jobs:
             rid="${rid%%/*}"
             cp "$f" "release/build-info-$rid.json"
           done
+          for path in "${zips[@]}"; do
+            z="$(basename "$path")"
+            [ -f "dist/symbols-${z#ffi-}" ] || { echo "::error::no symbols-${z#ffi-} for $z"; exit 1; }
+            cp "dist/symbols-${z#ffi-}" release/
+          done
           cd release
           for z in ffi-*.zip; do
             printf '%s  %s\n' "$(sha256sum "$z" | awk '{ print $1 }')" "$z"
           done > SHA256SUMS
           cat SHA256SUMS
+          for z in symbols-*.zip; do
+            printf '%s  %s\n' "$(sha256sum "$z" | awk '{ print $1 }')" "$z"
+          done > SHA256SUMS-symbols
+          cat SHA256SUMS-symbols
           {
             echo "### RootApp FFI assets"
             echo
@@ -385,7 +528,7 @@ jobs:
           PUBLISH: ${{ needs.plan.outputs.publish }}
         run: |
           set -euo pipefail
-          notes="RootApp livekit-ffi fork build of $GITHUB_SHA. SHA256SUMS lists every zip; the desktop pins each one as rootapp/<asset> in external/LivekitRtc/ffi-checksums.sha256."
+          notes="RootApp livekit-ffi fork build of $GITHUB_SHA. SHA256SUMS lists every ffi-*.zip; the desktop pins each one as rootapp/<asset> in external/LivekitRtc/ffi-checksums.sha256. symbols-*.zip hold each library's debug file (PDB, .debug or dSYM), listed in SHA256SUMS-symbols."
           if release="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,targetCommitish --jq '"\(.isDraft) \(.targetCommitish)"' 2> /dev/null)"; then
             read -r draft target <<< "$release"
             if [ "$draft" = true ] && [ "$target" != "$GITHUB_SHA" ]; then

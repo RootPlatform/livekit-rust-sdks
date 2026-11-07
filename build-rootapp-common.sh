@@ -61,8 +61,30 @@ rk_asset() {
   esac
 }
 
+rk_symbols_asset() {
+  local asset
+  asset="$(rk_asset "$1")" || return 1
+  echo "symbols-${asset#ffi-}"
+}
+
 rk_json() {
   printf '%s' "$1" | tr -d '"\\\r\n'
+}
+
+# Sentry's debug id for an ELF file: the first 16 bytes of the GNU build-id (zero-padded), read as
+# a little-endian GUID.
+rk_elf_debug_id() {
+  local b
+  b="$(printf '%s' "$1" | tr 'A-F' 'a-f')"
+  while [ "${#b}" -lt 32 ]; do b="${b}0"; done
+  printf '%s-%s-%s-%s-%s\n' "${b:6:2}${b:4:2}${b:2:2}${b:0:2}" "${b:10:2}${b:8:2}" "${b:14:2}${b:12:2}" "${b:16:4}" "${b:20:12}"
+}
+
+# The release profile's debug settings for builds that write debug files. They only add line tables
+# and a separate debug file; opt-level, LTO, codegen units and panic stay as in Cargo.toml.
+rk_debug_profile_env() {
+  export CARGO_PROFILE_RELEASE_DEBUG=line-tables-only
+  rk_info "debug info: CARGO_PROFILE_RELEASE_DEBUG=line-tables-only (written to a separate debug file)"
 }
 
 rk_rust_version() {
@@ -201,15 +223,37 @@ rk_git_field() {
 }
 
 rk_write_build_info() {
-  local dest="$1" rid="$2" target="$3" lib="$4" min_os="$5" hw="$6" f
+  local dest="$1" rid="$2" target="$3" lib="$4" min_os="$5" hw="$6" debug_file="$7" debug_id="$8" f
   f="$dest/build-info.json"
-  printf '{\n  "rid": "%s",\n  "target": "%s",\n  "library": "%s",\n  "librarySha256": "%s",\n  "ffiVersion": "%s",\n  "commit": "%s",\n  "branch": "%s",\n  "dirty": %s,\n  "rustc": "%s",\n  "builtAt": "%s",\n  "buildHost": "%s",\n  "minimumOs": "%s",\n  "hardwareVideo": "%s"\n}\n' \
+  printf '{\n  "rid": "%s",\n  "target": "%s",\n  "library": "%s",\n  "librarySha256": "%s",\n  "ffiVersion": "%s",\n  "commit": "%s",\n  "branch": "%s",\n  "dirty": %s,\n  "rustc": "%s",\n  "builtAt": "%s",\n  "buildHost": "%s",\n  "minimumOs": "%s",\n  "hardwareVideo": "%s",\n  "debugFile": "%s",\n  "debugId": "%s"\n}\n' \
     "$rid" "$target" "$lib" "$(rk_sha256 "$dest/$lib")" "$(rk_json "$(rk_ffi_version)")" \
     "$(rk_json "$(rk_git_field commit)")" "$(rk_json "$(rk_git_field branch)")" "$(rk_git_field dirty)" \
     "$(rk_json "$(cd "$ROOT" && rustc --version)")" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    "$(rk_json "$(uname -srm)")" "$(rk_json "$min_os")" "$(rk_json "$hw")" > "$f.partial"
+    "$(rk_json "$(uname -srm)")" "$(rk_json "$min_os")" "$(rk_json "$hw")" \
+    "$(rk_json "$debug_file")" "$(rk_json "$debug_id")" > "$f.partial"
   mv -f "$f.partial" "$f"
   rk_info "build info: $f"
+}
+
+# rk_install_debug <src> <dest dir>: installs a debug file or bundle (a .dSYM directory) as
+# <dest dir>/<name>, replacing an older one.
+rk_install_debug() {
+  local src="$1" dest="$2" name
+  name="$(basename "$src")"
+  mkdir -p "$dest"
+  rm -rf "$dest/$name.partial" "$dest/$name"
+  cp -R "$src" "$dest/$name.partial"
+  mv -f "$dest/$name.partial" "$dest/$name"
+  rk_info "installed: $dest/$name"
+}
+
+rk_record_sum() {
+  local sums="$1" asset="$2" sha="$3"
+  {
+    if [ -f "$sums" ]; then awk -v a="$asset" '$2 != a' "$sums"; fi
+    printf '%s  %s\n' "$sha" "$asset"
+  } > "$sums.partial"
+  mv -f "$sums.partial" "$sums"
 }
 
 rk_install_lib() {
@@ -247,14 +291,27 @@ rk_package() {
   rm -rf "$work"
   sha="$(rk_sha256 "$DIST/$asset")"
   sums="$DIST/SHA256SUMS"
-  {
-    if [ -f "$sums" ]; then awk -v a="$asset" '$2 != a' "$sums"; fi
-    printf '%s  %s\n' "$sha" "$asset"
-  } > "$sums.partial"
-  mv -f "$sums.partial" "$sums"
+  rk_record_sum "$sums" "$asset" "$sha"
   rk_info "zip: $DIST/$asset"
   rk_info "sha256: $sha (recorded in $sums)"
   rk_info "desktop ffi-checksums.sha256 line: $sha  rootapp/$asset"
+}
+
+# rk_package_symbols <rid> <debug dir> <name>: zips <debug dir>/<name> (a file, or a .dSYM bundle)
+# as symbols-<os>-<arch>.zip and records it in SHA256SUMS-symbols. SHA256SUMS keeps listing only
+# the ffi-*.zip files the desktop pins.
+rk_package_symbols() {
+  local rid="$1" dir="$2" name="$3" asset sha sums
+  asset="$(rk_symbols_asset "$rid")" || rk_die "unknown RID $rid"
+  command -v zip >/dev/null 2>&1 || rk_die "zip is not on PATH (needed for --zip)"
+  [ -e "$dir/$name" ] || rk_die "$dir/$name is missing"
+  rm -f "$DIST/$asset"
+  (cd "$dir" && zip -X -r -q "$DIST/$asset" "$name")
+  sha="$(rk_sha256 "$DIST/$asset")"
+  sums="$DIST/SHA256SUMS-symbols"
+  rk_record_sum "$sums" "$asset" "$sha"
+  rk_info "debug files zip: $DIST/$asset"
+  rk_info "sha256: $sha (recorded in $sums)"
 }
 
 rk_handoff_hint() {
