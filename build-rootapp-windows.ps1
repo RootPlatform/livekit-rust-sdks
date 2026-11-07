@@ -338,7 +338,10 @@ foreach ($target in $Targets) {
         # livekit_ffi.pdb); -Cstrip=none only keeps it from stripping anything out of the PDB.
         $rustDebug = @('-Cdebuginfo=line-tables-only', '-Cstrip=none')
         $cTarget = $target -replace '-', '_'
-        foreach ($name in "CFLAGS_$cTarget", "CXXFLAGS_$cTarget") {
+        # On arm64, ring compiles its C and assembly with GNU-style clang, which rejects -Z7, so C
+        # gets no debug info there; the C++ (webrtc-sys, libyuv) goes through cl or clang-cl.
+        $flagVars = if ($target -eq 'aarch64-pc-windows-msvc') { @("CXXFLAGS_$cTarget") } else { @("CFLAGS_$cTarget", "CXXFLAGS_$cTarget") }
+        foreach ($name in $flagVars) {
             $current = if ($targetEnv.Contains($name)) { $targetEnv[$name] } else { [Environment]::GetEnvironmentVariable($name) }
             $targetEnv[$name] = (@($current, '-Z7') | Where-Object { $_ }) -join ' '
         }
@@ -348,7 +351,7 @@ foreach ($target in $Targets) {
         else {
             $debugArgs = @('--config', "target.$target.rustflags=[$(($rustDebug | ForEach-Object { "'$_'" }) -join ',')]")
         }
-        Write-Host "debug info: $($rustDebug -join ' ') $($debugArgs -join ' '); C/C++ -Z7"
+        Write-Host "debug info: $($rustDebug -join ' ') $($debugArgs -join ' '); -Z7 in $($flagVars -join ', ')"
     }
     foreach ($name in $targetEnv.Keys) {
         $saved[$name] = [Environment]::GetEnvironmentVariable($name)
