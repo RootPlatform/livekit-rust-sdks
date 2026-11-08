@@ -49,6 +49,7 @@ pub mod resampler;
 pub mod room;
 pub mod rootapp_audio;
 pub mod rootapp_screen_audio;
+pub mod rootapp_video;
 mod utils;
 pub mod video_source;
 mod video_stall;

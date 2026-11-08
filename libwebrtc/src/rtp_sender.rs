@@ -211,4 +211,103 @@ mod tests {
         alice.close();
         bob.close();
     }
+
+    async fn frames_encoded(pc: &PeerConnection) -> u32 {
+        pc.get_stats()
+            .await
+            .unwrap()
+            .into_iter()
+            .find_map(|stats| match stats {
+                RtcStats::OutboundRtp(o) if o.stream.kind == "video" => {
+                    Some(o.outbound.frames_encoded)
+                }
+                _ => None,
+            })
+            .unwrap_or(0)
+    }
+
+    // A sending sender takes new caps, a degradation preference and a content hint
+    // without renegotiation, and keeps encoding.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_sender_takes_new_encoding_and_content_hint() {
+        use crate::video_track::VideoContentHint;
+
+        let factory = PeerConnectionFactory::default();
+        let alice = factory.create_peer_connection(RtcConfiguration::default()).unwrap();
+        let bob = factory.create_peer_connection(RtcConfiguration::default()).unwrap();
+        forward_candidates(&alice, bob.clone());
+        forward_candidates(&bob, alice.clone());
+
+        let source = NativeVideoSource::new(VideoResolution { width: 320, height: 240 }, true);
+        let track = factory.create_video_track("screen", source.clone());
+        let transceiver = alice
+            .add_transceiver(
+                MediaStreamTrack::Video(track.clone()),
+                RtpTransceiverInit {
+                    direction: RtpTransceiverDirection::SendOnly,
+                    stream_ids: Vec::new(),
+                    send_encodings: vec![RtpEncodingParameters {
+                        max_bitrate: Some(300_000),
+                        max_framerate: Some(15.0),
+                        ..Default::default()
+                    }],
+                },
+            )
+            .unwrap();
+
+        let offer = alice.create_offer(OfferOptions::default()).await.unwrap();
+        alice.set_local_description(offer.clone()).await.unwrap();
+        bob.set_remote_description(offer).await.unwrap();
+        let answer = bob.create_answer(AnswerOptions::default()).await.unwrap();
+        bob.set_local_description(answer.clone()).await.unwrap();
+        alice.set_remote_description(answer).await.unwrap();
+
+        let pump = tokio::spawn(async move {
+            let start = Instant::now();
+            let mut tick = tokio::time::interval(Duration::from_millis(33));
+            loop {
+                tick.tick().await;
+                source.capture_frame(&VideoFrame {
+                    rotation: VideoRotation::VideoRotation0,
+                    timestamp_us: start.elapsed().as_micros() as i64,
+                    frame_metadata: None,
+                    buffer: I420Buffer::new(320, 240),
+                });
+            }
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while frames_encoded(&alice).await == 0 {
+            assert!(Instant::now() < deadline, "the video encoder never produced a frame");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let sender = transceiver.sender();
+        let mut params = sender.parameters();
+        params.encodings[0].max_bitrate = Some(2_000_000);
+        params.encodings[0].max_framerate = Some(30.0);
+        params.set_degradation_preference(DegradationPreference::MaintainResolution);
+        sender.set_parameters(params).unwrap();
+        track.set_content_hint(VideoContentHint::Text);
+
+        let applied = sender.parameters();
+        assert_eq!(applied.encodings[0].max_bitrate, Some(2_000_000));
+        assert_eq!(applied.encodings[0].max_framerate, Some(30.0));
+        assert_eq!(
+            applied.degradation_preference(),
+            Some(DegradationPreference::MaintainResolution)
+        );
+        assert_eq!(track.content_hint(), VideoContentHint::Text);
+
+        let before = frames_encoded(&alice).await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while frames_encoded(&alice).await <= before {
+            assert!(Instant::now() < deadline, "encoding stopped after the change");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        pump.abort();
+        alice.close();
+        bob.close();
+    }
 }

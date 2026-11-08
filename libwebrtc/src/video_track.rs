@@ -22,6 +22,18 @@ use crate::{
 #[cfg(not(target_arch = "wasm32"))]
 use crate::native::packet_trailer::PacketTrailerHandler;
 
+/// What a video track carries, as the W3C `MediaStreamTrack.contentHint` values. The encoder
+/// tunes for it: `Detail` and `Text` encode as screen content and keep resolution under load.
+/// Maps to WebRTC's `kNone`, `kFluid`, `kDetailed` and `kText`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VideoContentHint {
+    #[default]
+    None,
+    Motion,
+    Detail,
+    Text,
+}
+
 #[derive(Clone)]
 pub struct RtcVideoTrack {
     pub(crate) handle: imp_vt::RtcVideoTrack,
@@ -52,6 +64,18 @@ impl RtcVideoTrack {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn request_key_frame(&self) {
         self.handle.request_key_frame();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn content_hint(&self) -> VideoContentHint {
+        self.handle.content_hint()
+    }
+
+    /// Sets the content hint. On a published track the sender reconfigures its encoder for the
+    /// new content without renegotiation. Blocks on WebRTC's signaling thread.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn set_content_hint(&self, hint: VideoContentHint) {
+        self.handle.set_content_hint(hint);
     }
 }
 
@@ -140,6 +164,25 @@ mod tests {
                 _ => None,
             })
             .unwrap_or(0)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn content_hint_round_trips_through_the_native_track() {
+        use super::VideoContentHint;
+
+        let factory = PeerConnectionFactory::default();
+        let source = NativeVideoSource::new(VideoResolution { width: 320, height: 240 }, true);
+        let track = factory.create_video_track("video", source);
+        assert_eq!(track.content_hint(), VideoContentHint::None);
+        for hint in [
+            VideoContentHint::Motion,
+            VideoContentHint::Detail,
+            VideoContentHint::Text,
+            VideoContentHint::None,
+        ] {
+            track.set_content_hint(hint);
+            assert_eq!(track.content_hint(), hint);
+        }
     }
 
     // In-process sender and receiver over loopback ICE: a key frame request on

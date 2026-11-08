@@ -38,6 +38,6 @@ pub use crate::{
         NV12Buffer, VideoBuffer, VideoBufferType, VideoFormatType, VideoFrame, VideoRotation,
     },
     video_source::{RtcVideoSource, VideoResolution},
-    video_track::RtcVideoTrack,
+    video_track::{RtcVideoTrack, VideoContentHint},
     MediaType, RtcError, RtcErrorType,
 };

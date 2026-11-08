@@ -1,0 +1,33 @@
+// RootApp fork: video publishing controls. Fork oneof cases in ffi.proto start at 1000.
+
+syntax = "proto2";
+
+package livekit.proto;
+option csharp_namespace = "LiveKit.Proto";
+
+import "room.proto";
+
+// MediaStreamTrack.contentHint. DETAIL and TEXT encode as screen content.
+enum RootVideoContentHint {
+  ROOT_VIDEO_CONTENT_HINT_NONE = 0;
+  ROOT_VIDEO_CONTENT_HINT_MOTION = 1;
+  ROOT_VIDEO_CONTENT_HINT_DETAIL = 2;
+  ROOT_VIDEO_CONTENT_HINT_TEXT = 3;
+}
+
+// Changes a published local video track's encoder in place through RtpSender::SetParameters: no
+// renegotiation, same track sid. Unset fields stay as they are. max_bitrate_bps and max_framerate
+// cap the top simulcast layer; a framerate cap also holds every other layer at the lower of the cap
+// and its framerate before the first update. Layer active flags stay with dynacast. content_hint
+// alone also works on an unpublished track. A republish (LocalTrackRepublished) starts over from
+// the publish options, apart from the content hint, which stays on the track.
+message RootSetSenderEncodingRequest {
+  required uint64 track_handle = 1;
+  optional uint64 max_bitrate_bps = 2;
+  optional double max_framerate = 3;
+  optional DegradationPreference degradation_preference = 4;
+  optional RootVideoContentHint content_hint = 5;
+}
+message RootSetSenderEncodingResponse {
+  optional string error = 1;
+}

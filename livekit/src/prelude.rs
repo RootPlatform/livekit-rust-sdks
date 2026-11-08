@@ -29,9 +29,9 @@ pub use crate::{
     track::{
         AudioTrack, LocalAudioTrack, LocalTrack, LocalVideoTrack, PublishTimingEvent,
         PublishTimingEventStream, PublishTimingStage, PublishingLayer, PublishingLayerQuality,
-        RemoteAudioTrack, RemoteTrack, RemoteVideoTrack, StreamState, SubscribeTimingEvent,
-        SubscribeTimingEventStream, SubscribeTimingStage, Track, TrackDimension, TrackKind,
-        TrackSource, VideoTrack,
+        RemoteAudioTrack, RemoteTrack, RemoteVideoTrack, SenderEncodingUpdate, StreamState,
+        SubscribeTimingEvent, SubscribeTimingEventStream, SubscribeTimingStage, Track,
+        TrackDimension, TrackKind, TrackSource, VideoContentHint, VideoTrack,
     },
     ConnectionState, DataPacket, DataPacketKind, Room, RoomError, RoomEvent, RoomOptions,
     RoomResult, RoomSdkOptions, SipDTMF, Transcription, TranscriptionSegment,

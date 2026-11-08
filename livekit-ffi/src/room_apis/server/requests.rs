@@ -30,8 +30,8 @@ use super::{
     participant::FfiParticipant,
     platform_audio, resampler,
     room::{self, FfiPublication, FfiTrack},
-    rootapp_audio, rootapp_screen_audio, video_source, video_stream, FfiError, FfiResult,
-    FfiServer,
+    rootapp_audio, rootapp_screen_audio, rootapp_video, video_source, video_stream, FfiError,
+    FfiResult, FfiServer,
 };
 use crate::proto;
 
@@ -1554,6 +1554,9 @@ pub fn handle_request(
         Request::RootScreenAudioStart(req) => rootapp_screen_audio::on_start(server, req)?.into(),
         Request::RootScreenAudioStop(req) => rootapp_screen_audio::on_stop(server, req)?.into(),
         Request::RootScreenAudioStats(req) => rootapp_screen_audio::on_stats(server, req)?.into(),
+        Request::RootSetSenderEncoding(req) => {
+            rootapp_video::on_set_sender_encoding(server, req)?.into()
+        }
 
         #[cfg(feature = "capture")]
         Request::NewCaptureSource(req) => capture::on_new_capture_source(server, req)?.into(),

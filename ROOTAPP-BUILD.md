@@ -3593,6 +3593,30 @@ v0.13.4-hw.8 plus two crash fixes (`rootapp/codec-exceptions`). Caps 32767. Prot
   with `Environment.Exit` (ROOT-DESKTOP-3NB); a late ready request now fails as an invalid handle.
 - `LK_DISABLE_NVDEC` (upstream) still turns NVDEC off; it was the workaround on hw.8 and earlier.
 
+## Live sender encoding (`rootapp/live-sender-params`, not released)
+
+Changes a published local video track's encoder without unpublishing, for screen-share quality
+changes mid-share: `RtpSender::SetParameters` and the track's content hint, so no renegotiation and
+the same track sid. Proto `rootapp_video.proto`: `RootSetSenderEncodingRequest` /
+`RootSetSenderEncodingResponse` (FfiRequest/FfiResponse case 1015), keyed by the local track handle
+(as `LocalTrackMuteRequest`), every setting optional: `max_bitrate_bps`, `max_framerate`,
+`degradation_preference` (room.proto's enum) and `content_hint` (`RootVideoContentHint`
+NONE/MOTION/DETAIL/TEXT, WebRTC's kNone/kFluid/kDetailed/kText). Errors come back in `error`; an
+unknown track handle fails the request. `livekit_ffi_rootapp_video_caps()` reports bit 0
+SENDER_ENCODING; an older library rejects the request as empty.
+
+- livekit: `LocalVideoTrack::set_sender_encoding(&SenderEncodingUpdate)`. The bitrate and framerate
+  caps go to the top layer (smallest `scale_resolution_down_by`, then highest RID). A framerate cap
+  holds each other layer at the lower of the cap and its framerate before the first update on this
+  sender, so raising the cap again restores them. `active` stays with dynacast, and dynacast's and
+  this read-modify-write of the sender parameters take one lock. A republish (full reconnect)
+  starts over from the publish options; the content hint stays on the track.
+- libwebrtc: `RtcVideoTrack::content_hint` / `set_content_hint` (`VideoContentHint`).
+- Tests: `cargo test --release -p livekit --lib local_video_track` (layer merge, validation),
+  `-p livekit-ffi --lib rootapp_video`, `-p libwebrtc --lib video_track` (hint round trip) and
+  `-p libwebrtc --lib rtp_sender` (`live_sender_takes_new_encoding_and_content_hint`: a sending
+  loopback sender takes new caps, degradation preference and hint, and keeps encoding).
+
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
 | Commit | Change |

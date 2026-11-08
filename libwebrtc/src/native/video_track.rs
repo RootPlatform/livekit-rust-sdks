@@ -22,6 +22,7 @@ use webrtc_sys::video_track as sys_vt;
 use super::media_stream_track::impl_media_stream_track;
 use super::packet_trailer::PacketTrailerHandler;
 use crate::media_stream_track::RtcTrackState;
+use crate::video_track::VideoContentHint;
 
 #[derive(Clone)]
 pub struct RtcVideoTrack {
@@ -56,5 +57,23 @@ impl RtcVideoTrack {
 
     pub fn request_key_frame(&self) {
         self.sys_handle.request_key_frame();
+    }
+
+    pub fn content_hint(&self) -> VideoContentHint {
+        match self.sys_handle.content_hint() {
+            sys_vt::ffi::ContentHint::Fluid => VideoContentHint::Motion,
+            sys_vt::ffi::ContentHint::Detailed => VideoContentHint::Detail,
+            sys_vt::ffi::ContentHint::Text => VideoContentHint::Text,
+            _ => VideoContentHint::None,
+        }
+    }
+
+    pub fn set_content_hint(&self, hint: VideoContentHint) {
+        self.sys_handle.set_content_hint(match hint {
+            VideoContentHint::None => sys_vt::ffi::ContentHint::None,
+            VideoContentHint::Motion => sys_vt::ffi::ContentHint::Fluid,
+            VideoContentHint::Detail => sys_vt::ffi::ContentHint::Detailed,
+            VideoContentHint::Text => sys_vt::ffi::ContentHint::Text,
+        });
     }
 }

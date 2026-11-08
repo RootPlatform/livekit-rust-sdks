@@ -122,6 +122,14 @@ pub extern "C" fn livekit_ffi_rootapp_audio_caps() -> u64 {
     server::rootapp_audio::ROOTAPP_AUDIO_CAPS
 }
 
+/// Bitmask of the RootApp video requests this build implements (bits in
+/// `server::rootapp_video`). Hosts check it before sending them, since an older
+/// library rejects them as an empty request.
+#[no_mangle]
+pub extern "C" fn livekit_ffi_rootapp_video_caps() -> u64 {
+    server::rootapp_video::ROOTAPP_VIDEO_CAPS
+}
+
 /// The `audio_effects_sdk::INotificationHandler*` the host installs on every
 /// Effects SDK pipeline it hands over (RootAudioSetDenoiserRequest). A static
 /// native object that only counts notifications (RootAudioStats

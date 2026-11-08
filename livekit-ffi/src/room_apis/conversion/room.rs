@@ -69,7 +69,9 @@ fn video_encoder_from_proto(backend: Option<i32>) -> Option<VideoEncoderBackend>
     }
 }
 
-fn degradation_preference_from_proto(pref: Option<i32>) -> Option<DegradationPreference> {
+pub(crate) fn degradation_preference_from_proto(
+    pref: Option<i32>,
+) -> Option<DegradationPreference> {
     match pref.and_then(|value| proto::DegradationPreference::try_from(value).ok())? {
         proto::DegradationPreference::Balanced => Some(DegradationPreference::Balanced),
         proto::DegradationPreference::MaintainFramerate => {

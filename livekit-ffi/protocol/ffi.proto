@@ -28,6 +28,7 @@ import "track.proto";
 import "track_publication.proto";
 import "video_frame.proto";
 import "rootapp_audio.proto";
+import "rootapp_video.proto";
 
 option csharp_namespace = "LiveKit.Proto";
 
@@ -206,6 +207,8 @@ message FfiRequest {
     RootScreenAudioStartRequest root_screen_audio_start = 1012;
     RootScreenAudioStopRequest root_screen_audio_stop = 1013;
     RootScreenAudioStatsRequest root_screen_audio_stats = 1014;
+    // rootapp_video.proto
+    RootSetSenderEncodingRequest root_set_sender_encoding = 1015;
 
     // Capture sources (livekit-capture; requires the `capture` feature)
     NewCaptureSourceRequest new_capture_source = 91;
@@ -362,6 +365,8 @@ message FfiResponse {
     RootScreenAudioStartResponse root_screen_audio_start = 1012;
     RootScreenAudioStopResponse root_screen_audio_stop = 1013;
     RootScreenAudioStatsResponse root_screen_audio_stats = 1014;
+    // rootapp_video.proto
+    RootSetSenderEncodingResponse root_set_sender_encoding = 1015;
 
     // Capture sources (livekit-capture; requires the `capture` feature)
     NewCaptureSourceResponse new_capture_source = 91;
