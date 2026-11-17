@@ -22,6 +22,14 @@ extern "C" {
         -> i32;
 }
 
+/// For scenarios that compare a texture's device with the encoder's: the shared device must not be
+/// retired while they run.
+fn run_on_shared_device(scenario: &str) {
+    let _registry =
+        crate::mf_device::DEVICE_REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    run(scenario);
+}
+
 fn run(scenario: &str) {
     let name = CString::new(scenario).unwrap();
     let mut message = vec![0 as c_char; 2048];
@@ -43,4 +51,46 @@ fn run(scenario: &str) {
 #[test]
 fn a_refused_send_is_not_an_encode_error() {
     run("refused_send");
+}
+
+/// A GPU too busy to run the encoder for 1.5 s (a game hitching) drops frames instead of moving
+/// the share to OpenH264 for the rest of the session, and encoding carries on afterwards.
+#[test]
+fn a_briefly_stalled_hardware_encoder_stays_on_hardware() {
+    run("slow_hardware");
+}
+
+/// A D3D11 texture on the encoder's device is converted and scaled to NV12 on the GPU; the
+/// decoded frames carry the colours libyuv gives the memory path, at full size and at a scaled
+/// layer.
+#[test]
+fn a_d3d11_texture_encodes_on_the_gpu() {
+    run_on_shared_device("gpu_input");
+}
+
+/// The D3D11 video processor turns RGBA bars into NV12 with the colours libyuv gives, at full
+/// size and scaled to half.
+#[test]
+fn the_video_processor_converts_like_libyuv() {
+    run_on_shared_device("gpu_convert");
+}
+
+/// A D3D11 frame reads back to the same I420 libyuv makes from the pixels, and its lazy
+/// crop-and-scale stays a texture until read.
+#[test]
+fn a_d3d11_frame_reads_back_like_libyuv() {
+    run_on_shared_device("gpu_readback");
+}
+
+/// A texture on another device than the encoder's is read back to memory and still encodes in
+/// hardware.
+#[test]
+fn a_d3d11_texture_on_another_device_falls_back_to_memory() {
+    run_on_shared_device("gpu_other_device");
+}
+
+/// An encoder that makes no progress for longer than the limit still falls back to software.
+#[test]
+fn a_stuck_hardware_encoder_still_falls_back() {
+    run("stuck_hardware");
 }

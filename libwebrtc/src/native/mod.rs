@@ -20,6 +20,8 @@ pub mod audio_resampler;
 pub mod audio_source;
 pub mod audio_stream;
 pub mod audio_track;
+#[cfg(all(test, target_os = "windows"))]
+mod d3d11_loopback_tests;
 pub mod data_channel;
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 pub mod desktop_capturer;

@@ -31,3 +31,23 @@ message RootSetSenderEncodingRequest {
 message RootSetSenderEncodingResponse {
   optional string error = 1;
 }
+
+// Windows: captures a frame held in a D3D11 texture into a native video source with no CPU
+// round trip. The top-left width x height of `texture` (an ID3D11Texture2D*, R8G8B8A8_UNORM or
+// B8G8R8A8_UNORM, on a multithread-protected device such as the one
+// livekit_ffi_d3d11_acquire_shared_device hands out) is copied on the GPU into a pooled texture
+// before the call returns, so the host may reuse its texture right away. The MediaFoundation
+// encoder converts and scales it to NV12 on the GPU when it runs on the same device, and reads it
+// back to memory otherwise. Send it from the thread that may use the device (holding its
+// multithread lock is fine). `error` is set, and nothing is captured, when the texture or its
+// device cannot be used or too many earlier frames are still queued; send that frame as memory.
+message RootCaptureD3d11FrameRequest {
+  required uint64 source_handle = 1;
+  required uint64 texture = 2;
+  required uint32 width = 3;
+  required uint32 height = 4;
+  optional int64 timestamp_us = 5;
+}
+message RootCaptureD3d11FrameResponse {
+  optional string error = 1;
+}

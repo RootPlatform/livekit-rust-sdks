@@ -36,6 +36,11 @@ extern "C" {
     /// Returns an HRESULT: E_INVALIDARG when `device` holds no host reference.
     pub fn lk_mf_release_host_d3d11_device(device: *mut c_void) -> i32;
 
+    /// The adapter of the hardware H.264 encoder MFT that encoders open. Returns an HRESULT:
+    /// S_FALSE with the default adapter when the MFT names none, MF_E_NOT_FOUND without a
+    /// hardware encoder.
+    pub fn lk_mf_encoder_adapter_luid(out: *mut Luid) -> i32;
+
     /// What the MF decode watchdogs (`src/mf/mf_decode_watchdog.h`) saw in this
     /// process: calls abandoned in the driver (each turns MF decoding off until
     /// the process exits) and streams given up on for decoding no frame.
@@ -43,11 +48,18 @@ extern "C" {
     pub fn lk_mf_decode_watchdog_counts(hangs: *mut u32, silences: *mut u32);
 }
 
+/// Held by tests that depend on the shared D3D11 device registry staying put
+/// (`host_device_contract` retires the device and turns sharing off).
+#[cfg(test)]
+pub(crate) static DEVICE_REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const S_OK: i32 = 0;
+    const S_FALSE: i32 = 1;
+    const MF_E_NOT_FOUND: i32 = 0xC00D_36D5_u32 as i32;
     const E_POINTER: i32 = 0x8000_4003_u32 as i32;
     const E_INVALIDARG: i32 = 0x8007_0057_u32 as i32;
     const DXGI_ERROR_DEVICE_REMOVED: i32 = 0x887A_0005_u32 as i32;
@@ -101,8 +113,36 @@ mod tests {
     }
 
     // One test, so the fault switch it sets never races another acquire.
+    // A host that takes the shared device on the encoder adapter gets a device it can acquire
+    // again by that LUID (the encoders open theirs through the same registry).
+    #[test]
+    fn encoder_adapter_luid_names_an_adapter_with_a_shared_device() {
+        let _registry = DEVICE_REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            assert_eq!(lk_mf_encoder_adapter_luid(std::ptr::null_mut()), E_POINTER);
+            let mut luid = Luid::default();
+            let hr = lk_mf_encoder_adapter_luid(&mut luid);
+            if hr == MF_E_NOT_FOUND {
+                eprintln!("skipped: no hardware H.264 encoder");
+                return;
+            }
+            assert!(hr == S_OK || hr == S_FALSE, "hr {hr:#x}");
+            assert_ne!(luid, Luid::default());
+            let (hr, device) = acquire(Some(&luid));
+            assert_eq!(hr, S_OK);
+            let (hr, again) = acquire(Some(&luid));
+            assert_eq!(hr, S_OK);
+            assert_eq!(device, again);
+            release(again);
+            release(device);
+            assert_eq!(lk_mf_release_host_d3d11_device(device), S_OK);
+            assert_eq!(lk_mf_release_host_d3d11_device(device), S_OK);
+        }
+    }
+
     #[test]
     fn host_device_contract() {
+        let _registry = DEVICE_REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         unsafe {
             assert_eq!(
                 lk_mf_acquire_host_d3d11_device(std::ptr::null(), std::ptr::null_mut()),

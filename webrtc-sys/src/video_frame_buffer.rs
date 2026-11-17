@@ -183,6 +183,20 @@ pub mod ffi {
         /// is not DMA-BUF backed.
         fn native_buffer_to_dmabuf_fd(buffer: &UniquePtr<VideoFrameBuffer>) -> i32;
 
+        /// Copies the top-left `width` x `height` of an `ID3D11Texture2D*`
+        /// (RGBA or BGRA, on a multithread-protected device) into a pooled
+        /// texture the MF encoder converts on the GPU. Null when that is not
+        /// possible, and always off Windows.
+        ///
+        /// # Safety
+        /// `texture` must be a valid `ID3D11Texture2D*` for the duration of
+        /// the call, used under its device's rules for the calling thread.
+        unsafe fn new_native_buffer_from_d3d11_texture(
+            texture: *mut u8,
+            width: i32,
+            height: i32,
+        ) -> UniquePtr<VideoFrameBuffer>;
+
         unsafe fn yuv_to_vfb(yuv: *const PlanarYuvBuffer) -> *const VideoFrameBuffer;
         unsafe fn biyuv_to_vfb(yuv: *const BiplanarYuvBuffer) -> *const VideoFrameBuffer;
         unsafe fn yuv8_to_yuv(yuv8: *const PlanarYuv8Buffer) -> *const PlanarYuvBuffer;

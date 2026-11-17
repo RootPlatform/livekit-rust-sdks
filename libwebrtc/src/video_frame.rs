@@ -642,6 +642,28 @@ pub mod native {
             vf_imp::NativeBuffer::from_dmabuf(dmabuf_fd, resolution, pixel_format)
         }
 
+        /// Copies the top-left `width` x `height` of a D3D11 texture into a
+        /// pooled texture on the same device, for the MediaFoundation encoder
+        /// to convert and scale on the GPU. The caller may reuse its texture
+        /// once this returns.
+        ///
+        /// `None` when the texture is not R8G8B8A8_UNORM or B8G8R8A8_UNORM,
+        /// its device is not multithread protected, the region does not fit,
+        /// or too many earlier frames are still queued.
+        ///
+        /// # Safety
+        /// `texture` must be a valid `ID3D11Texture2D*` for the duration of
+        /// the call.
+        #[cfg(target_os = "windows")]
+        pub unsafe fn from_d3d11_texture(
+            texture: *mut std::ffi::c_void,
+            width: u32,
+            height: u32,
+        ) -> Option<Self> {
+            // SAFETY: forwarded from the caller.
+            unsafe { vf_imp::NativeBuffer::from_d3d11_texture(texture, width, height) }
+        }
+
         /// Returns the DMA-BUF fd that backs this buffer, or `None` if this
         /// buffer is not DMA-BUF backed.
         ///

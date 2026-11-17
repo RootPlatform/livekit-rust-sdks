@@ -135,6 +135,47 @@ impl FfiVideoSource {
         Ok(())
     }
 
+    /// Captures the top-left `width` x `height` of an `ID3D11Texture2D*` (see
+    /// `RootCaptureD3d11FrameRequest`). The error says why the texture could not be taken; the
+    /// host then sends the frame as memory.
+    ///
+    /// # Safety
+    /// `texture` must be a valid `ID3D11Texture2D*` for the duration of the call.
+    #[cfg(target_os = "windows")]
+    pub unsafe fn capture_d3d11_texture(
+        &self,
+        texture: *mut std::ffi::c_void,
+        width: u32,
+        height: u32,
+        timestamp_us: i64,
+    ) -> Result<(), String> {
+        if self.source_type != proto::VideoSourceType::VideoSourceNative {
+            return Err("textures require a native video source".into());
+        }
+        if texture.is_null() || width == 0 || height == 0 {
+            return Err("empty texture".into());
+        }
+        let RtcVideoSource::Native(ref source) = self.source else {
+            return Err("not a native video source".into());
+        };
+        // SAFETY: forwarded from the caller.
+        let Some(buffer) = (unsafe {
+            livekit::webrtc::video_frame::native::NativeBuffer::from_d3d11_texture(
+                texture, width, height,
+            )
+        }) else {
+            return Err("the texture cannot be taken (format, device or pool)".into());
+        };
+        let frame = VideoFrame {
+            rotation: VideoRotation::VideoRotation0,
+            timestamp_us,
+            frame_metadata: None,
+            buffer,
+        };
+        source.capture_frame(&frame);
+        Ok(())
+    }
+
     pub fn capture_encoded_frame(
         &self,
         capture: &proto::CaptureEncodedVideoFrameRequest,

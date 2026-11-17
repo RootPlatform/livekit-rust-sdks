@@ -853,6 +853,41 @@ extern "C" HRESULT lk_mf_release_host_d3d11_device(ID3D11Device* device) {
   }
 }
 
+// The adapter the first hardware H.264 encoder MFT (the one encoders open)
+// runs on, for a host that wants its capture on the encoders' device. S_FALSE
+// with the default adapter's LUID when the MFT names none; MF_E_NOT_FOUND
+// without a hardware encoder.
+extern "C" HRESULT lk_mf_encoder_adapter_luid(LUID* out) {
+  if (!out) {
+    return E_POINTER;
+  }
+  try {
+    if (!livekit_ffi::IsMfPlatAvailable() || !livekit_ffi::EnsureMFStarted()) {
+      return MF_E_NOT_FOUND;
+    }
+    livekit_ffi::EnsureComInitialized();
+    std::vector<livekit_ffi::ComPtr<IMFActivate>> encoders =
+        livekit_ffi::EnumHardwareH264Encoders();
+    if (encoders.empty()) {
+      return MF_E_NOT_FOUND;
+    }
+    UINT64 luid_u64 = 0;
+    if (SUCCEEDED(encoders[0]->GetUINT64(livekit_ffi::kMftEnumAdapterLuid, &luid_u64))) {
+      out->LowPart = static_cast<DWORD>(luid_u64 & 0xFFFFFFFF);
+      out->HighPart = static_cast<LONG>(luid_u64 >> 32);
+      return S_OK;
+    }
+    if (SUCCEEDED(encoders[0]->GetBlob(livekit_ffi::kMftEnumAdapterLuid,
+                                       reinterpret_cast<UINT8*>(out),
+                                       sizeof(*out), nullptr))) {
+      return S_OK;
+    }
+    return SUCCEEDED(livekit_ffi::DefaultAdapterLuid(out)) ? S_FALSE : MF_E_NOT_FOUND;
+  } catch (...) {
+    return E_OUTOFMEMORY;
+  }
+}
+
 #if defined(ROOTAPP_HARNESS)
 // mf_device.rs's tests: whether two codec acquires on the default adapter
 // share a device, and whether one after RetireD3D11Device gets a new one.

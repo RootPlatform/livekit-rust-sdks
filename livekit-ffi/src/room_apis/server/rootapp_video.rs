@@ -16,14 +16,55 @@
 
 use livekit::prelude::*;
 
-use super::{room::FfiTrack, FfiServer};
+use super::{room::FfiTrack, video_source::FfiVideoSource, FfiServer};
 use crate::{conversion::room::degradation_preference_from_proto, proto, FfiResult};
 
 /// RootSetSenderEncodingRequest.
 pub const CAP_SENDER_ENCODING: u64 = 1 << 0;
 
+/// RootCaptureD3d11FrameRequest (Windows only).
+pub const CAP_D3D11_CAPTURE: u64 = 1 << 1;
+
 /// What `livekit_ffi_rootapp_video_caps` reports.
+#[cfg(target_os = "windows")]
+pub const ROOTAPP_VIDEO_CAPS: u64 = CAP_SENDER_ENCODING | CAP_D3D11_CAPTURE;
+#[cfg(not(target_os = "windows"))]
 pub const ROOTAPP_VIDEO_CAPS: u64 = CAP_SENDER_ENCODING;
+
+/// Captures a D3D11 texture into a native video source. Runs on the caller's
+/// thread: the GPU copy is queued before it returns.
+pub fn on_capture_d3d11_frame(
+    server: &'static FfiServer,
+    req: proto::RootCaptureD3d11FrameRequest,
+) -> FfiResult<proto::RootCaptureD3d11FrameResponse> {
+    let source = server.retrieve_handle::<FfiVideoSource>(req.source_handle)?;
+    #[cfg(target_os = "windows")]
+    let error = {
+        let timestamp_us = req.timestamp_us.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_micros() as i64)
+                .unwrap_or(0)
+        });
+        // SAFETY: the host passes a live ID3D11Texture2D* it keeps for the duration of the
+        // request (RootCaptureD3d11FrameRequest).
+        unsafe {
+            source.capture_d3d11_texture(
+                req.texture as usize as *mut std::ffi::c_void,
+                req.width,
+                req.height,
+                timestamp_us,
+            )
+        }
+        .err()
+    };
+    #[cfg(not(target_os = "windows"))]
+    let error = {
+        let _ = (&source, &req);
+        Some("D3D11 textures are only taken on Windows".to_owned())
+    };
+    Ok(proto::RootCaptureD3d11FrameResponse { error })
+}
 
 /// Changes a published local video track's encoder in place. Runs on the
 /// caller's thread and blocks on WebRTC's signaling thread for the sender's

@@ -64,3 +64,7 @@ web-sys = { version = "0.3", features = [
 
 [dev-dependencies]
 env_logger = { workspace = true }
+
+# The MF encoder harness exports the D3D11 loopback test uses.
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+webrtc-sys = { workspace = true, features = ["harness"] }

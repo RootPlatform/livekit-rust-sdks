@@ -18,6 +18,9 @@
 
 #include "api/make_ref_counted.h"
 #include "livekit/dmabuf_video_frame_buffer.h"
+#if defined(_WIN32)
+#include "livekit/d3d11_texture_buffer.h"
+#endif
 
 namespace livekit_ffi {
 
@@ -406,6 +409,23 @@ std::unique_ptr<VideoFrameBuffer> new_native_buffer_from_dmabuf(
       webrtc::make_ref_counted<livekit::DmaBufVideoFrameBuffer>(
           dmabuf_fd, width, height,
           static_cast<livekit::DmaBufPixelFormat>(pixel_format)));
+}
+
+std::unique_ptr<VideoFrameBuffer> new_native_buffer_from_d3d11_texture(
+    uint8_t* texture,
+    int width,
+    int height) {
+#if defined(_WIN32)
+  webrtc::scoped_refptr<livekit::D3D11TextureBuffer> buffer =
+      livekit::D3D11TextureBuffer::CopyFrom(
+          reinterpret_cast<ID3D11Texture2D*>(texture), width, height);
+  if (!buffer) {
+    return nullptr;
+  }
+  return std::make_unique<VideoFrameBuffer>(buffer);
+#else
+  return nullptr;
+#endif
 }
 
 int native_buffer_to_dmabuf_fd(

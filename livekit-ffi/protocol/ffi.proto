@@ -209,6 +209,7 @@ message FfiRequest {
     RootScreenAudioStatsRequest root_screen_audio_stats = 1014;
     // rootapp_video.proto
     RootSetSenderEncodingRequest root_set_sender_encoding = 1015;
+    RootCaptureD3d11FrameRequest root_capture_d3d11_frame = 1016;
 
     // Capture sources (livekit-capture; requires the `capture` feature)
     NewCaptureSourceRequest new_capture_source = 91;
@@ -367,6 +368,7 @@ message FfiResponse {
     RootScreenAudioStatsResponse root_screen_audio_stats = 1014;
     // rootapp_video.proto
     RootSetSenderEncodingResponse root_set_sender_encoding = 1015;
+    RootCaptureD3d11FrameResponse root_capture_d3d11_frame = 1016;
 
     // Capture sources (livekit-capture; requires the `capture` feature)
     NewCaptureSourceResponse new_capture_source = 91;

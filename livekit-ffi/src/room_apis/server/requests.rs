@@ -1557,6 +1557,9 @@ pub fn handle_request(
         Request::RootSetSenderEncoding(req) => {
             rootapp_video::on_set_sender_encoding(server, req)?.into()
         }
+        Request::RootCaptureD3d11Frame(req) => {
+            rootapp_video::on_capture_d3d11_frame(server, req)?.into()
+        }
 
         #[cfg(feature = "capture")]
         Request::NewCaptureSource(req) => capture::on_new_capture_source(server, req)?.into(),

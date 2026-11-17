@@ -16,6 +16,8 @@
 
 #include "h264_encoder_impl.h"
 
+#include <d3d10_1.h>  // ID3D10Multithread
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -25,6 +27,7 @@
 #include <limits>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 
 #include <common_video/h264/h264_common.h>
@@ -60,6 +63,11 @@ enum H264EncoderImplEvent {
 // very first request after initialization can lag while the driver spins up.
 constexpr int kNeedInputTimeoutMs = 500;
 constexpr int kOutputWaitTimeoutMs = 500;
+// How long an MFT may make no progress (no input request, no output) before
+// the encoder gives up on hardware. Below it, frames are dropped.
+constexpr int64_t kStallFallbackMs = 5000;
+// The wait for an input slot or output once the MFT is already stalled.
+constexpr int kStalledWaitMs = 50;
 // How many frames may be in flight inside the MFT before Encode() blocks
 // waiting for output. Low-latency mode keeps this near 1 in practice.
 constexpr size_t kMaxPendingFrames = 4;
@@ -1212,12 +1220,14 @@ void MFH264EncoderImpl::ReleaseTransform(bool defer) {
     resources->staging_textures.push_back(std::move(slot.texture));
   }
   staging_.clear();
+  converter_.Reset();
   resources->upload_fence = std::move(upload_fence_);
   resources->d3d = std::move(d3d_);
   resources->input_stream_id = input_stream_id_;
   resources->session_open = std::exchange(session_open_, false);
   next_staging_ = 0;
   need_input_credits_ = 0;
+  stalled_since_.reset();
   sequence_header_.clear();
   is_async_ = false;
   requested_keyframes_ = 0;
@@ -1523,10 +1533,136 @@ HRESULT MFH264EncoderImpl::CreateD3DInputSample(const VideoFrameBuffer& buffer,
   return S_OK;
 }
 
+#if defined(ROOTAPP_HARNESS)
+namespace {
+// Per thread: the harness encodes on its own thread, and tests run in
+// parallel.
+thread_local int64_t gpu_frames_for_test = 0;
+thread_local std::string gpu_note_for_test;
+std::atomic<int64_t> gpu_frames_total_for_test{0};
+std::mutex frame_types_mutex;
+std::string frame_types_for_test;
+
+void RecordFrameTypeForTest(VideoFrameBuffer::Type type, bool d3d11) {
+  std::lock_guard<std::mutex> lock(frame_types_mutex);
+  const std::string name = d3d11 ? std::string("D3D11")
+                                 : VideoFrameBufferTypeToString(type);
+  if (frame_types_for_test.find(name) == std::string::npos) {
+    frame_types_for_test += name + " ";
+  }
+}
+}  // namespace
+#endif
+
+webrtc::scoped_refptr<VideoFrameBuffer> MFH264EncoderImpl::ToEncoderMemory(
+    webrtc::scoped_refptr<VideoFrameBuffer> buffer) {
+  if (buffer->width() != configuration_.width ||
+      buffer->height() != configuration_.height) {
+    buffer = buffer->Scale(configuration_.width, configuration_.height);
+  }
+  if (buffer && (buffer->type() == VideoFrameBuffer::Type::kNV12 ||
+                 buffer->type() == VideoFrameBuffer::Type::kI420)) {
+    return buffer;
+  }
+  webrtc::scoped_refptr<I420BufferInterface> i420 =
+      buffer ? buffer->ToI420() : nullptr;
+  if (!i420) {
+    RTC_LOG(LS_ERROR) << "Failed to convert "
+                      << (buffer ? VideoFrameBufferTypeToString(buffer->type())
+                                 : "a missing")
+                      << " image to I420. Can't encode frame.";
+    return nullptr;
+  }
+  return i420;
+}
+
+HRESULT MFH264EncoderImpl::CreateGpuInputSample(
+    const livekit::D3D11TextureBuffer& buffer,
+    int64_t sample_time_100ns,
+    int64_t duration_100ns,
+    IMFSample** sample_out) {
+  ComPtr<IMFSample> sample;
+  ComPtr<ID3D11Texture2D> texture;
+  HRESULT hr = AcquireInputSample(&sample, &texture);
+  if (FAILED(hr)) {
+    return hr;
+  }
+  ComPtr<ID3D10Multithread> multithread;
+  hr = d3d_->context.As(&multithread);
+  if (FAILED(hr)) {
+    return hr;
+  }
+  multithread->Enter();
+  hr = converter_.Convert(d3d_->device.Get(), d3d_->context.Get(),
+                          buffer.texture(), buffer.source_rect(),
+                          texture.Get(), configuration_.width,
+                          configuration_.height);
+  multithread->Leave();
+  if (FAILED(hr)) {
+    return hr;
+  }
+#if defined(ROOTAPP_HARNESS)
+  gpu_frames_for_test++;
+  gpu_frames_total_for_test++;
+#endif
+  if (gpu_frames_++ == 0) {
+    RTC_LOG(LS_INFO) << "MF encoder takes D3D11 frames on the GPU ("
+                     << buffer.width() << "x" << buffer.height() << " -> "
+                     << configuration_.width << "x" << configuration_.height
+                     << ").";
+  }
+  sample->SetSampleTime(sample_time_100ns);
+  sample->SetSampleDuration(duration_100ns);
+  hr = input_pool_->Arm(sample.Get());
+  if (FAILED(hr)) {
+    RTC_LOG(LS_ERROR) << "Failed to track encoder input sample: "
+                      << HResultToString(hr);
+    return hr;
+  }
+  *sample_out = sample.Detach();
+  return S_OK;
+}
+
+#if defined(ROOTAPP_HARNESS)
+namespace {
+struct TestStall {
+  int64_t after_frames = 0;
+  int stall_ms = 0;
+  std::optional<std::chrono::steady_clock::time_point> started;
+};
+thread_local TestStall test_stall;
+}  // namespace
+#endif
+
+bool MFH264EncoderImpl::StallForTest(std::chrono::steady_clock::duration wait) {
+#if defined(ROOTAPP_HARNESS)
+  if (test_stall.stall_ms <= 0 || frames_submitted_ < test_stall.after_frames) {
+    return false;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (!test_stall.started) {
+    test_stall.started = now;
+  }
+  if (now - *test_stall.started >=
+      std::chrono::milliseconds(test_stall.stall_ms)) {
+    return false;
+  }
+  std::this_thread::sleep_for(std::max(wait, std::chrono::steady_clock::duration::zero()));
+  return true;
+#else
+  return false;
+#endif
+}
+
 int32_t MFH264EncoderImpl::PumpEvents(int timeout_ms,
                                       bool until_need_input,
                                       size_t until_pending_at_most,
                                       bool fail_on_timeout) {
+  // While the MFT is already stalled every wait is short: frames are dropped
+  // promptly instead of blocking the encoder thread for the full timeout.
+  if (stalled_since_ && fail_on_timeout) {
+    timeout_ms = std::min(timeout_ms, kStalledWaitMs);
+  }
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
   for (;;) {
@@ -1539,14 +1675,43 @@ int32_t MFH264EncoderImpl::PumpEvents(int timeout_ms,
                           ? std::chrono::steady_clock::duration::zero()
                           : deadline - std::chrono::steady_clock::now();
     const MFAsyncEventPump::WaitResult result =
-        event_pump_->Wait(wait, &type, &status);
+        StallForTest(wait) ? MFAsyncEventPump::WaitResult::kTimeout
+                           : event_pump_->Wait(wait, &type, &status);
     if (result == MFAsyncEventPump::WaitResult::kTimeout) {
       if (goals_met || !fail_on_timeout) {
         return WEBRTC_VIDEO_CODEC_OK;
       }
+      const auto now = std::chrono::steady_clock::now();
+      if (!stalled_since_) {
+        stalled_since_ = now - std::chrono::milliseconds(timeout_ms);
+      }
+      const int64_t stalled_ms =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              now - *stalled_since_)
+              .count();
+      if (stalled_ms < kStallFallbackMs) {
+        // A hardware encoder sharing the GPU with a game can fall behind for
+        // a while. Dropping frames keeps it; falling back to software here
+        // would keep the share on OpenH264 for the rest of the session.
+        frames_dropped_slow_++;
+        uint64_t held_back = 0;
+        if (slow_mft_log_.Allow(&held_back)) {
+          RTC_LOG(LS_WARNING)
+              << "Encoder MFT slow (waiting for "
+              << (until_need_input ? "an input slot" : "output") << ", "
+              << pending_frames_.size() << " frames in flight, no progress for "
+              << stalled_ms << " ms); dropped frame, staying on hardware ("
+              << frames_dropped_slow_ << " dropped so far)"
+              << livekit_ffi::LogRepeatNote(held_back);
+        }
+        return until_need_input ? WEBRTC_VIDEO_CODEC_NO_OUTPUT
+                                : WEBRTC_VIDEO_CODEC_OK;
+      }
       RTC_LOG(LS_ERROR) << "Timed out waiting for encoder MFT ("
                         << (until_need_input ? "input slot" : "output") << ", "
-                        << pending_frames_.size() << " frames in flight).";
+                        << pending_frames_.size()
+                        << " frames in flight, no progress for " << stalled_ms
+                        << " ms).";
       ReportError();
       return kHardwareFailure;
     }
@@ -1559,7 +1724,9 @@ int32_t MFH264EncoderImpl::PumpEvents(int timeout_ms,
 
     if (type == METransformNeedInput) {
       need_input_credits_++;
+      stalled_since_.reset();
     } else if (type == METransformHaveOutput) {
+      stalled_since_.reset();
       int32_t ret = CollectOneOutput();
       if (ret != WEBRTC_VIDEO_CODEC_OK) {
         return ret;
@@ -1606,20 +1773,38 @@ int32_t MFH264EncoderImpl::Encode(
     }
   }
 
-  // NV12 is the MFT's input format and is copied as is; anything else goes
-  // through I420.
+  // A D3D11 texture on this encoder's device is converted and scaled on the
+  // GPU. NV12 is the MFT's input format and is copied as is; anything else,
+  // and a texture this encoder cannot take, goes through I420. A native frame
+  // arrives at the source's size (SimulcastEncoderAdapter passes it on
+  // unscaled), so the memory path scales it to this layer.
   webrtc::scoped_refptr<VideoFrameBuffer> frame_buffer =
       input_frame.video_frame_buffer();
-  if (frame_buffer->type() != VideoFrameBuffer::Type::kNV12 &&
+  const livekit::D3D11TextureBuffer* gpu_frame =
+      livekit::D3D11TextureBuffer::FromNative(frame_buffer.get());
+#if defined(ROOTAPP_HARNESS)
+  RecordFrameTypeForTest(frame_buffer->type(), gpu_frame != nullptr);
+#endif
+  if (gpu_frame && (!d3d_ || gpu_input_disabled_ ||
+                    gpu_frame->device() != d3d_->device.Get())) {
+#if defined(ROOTAPP_HARNESS)
+    gpu_note_for_test = !d3d_                 ? "encoder has no D3D11 device"
+                        : gpu_input_disabled_ ? "GPU input disabled"
+                                              : "texture on another device";
+    RecordFrameTypeForTest(VideoFrameBuffer::Type::kNative, false);
+    {
+      std::lock_guard<std::mutex> lock(frame_types_mutex);
+      frame_types_for_test += "(" + gpu_note_for_test + ") ";
+    }
+#endif
+    gpu_frame = nullptr;
+  }
+  if (!gpu_frame && frame_buffer->type() != VideoFrameBuffer::Type::kNV12 &&
       frame_buffer->type() != VideoFrameBuffer::Type::kI420) {
-    webrtc::scoped_refptr<I420BufferInterface> i420 = frame_buffer->ToI420();
-    if (!i420) {
-      RTC_LOG(LS_ERROR) << "Failed to convert "
-                        << VideoFrameBufferTypeToString(frame_buffer->type())
-                        << " image to I420. Can't encode frame.";
+    frame_buffer = ToEncoderMemory(frame_buffer);
+    if (!frame_buffer) {
       return kHardwareFailure;
     }
-    frame_buffer = i420;
   }
 
   bool is_keyframe_needed = false;
@@ -1635,8 +1820,8 @@ int32_t MFH264EncoderImpl::Encode(
     configuration_.key_frame_request = false;
   }
 
-  RTC_DCHECK_EQ(configuration_.width, frame_buffer->width());
-  RTC_DCHECK_EQ(configuration_.height, frame_buffer->height());
+  RTC_DCHECK(gpu_frame || configuration_.width == frame_buffer->width());
+  RTC_DCHECK(gpu_frame || configuration_.height == frame_buffer->height());
 
   if (!configuration_.sending) {
     return WEBRTC_VIDEO_CODEC_NO_OUTPUT;
@@ -1656,6 +1841,9 @@ int32_t MFH264EncoderImpl::Encode(
     int32_t ret = PumpEvents(kNeedInputTimeoutMs, /*until_need_input=*/true,
                              /*until_pending_at_most=*/SIZE_MAX);
     if (ret != WEBRTC_VIDEO_CODEC_OK) {
+      if (ret == WEBRTC_VIDEO_CODEC_NO_OUTPUT && is_keyframe_needed) {
+        configuration_.key_frame_request = true;
+      }
       return ret;
     }
   }
@@ -1699,11 +1887,33 @@ int32_t MFH264EncoderImpl::Encode(
   frame_count_++;
 
   ComPtr<IMFSample> sample;
-  HRESULT hr = d3d_
-                   ? CreateD3DInputSample(*frame_buffer, sample_time_100ns,
-                                          duration_100ns, &sample)
-                   : CreateInputSample(*frame_buffer, sample_time_100ns,
-                                       duration_100ns, &sample);
+  HRESULT hr = E_FAIL;
+  if (gpu_frame) {
+    hr = CreateGpuInputSample(*gpu_frame, sample_time_100ns, duration_100ns,
+                              &sample);
+    if (FAILED(hr)) {
+      // The GPU path stays off for this encoder; the memory path reads the
+      // texture back, so the frame is still encoded on the MFT.
+      gpu_input_disabled_ = true;
+#if defined(ROOTAPP_HARNESS)
+      gpu_note_for_test = "conversion failed " + HResultToString(hr);
+#endif
+      RTC_LOG(LS_WARNING) << "D3D11 frame conversion failed ("
+                          << HResultToString(hr)
+                          << "); reading frames back to memory from now on.";
+      frame_buffer = ToEncoderMemory(frame_buffer);
+      if (!frame_buffer) {
+        return kHardwareFailure;
+      }
+      gpu_frame = nullptr;
+    }
+  }
+  if (!gpu_frame) {
+    hr = d3d_ ? CreateD3DInputSample(*frame_buffer, sample_time_100ns,
+                                     duration_100ns, &sample)
+              : CreateInputSample(*frame_buffer, sample_time_100ns,
+                                  duration_100ns, &sample);
+  }
   if (FAILED(hr)) {
     RTC_LOG(LS_ERROR) << "Failed to create input sample: "
                       << HResultToString(hr);
@@ -2020,7 +2230,9 @@ int32_t MFH264EncoderImpl::ProcessEncodedFrame(std::vector<uint8_t>& packet) {
 
 VideoEncoder::EncoderInfo MFH264EncoderImpl::GetEncoderInfo() const {
   EncoderInfo info;
-  info.supports_native_handle = false;
+  // D3D11TextureBuffer frames on this encoder's device are converted on the
+  // GPU; any other native frame is read back in Encode().
+  info.supports_native_handle = true;
   info.implementation_name = friendly_name_.empty()
                                  ? "MediaFoundation H264 Encoder"
                                  : "MediaFoundation H264 Encoder (" +
@@ -2112,3 +2324,28 @@ void MFH264EncoderImpl::LayerConfig::SetStreamState(bool send_stream) {
 }
 
 }  // namespace webrtc
+
+#if defined(ROOTAPP_HARNESS)
+int64_t livekit_ffi::MfEncoderGpuFramesForTest() {
+  return webrtc::gpu_frames_for_test;
+}
+
+int64_t livekit_ffi::MfEncoderGpuFramesTotalForTest() {
+  return webrtc::gpu_frames_total_for_test.load();
+}
+
+std::string livekit_ffi::MfEncoderFrameTypesForTest() {
+  std::lock_guard<std::mutex> lock(webrtc::frame_types_mutex);
+  return webrtc::frame_types_for_test;
+}
+
+std::string livekit_ffi::MfEncoderGpuNoteForTest() {
+  return std::exchange(webrtc::gpu_note_for_test, std::string());
+}
+
+void livekit_ffi::SetMfEncoderStallForTest(int64_t after_frames, int stall_ms) {
+  webrtc::test_stall = {};
+  webrtc::test_stall.after_frames = after_frames;
+  webrtc::test_stall.stall_ms = stall_ms;
+}
+#endif

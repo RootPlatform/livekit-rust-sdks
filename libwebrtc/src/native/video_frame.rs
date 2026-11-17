@@ -212,6 +212,23 @@ impl NativeBuffer {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    pub unsafe fn from_d3d11_texture(
+        texture: *mut std::ffi::c_void,
+        width: u32,
+        height: u32,
+    ) -> Option<vf::native::NativeBuffer> {
+        let (Ok(width), Ok(height)) = (i32::try_from(width), i32::try_from(height)) else {
+            return None;
+        };
+        // SAFETY: the caller guarantees `texture` is a valid ID3D11Texture2D* for this call.
+        let sys_handle = unsafe {
+            vfb_sys::ffi::new_native_buffer_from_d3d11_texture(texture as *mut u8, width, height)
+        };
+        (!sys_handle.is_null())
+            .then(|| vf::native::NativeBuffer { handle: NativeBuffer { sys_handle } })
+    }
+
     #[cfg(target_os = "linux")]
     pub fn get_dmabuf_fd(&self) -> Option<vf::native::DmaBufFileDescriptor> {
         let fd = vfb_sys::ffi::native_buffer_to_dmabuf_fd(&self.sys_handle);

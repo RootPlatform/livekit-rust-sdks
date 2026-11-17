@@ -240,6 +240,11 @@ std::unique_ptr<VideoFrameBuffer> new_native_buffer_from_platform_image_buffer(P
 PlatformImageBuffer* native_buffer_to_platform_image_buffer(const std::unique_ptr<VideoFrameBuffer> &);
 
 std::unique_ptr<VideoFrameBuffer> new_native_buffer_from_dmabuf(int dmabuf_fd, int width, int height, int pixel_format);
+
+// Copies the top-left width x height of a D3D11 texture (an ID3D11Texture2D*)
+// into a pooled texture for the MF encoder. Null where that is unavailable:
+// see livekit::D3D11TextureBuffer::CopyFrom; always null off Windows.
+std::unique_ptr<VideoFrameBuffer> new_native_buffer_from_d3d11_texture(uint8_t* texture, int width, int height);
 int native_buffer_to_dmabuf_fd(const std::unique_ptr<VideoFrameBuffer> &);
 
 static const VideoFrameBuffer* yuv_to_vfb(const PlanarYuvBuffer* yuv) {

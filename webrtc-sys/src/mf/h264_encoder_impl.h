@@ -17,11 +17,14 @@
 #ifndef WEBRTC_MF_H264_ENCODER_IMPL_H_
 #define WEBRTC_MF_H264_ENCODER_IMPL_H_
 
+#include "d3d11_video_converter.h"
+#include "livekit/d3d11_texture_buffer.h"
 #include "mf_common.h"
 #include "mf_reinit_policy.h"
 
 #include <codecapi.h>
 
+#include <chrono>
 #include <deque>
 #include <memory>
 #include <optional>
@@ -125,6 +128,16 @@ class MFH264EncoderImpl : public VideoEncoder {
                                IMFSample** sample_out);
   HRESULT AcquireInputSample(IMFSample** sample_out,
                              ID3D11Texture2D** texture_out);
+  // A D3D11TextureBuffer on d3d_'s device: the video processor converts and
+  // scales it straight into a pooled NV12 input texture.
+  HRESULT CreateGpuInputSample(const livekit::D3D11TextureBuffer& buffer,
+                               int64_t sample_time_100ns,
+                               int64_t duration_100ns,
+                               IMFSample** sample_out);
+  // `buffer` at this layer's size in NV12 or I420, reading a native frame
+  // back; null when it cannot be converted.
+  webrtc::scoped_refptr<VideoFrameBuffer> ToEncoderMemory(
+      webrtc::scoped_refptr<VideoFrameBuffer> buffer);
   HRESULT AddStagingSlot(size_t index);
   // Maps the oldest upload slot for writing. A slot whose copy the GPU has
   // not run yet is never mapped with a blocking Map, which would hold the
@@ -191,6 +204,11 @@ class MFH264EncoderImpl : public VideoEncoder {
   size_t next_staging_ = 0;
   livekit_ffi::D3D11GpuFence upload_fence_;
   livekit_ffi::ComPtr<MFInputSamplePool> input_pool_;
+  D3D11VideoConverter converter_;
+  // Set once a GPU conversion failed; this encoder then reads D3D11 frames
+  // back to memory.
+  bool gpu_input_disabled_ = false;
+  int64_t gpu_frames_ = 0;
   bool buffer_size_supported_ = true;
   bool max_bitrate_supported_ = true;
   // Capture timestamp of the first frame since InitEncode; sample times are
@@ -206,6 +224,15 @@ class MFH264EncoderImpl : public VideoEncoder {
   int64_t frame_count_ = 0;
   // Frames accepted by ProcessInput since InitEncode.
   int64_t frames_submitted_ = 0;
+  // When the MFT stopped making progress (no input request and no output
+  // since); unset while it keeps up. PumpEvents drops frames until it has been
+  // stuck for kStallFallbackMs, and only then falls back to software.
+  std::optional<std::chrono::steady_clock::time_point> stalled_since_;
+  int64_t frames_dropped_slow_ = 0;
+  livekit_ffi::LogRepeatLimiter slow_mft_log_;
+  // True when a test hook (SetMfEncoderStallForTest) holds this encoder's MFT
+  // events back; PumpEvents then sleeps `wait` and reports a timeout.
+  bool StallForTest(std::chrono::steady_clock::duration wait);
   // This encoder holds a hardware session (counted for LK_MF_MAX_SESSIONS).
   bool session_open_ = false;
   // Set while the session waits for closing sessions; past it, the encoder
@@ -252,5 +279,24 @@ class MFH264EncoderImpl : public VideoEncoder {
 };
 
 }  // namespace webrtc
+
+#if defined(ROOTAPP_HARNESS)
+namespace livekit_ffi {
+// Harness only: on the calling thread, from the encoder's `after_frames`th
+// submitted frame, MFT events are held back for `stall_ms` as if the GPU were
+// busy. stall_ms 0 turns it off.
+void SetMfEncoderStallForTest(int64_t after_frames, int stall_ms);
+// Harness only: frames MF encoders converted on the GPU on the calling thread.
+int64_t MfEncoderGpuFramesForTest();
+// Harness only: frames every MF encoder in the process converted on the GPU.
+int64_t MfEncoderGpuFramesTotalForTest();
+// Harness only: the frame buffer types MF encoders were given ("D3D11" for
+// D3D11TextureBuffer), and why one was not converted on the GPU.
+std::string MfEncoderFrameTypesForTest();
+// Harness only: why the last D3D11 frame on this thread was not converted on
+// the GPU, then cleared; empty when it was.
+std::string MfEncoderGpuNoteForTest();
+}  // namespace livekit_ffi
+#endif
 
 #endif  // WEBRTC_MF_H264_ENCODER_IMPL_H_

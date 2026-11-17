@@ -225,6 +225,8 @@ fn main() {
                 .file("src/mf/mf_encoder_factory.cpp")
                 .file("src/mf/mf_decoder_factory.cpp")
                 .file("src/mf/h264_encoder_impl.cpp")
+                .file("src/mf/d3d11_texture_buffer.cpp")
+                .file("src/mf/d3d11_video_converter.cpp")
                 .file("src/mf/h264_decoder_impl.cpp")
                 .file("src/mf/mf_decode_watchdog.cpp")
                 .flag("/DUSE_MF_VIDEO_CODEC=1")

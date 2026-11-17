@@ -3617,6 +3617,46 @@ SENDER_ENCODING; an older library rejects the request as empty.
   `-p libwebrtc --lib rtp_sender` (`live_sender_takes_new_encoding_and_content_hint`: a sending
   loopback sender takes new caps, degradation preference and hint, and keeps encoding).
 
+## Screen share frames on the GPU, a patient NVENC (`rootapp/screen-gpu-encode`, hw.11)
+
+A game shared from an RTX 3090 (desktop 0.9.163) went to 160x90: libwebrtc's CPU adaptation timed
+the MF encoder, which waits behind the game for the GPU, and shrank the input to 320x180; the
+simulcast layer limit then dropped the top layer, and a 500 ms NVENC timeout moved a layer to
+OpenH264 for the rest of the share. The desktop now publishes hardware-encoded shares with
+`MaintainFramerateAndResolution`. Here:
+
+- **Stalled NVENC.** A wait for an input slot or for output that times out no longer asks for the
+  software fallback at once. While the MFT makes no progress (no `METransformNeedInput`, no output)
+  for less than 5 s (`kStallFallbackMs`) the frame is dropped (`NO_OUTPUT` before submit, a pending
+  key frame request is kept) and later waits are 50 ms; only a longer stall falls back.
+- **D3D11 texture frames.** `RootCaptureD3d11FrameRequest` (case 1016, `rootapp_video.proto`) takes
+  an `ID3D11Texture2D*` (R8G8B8A8 or B8G8R8A8, on a multithread-protected device) and a size. The
+  region is copied on the GPU into a pooled texture (`livekit::D3D11TextureBuffer`, kNative, at most
+  12 out per size), so the host may reuse its texture once the request returns. `CropAndScale` only
+  narrows the source rectangle; `ToI420` reads the region back (BT.601 limited, libyuv's
+  ABGR/ARGBToI420). The MF encoder now reports `supports_native_handle`: a D3D11 frame on its own
+  device goes through the D3D11 video processor (`D3D11VideoConverter`) straight into a pooled NV12
+  input texture, scaled to the layer (SimulcastEncoderAdapter passes native frames on unscaled). A
+  frame on another device, or any conversion failure (then for the rest of the encoder), is read back
+  and takes the memory path. `livekit_ffi_rootapp_video_caps()` bit 1 is D3D11_CAPTURE (Windows).
+- **Encoder adapter.** `livekit_ffi_d3d11_encoder_adapter_luid(LUID*)` names the adapter of the
+  hardware H.264 MFT encoders open (S_FALSE with adapter 0 when the MFT names none,
+  `MF_E_NOT_FOUND` without one), so the host takes the shared device there and its textures reach
+  the encoder with no copy, also on a hybrid laptop.
+- Tests (`cargo test --release -p webrtc-sys --lib mf_`): `slow_hardware` (1.5 s stall: frames
+  dropped, still MF, encoding resumes), `stuck_hardware` (8 s: falls back), `gpu_convert`,
+  `gpu_readback`, `gpu_input` (bars through the encoder at 640x360 and a 320x180 layer, decoded in
+  software within 1 of libyuv), `gpu_other_device` (memory path), and
+  `encoder_adapter_luid_names_an_adapter_with_a_shared_device`. GPU scenarios hold
+  `DEVICE_REGISTRY_TEST_LOCK`, since `host_device_contract` retires the shared device.
+  `cargo test --release -p libwebrtc --lib d3d11`: a loopback sender fed textures, encoded by MF on
+  the GPU, decoded by a second peer connection with the bars' colours; `--ignored` adds a 720p share
+  under a game-like GPU load (`LK_TEST_GPU_LOAD` iterations) comparing the old and new settings.
+
+## hw.11 (2026-11-17)
+
+`rootapp-ffi/v0.13.4-hw.11`: hw.10 plus the section above.
+
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
 | Commit | Change |

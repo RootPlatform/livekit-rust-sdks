@@ -164,6 +164,23 @@ pub unsafe extern "C" fn livekit_ffi_d3d11_acquire_shared_device(
     webrtc_sys::mf_device::lk_mf_acquire_host_d3d11_device(adapter_luid, out_device)
 }
 
+/// Writes the LUID of the adapter the MediaFoundation H.264 encoders run on, so a host can take
+/// `livekit_ffi_d3d11_acquire_shared_device` on that adapter and hand its textures to the encoder
+/// on the GPU (RootCaptureD3d11FrameRequest). Returns an HRESULT: S_FALSE with the default
+/// adapter's LUID when the encoder names no adapter, MF_E_NOT_FOUND (0xC00D36D5) without a
+/// hardware encoder.
+///
+/// # Safety
+///
+/// `out_luid` must be valid for a write of 8 bytes.
+#[cfg(target_os = "windows")]
+#[no_mangle]
+pub unsafe extern "C" fn livekit_ffi_d3d11_encoder_adapter_luid(
+    out_luid: *mut webrtc_sys::mf_device::Luid,
+) -> i32 {
+    webrtc_sys::mf_device::lk_mf_encoder_adapter_luid(out_luid)
+}
+
 /// Drops one reference taken by `livekit_ffi_d3d11_acquire_shared_device`.
 /// Returns an HRESULT. The pointer is only compared, so the caller's own COM
 /// reference may already be released.
