@@ -3657,6 +3657,23 @@ OpenH264 for the rest of the share. The desktop now publishes hardware-encoded s
 
 `rootapp-ffi/v0.13.4-hw.11`: hw.10 plus the section above.
 
+## hw.12 (2026-11-26)
+
+`rootapp-ffi/v0.16.0-hw.12`: hw.11 merged with upstream `main` through livekit-ffi 0.16.0
+(6143a96d, 39 commits since ab3711a7). libwebrtc stays `webrtc-a545de4` and the FFI proto is
+unchanged. The merge commit (f5d21d79) lists the conflict resolutions; in short:
+
+- The start bitrate still goes through `SetBitrate` (`BitratePreferences`, see "Start bitrate");
+  upstream's `x-google-start-bitrate` munging, now also on join-time offers, is not taken.
+- Opus NACK (upstream #1683) goes on every audio section of single PC offers, the initial offer
+  included, after the stereo munging (`munge_single_pc_offer`), and on dual PC answers after
+  `munge_answer_stereo_from_offer`.
+- FFI video frames: a tightly packed decoder I420 buffer still backs the handle without a copy
+  (`shared_i420_info`); every other frame converts into the stream's reused `FrameBuffers`
+  (upstream #1644). `to_libwebrtc_buffer` keeps the I420 pool.
+- Join-time track publishing (upstream #1050) runs the fork's sender setup: video tracks feed
+  `add_video_track`, stereo and external audio tracks register as before.
+
 ## Branch history (`rootapp/mf-hw-video` on top of `livekit-ffi/v0.12.76`)
 
 | Commit | Change |
