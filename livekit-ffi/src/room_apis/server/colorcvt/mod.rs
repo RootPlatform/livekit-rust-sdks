@@ -802,7 +802,7 @@ mod tests {
         assert_eq!(info.height, HEIGHT);
         let [y, u, v] = &info.components[..] else { panic!("expected three planes") };
         assert_eq!((y.stride, u.stride, v.stride), (WIDTH, chroma_w, chroma_w));
-
+    }
 
     fn filled(mut buffer: I420Buffer) -> I420Buffer {
         let (y, u, v) = buffer.data_mut();
